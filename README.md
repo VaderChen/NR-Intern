@@ -1,4 +1,4 @@
-# NR-Intern AI Agent
+# 永不休息的實習生
 
 獨立的 Go AI Agent 專案，包含：
 
