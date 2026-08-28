@@ -1,0 +1,162 @@
+package domain
+
+import "time"
+
+const (
+	SessionEntryMessage             = "message"
+	SessionEntryOperationStarted    = "operation_started"
+	SessionEntryOperationFinished   = "operation_finished"
+	SessionEntryTurnStarted         = "turn_started"
+	SessionEntryTurnFinished        = "turn_finished"
+	SessionEntryToolStarted         = "tool_started"
+	SessionEntryToolFinished        = "tool_finished"
+	SessionEntryCompaction          = "compaction"
+	SessionEntryMemoryRecall        = "memory_recall"
+	SessionEntryCompletionCheck     = "completion_check"
+	SessionEntryPlanCompletionCheck = "plan_completion_check"
+)
+
+const (
+	OperationStatusRunning   = "running"
+	OperationStatusCompleted = "completed"
+	OperationStatusFailed    = "failed"
+	OperationStatusCanceled  = "canceled"
+)
+
+type Usage struct {
+	InputTokens  int `json:"input_tokens,omitempty"`
+	OutputTokens int `json:"output_tokens,omitempty"`
+	TotalTokens  int `json:"total_tokens,omitempty"`
+}
+
+type ToolCall struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments,omitempty"`
+}
+
+type ToolDefinition struct {
+	Name               string         `json:"name"`
+	Label              string         `json:"label,omitempty"`
+	Version            string         `json:"version,omitempty"`
+	Category           string         `json:"category,omitempty"`
+	Description        string         `json:"description"`
+	InputSchema        map[string]any `json:"input_schema,omitempty"`
+	Platforms          []string       `json:"platforms,omitempty"`
+	Capabilities       []string       `json:"capabilities,omitempty"`
+	ReadOnly           bool           `json:"read_only,omitempty"`
+	RequiresPermission bool           `json:"requires_permission,omitempty"`
+}
+
+type ToolCatalogEntry struct {
+	Definition        ToolDefinition `json:"definition"`
+	Allowed           bool           `json:"allowed"`
+	Available         bool           `json:"available"`
+	UnavailableReason string         `json:"unavailable_reason,omitempty"`
+}
+
+type ToolExecution struct {
+	ToolCallID string         `json:"tool_call_id"`
+	ToolName   string         `json:"tool_name"`
+	Content    string         `json:"content"`
+	Details    map[string]any `json:"details,omitempty"`
+	IsError    bool           `json:"is_error,omitempty"`
+	Terminate  bool           `json:"terminate,omitempty"`
+}
+
+type ModelRequest struct {
+	SessionID    string `json:"session_id"`
+	ProviderID   string `json:"provider_id,omitempty"`
+	Model        string `json:"model,omitempty"`
+	ThinkingMode string `json:"thinking_mode,omitempty"`
+	ToolChoice   string `json:"tool_choice,omitempty"`
+	// SystemPrompt、HostPrompt、ToolPrompt、PhasePrompt、ContextPrompt、History 與 UserPrompt
+	// 保持獨立，讓 Provider adapter 以不同訊息區段編碼，不把權限、工具資料、
+	// Harness 階段控制與使用者內容混在一起。
+	SystemPrompt  string           `json:"system_prompt"`
+	HostPrompt    string           `json:"host_prompt,omitempty"`
+	ToolPrompt    string           `json:"tool_prompt,omitempty"`
+	PhasePrompt   string           `json:"phase_prompt,omitempty"`
+	ContextPrompt string           `json:"context_prompt,omitempty"`
+	History       []Message        `json:"history,omitempty"`
+	UserPrompt    string           `json:"user_prompt,omitempty"`
+	Tools         []ToolDefinition `json:"tools,omitempty"`
+	Metadata      map[string]any   `json:"metadata,omitempty"`
+}
+
+type ModelResponse struct {
+	ProviderID        string     `json:"provider_id,omitempty"`
+	ProviderRequestID string     `json:"provider_request_id,omitempty"`
+	Model             string     `json:"model,omitempty"`
+	Content           string     `json:"content,omitempty"`
+	Reasoning         string     `json:"reasoning,omitempty"`
+	ToolCalls         []ToolCall `json:"tool_calls,omitempty"`
+	StopReason        string     `json:"stop_reason,omitempty"`
+	Usage             Usage      `json:"usage,omitempty"`
+}
+
+const (
+	ModelEventTextDelta     = "text_delta"
+	ModelEventThinkingDelta = "thinking_delta"
+	ModelEventToolCallDelta = "tool_call_delta"
+	ModelEventUsage         = "usage"
+	ModelEventProgress      = "progress"
+)
+
+// ModelEvent 是 Provider 串流過程的結構化事件。
+//
+// 這裡刻意不是單純的 {type, text}：工具參數在 adapter 內部累積完才一次吐出時，
+// 前端無法顯示工具呼叫的形成過程；thinking 與 usage 同樣需要能被獨立辨識。
+// Delta 對 text_delta、thinking_delta、progress 是增量文字，
+// 對 tool_call_delta 則是該次工具參數的片段。
+type ModelEvent struct {
+	Type     string         `json:"type"`
+	Delta    string         `json:"delta,omitempty"`
+	ToolCall *ToolCallDelta `json:"tool_call,omitempty"`
+	Usage    *Usage         `json:"usage,omitempty"`
+}
+
+// ToolCallDelta 描述目前正在累積的工具呼叫。Index 是同一則訊息內的工具呼叫序號，
+// ID 與 Name 在 Provider 尚未送出前可能為空。
+type ToolCallDelta struct {
+	Index int    `json:"index"`
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+}
+
+// ModelCapabilities 是後端設定宣告的模型限制。
+//
+// OpenAI-compatible 端點無法可靠地被探測，用模型名稱字串比對又太脆弱，
+// 因此這些值由設定提供；ContextWindow 為 0 代表未知，此時退回設定的固定預算。
+type ModelCapabilities struct {
+	ContextWindow   int  `json:"context_window,omitempty"`
+	MaxOutputTokens int  `json:"max_output_tokens,omitempty"`
+	SupportsTools   bool `json:"supports_tools"`
+	Streaming       bool `json:"streaming"`
+}
+
+// UnresolvedToolFailure 是一次工具失敗，且同名工具在之後沒有成功執行過。
+type UnresolvedToolFailure struct {
+	ToolCallID string `json:"tool_call_id"`
+	ToolName   string `json:"tool_name"`
+	Summary    string `json:"summary,omitempty"`
+}
+
+// RunCompletion 記錄這次 run 的完成度判定結果。
+//
+// 沒有它時，「工具全部成功後完成」與「工具失敗後照樣宣稱完成」在 API 上
+// 完全無法區分，兩者都只是 status=completed。
+type RunCompletion struct {
+	ChecksPerformed    int                     `json:"checks_performed"`
+	UnresolvedFailures []UnresolvedToolFailure `json:"unresolved_failures,omitempty"`
+}
+
+type SessionEntry struct {
+	ID        string         `json:"id"`
+	SessionID string         `json:"session_id"`
+	Sequence  int64          `json:"sequence"`
+	Type      string         `json:"type"`
+	Message   *Message       `json:"message,omitempty"`
+	Data      map[string]any `json:"data,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+}

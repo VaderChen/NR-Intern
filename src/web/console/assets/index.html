@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>聰明的實習生</title>
+  <link rel="icon" type="image/png" href="/app-icon.png">
+  <script>
+    (() => {
+      const supportedModes = new Set(["auto", "light", "dark"]);
+      let mode = "auto";
+      try {
+        const storedMode = localStorage.getItem("displayMode");
+        if (supportedModes.has(storedMode)) mode = storedMode;
+      } catch (_) {}
+      const systemDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
+      document.documentElement.dataset.displayMode = mode;
+      document.documentElement.dataset.theme = mode === "auto" ? (systemDark ? "dark" : "light") : mode;
+    })();
+  </script>
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img id="brandMark" class="brand-mark" src="/app-icon.png" alt="">
+        <div class="brand-copy"><strong id="brandName">聰明的實習生</strong><small><span id="statusDot" class="dot"></span><span id="backendState">檢查中</span></small></div>
+      </div>
+      <div class="workspace-switcher">
+        <select id="workspaceSelect" aria-label="切換 Workspace" disabled></select>
+        <button id="newWorkspace" class="icon-button" type="button" title="建立 Workspace" aria-label="建立 Workspace" disabled>＋</button>
+      </div>
+      <section id="pinnedSection" class="navigation-section hidden">
+        <div class="section-title">已釘選</div>
+        <nav id="pinnedList" class="sessions" aria-label="已釘選對話"></nav>
+      </section>
+      <section class="navigation-section project-navigation">
+        <div class="navigation-heading">
+          <div class="section-title">專案</div>
+          <button id="newProject" class="icon-button" type="button" title="建立專案" aria-label="建立專案" disabled>＋</button>
+        </div>
+        <nav id="projectList" class="project-list" aria-label="專案與對話"></nav>
+      </section>
+      <div class="sidebar-actions">
+        <button id="openManagement" class="ghost full" disabled>系統管理</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="session-heading">
+          <h1 id="sessionTitle">選擇或建立對話</h1>
+          <small id="agentLabel">General Harness Agent</small>
+        </div>
+        <div class="topbar-meta">
+          <div id="sessionRuntimeControls" class="session-runtime-controls hidden" aria-label="對話 Provider 與模型">
+            <label title="此對話使用的 Provider">
+              <span>Provider</span>
+              <select id="sessionProviderSelect" aria-label="對話 Provider"></select>
+            </label>
+            <label title="此對話使用的模型">
+              <span>模型</span>
+              <select id="sessionModelSelect" aria-label="對話模型"></select>
+            </label>
+          </div>
+          <label class="display-mode-control" title="顯示模式">
+            <span>外觀</span>
+            <select id="displayMode" aria-label="顯示模式">
+              <option value="auto">自動</option>
+              <option value="light">明亮</option>
+              <option value="dark">深色</option>
+            </select>
+          </label>
+          <span id="sessionPermission" class="chip hidden"></span>
+        </div>
+      </header>
+
+      <section id="emptyState" class="empty-state">
+        <div class="empty-icon">◎</div>
+        <h2>從實際行動開始</h2>
+        <p>Agent 不會先固定拆解問題，而會依目前狀態、記憶與原生工具結果持續運作。</p>
+      </section>
+      <section id="messages" class="messages hidden" aria-live="polite"></section>
+
+      <section id="activity" class="activity hidden" aria-live="polite">
+        <span id="activityText"></span>
+        <button id="retryRun" class="small hidden" type="button">重試 Run</button>
+      </section>
+      <div class="conversation-actions">
+        <button id="openPlan" class="plan-trigger ghost hidden" type="button" aria-haspopup="dialog" title="檢視或建立工作計畫">
+          <span>計畫</span><strong id="planProgress">建立</strong>
+        </button>
+      </div>
+      <form id="composer" class="composer">
+        <div id="attachmentTray" class="attachment-tray hidden" aria-label="待送出附件"></div>
+        <div class="composer-input-row">
+          <textarea id="prompt" rows="2" placeholder="請輸入任務…（Enter 送出，Shift+Enter 換行）" disabled></textarea>
+          <button id="send" class="send" type="button" aria-label="送出訊息" title="送出訊息" disabled>
+            <svg id="sendIcon" class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 19V5m0 0-6 6m6-6 6 6" />
+            </svg>
+            <svg id="stopIcon" class="run-action-icon hidden" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="7" y="7" width="10" height="10" rx="1.5" />
+            </svg>
+          </button>
+        </div>
+        <small class="composer-drop-hint">可從系統剪貼簿貼上，或拖放檔案與媒體到對話區域</small>
+      </form>
+    </main>
+
+    <section id="managementPanel" class="management-page hidden" aria-label="系統管理">
+      <div class="panel-head">
+        <button id="closeManagement" class="ghost back-button">← 返回</button>
+        <div><strong>系統管理</strong><small id="managementSubtitle">後端與 Session</small></div>
+      </div>
+      <div class="panel-tabs" role="tablist">
+        <button class="panel-tab active" data-panel="overview" role="tab">概況</button>
+        <button class="panel-tab" data-panel="providers" role="tab">Provider 設定</button>
+        <button class="panel-tab" data-panel="tools" role="tab">工具</button>
+        <button class="panel-tab" data-panel="audit" role="tab">稽核</button>
+      </div>
+
+      <div id="overviewPanel" class="panel-content">
+        <form id="serviceSettings" class="management-section">
+          <div class="section-head"><h2>介面設定</h2><span id="serviceSettingsState" class="save-state"></span></div>
+          <label>顯示名稱<input id="settingServiceName" maxlength="80" autocomplete="off" required></label>
+          <p class="hint">名稱會套用到左上角品牌、網頁標題與 Agent 顯示名稱。</p>
+          <button id="saveServiceSettings" class="primary" type="submit">儲存介面設定</button>
+        </form>
+        <section class="management-section backend-card">
+          <div class="section-head"><h2>後端程序</h2><span class="status-line"><span id="managementStatusDot" class="dot"></span><strong id="managementBackendState">檢查中</strong></span></div>
+          <small id="backendURL"></small>
+          <small id="backendDetail"></small>
+          <div class="control-row">
+            <button id="startBackend" class="small">啟動</button>
+            <button id="restartBackend" class="small">重啟</button>
+            <button id="stopBackend" class="small danger">停止</button>
+          </div>
+        </section>
+        <section class="management-section">
+          <div class="section-head"><h2>後端診斷</h2><button id="refreshDiagnostics" class="small ghost">重新整理</button></div>
+          <div id="diagnosticCards" class="metric-grid"></div>
+          <dl id="providerSummary" class="summary-list"></dl>
+          <details><summary>脫敏設定</summary><pre id="diagnosticConfig" class="json-view"></pre></details>
+        </section>
+
+        <form id="workspaceSettings" class="management-section hidden">
+          <div class="section-head"><h2>Workspace 設定</h2><span id="workspaceSettingsState" class="save-state"></span></div>
+          <label>名稱<input id="settingWorkspaceName" autocomplete="off"></label>
+          <label>說明<textarea id="settingWorkspaceDescription" rows="2"></textarea></label>
+          <label>預設 Provider<select id="settingWorkspaceProvider"></select></label>
+          <label>預設模型<input id="settingWorkspaceModel" placeholder="使用 Provider 預設模型" autocomplete="off"></label>
+          <p class="hint">不同前端分頁可同時選擇不同 Workspace；此處更新只影響之後未指定 override 的 Run。</p>
+          <button id="saveWorkspaceSettings" class="primary" type="submit">儲存 Workspace 設定</button>
+        </form>
+
+        <form id="sessionSettings" class="management-section hidden">
+          <div class="section-head"><h2>Session 設定</h2><span id="settingsState" class="save-state"></span></div>
+          <label>名稱<input id="settingTitle" autocomplete="off"></label>
+          <label>所屬專案<select id="settingProject"></select></label>
+          <label>Provider override<select id="settingProvider"></select></label>
+          <label>模型<input id="settingModel" placeholder="使用後端預設" autocomplete="off"></label>
+          <label>工具權限
+            <select id="settingPermission">
+              <option value="default">標準權限</option>
+              <option value="trusted">信任工具權限</option>
+            </select>
+          </label>
+          <label>Memory scope<input id="settingMemoryScope" placeholder="使用 Agent 預設 scope" autocomplete="off"></label>
+          <label class="check-label"><input id="settingPinned" type="checkbox">釘選此對話</label>
+          <p class="hint">Workspace root 不可由 HTTP 管理介面變更。信任權限仍須後端允許 elevated tools。</p>
+          <button id="saveSessionSettings" class="primary" type="submit">儲存 Session 設定</button>
+        </form>
+        <section id="noSessionManagement" class="management-section quiet">選擇 Session 後可管理模型、權限與記憶 scope。</section>
+      </div>
+
+      <div id="providersPanel" class="panel-content hidden">
+        <div class="provider-settings-layout">
+          <section class="management-section provider-settings-sidebar">
+            <div class="section-head">
+              <div><h2>Provider 清單</h2><p class="hint">可建立多個 Provider，並由 Workspace 選擇使用。</p></div>
+              <button id="addProviderSetting" class="icon-button" type="button" title="新增 Provider" aria-label="新增 Provider">＋</button>
+            </div>
+            <div id="providerSettingsList" class="provider-settings-list"></div>
+          </section>
+
+          <form id="providerSettingsForm" class="management-section provider-settings-editor hidden">
+            <div class="section-head">
+              <div><h2 id="providerSettingsEditorTitle">Provider 設定</h2><p class="hint">設定儲存後會直接套用到新的模型請求。</p></div>
+              <span id="providerSettingsState" class="save-state"></span>
+            </div>
+            <div class="provider-field-grid">
+              <label>Provider ID<input id="providerSettingID" maxlength="80" autocomplete="off" required></label>
+              <label>類型<select id="providerSettingType"><option value="openai-compatible">openai-compatible</option></select></label>
+              <label class="provider-field-full">Base URL<input id="providerSettingBaseURL" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" required></label>
+              <label class="provider-field-full">API Key
+                <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
+                <small id="providerSettingAPIKeyState"></small>
+              </label>
+              <label id="providerSettingClearKeyRow" class="check-label provider-field-full hidden"><input id="providerSettingClearKey" type="checkbox">清除目前已儲存的 API Key</label>
+              <label class="provider-field-full">預設模型
+                <div class="provider-model-control">
+                  <div class="provider-model-value">
+                    <input id="providerSettingModel" placeholder="gpt-4o-mini" autocomplete="off" required>
+                    <select id="providerSettingModelCatalog" class="hidden" aria-label="可用模型列表"></select>
+                  </div>
+                  <button id="refreshProviderModels" class="small ghost" type="button">更新列表</button>
+                </div>
+                <small id="providerModelState">模型列表尚未載入，仍可手動輸入模型名稱。</small>
+              </label>
+              <label>Instruction role<select id="providerSettingInstructionRole"><option value="system">system</option><option value="developer">developer</option></select></label>
+              <label>重試次數<input id="providerSettingMaxAttempts" type="number" min="1" max="3" required></label>
+            </div>
+            <div class="provider-check-grid">
+              <label class="check-label"><input id="providerSettingDefault" type="checkbox">設為系統預設</label>
+              <label class="check-label"><input id="providerSettingDisableStreaming" type="checkbox">停用 Streaming</label>
+              <label class="check-label"><input id="providerSettingStreamUsage" type="checkbox">串流包含 Usage</label>
+              <label class="check-label"><input id="providerSettingOmitToolChoice" type="checkbox">省略 tool_choice</label>
+            </div>
+            <details class="provider-advanced">
+              <summary>進階設定</summary>
+              <div class="provider-field-grid">
+                <label>請求逾時（秒）<input id="providerSettingTimeout" type="number" min="1" required></label>
+                <label>連線逾時（秒）<input id="providerSettingConnectTimeout" type="number" min="1" required></label>
+                <label>回應標頭逾時（秒）<input id="providerSettingHeaderTimeout" type="number" min="1" required></label>
+                <label>Context window<input id="providerSettingContextWindow" type="number" min="0"></label>
+                <label>最大輸出 Tokens<input id="providerSettingMaxOutputTokens" type="number" min="0"></label>
+              </div>
+            </details>
+            <div class="provider-editor-actions">
+              <button id="deleteProviderSetting" class="danger ghost" type="button">刪除 Provider</button>
+              <div class="provider-editor-action-group">
+                <span id="providerTestState" class="hint"></span>
+                <button id="testProviderSetting" class="ghost" type="button">測試連線</button>
+                <button id="saveProviderSetting" class="primary" type="submit">儲存 Provider</button>
+              </div>
+            </div>
+          </form>
+
+          <section id="noProviderSettings" class="management-section quiet provider-settings-empty">請選擇 Provider，或建立新的 Provider。</section>
+        </div>
+      </div>
+
+      <div id="toolsPanel" class="panel-content hidden">
+        <section class="management-section">
+          <div class="section-head"><h2>原生工具</h2><button id="refreshTools" class="small ghost">重新整理</button></div>
+          <p class="hint">可用性同時由後端 allowlist、elevated tools 設定與 Session 權限判斷。</p>
+          <div id="toolList" class="tool-list"></div>
+        </section>
+      </div>
+
+      <div id="auditPanel" class="panel-content hidden">
+        <section class="management-section">
+          <div class="section-head"><h2>Harness 稽核</h2><button id="refreshAudit" class="small ghost">重新整理</button></div>
+          <p class="hint">依 sequence 顯示 operation、turn 與 tool call 的持久化生命週期。</p>
+          <div id="auditList" class="audit-list"></div>
+          <button id="loadMoreAudit" class="ghost full hidden">載入更多</button>
+        </section>
+      </div>
+    </section>
+
+  </div>
+
+  <div id="sessionContextMenu" class="context-menu hidden" role="menu" aria-label="對話操作">
+    <button id="inspectContextSession" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12s3.3-6 9-6 9 6 9 6-3.3 6-9 6-9-6-9-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+      <span>檢視內容</span>
+    </button>
+    <button id="renameContextSession" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m4 16-.8 4 4-.8L18.7 7.7a2 2 0 0 0-2.8-2.8Z"/><path d="m14.5 6.3 3.2 3.2"/></svg>
+      <span>重新命名</span>
+    </button>
+    <button id="pinContextSession" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 4 6 6-3 1-4 4-1 5-2-2-2-2 5-1 4-4Z"/><path d="m9 15-5 5"/></svg>
+      <span id="pinContextSessionLabel">釘選對話</span>
+    </button>
+    <div class="context-menu-separator" role="separator"></div>
+    <button id="deleteContextSession" class="danger" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>
+      <span>刪除對話</span>
+    </button>
+  </div>
+
+  <div id="resourceContextMenu" class="context-menu resource-context-menu hidden" role="menu" aria-label="連結操作">
+    <button id="openContextResource" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6m0-6-9 9"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/></svg>
+      <span id="openContextResourceLabel">開啟</span>
+    </button>
+    <button id="revealContextResource" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l2 2h9v8.25A1.75 1.75 0 0 1 18.75 19.5H5.25a1.75 1.75 0 0 1-1.75-1.75Z"/><circle cx="16.5" cy="14.5" r="2.5"/><path d="m18.3 16.3 2.2 2.2"/></svg>
+      <span>在檔案管理器中顯示</span>
+    </button>
+    <div class="context-menu-separator" role="separator"></div>
+    <button id="copyContextResource" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="1.5"/><path d="M16 4H5a1 1 0 0 0-1 1v11"/></svg>
+      <span id="copyContextResourceLabel">複製</span>
+    </button>
+  </div>
+
+  <dialog id="sessionDialog">
+    <form method="dialog" id="sessionForm">
+      <h2>建立新 Session</h2>
+      <label>名稱<input id="newTitle" placeholder="例如：程式碼檢查" required></label>
+      <label>所屬專案<select id="newSessionProject"></select></label>
+      <label>Provider override<select id="newProvider"></select></label>
+      <label>模型<input id="newModel" placeholder="省略時使用後端預設"></label>
+      <label>工具權限
+        <select id="newPermission"><option value="default">標準權限</option><option value="trusted">信任工具權限</option></select>
+      </label>
+      <label>Memory scope<input id="newMemoryScope" placeholder="省略時使用 Agent 預設"></label>
+      <label class="check-label"><input id="newPinned" type="checkbox">建立後釘選</label>
+      <p class="warning">信任權限可使用 shell／SSH，仍須後端設定允許。</p>
+      <div class="dialog-actions"><button type="button" id="cancelSession" class="ghost">取消</button><button id="createSession" value="default" class="primary">建立</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="renameSessionDialog">
+    <form method="dialog" id="renameSessionForm">
+      <h2>重新命名對話</h2>
+      <label>名稱<input id="renameSessionTitle" maxlength="160" autocomplete="off" required></label>
+      <div class="dialog-actions">
+        <button type="button" id="cancelRenameSession" class="ghost">取消</button>
+        <button id="saveRenameSession" value="default" class="primary">儲存</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="sessionContentDialog" class="session-content-dialog">
+    <div class="dialog-title-row">
+      <div>
+        <h2 id="sessionContentTitle">對話內容</h2>
+        <small id="sessionContentMeta" class="quiet"></small>
+      </div>
+      <button id="closeSessionContent" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+    </div>
+    <div id="sessionContentList" class="session-content-list" aria-live="polite"></div>
+  </dialog>
+
+  <dialog id="deleteSessionDialog">
+    <form method="dialog" id="deleteSessionForm">
+      <h2>刪除對話</h2>
+      <p id="deleteSessionMessage"></p>
+      <p class="warning">刪除後將一併移除這個 Session 的訊息、稽核資料及私有工作目錄，無法復原。</p>
+      <div class="dialog-actions">
+        <button type="button" id="cancelDeleteSession" class="ghost">取消</button>
+        <button id="confirmDeleteSession" value="default" class="danger">刪除</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="projectDialog" class="project-dialog">
+    <form method="dialog" id="projectForm">
+      <h2>建立新專案</h2>
+      <label>名稱<input id="newProjectName" placeholder="例如：NR-Intern" required></label>
+      <label>說明<textarea id="newProjectDescription" rows="3" placeholder="選填"></textarea></label>
+      <fieldset class="sandbox-fieldset">
+        <legend>Sandbox 目錄</legend>
+        <p class="hint">可加入多個既有的絕對目錄。Agent 的檔案與 Shell 工具只能在這些範圍內運作。</p>
+        <button id="pickProjectFolders" class="ghost full folder-picker" type="button">
+          <span class="folder-picker-icon" aria-hidden="true">▱</span>
+          <span><strong>拖入一個或多個目錄</strong><small>或按一下使用系統目錄選擇器</small></span>
+        </button>
+        <p id="projectSandboxEmpty" class="sandbox-empty">尚未加入目錄；將使用 Session 私有工作目錄。</p>
+        <div id="projectSandboxRoots" class="sandbox-root-list" aria-live="polite"></div>
+      </fieldset>
+      <div class="dialog-actions"><button type="button" id="cancelProject" class="ghost">取消</button><button id="createProject" value="default" class="primary">建立</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="projectSettingsDialog" class="project-dialog">
+    <form method="dialog" id="projectSettingsForm">
+      <div class="dialog-title-row">
+        <h2>專案設定</h2>
+        <span id="projectSettingsState" class="save-state"></span>
+      </div>
+      <label>名稱<input id="editProjectName" required></label>
+      <label>說明<textarea id="editProjectDescription" rows="3" placeholder="選填"></textarea></label>
+      <fieldset class="sandbox-fieldset">
+        <legend>Sandbox 目錄</legend>
+        <p class="hint">可加入多個既有的絕對目錄。儲存後，Agent 的檔案與 Shell 工具會使用更新後的範圍。</p>
+        <button id="pickEditProjectFolders" class="ghost full folder-picker" type="button">
+          <span class="folder-picker-icon" aria-hidden="true">▱</span>
+          <span><strong>拖入一個或多個目錄</strong><small>或按一下使用系統目錄選擇器</small></span>
+        </button>
+        <p id="editProjectSandboxEmpty" class="sandbox-empty">尚未加入目錄；將使用 Session 私有工作目錄。</p>
+        <div id="editProjectSandboxRoots" class="sandbox-root-list" aria-live="polite"></div>
+      </fieldset>
+      <div class="dialog-actions split-actions">
+        <button type="button" id="deleteProjectSettings" class="danger ghost">刪除專案</button>
+        <span class="dialog-action-group">
+          <button type="button" id="cancelProjectSettings" class="ghost">取消</button>
+          <button id="saveProjectSettings" value="default" class="primary">儲存</button>
+        </span>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="workspaceDialog">
+    <form method="dialog" id="workspaceForm">
+      <h2>建立新 Workspace</h2>
+      <label>名稱<input id="newWorkspaceName" placeholder="例如：產品開發" required></label>
+      <label>說明<textarea id="newWorkspaceDescription" rows="3" placeholder="選填"></textarea></label>
+      <label>Provider<select id="newWorkspaceProvider"></select></label>
+      <label>預設模型<input id="newWorkspaceModel" placeholder="省略時使用 Provider 預設模型"></label>
+      <div class="dialog-actions"><button type="button" id="cancelWorkspace" class="ghost">取消</button><button id="createWorkspace" value="default" class="primary">建立</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="approvalDialog" class="approval-dialog">
+    <form method="dialog" id="approvalForm">
+      <h2>工具執行審核</h2>
+      <p>Agent 要求執行 <strong id="approvalToolName"></strong></p>
+      <p id="approvalReasonText" class="hint"></p>
+      <label id="approvalArgumentsField">工具參數<pre id="approvalArguments" class="approval-arguments"></pre></label>
+      <label>決策理由（選填）<textarea id="approvalDecisionReason" rows="3" placeholder="此理由會回傳給 Agent"></textarea></label>
+      <label class="check-label approval-permanent"><input id="permanentApproval" type="checkbox">永久核准此對話，之後不再詢問</label>
+      <div class="dialog-actions">
+        <button type="button" id="denyTool" class="danger">拒絕</button>
+        <button type="button" id="approveTool" class="primary">核准執行</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="planDialog" class="plan-dialog">
+    <div class="dialog-title-row">
+      <div>
+        <h2>工作計畫</h2>
+        <small id="planDialogMeta" class="quiet">依序執行並驗證每一個步驟</small>
+      </div>
+      <button id="closePlan" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+    </div>
+    <section id="planView">
+      <div class="plan-tabs" role="tablist" aria-label="計畫狀態">
+        <button id="activePlanTab" class="plan-tab is-selected" type="button" role="tab" aria-selected="true" aria-controls="planListPanel">
+          進行中 <span id="activePlanCount" class="plan-tab-count">0</span>
+        </button>
+        <button id="completedPlanTab" class="plan-tab" type="button" role="tab" aria-selected="false" aria-controls="planListPanel" tabindex="-1">
+          已完成 <span id="completedPlanCount" class="plan-tab-count">0</span>
+        </button>
+      </div>
+      <div id="planListPanel" role="tabpanel" aria-labelledby="activePlanTab">
+        <div class="plan-list-toolbar">
+          <small id="planListHint">拖曳計畫可調整執行順序</small>
+          <button id="createPlan" class="small primary" type="button">＋ 新增計畫</button>
+        </div>
+        <div id="planEmpty" class="plan-empty">
+          <strong id="planEmptyTitle">尚未建立計畫</strong>
+          <p id="planEmptyDescription">你可以先拆解長任務；Agent 遇到多步驟工作時也能自行建立計畫。</p>
+          <button id="createPlanFromEmpty" class="primary" type="button">新增計畫</button>
+        </div>
+        <div id="planList" class="plan-list" aria-live="polite"></div>
+      </div>
+    </section>
+    <form id="planForm" class="hidden">
+      <label>計畫名稱<input id="newPlanTitle" maxlength="160" required></label>
+      <label>目標<textarea id="newPlanObjective" rows="2" placeholder="說明整份計畫要達成的結果（選填）"></textarea></label>
+      <section class="plan-step-fieldset">
+        <div class="plan-step-heading">
+          <strong>執行步驟</strong>
+          <button id="addPlanStep" class="small ghost" type="button">＋ 新增步驟</button>
+        </div>
+        <p class="hint">每一步都要有可由工具確認的客觀驗證條件。</p>
+        <div id="planStepEditor" class="plan-step-editor"></div>
+      </section>
+      <div class="dialog-actions">
+        <button id="cancelPlanEdit" class="ghost" type="button">取消</button>
+        <button id="savePlan" class="primary" type="submit">儲存計畫</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/vendor/marked/marked.umd.js" defer></script>
+  <script src="/vendor/dompurify/purify.min.js" defer></script>
+  <script src="/vendor/katex/katex.min.js" defer></script>
+  <script src="/vendor/katex/auto-render.min.js" defer></script>
+  <script src="/rich-text.js" defer></script>
+  <script src="/app.js" defer></script>
+</body>
+</html>

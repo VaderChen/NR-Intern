@@ -1,0 +1,1204 @@
+package application
+
+import (
+	"AgenticService/src/domain"
+	"AgenticService/src/internal/logging"
+	"AgenticService/src/internal/textutil"
+	"AgenticService/src/internal/valueutil"
+	"AgenticService/src/ports"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+)
+
+type EventSink func(domain.Event) error
+
+type activeRun struct {
+	sessionID string
+	cancel    context.CancelFunc
+}
+
+type Service struct {
+	registry    *Registry
+	runs        ports.RunRepository
+	events      ports.RunEventRepository
+	projects    ports.ProjectRepository
+	workspaces  ports.WorkspaceRepository
+	providers   ports.ProviderCatalog
+	approvals   ports.ApprovalCoordinator
+	memories    ports.MemoryRepository
+	plans       ports.PlanRepository
+	attachments ports.AttachmentRepository
+	// permissions 是後端唯一的 permission profile 依據。
+	// 呼叫端要求的 profile 必須先經過這裡解析，才不會讓 API request 自行決定提權。
+	permissions domain.PermissionPolicy
+	logger      *slog.Logger
+	now         func() time.Time
+	rootCtx     context.Context
+	stop        context.CancelFunc
+
+	startMu        sync.Mutex
+	mu             sync.Mutex
+	active         map[string]activeRun
+	sessionGates   map[string]chan struct{}
+	pausedSessions map[string]string
+	sessionSignals map[string]chan struct{}
+	watchers       map[string]map[uint64]chan struct{}
+	nextWatcher    uint64
+	closed         bool
+	wg             sync.WaitGroup
+}
+
+// Dependencies 取代一長串位置參數：這些欄位多半是介面，順序寫錯不會被型別系統擋下。
+type Dependencies struct {
+	Registry   *Registry
+	Runs       ports.RunRepository
+	Events     ports.RunEventRepository
+	Projects   ports.ProjectRepository
+	Workspaces ports.WorkspaceRepository
+	Providers  ports.ProviderCatalog
+	Approvals  ports.ApprovalCoordinator
+	// Memories 可以是 nil：後端停用長期記憶時，記憶 API 會回報 conflict 而不是假裝成功。
+	Memories ports.MemoryRepository
+	// Plans 是 Session 計畫的持久化來源，也是 Agent 與使用者介面共用的唯一真實狀態。
+	Plans ports.PlanRepository
+	// Attachments 可以是 nil；只有建立含附件的 Run 時才要求此能力。
+	Attachments ports.AttachmentRepository
+	Permissions domain.PermissionPolicy
+	Logger      *slog.Logger
+}
+
+func NewService(dependencies Dependencies) (*Service, error) {
+	registry, runs, events := dependencies.Registry, dependencies.Runs, dependencies.Events
+	projects, workspaces, providers := dependencies.Projects, dependencies.Workspaces, dependencies.Providers
+	if registry == nil || runs == nil || events == nil || projects == nil || workspaces == nil || providers == nil || dependencies.Plans == nil {
+		return nil, fmt.Errorf("%w: registry, run, event, project, workspace, provider and plan dependencies are required", domain.ErrInvalidInput)
+	}
+	rootCtx, stop := context.WithCancel(context.Background())
+	service := &Service{
+		registry:       registry,
+		runs:           runs,
+		events:         events,
+		projects:       projects,
+		workspaces:     workspaces,
+		providers:      providers,
+		approvals:      dependencies.Approvals,
+		memories:       dependencies.Memories,
+		plans:          dependencies.Plans,
+		attachments:    dependencies.Attachments,
+		permissions:    dependencies.Permissions.Normalize(),
+		logger:         logging.Or(dependencies.Logger),
+		now:            time.Now,
+		rootCtx:        rootCtx,
+		stop:           stop,
+		active:         map[string]activeRun{},
+		sessionGates:   map[string]chan struct{}{},
+		pausedSessions: map[string]string{},
+		sessionSignals: map[string]chan struct{}{},
+		watchers:       map[string]map[uint64]chan struct{}{},
+	}
+	if err := service.reconcileTerminalEvents(context.Background()); err != nil {
+		stop()
+		return nil, err
+	}
+	return service, nil
+}
+
+func (s *Service) ListAgents() []domain.AgentDescriptor {
+	return s.registry.List()
+}
+
+func (s *Service) GetAgent(id string) (domain.AgentDescriptor, error) {
+	engine, err := s.registry.Get(id)
+	if err != nil {
+		return domain.AgentDescriptor{}, err
+	}
+	return engine.Descriptor(), nil
+}
+
+func (s *Service) CreateSession(ctx context.Context, agentID string, input domain.CreateSessionInput) (domain.Session, error) {
+	engine, err := s.registry.Get(agentID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	input.WorkspaceID = strings.TrimSpace(input.WorkspaceID)
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.ProviderID = strings.TrimSpace(input.ProviderID)
+	input.Metadata = valueutil.CloneMap(input.Metadata)
+	delete(input.Metadata, "workspace_root")
+	delete(input.Metadata, "sandbox_roots")
+	if err := s.validateSessionPlacement(ctx, input.WorkspaceID, input.ProjectID); err != nil {
+		return domain.Session{}, err
+	}
+	workspace, err := s.workspaces.Get(ctx, input.WorkspaceID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	defaultProviderID := strings.TrimSpace(workspace.DefaultProviderID)
+	// Session 建立後便保存實際 Provider 與模型，避免 Workspace 日後調整預設值時，
+	// 舊對話在沒有明確操作的情況下被悄悄切換推理環境。
+	if input.ProviderID == "" {
+		input.ProviderID = defaultProviderID
+	}
+	if strings.TrimSpace(input.Model) == "" {
+		if input.ProviderID == defaultProviderID {
+			input.Model = strings.TrimSpace(workspace.Model)
+		}
+		if input.Model == "" {
+			input.Model = s.defaultModelForProvider(input.ProviderID)
+		}
+	}
+	if err := s.validateWorkspaceProvider(ctx, input.WorkspaceID, input.ProviderID); err != nil {
+		return domain.Session{}, err
+	}
+	profile, err := s.permissions.Resolve(input.PermissionProfile)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	input.PermissionProfile = profile
+	return engine.CreateSession(ctx, input)
+}
+
+func (s *Service) ListSessions(ctx context.Context, agentID string) ([]domain.Session, error) {
+	engine, err := s.registry.Get(agentID)
+	if err != nil {
+		return nil, err
+	}
+	return engine.ListSessions(ctx)
+}
+
+func (s *Service) GetSession(ctx context.Context, sessionID string) (domain.Session, error) {
+	_, session, err := s.resolveSession(ctx, sessionID)
+	return session, err
+}
+
+func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	engine, _, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	if s.hasActiveSession(sessionID) {
+		return fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
+	}
+	if err := engine.DeleteSession(ctx, sessionID); err != nil {
+		return err
+	}
+	return s.plans.DeleteSession(ctx, sessionID)
+}
+
+func (s *Service) UpdateSession(ctx context.Context, sessionID string, input domain.UpdateSessionInput) (domain.Session, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	engine, current, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	if s.hasActiveSession(sessionID) {
+		return domain.Session{}, fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
+	}
+	workspaceID := current.WorkspaceID
+	projectID := current.ProjectID
+	if input.WorkspaceID != nil {
+		workspaceID = strings.TrimSpace(*input.WorkspaceID)
+		input.WorkspaceID = &workspaceID
+	}
+	if input.ProjectID != nil {
+		projectID = strings.TrimSpace(*input.ProjectID)
+		input.ProjectID = &projectID
+	}
+	if input.WorkspaceID != nil || input.ProjectID != nil || input.ProviderID != nil {
+		if err := s.validateSessionPlacement(ctx, workspaceID, projectID); err != nil {
+			return domain.Session{}, err
+		}
+	}
+	providerID := current.ProviderID
+	if input.ProviderID != nil {
+		providerID = strings.TrimSpace(*input.ProviderID)
+		input.ProviderID = &providerID
+	}
+	if input.WorkspaceID != nil || input.ProviderID != nil {
+		if err := s.validateWorkspaceProvider(ctx, workspaceID, providerID); err != nil {
+			return domain.Session{}, err
+		}
+	}
+	if input.PermissionProfile != nil {
+		profile, resolveErr := s.permissions.Resolve(*input.PermissionProfile)
+		if resolveErr != nil {
+			return domain.Session{}, resolveErr
+		}
+		input.PermissionProfile = &profile
+	}
+	return engine.UpdateSession(ctx, sessionID, input)
+}
+
+func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectInput) (domain.Project, error) {
+	input.WorkspaceID = strings.TrimSpace(input.WorkspaceID)
+	if _, err := s.workspaces.Get(ctx, input.WorkspaceID); err != nil {
+		return domain.Project{}, err
+	}
+	return s.projects.Create(ctx, input)
+}
+
+func (s *Service) ListProjects(ctx context.Context) ([]domain.Project, error) {
+	return s.projects.List(ctx)
+}
+
+func (s *Service) GetProject(ctx context.Context, projectID string) (domain.Project, error) {
+	return s.projects.Get(ctx, strings.TrimSpace(projectID))
+}
+
+func (s *Service) UpdateProject(ctx context.Context, projectID string, input domain.UpdateProjectInput) (domain.Project, error) {
+	return s.projects.Update(ctx, strings.TrimSpace(projectID), input)
+}
+
+// DeleteProject 只刪除空專案；Session 必須先移至其他專案或未分類，避免隱含級聯刪除。
+func (s *Service) DeleteProject(ctx context.Context, projectID string) error {
+	projectID = strings.TrimSpace(projectID)
+	if _, err := s.projects.Get(ctx, projectID); err != nil {
+		return err
+	}
+	for _, engine := range s.registry.Engines() {
+		sessions, err := engine.ListSessions(ctx)
+		if err != nil {
+			return err
+		}
+		for _, session := range sessions {
+			if session.ProjectID == projectID {
+				return fmt.Errorf("%w: project still contains sessions", domain.ErrConflict)
+			}
+		}
+	}
+	return s.projects.Delete(ctx, projectID)
+}
+
+func (s *Service) CreateWorkspace(ctx context.Context, input domain.CreateWorkspaceInput) (domain.Workspace, error) {
+	input.ProviderIDs = normalizeStrings(input.ProviderIDs)
+	input.DefaultProviderID = strings.TrimSpace(input.DefaultProviderID)
+	if len(input.ProviderIDs) == 0 || input.DefaultProviderID == "" {
+		return domain.Workspace{}, fmt.Errorf("%w: provider_ids and default_provider_id are required", domain.ErrInvalidInput)
+	}
+	for _, providerID := range input.ProviderIDs {
+		if err := s.validateProvider(providerID); err != nil {
+			return domain.Workspace{}, err
+		}
+	}
+	if !contains(input.ProviderIDs, input.DefaultProviderID) {
+		return domain.Workspace{}, fmt.Errorf("%w: default provider must belong to provider_ids", domain.ErrInvalidInput)
+	}
+	return s.workspaces.Create(ctx, input)
+}
+
+func (s *Service) ListWorkspaces(ctx context.Context) ([]domain.Workspace, error) {
+	return s.workspaces.List(ctx)
+}
+
+func (s *Service) GetWorkspace(ctx context.Context, workspaceID string) (domain.Workspace, error) {
+	return s.workspaces.Get(ctx, strings.TrimSpace(workspaceID))
+}
+
+func (s *Service) UpdateWorkspace(ctx context.Context, workspaceID string, input domain.UpdateWorkspaceInput) (domain.Workspace, error) {
+	current, err := s.workspaces.Get(ctx, strings.TrimSpace(workspaceID))
+	if err != nil {
+		return domain.Workspace{}, err
+	}
+	providerIDs := current.ProviderIDs
+	defaultProviderID := current.DefaultProviderID
+	if input.ProviderIDs != nil {
+		values := normalizeStrings(*input.ProviderIDs)
+		input.ProviderIDs = &values
+		providerIDs = values
+	}
+	for _, providerID := range providerIDs {
+		if err := s.validateProvider(providerID); err != nil {
+			return domain.Workspace{}, err
+		}
+	}
+	if input.DefaultProviderID != nil {
+		value := strings.TrimSpace(*input.DefaultProviderID)
+		input.DefaultProviderID = &value
+		defaultProviderID = value
+	}
+	if len(providerIDs) == 0 || !contains(providerIDs, defaultProviderID) {
+		return domain.Workspace{}, fmt.Errorf("%w: default provider must belong to provider_ids", domain.ErrInvalidInput)
+	}
+	if err := s.validateProvider(defaultProviderID); err != nil {
+		return domain.Workspace{}, err
+	}
+	if input.ProviderIDs != nil {
+		for _, engine := range s.registry.Engines() {
+			sessions, err := engine.ListSessions(ctx)
+			if err != nil {
+				return domain.Workspace{}, err
+			}
+			for _, session := range sessions {
+				if session.WorkspaceID == current.ID && session.ProviderID != "" && !contains(providerIDs, session.ProviderID) {
+					return domain.Workspace{}, fmt.Errorf("%w: provider %q is still referenced by session %q", domain.ErrConflict, session.ProviderID, session.ID)
+				}
+			}
+		}
+	}
+	return s.workspaces.Update(ctx, strings.TrimSpace(workspaceID), input)
+}
+
+func (s *Service) DeleteWorkspace(ctx context.Context, workspaceID string) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if _, err := s.workspaces.Get(ctx, workspaceID); err != nil {
+		return err
+	}
+	projects, err := s.projects.List(ctx)
+	if err != nil {
+		return err
+	}
+	for _, project := range projects {
+		if project.WorkspaceID == workspaceID {
+			return fmt.Errorf("%w: workspace still contains projects", domain.ErrConflict)
+		}
+	}
+	for _, engine := range s.registry.Engines() {
+		sessions, err := engine.ListSessions(ctx)
+		if err != nil {
+			return err
+		}
+		for _, session := range sessions {
+			if session.WorkspaceID == workspaceID {
+				return fmt.Errorf("%w: workspace still contains sessions", domain.ErrConflict)
+			}
+		}
+	}
+	values, err := s.workspaces.List(ctx)
+	if err != nil {
+		return err
+	}
+	if len(values) <= 1 {
+		return fmt.Errorf("%w: cannot delete the last workspace", domain.ErrConflict)
+	}
+	return s.workspaces.Delete(ctx, workspaceID)
+}
+
+func (s *Service) ListProviders() []domain.ProviderDescriptor {
+	return s.providers.ListProviders()
+}
+
+func (s *Service) validateSessionPlacement(ctx context.Context, workspaceID, projectID string) error {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return fmt.Errorf("%w: workspace_id is required", domain.ErrInvalidInput)
+	}
+	if _, err := s.workspaces.Get(ctx, workspaceID); err != nil {
+		return err
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil
+	}
+	project, err := s.projects.Get(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	if project.WorkspaceID != workspaceID {
+		return fmt.Errorf("%w: project does not belong to workspace", domain.ErrInvalidInput)
+	}
+	return nil
+}
+
+func (s *Service) validateProvider(providerID string) error {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil
+	}
+	if !s.providers.HasProvider(providerID) {
+		return fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
+	}
+	return nil
+}
+
+func (s *Service) defaultModelForProvider(providerID string) string {
+	providerID = strings.TrimSpace(providerID)
+	for _, provider := range s.providers.ListProviders() {
+		if strings.TrimSpace(provider.ID) == providerID {
+			return strings.TrimSpace(provider.DefaultModel)
+		}
+	}
+	return ""
+}
+
+func (s *Service) validateWorkspaceProvider(ctx context.Context, workspaceID, providerID string) error {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil
+	}
+	if err := s.validateProvider(providerID); err != nil {
+		return err
+	}
+	workspace, err := s.workspaces.Get(ctx, strings.TrimSpace(workspaceID))
+	if err != nil {
+		return err
+	}
+	if !contains(workspace.ProviderIDs, providerID) {
+		return fmt.Errorf("%w: provider %q does not belong to workspace %q", domain.ErrInvalidInput, providerID, workspace.ID)
+	}
+	return nil
+}
+
+func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]domain.Message, error) {
+	engine, _, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return engine.ListMessages(ctx, sessionID)
+}
+
+func (s *Service) ListEntries(ctx context.Context, sessionID string) ([]domain.SessionEntry, error) {
+	engine, _, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return engine.ListEntries(ctx, sessionID)
+}
+
+func (s *Service) ListRuns(ctx context.Context, sessionID string) ([]domain.Run, error) {
+	return s.runs.List(ctx, strings.TrimSpace(sessionID))
+}
+
+func (s *Service) GetRun(ctx context.Context, runID string) (domain.Run, error) {
+	return s.runs.Get(ctx, strings.TrimSpace(runID))
+}
+
+func (s *Service) ListRunEvents(ctx context.Context, runID string, afterSequence int64) ([]domain.Event, error) {
+	runID = strings.TrimSpace(runID)
+	if _, err := s.runs.Get(ctx, runID); err != nil {
+		return nil, err
+	}
+	if afterSequence < 0 {
+		return nil, fmt.Errorf("%w: after_sequence cannot be negative", domain.ErrInvalidInput)
+	}
+	return s.events.List(ctx, runID, afterSequence)
+}
+
+// StartRun 建立 durable Run 後立即返回。實際工作使用 service-owned context，
+// 不會因建立 Run 的 HTTP request 結束或 SSE client 斷線而取消。
+func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.Run, error) {
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.UserInput = strings.TrimSpace(textutil.NormalizeFullwidthASCII(input.UserInput))
+	input.AttachmentIDs = normalizedAttachmentIDs(input.AttachmentIDs)
+	input.IdempotencyKey = strings.TrimSpace(input.IdempotencyKey)
+	if input.SessionID == "" || input.UserInput == "" {
+		return domain.Run{}, fmt.Errorf("%w: session_id and input are required", domain.ErrInvalidInput)
+	}
+	if len(input.AttachmentIDs) > 16 {
+		return domain.Run{}, fmt.Errorf("%w: no more than 16 attachments are allowed", domain.ErrInvalidInput)
+	}
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	engine, session, err := s.resolveSession(ctx, input.SessionID)
+	if err != nil {
+		return domain.Run{}, err
+	}
+	input.Metadata = valueutil.CloneMap(input.Metadata)
+	if input.Metadata == nil {
+		input.Metadata = map[string]any{}
+	}
+	// sandbox_roots 是後端根據 Project 產生的保留欄位，不能由 Run 呼叫端自行擴權。
+	delete(input.Metadata, "sandbox_roots")
+	// attachments 同樣是後端解析 Attachment ID 後產生的可信 manifest；Client
+	// 直接夾帶同名 metadata 不能注入任意主機路徑。
+	delete(input.Metadata, "attachments")
+	sandboxRoots := []string{}
+	if session.ProjectID != "" {
+		project, projectErr := s.projects.Get(ctx, session.ProjectID)
+		if projectErr != nil {
+			return domain.Run{}, projectErr
+		}
+		if len(project.SandboxRoots) > 0 {
+			sandboxRoots = append(sandboxRoots, project.SandboxRoots...)
+		}
+	}
+	// Session 私有工作目錄由後端建立，用來容納對話附件與未綁定 Project 的工作。
+	// Project 根目錄仍排第一，確保相對路徑維持以 Project 為基準。
+	if workspaceRoot, _ := session.Metadata["workspace_root"].(string); strings.TrimSpace(workspaceRoot) != "" {
+		sandboxRoots = appendUniqueString(sandboxRoots, strings.TrimSpace(workspaceRoot))
+	}
+	if len(sandboxRoots) > 0 {
+		input.Metadata["sandbox_roots"] = sandboxRoots
+	}
+	if len(input.AttachmentIDs) > 0 {
+		if s.attachments == nil {
+			return domain.Run{}, fmt.Errorf("%w: attachment storage is unavailable", domain.ErrConflict)
+		}
+		manifest := make([]domain.Attachment, 0, len(input.AttachmentIDs))
+		for _, attachmentID := range input.AttachmentIDs {
+			attachment, attachmentErr := s.attachments.Get(ctx, session.ID, attachmentID)
+			if attachmentErr != nil {
+				return domain.Run{}, attachmentErr
+			}
+			manifest = append(manifest, attachment)
+		}
+		input.Metadata["attachments"] = manifest
+	}
+	input.ProviderID = valueutil.FirstNonEmpty(strings.TrimSpace(input.ProviderID), strings.TrimSpace(session.ProviderID))
+	input.Model = valueutil.FirstNonEmpty(strings.TrimSpace(input.Model), strings.TrimSpace(session.Model))
+	if session.WorkspaceID != "" && (input.ProviderID == "" || input.Model == "") {
+		workspace, workspaceErr := s.workspaces.Get(ctx, session.WorkspaceID)
+		if workspaceErr != nil {
+			return domain.Run{}, workspaceErr
+		}
+		input.ProviderID = valueutil.FirstNonEmpty(input.ProviderID, workspace.DefaultProviderID)
+		input.Model = valueutil.FirstNonEmpty(input.Model, workspace.Model)
+	}
+	if input.ProviderID == "" {
+		input.ProviderID = s.providers.DefaultProviderID()
+	}
+	if err := s.validateWorkspaceProvider(ctx, session.WorkspaceID, input.ProviderID); err != nil {
+		return domain.Run{}, err
+	}
+
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return domain.Run{}, fmt.Errorf("%w: service is shutting down", domain.ErrConflict)
+	}
+	if input.IdempotencyKey != "" {
+		existing, findErr := s.runs.FindByIdempotencyKey(ctx, input.SessionID, input.IdempotencyKey)
+		if findErr == nil {
+			return existing, nil
+		}
+		if !errors.Is(findErr, domain.ErrNotFound) {
+			return domain.Run{}, findErr
+		}
+	}
+
+	now := s.now().UTC()
+	run := domain.Run{
+		ID:             domain.NewID("run"),
+		AgentID:        session.AgentID,
+		SessionID:      session.ID,
+		Status:         domain.RunStatusQueued,
+		Input:          input.UserInput,
+		AttachmentIDs:  append([]string(nil), input.AttachmentIDs...),
+		ProviderID:     input.ProviderID,
+		Model:          input.Model,
+		IdempotencyKey: input.IdempotencyKey,
+		Metadata:       valueutil.CloneMap(input.Metadata),
+		CreatedAt:      now,
+	}
+	if err := s.runs.Save(ctx, run); err != nil {
+		return domain.Run{}, err
+	}
+	input.RunID = run.ID
+	runCtx, cancel := context.WithCancel(s.rootCtx)
+	s.mu.Lock()
+	s.active[run.ID] = activeRun{sessionID: session.ID, cancel: cancel}
+	s.mu.Unlock()
+	s.wg.Add(1)
+	s.logger.Info("run queued", "run_id", run.ID, "session_id", session.ID, "agent_id", session.AgentID, "provider_id", run.ProviderID, "model", run.Model)
+	go s.executeRun(runCtx, engine, session, input, run)
+	return run, nil
+}
+
+// ExecuteRun 提供同步等待介面；底層仍是非同步 Run。ctx 取消只停止等待，
+// 若要取消工作本身必須明確呼叫 CancelRun。
+func (s *Service) ExecuteRun(ctx context.Context, input domain.RunInput, sink EventSink) (domain.Run, error) {
+	run, err := s.StartRun(ctx, input)
+	if err != nil {
+		return domain.Run{}, err
+	}
+	return s.WaitRun(ctx, run.ID, 0, sink)
+}
+
+func (s *Service) WaitRun(ctx context.Context, runID string, afterSequence int64, sink EventSink) (domain.Run, error) {
+	for {
+		updates, unsubscribe, err := s.SubscribeRunEvents(ctx, runID)
+		if err != nil {
+			return domain.Run{}, err
+		}
+		events, err := s.ListRunEvents(ctx, runID, afterSequence)
+		if err != nil {
+			unsubscribe()
+			return domain.Run{}, err
+		}
+		for _, event := range events {
+			if sink != nil {
+				if sinkErr := sink(event); sinkErr != nil {
+					unsubscribe()
+					current, _ := s.GetRun(context.WithoutCancel(ctx), runID)
+					return current, sinkErr
+				}
+			}
+			afterSequence = event.Sequence
+		}
+		run, err := s.GetRun(ctx, runID)
+		if err != nil {
+			unsubscribe()
+			return domain.Run{}, err
+		}
+		if terminalRun(run.Status) {
+			unsubscribe()
+			return run, nil
+		}
+		select {
+		case <-ctx.Done():
+			unsubscribe()
+			return run, ctx.Err()
+		case <-updates:
+			unsubscribe()
+		}
+	}
+}
+
+// SubscribeRunEvents 只提供喚醒通知；事件內容一律重新讀 durable log，
+// 因此通知合併或 client 暫時離線都不會造成事件缺口。
+func (s *Service) SubscribeRunEvents(ctx context.Context, runID string) (<-chan struct{}, func(), error) {
+	runID = strings.TrimSpace(runID)
+	if _, err := s.runs.Get(ctx, runID); err != nil {
+		return nil, nil, err
+	}
+	channel := make(chan struct{}, 1)
+	s.mu.Lock()
+	s.nextWatcher++
+	id := s.nextWatcher
+	if s.watchers[runID] == nil {
+		s.watchers[runID] = map[uint64]chan struct{}{}
+	}
+	s.watchers[runID][id] = channel
+	s.mu.Unlock()
+	var once sync.Once
+	unsubscribe := func() {
+		once.Do(func() {
+			s.mu.Lock()
+			delete(s.watchers[runID], id)
+			if len(s.watchers[runID]) == 0 {
+				delete(s.watchers, runID)
+			}
+			s.mu.Unlock()
+		})
+	}
+	return channel, unsubscribe, nil
+}
+
+func (s *Service) CancelRun(ctx context.Context, runID string) (domain.Run, error) {
+	run, err := s.runs.Get(ctx, strings.TrimSpace(runID))
+	if err != nil {
+		return domain.Run{}, err
+	}
+	s.mu.Lock()
+	active, ok := s.active[run.ID]
+	s.mu.Unlock()
+	if !ok {
+		if terminalRun(run.Status) {
+			return run, nil
+		}
+		return run, fmt.Errorf("%w: run is not active", domain.ErrConflict)
+	}
+	active.cancel()
+	return run, nil
+}
+
+func (s *Service) DecideRun(ctx context.Context, runID string, input domain.ToolApprovalDecisionInput) (domain.Run, error) {
+	if s.approvals == nil {
+		return domain.Run{}, fmt.Errorf("%w: approval workflow is unavailable", domain.ErrConflict)
+	}
+	run, err := s.runs.Get(ctx, strings.TrimSpace(runID))
+	if err != nil {
+		return domain.Run{}, err
+	}
+	input.ApprovalID = strings.TrimSpace(input.ApprovalID)
+	if run.Status != domain.RunStatusWaitingApproval || run.PendingApproval == nil {
+		return run, fmt.Errorf("%w: run is not waiting for approval", domain.ErrConflict)
+	}
+	if input.ApprovalID == "" || input.ApprovalID != run.PendingApproval.ID {
+		return run, fmt.Errorf("%w: approval_id does not match the pending approval", domain.ErrConflict)
+	}
+	if input.Permanent && input.Decision != domain.ToolApprovalApprove {
+		return run, fmt.Errorf("%w: permanent approval requires an approve decision", domain.ErrInvalidInput)
+	}
+	var permanentEngine ports.AgentEngine
+	permanentChanged := false
+	if input.Permanent {
+		engine, session, resolveErr := s.resolveSession(ctx, run.SessionID)
+		if resolveErr != nil {
+			return run, resolveErr
+		}
+		permanentEngine = engine
+		if !session.PermanentToolApproval {
+			if _, updateErr := engine.SetPermanentToolApproval(ctx, run.SessionID, true); updateErr != nil {
+				return run, updateErr
+			}
+			permanentChanged = true
+		}
+	}
+	if err := s.approvals.Decide(run.ID, input); err != nil {
+		// 決策未送達 waiter 時回復剛才的持久化變更，避免一次失敗的 API
+		// 呼叫意外替 Session 開啟永久核准。
+		if permanentChanged && permanentEngine != nil {
+			_, _ = permanentEngine.SetPermanentToolApproval(context.WithoutCancel(ctx), run.SessionID, false)
+		}
+		return run, err
+	}
+	// 決策喚醒 Harness 後，狀態會由 durable run.approval_resolved 事件切回 running。
+	// 這裡重新讀取可取得已經完成切換的狀態；若 goroutine 尚未排程則仍回 waiting。
+	if current, getErr := s.runs.Get(ctx, run.ID); getErr == nil {
+		return current, nil
+	}
+	return run, nil
+}
+
+// RetryRun 建立新的 durable Run，保留原 Run 作為不可變稽核紀錄。呼叫端應提供
+// Idempotency-Key，讓 HTTP 回應遺失時重送不會再建立第三份工作。
+func (s *Service) RetryRun(ctx context.Context, runID, idempotencyKey string) (domain.Run, error) {
+	original, err := s.runs.Get(ctx, strings.TrimSpace(runID))
+	if err != nil {
+		return domain.Run{}, err
+	}
+	if original.Status != domain.RunStatusFailed && original.Status != domain.RunStatusCanceled {
+		return original, fmt.Errorf("%w: only failed or canceled runs can be retried", domain.ErrConflict)
+	}
+	if original.Error == nil || !original.Error.Retryable {
+		return original, fmt.Errorf("%w: run is not retryable", domain.ErrConflict)
+	}
+	metadata := valueutil.CloneMap(original.Metadata)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	delete(metadata, "termination")
+	delete(metadata, "budget_exceeded")
+	metadata["retry_of"] = original.ID
+	return s.StartRun(ctx, domain.RunInput{
+		SessionID:      original.SessionID,
+		UserInput:      original.Input,
+		AttachmentIDs:  append([]string(nil), original.AttachmentIDs...),
+		ProviderID:     original.ProviderID,
+		Model:          original.Model,
+		Metadata:       metadata,
+		IdempotencyKey: strings.TrimSpace(idempotencyKey),
+	})
+}
+
+func normalizedAttachmentIDs(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func (s *Service) Close(ctx context.Context) error {
+	s.startMu.Lock()
+	s.mu.Lock()
+	if !s.closed {
+		s.closed = true
+		s.stop()
+	}
+	s.mu.Unlock()
+	s.startMu.Unlock()
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
+}
+
+func approvalRequestFromPayload(payload map[string]any) (domain.ToolApprovalRequest, bool) {
+	if payload == nil {
+		return domain.ToolApprovalRequest{}, false
+	}
+	switch value := payload["approval"].(type) {
+	case domain.ToolApprovalRequest:
+		return value, strings.TrimSpace(value.ID) != ""
+	case *domain.ToolApprovalRequest:
+		if value != nil {
+			return *value, strings.TrimSpace(value.ID) != ""
+		}
+	}
+	return domain.ToolApprovalRequest{}, false
+}
+
+func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, session domain.Session, input domain.RunInput, run domain.Run) {
+	sequence := int64(0)
+	defer s.wg.Done()
+	defer s.clearActive(run.ID)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// 這裡過去完全沒有紀錄：panic 被吞掉，只留下一筆沒有原因的 failed run。
+			s.logger.Error("run panicked", "run_id", run.ID, "session_id", run.SessionID, "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			latest, err := s.runs.Get(context.Background(), run.ID)
+			if err == nil && !terminalRun(latest.Status) {
+				s.finishFailed(latest, "agent_panic", fmt.Errorf("unexpected panic: %v", recovered), false, &sequence)
+			}
+		}
+	}()
+
+	release, err := s.acquireSession(ctx, session.ID, run.ID)
+	if err != nil {
+		s.finishCanceled(run, err, &sequence)
+		return
+	}
+	defer func() {
+		if release != nil {
+			release()
+		}
+		s.clearSessionPause(session.ID, run.ID)
+	}()
+	if err := ctx.Err(); err != nil {
+		s.finishCanceled(run, err, &sequence)
+		return
+	}
+
+	startedAt := s.now().UTC()
+	run.Status = domain.RunStatusRunning
+	run.StartedAt = &startedAt
+	if err := s.runs.Save(context.Background(), run); err != nil {
+		s.finishFailed(run, "run_state_write_failed", err, true, &sequence)
+		return
+	}
+	if err := s.appendEvent(run, &sequence, "run.started", map[string]any{"status": run.Status}); err != nil {
+		s.finishFailed(run, "event_write_failed", err, true, &sequence)
+		return
+	}
+
+	result, runErr := engine.Run(ctx, input, func(event domain.EngineEvent) error {
+		switch event.Type {
+		case "run.approval_required":
+			request, ok := approvalRequestFromPayload(event.Payload)
+			if !ok {
+				return fmt.Errorf("%w: approval event has no request", domain.ErrInvalidInput)
+			}
+			run.Status = domain.RunStatusWaitingApproval
+			run.PendingApproval = &request
+			if err := s.runs.Save(context.Background(), run); err != nil {
+				return err
+			}
+			if err := s.appendEvent(run, &sequence, event.Type, event.Payload); err != nil {
+				return err
+			}
+			// 先建立邏輯預約再歸還 gate，已排隊的其他 Run 才不會插入尚未完成的
+			// assistant/tool 協定區段。
+			s.pauseSession(session.ID, run.ID)
+			release()
+			release = nil
+			return nil
+		case "run.approval_resolved":
+			if release == nil {
+				newRelease, err := s.acquireSession(ctx, session.ID, run.ID)
+				if err != nil {
+					return err
+				}
+				release = newRelease
+			}
+			s.clearSessionPause(session.ID, run.ID)
+			run.Status = domain.RunStatusRunning
+			run.PendingApproval = nil
+			if err := s.runs.Save(context.Background(), run); err != nil {
+				return err
+			}
+			return s.appendEvent(run, &sequence, event.Type, event.Payload)
+		default:
+			return s.appendEvent(run, &sequence, event.Type, event.Payload)
+		}
+	})
+	if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, domain.ErrCanceled) {
+		s.finishCanceled(run, valueutil.FirstError(runErr, ctx.Err()), &sequence)
+		return
+	}
+	if runErr != nil {
+		code, retryable := classifyRunFailure(runErr)
+		s.finishFailed(run, code, runErr, retryable, &sequence)
+		return
+	}
+
+	completedAt := s.now().UTC()
+	run.Status = domain.RunStatusCompleted
+	run.Result = &result
+	run.PendingApproval = nil
+	if result.BudgetExceeded != nil {
+		run.Metadata = valueutil.CloneMap(run.Metadata)
+		if run.Metadata == nil {
+			run.Metadata = map[string]any{}
+		}
+		run.Metadata["termination"] = "budget_exceeded"
+		run.Metadata["budget_exceeded"] = *result.BudgetExceeded
+	}
+	run.CompletedAt = &completedAt
+	s.logger.Info("run completed", "run_id", run.ID, "session_id", run.SessionID, "duration_ms", completedAt.Sub(startedAt).Milliseconds(), "event_count", sequence)
+	if err := s.runs.Save(context.Background(), run); err != nil {
+		s.finishFailed(run, "run_state_write_failed", err, true, &sequence)
+		return
+	}
+	if err := s.appendEvent(run, &sequence, "run.completed", map[string]any{"status": run.Status, "result": result}); err != nil {
+		s.finishFailed(run, "event_write_failed", err, true, &sequence)
+	}
+}
+
+func classifyRunFailure(cause error) (code string, retryable bool) {
+	switch {
+	case errors.Is(cause, domain.ErrProviderProtocol):
+		return "provider_protocol_incompatible", false
+	case errors.Is(cause, domain.ErrInvalidInput):
+		return "invalid_input", false
+	default:
+		return "agent_run_failed", true
+	}
+}
+
+func (s *Service) appendEvent(run domain.Run, sequence *int64, eventType string, payload map[string]any) error {
+	next := *sequence + 1
+	event := domain.Event{
+		SchemaVersion: domain.EventSchemaVersion,
+		ID:            domain.NewID("evt"),
+		Type:          eventType,
+		AgentID:       run.AgentID,
+		SessionID:     run.SessionID,
+		RunID:         run.ID,
+		Sequence:      next,
+		CreatedAt:     s.now().UTC(),
+		Payload:       valueutil.CloneMap(payload),
+	}
+	if err := s.events.Append(context.Background(), event); err != nil {
+		return err
+	}
+	*sequence = next
+	s.notifyRun(run.ID)
+	return nil
+}
+
+func (s *Service) finishCanceled(run domain.Run, cause error, sequence *int64) {
+	s.logger.Info("run canceled", "run_id", run.ID, "session_id", run.SessionID, "cause", cause)
+	completedAt := s.now().UTC()
+	run.Status = domain.RunStatusCanceled
+	run.PendingApproval = nil
+	run.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
+	if cause != nil {
+		run.Error.Message = cause.Error()
+	}
+	run.CompletedAt = &completedAt
+	_ = s.runs.Save(context.Background(), run)
+	_ = s.appendEvent(run, sequence, "run.canceled", map[string]any{"status": run.Status, "error": run.Error})
+}
+
+func (s *Service) finishFailed(run domain.Run, code string, cause error, retryable bool, sequence *int64) {
+	s.logger.Error("run failed", "run_id", run.ID, "session_id", run.SessionID, "code", code, "retryable", retryable, "error", cause)
+	completedAt := s.now().UTC()
+	run.Status = domain.RunStatusFailed
+	run.PendingApproval = nil
+	run.Error = &domain.RunError{Code: code, Message: cause.Error(), Retryable: retryable}
+	run.CompletedAt = &completedAt
+	_ = s.runs.Save(context.Background(), run)
+	_ = s.appendEvent(run, sequence, "run.failed", map[string]any{"status": run.Status, "error": run.Error})
+}
+
+func (s *Service) resolveSession(ctx context.Context, sessionID string) (ports.AgentEngine, domain.Session, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, domain.Session{}, fmt.Errorf("%w: session id is required", domain.ErrInvalidInput)
+	}
+	for _, engine := range s.registry.Engines() {
+		session, err := engine.GetSession(ctx, sessionID)
+		if err == nil {
+			return engine, session, nil
+		}
+		if !errors.Is(err, domain.ErrNotFound) {
+			return nil, domain.Session{}, err
+		}
+	}
+	return nil, domain.Session{}, fmt.Errorf("%w: session %q", domain.ErrNotFound, sessionID)
+}
+
+func (s *Service) acquireSession(ctx context.Context, sessionID, runID string) (func(), error) {
+	for {
+		s.mu.Lock()
+		gate := s.sessionGates[sessionID]
+		if gate == nil {
+			gate = make(chan struct{}, 1)
+			gate <- struct{}{}
+			s.sessionGates[sessionID] = gate
+		}
+		signal := s.sessionSignals[sessionID]
+		if signal == nil {
+			signal = make(chan struct{})
+			s.sessionSignals[sessionID] = signal
+		}
+		pausedBy := s.pausedSessions[sessionID]
+		s.mu.Unlock()
+		if pausedBy != "" && pausedBy != runID {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-signal:
+				continue
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-gate:
+		}
+		// pause 可能在取得 token 前一刻建立，因此持有 token 後必須再確認一次。
+		s.mu.Lock()
+		pausedBy = s.pausedSessions[sessionID]
+		signal = s.sessionSignals[sessionID]
+		s.mu.Unlock()
+		if pausedBy == "" || pausedBy == runID {
+			return func() { gate <- struct{}{} }, nil
+		}
+		gate <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-signal:
+		}
+	}
+}
+
+func (s *Service) pauseSession(sessionID, runID string) {
+	s.mu.Lock()
+	s.pausedSessions[sessionID] = runID
+	s.notifySessionStateLocked(sessionID)
+	s.mu.Unlock()
+}
+
+func (s *Service) clearSessionPause(sessionID, runID string) {
+	s.mu.Lock()
+	if s.pausedSessions[sessionID] == runID {
+		delete(s.pausedSessions, sessionID)
+		s.notifySessionStateLocked(sessionID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) notifySessionStateLocked(sessionID string) {
+	if signal := s.sessionSignals[sessionID]; signal != nil {
+		close(signal)
+	}
+	s.sessionSignals[sessionID] = make(chan struct{})
+}
+
+func (s *Service) clearActive(runID string) {
+	s.mu.Lock()
+	if item, ok := s.active[runID]; ok {
+		item.cancel()
+		delete(s.active, runID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Service) hasActiveSession(sessionID string) bool {
+	sessionID = strings.TrimSpace(sessionID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, run := range s.active {
+		if run.sessionID == sessionID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) notifyRun(runID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, channel := range s.watchers[runID] {
+		select {
+		case channel <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// reconcileTerminalEvents 補齊伺服器重啟或先前事件寫入失敗留下的終止事件，
+// 讓任何 terminal Run 的 durable event log 都能自行說明最終狀態。
+func (s *Service) reconcileTerminalEvents(ctx context.Context) error {
+	runs, err := s.runs.List(ctx, "")
+	if err != nil {
+		return err
+	}
+	for _, run := range runs {
+		if !terminalRun(run.Status) {
+			continue
+		}
+		values, err := s.events.List(ctx, run.ID, 0)
+		if err != nil {
+			return err
+		}
+		if len(values) > 0 && terminalEvent(values[len(values)-1].Type) {
+			continue
+		}
+		sequence := int64(0)
+		if len(values) > 0 {
+			sequence = values[len(values)-1].Sequence
+		}
+		payload := map[string]any{"status": run.Status}
+		if run.Result != nil {
+			payload["result"] = *run.Result
+		}
+		if run.Error != nil {
+			payload["error"] = run.Error
+		}
+		s.logger.Warn("reconciling missing terminal event after restart", "run_id", run.ID, "status", run.Status)
+		if err := s.appendEvent(run, &sequence, "run."+string(run.Status), payload); err != nil {
+			return fmt.Errorf("reconcile run %q terminal event: %w", run.ID, err)
+		}
+	}
+	return nil
+}
+
+func terminalEvent(eventType string) bool {
+	return eventType == "run.completed" || eventType == "run.failed" || eventType == "run.canceled"
+}
+
+func terminalRun(status domain.RunStatus) bool {
+	return status == domain.RunStatusCompleted || status == domain.RunStatusFailed || status == domain.RunStatusCanceled
+}
+
+func normalizeStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func contains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}

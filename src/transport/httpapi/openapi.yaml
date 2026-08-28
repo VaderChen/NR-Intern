@@ -1,0 +1,1248 @@
+openapi: 3.1.0
+info:
+  title: 聰明的實習生 HTTP API
+  version: 0.1.0
+  description: 後端可獨立執行的 Harness AI Agent API；Run 採非同步執行，事件可持久化重播。
+servers:
+  - url: http://127.0.0.1:8787
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      summary: Process health
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+  /readyz:
+    get:
+      summary: Application readiness
+      security: []
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        "503": { $ref: "#/components/responses/Problem" }
+  /api/v1/openapi.yaml:
+    get:
+      summary: 取得本 OpenAPI 契約
+      responses:
+        "200":
+          description: OpenAPI YAML
+          content:
+            application/yaml:
+              schema: { type: string }
+  /api/v1/admin/status:
+    get:
+      summary: 取得服務狀態
+      responses:
+        "200":
+          description: 服務狀態
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceStatusEnvelope" }
+  /api/v1/admin/diagnostics:
+    get:
+      summary: 取得脫敏後台診斷
+      description: 不包含 HTTP token、LLM API key、SSH 密碼、passphrase 或私鑰內容。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/service-settings:
+    get:
+      summary: 取得服務顯示設定
+      responses:
+        "200":
+          description: 服務顯示設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceSettingsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    put:
+      summary: 持久化並立即套用服務顯示名稱
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateServiceSettingsInput" }
+      responses:
+        "200":
+          description: 已套用的服務顯示設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceSettingsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings:
+    get:
+      summary: 取得可編輯的 Provider 設定
+      description: API Key 僅以 has_api_key 回報，永遠不傳回明文。
+      responses:
+        "200":
+          description: Provider 設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderSettingsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    put:
+      summary: 驗證、持久化並立即套用完整 Provider 集合
+      description: >-
+        openai_compatible.api_key 省略時保留既有值，空字串表示清除。
+        仍被 Workspace 引用的 Provider 不可移除。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateProviderSettingsInput" }
+      responses:
+        "200":
+          description: 已套用的脫敏設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderSettingsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/models:
+    get:
+      summary: 更新指定 Provider 的可用模型列表
+      description: 呼叫 OpenAI-compatible 的 models 端點；不支援模型目錄時會回傳可讀取的錯誤，設定仍可手動輸入模型。
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Provider 模型目錄
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderModelsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/test:
+    post:
+      summary: 測試指定 Provider 的實際模型請求
+      description: 使用已儲存設定執行最小 Chat Completions 請求，成功後一併嘗試更新模型列表。
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Provider 測試成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderTestResultEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/tools:
+    get:
+      summary: 查詢原生工具目錄與可用性
+      parameters:
+        - name: session_id
+          in: query
+          schema: { type: string }
+          description: 提供後會一併判斷該 Session 的 permission profile。
+      responses:
+        "200":
+          description: 工具目錄
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ToolCatalogEntry" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/providers:
+    get:
+      summary: 列出已註冊 Provider adapters
+      description: 目前工廠只實作 openai-compatible，但回應與 Router 可容納多種 protocol。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+  /api/v1/workspaces:
+    get:
+      summary: 列出 Workspaces
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    post:
+      summary: 建立 Workspace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWorkspaceInput" }
+      responses:
+        "201":
+          description: 已建立
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/workspaces/{workspace_id}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+    get:
+      summary: 取得 Workspace
+      responses:
+        "200":
+          description: Workspace
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    patch:
+      summary: 更新 Workspace 的 Provider 集合、預設 Provider 與模型
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateWorkspaceInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 刪除空 Workspace
+      description: 仍含 Project 或 Session，以及系統最後一個 Workspace 時，回傳 409。
+      responses:
+        "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/projects:
+    get:
+      summary: 列出結構化 Projects
+      parameters:
+        - name: workspace_id
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    post:
+      summary: 建立 Project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateProjectInput" }
+      responses:
+        "201":
+          description: 已建立
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProjectEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/projects/{project_id}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectID"
+    get:
+      summary: 取得 Project
+      responses:
+        "200":
+          description: Project
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProjectEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    patch:
+      summary: 更新 Project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateProjectInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProjectEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 刪除空 Project
+      description: Project 仍有 Session 時回傳 409，不會隱含級聯刪除。
+      responses:
+        "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/agents:
+    get:
+      summary: 列出 Agent
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+  /api/v1/agents/{agent_id}:
+    parameters:
+      - $ref: "#/components/parameters/AgentID"
+    get:
+      summary: 取得 Agent 描述
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/agents/{agent_id}/sessions:
+    parameters:
+      - $ref: "#/components/parameters/AgentID"
+    get:
+      summary: 列出 Agent Sessions
+      parameters:
+        - name: workspace_id
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    post:
+      summary: 建立 Session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSessionInput" }
+      responses:
+        "201":
+          description: 已建立
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      summary: 取得 Session
+      responses:
+        "200":
+          description: Session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    patch:
+      summary: 更新 Session 管理欄位
+      description: workspace_root 不可透過此 API 修改。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateSessionInput" }
+      responses:
+        "200":
+          description: 已更新 Session
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 刪除 Session 與 workspace
+      responses:
+        "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/messages:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      summary: 取得 Session 訊息
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plan:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      summary: 取得 Session 計畫
+      description: 尚未建立計畫時 data 為 null。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    put:
+      summary: 由使用者建立或完整取代 Session 目前計畫（相容端點）
+      description: Run 正在排隊或執行時不可取代計畫。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePlanInput" }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 刪除 Session 目前計畫（相容端點）
+      responses:
+        "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plans:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      summary: 取得 Session 的有序計畫列表
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    post:
+      summary: 在 Session 計畫佇列尾端新增計畫
+      description: 第一份未完成計畫會執行，後續計畫保持 queued；Run 正在排隊或執行時不可新增。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePlanInput" }
+      responses:
+        "201": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plans/order:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    put:
+      summary: 調整 Session 計畫執行順序
+      description: 必須提供完整且不重複的計畫 ID；已開始執行的計畫不可移到其他未完成計畫之後。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReorderPlansInput" }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plans/{plan_id}:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - name: plan_id
+        in: path
+        required: true
+        schema: { type: string }
+    put:
+      summary: 重建指定計畫
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreatePlanInput" }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 刪除指定計畫
+      responses:
+        "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/attachments:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      summary: 上傳對話附件到 Session 私有工作目錄
+      description: Client 之後只需把回傳的 attachment id 放入 RunInput；不能自行指定主機路徑。單檔預設上限 8 MiB，一次最多 16 個。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  maxItems: 16
+                  items: { type: string, format: binary }
+      responses:
+        "201":
+          description: 已儲存附件
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Attachment" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/entries:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - name: after_sequence
+        in: query
+        schema: { type: integer, format: int64, minimum: 0, default: 0 }
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+    get:
+      summary: 分頁取得完整 Session 稽核 entries
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/runs:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      summary: 列出 Session Runs
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+    post:
+      summary: 建立非同步 Run
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunInput" }
+      responses:
+        "202":
+          description: Run 已排入執行
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  "/api/v1/sessions/{session_id}/runs:stream":
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      summary: 建立 Run 並串流 durable SSE events
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/LastEventID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RunInput" }
+      responses:
+        "200":
+          description: SSE event stream
+          headers:
+            X-Run-ID: { schema: { type: string } }
+            Location: { schema: { type: string } }
+          content:
+            text/event-stream:
+              schema: { type: string }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs:
+    get:
+      summary: 列出 Runs
+      parameters:
+        - name: session_id
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          description: 逗號分隔的狀態過濾，例如 waiting_approval,running。未指定時回傳全部。
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/memories:
+    get:
+      summary: 搜尋長期記憶
+      description: 未指定 scope 時使用後端預設 scope。記憶被遺忘後不再出現在結果中。
+      parameters:
+        - name: scope
+          in: query
+          schema: { type: string }
+        - name: q
+          in: query
+          description: 詞彙比對查詢字串。
+          schema: { type: string }
+        - name: kinds
+          in: query
+          description: 逗號分隔，可用值 fact,preference,decision,procedure,constraint。
+          schema: { type: string }
+        - name: tags
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    post:
+      summary: 寫入長期記憶
+      description: 由使用者直接寫入，metadata.source 會標記為 operator，以與 Agent 自行寫入的記憶區分。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RememberMemoryInput" }
+      responses:
+        "201": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/memories/{memory_id}:
+    parameters:
+      - name: memory_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: scope
+        in: query
+        schema: { type: string }
+    get:
+      summary: 取得單筆長期記憶
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 軟性遺忘一筆長期記憶
+      description: 記憶保留稽核資訊但不再被召回，因此回傳更新後的內容而非空回應。
+      parameters:
+        - name: reason
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/export:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      summary: 匯出整個 Session
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [json, markdown], default: json }
+        - name: include_entries
+          in: query
+          description: 是否附上完整 transcript（稽核與問題重現用）。
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: Session 快照
+          content:
+            application/json: { schema: { type: object } }
+            text/markdown: { schema: { type: string } }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    get:
+      summary: 取得 Run 狀態與結果
+      responses:
+        "200":
+          description: Run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+      - $ref: "#/components/parameters/LastEventID"
+      - name: after_sequence
+        in: query
+        schema: { type: integer, format: int64, minimum: 0 }
+    get:
+      summary: 重播並持續訂閱 Run SSE events
+      responses:
+        "200":
+          description: Last-Event-ID 之後的 durable event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    post:
+      summary: 明確取消 Run
+      responses:
+        "202":
+          description: 已送出取消要求
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/decision:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    post:
+      summary: 核准或拒絕等待中的工具呼叫
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ToolApprovalDecisionInput" }
+      responses:
+        "202":
+          description: 決策已送交等待中的 Run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/retry:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+      - $ref: "#/components/parameters/IdempotencyKey"
+    post:
+      summary: 以原始輸入建立新的重試 Run
+      description: 只接受 retryable 的 failed 或 canceled Run；原 Run 保持不變。
+      responses:
+        "202":
+          description: 新 Run 已建立
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    AgentID:
+      name: agent_id
+      in: path
+      required: true
+      schema: { type: string }
+    SessionID:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string }
+    ProjectID:
+      name: project_id
+      in: path
+      required: true
+      schema: { type: string }
+    WorkspaceID:
+      name: workspace_id
+      in: path
+      required: true
+      schema: { type: string }
+    RunID:
+      name: run_id
+      in: path
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string }
+      description: Client 產生的唯一鍵；斷線重試時必須重用。
+    LastEventID:
+      name: Last-Event-ID
+      in: header
+      schema: { type: integer, format: int64, minimum: 0 }
+      description: 最後完整處理的 Run event sequence。
+  responses:
+    JSONData:
+      description: JSON data envelope
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: {}
+    Problem:
+      description: RFC 9457-style problem response
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+  schemas:
+    RememberMemoryInput:
+      type: object
+      required: [content]
+      properties:
+        scope: { type: string, description: 留空時使用後端預設 scope。 }
+        content: { type: string, minLength: 1 }
+        kind: { type: string, enum: [fact, preference, decision, procedure, constraint], default: fact }
+        tags: { type: array, items: { type: string } }
+        confidence: { type: number, minimum: 0, maximum: 1, default: 1 }
+        supersedes: { type: array, items: { type: string }, description: 被這筆記憶取代的舊記憶 ID。 }
+        metadata: { type: object, additionalProperties: true }
+    AgentDescriptor:
+      type: object
+      required: [id, name, version]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        description: { type: string }
+        capabilities: { type: array, items: { type: string } }
+    Session:
+      type: object
+      required: [id, agent_id, workspace_id, title, created_at, updated_at]
+      properties:
+        id: { type: string }
+        agent_id: { type: string }
+        workspace_id: { type: string }
+        project_id: { type: string }
+        title: { type: string }
+        provider_id: { type: string, description: 建立時會保存實際值；未指定時複製 Workspace 預設 Provider。 }
+        model: { type: string, description: 建立時會保存實際值；未指定時使用 Workspace 預設模型，再回退至 Provider 預設模型。 }
+        permission_profile: { type: string, description: 後端指派的權限 profile；決定該 Session 是否能使用高權限工具。 }
+        permanent_tool_approval: { type: boolean, description: 目前 Session 是否已經由有效人工決策開啟永久工具核准；唯讀狀態，不能透過 Session PATCH 設定。 }
+        pinned: { type: boolean }
+        pinned_at: { type: string, format: date-time }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateSessionInput:
+      type: object
+      required: [workspace_id]
+      properties:
+        title: { type: string }
+        workspace_id: { type: string }
+        project_id: { type: string }
+        provider_id: { type: string, description: 未指定或空字串時，建立的 Session 會複製 Workspace 預設 Provider；指定時必須屬於 Workspace 的 provider_ids。 }
+        model: { type: string, description: 未指定或空字串時，建立的 Session 會複製 Workspace 預設模型，再回退至 Provider 預設模型。 }
+        permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。留空時套用後端預設 profile。 }
+        pinned: { type: boolean }
+        metadata: { type: object, additionalProperties: true }
+    UpdateSessionInput:
+      type: object
+      minProperties: 1
+      properties:
+        title: { type: string, minLength: 1 }
+        workspace_id: { type: string, description: 搬移時 project_id 必須同屬此 Workspace。 }
+        project_id: { type: string, description: 空字串表示未分類。 }
+        provider_id: { type: string, description: 空字串恢復 Workspace 預設；指定時必須屬於 Workspace 的 provider_ids。 }
+        model: { type: string }
+        permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。 }
+        memory_scope: { type: string, description: 空字串會恢復 Agent 預設 scope。 }
+        pinned: { type: boolean }
+    Plan:
+      type: object
+      required: [id, session_id, title, status, position, created_by, steps, created_at, updated_at]
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        title: { type: string }
+        objective: { type: string }
+        status: { type: string, enum: [queued, active, completed, canceled] }
+        position: { type: integer, minimum: 0 }
+        current_step_id: { type: string }
+        created_by: { type: string, enum: [user, agent] }
+        steps:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { $ref: "#/components/schemas/PlanStep" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    PlanStep:
+      type: object
+      required: [id, title, verification, status]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        description: { type: string }
+        verification: { type: string }
+        status: { type: string, enum: [pending, in_progress, verifying, completed, blocked, skipped] }
+        evidence: { type: string }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+    CreatePlanInput:
+      type: object
+      required: [title, steps]
+      properties:
+        title: { type: string, minLength: 1 }
+        objective: { type: string }
+        steps:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            required: [title, verification]
+            properties:
+              title: { type: string, minLength: 1 }
+              description: { type: string }
+              verification: { type: string, minLength: 1, description: 可由實際工具檢查的客觀完成條件。 }
+    ReorderPlansInput:
+      type: object
+      required: [plan_ids]
+      properties:
+        plan_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string }
+    Project:
+      type: object
+      required: [id, workspace_id, name, position, created_at, updated_at]
+      properties:
+        id: { type: string }
+        workspace_id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        sandbox_roots:
+          type: array
+          items: { type: string }
+          description: Project 允許原生檔案與 Shell 工具存取的絕對目錄；後端會解析 symlink、去重並拒絕檔案系統根目錄。
+        position: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateProjectInput:
+      type: object
+      required: [name, workspace_id]
+      properties:
+        name: { type: string, minLength: 1, description: 同一 Workspace 內唯一。 }
+        workspace_id: { type: string }
+        description: { type: string }
+        sandbox_roots:
+          type: array
+          items: { type: string }
+          description: 可同時指定多個既有的絕對目錄。
+    UpdateProjectInput:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1 }
+        description: { type: string }
+        sandbox_roots:
+          type: array
+          items: { type: string }
+          description: 完整取代 Project 的 Sandbox 目錄集合；空陣列表示恢復 Session 私有工作目錄。
+        position: { type: integer, minimum: 0 }
+    Workspace:
+      type: object
+      required: [id, name, provider_ids, default_provider_id, position, created_at, updated_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+        default_provider_id: { type: string, description: 必須存在於 provider_ids。 }
+        model: { type: string }
+        position: { type: integer, minimum: 0 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    CreateWorkspaceInput:
+      type: object
+      required: [name, provider_ids, default_provider_id]
+      properties:
+        name: { type: string, minLength: 1 }
+        description: { type: string }
+        provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+        default_provider_id: { type: string }
+        model: { type: string }
+    UpdateWorkspaceInput:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1 }
+        description: { type: string }
+        provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
+        default_provider_id: { type: string, minLength: 1 }
+        model: { type: string }
+        position: { type: integer, minimum: 0 }
+    ProviderDescriptor:
+      type: object
+      required: [id, protocol, endpoint, default_model, streaming, has_api_key]
+      properties:
+        id: { type: string }
+        protocol: { type: string }
+        endpoint: { type: string, format: uri }
+        default_model: { type: string }
+        streaming: { type: boolean }
+        has_api_key: { type: boolean }
+    ServiceSettings:
+      type: object
+      required: [service_name]
+      properties:
+        service_name: { type: string, minLength: 1, maxLength: 80 }
+    UpdateServiceSettingsInput:
+      allOf:
+        - $ref: "#/components/schemas/ServiceSettings"
+    ProviderSettings:
+      type: object
+      required: [default_provider_id, providers]
+      properties:
+        default_provider_id: { type: string }
+        providers:
+          type: array
+          minItems: 1
+          items: { $ref: "#/components/schemas/ProviderSetting" }
+    UpdateProviderSettingsInput:
+      allOf:
+        - $ref: "#/components/schemas/ProviderSettings"
+    ProviderSetting:
+      type: object
+      required: [id, type]
+      properties:
+        id: { type: string, minLength: 1, maxLength: 80 }
+        type: { type: string, enum: [openai-compatible] }
+        openai_compatible: { $ref: "#/components/schemas/OpenAICompatibleProviderSetting" }
+    OpenAICompatibleProviderSetting:
+      type: object
+      required: [base_url, model, instruction_role, max_attempts]
+      properties:
+        base_url: { type: string, format: uri }
+        api_key: { type: string, writeOnly: true, description: 省略時保留，空字串清除。 }
+        has_api_key: { type: boolean, readOnly: true }
+        model: { type: string, minLength: 1 }
+        instruction_role: { type: string, enum: [system, developer] }
+        disable_streaming: { type: boolean }
+        stream_include_usage: { type: boolean }
+        omit_tool_choice: { type: boolean }
+        max_attempts: { type: integer, minimum: 1, maximum: 3 }
+        timeout_seconds: { type: integer, minimum: 1 }
+        connect_timeout_seconds: { type: integer, minimum: 1 }
+        response_header_timeout_seconds: { type: integer, minimum: 1 }
+        context_window: { type: integer, minimum: 0 }
+        max_output_tokens: { type: integer, minimum: 0 }
+    Usage:
+      type: object
+      properties:
+        input_tokens: { type: integer, minimum: 0 }
+        output_tokens: { type: integer, minimum: 0 }
+        total_tokens: { type: integer, minimum: 0 }
+    ProviderModels:
+      type: object
+      required: [provider_id, models]
+      properties:
+        provider_id: { type: string }
+        models:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+    ProviderTestResult:
+      type: object
+      required: [ok, tool_calling, provider_id, model, duration_milliseconds, usage]
+      properties:
+        ok: { type: boolean }
+        tool_calling: { type: boolean, description: 是否已實際收到原生工具呼叫。 }
+        provider_id: { type: string }
+        model: { type: string }
+        provider_request_id: { type: string }
+        response_preview: { type: string }
+        duration_milliseconds: { type: integer, minimum: 0 }
+        usage: { $ref: "#/components/schemas/Usage" }
+        models:
+          type: array
+          uniqueItems: true
+          items: { type: string }
+        warning: { type: string }
+    RunInput:
+      type: object
+      required: [input]
+      properties:
+        input: { type: string, minLength: 1 }
+        attachment_ids:
+          type: array
+          maxItems: 16
+          uniqueItems: true
+          items: { type: string }
+        provider_id: { type: string, description: Run override；必須屬於 Session 所在 Workspace 的 provider_ids。 }
+        model: { type: string }
+        metadata: { type: object, additionalProperties: true }
+    Run:
+      type: object
+      required: [id, agent_id, session_id, status, input, created_at]
+      properties:
+        id: { type: string }
+        agent_id: { type: string }
+        session_id: { type: string }
+        status: { type: string, enum: [queued, running, waiting_approval, completed, failed, canceled] }
+        input: { type: string }
+        attachment_ids:
+          type: array
+          items: { type: string }
+        provider_id: { type: string }
+        model: { type: string }
+        idempotency_key: { type: string }
+        result: { $ref: "#/components/schemas/RunResult" }
+        error: { type: object, additionalProperties: true }
+        pending_approval: { $ref: "#/components/schemas/ToolApprovalRequest" }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+    Attachment:
+      type: object
+      required: [id, session_id, name, path, size, created_at]
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        name: { type: string }
+        media_type: { type: string }
+        path: { type: string, description: Session Sandbox 內由後端產生的絕對路徑。 }
+        size: { type: integer, format: int64, minimum: 0 }
+        created_at: { type: string, format: date-time }
+    RunResult:
+      type: object
+      required: [message]
+      properties:
+        message: { $ref: "#/components/schemas/Message" }
+        budget_exceeded: { $ref: "#/components/schemas/RunBudgetExceeded" }
+        completion: { $ref: "#/components/schemas/RunCompletion" }
+    Message:
+      type: object
+      required: [id, session_id, role, created_at]
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        role: { type: string, enum: [user, assistant, tool] }
+        content: { type: string }
+        reasoning:
+          type: string
+          description: Provider 回傳且可供使用者檢視的 reasoning 內容。
+        tool_calls:
+          type: array
+          items:
+            type: object
+            required: [id, name]
+            properties:
+              id: { type: string }
+              name: { type: string }
+              arguments: { type: object, additionalProperties: true }
+        tool_call_id: { type: string }
+        tool_name: { type: string }
+        is_error: { type: boolean }
+        provider_id: { type: string }
+        provider_request_id: { type: string }
+        model: { type: string }
+        stop_reason: { type: string }
+        usage:
+          type: object
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+            total_tokens: { type: integer }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    RunCompletion:
+      type: object
+      description: >-
+        這次 Run 的完成度判定。checks_performed 大於 0 代表模型曾宣稱完成但被追問；
+        unresolved_failures 非空代表仍有工具失敗沒有後續成功的同名呼叫，
+        呼叫端應據此判斷這次「完成」的可信度。
+      required: [checks_performed]
+      properties:
+        checks_performed: { type: integer }
+        unresolved_failures:
+          type: array
+          items:
+            type: object
+            required: [tool_call_id, tool_name]
+            properties:
+              tool_call_id: { type: string }
+              tool_name: { type: string }
+              summary: { type: string }
+    RunBudgetExceeded:
+      type: object
+      required: [resource, limit, observed, usage]
+      properties:
+        resource:
+          type: string
+          enum: [max_turns, max_wall_clock, max_tokens, max_tool_calls]
+        limit: { type: integer, format: int64 }
+        observed: { type: integer, format: int64 }
+        usage: { $ref: "#/components/schemas/RunBudgetUsage" }
+    RunBudgetUsage:
+      type: object
+      required: [turns, wall_clock_milliseconds, tokens, tool_calls]
+      properties:
+        turns: { type: integer, minimum: 0 }
+        wall_clock_milliseconds: { type: integer, format: int64, minimum: 0 }
+        tokens: { type: integer, minimum: 0 }
+        tool_calls: { type: integer, minimum: 0 }
+    ToolApprovalRequest:
+      type: object
+      required: [id, run_id, session_id, tool_call_id, tool_name, requested_at]
+      properties:
+        id: { type: string }
+        run_id: { type: string }
+        session_id: { type: string }
+        tool_call_id: { type: string }
+        tool_name: { type: string }
+        arguments: { type: object, additionalProperties: true }
+        reason: { type: string }
+        requested_at: { type: string, format: date-time }
+    ToolApprovalDecisionInput:
+      type: object
+      required: [approval_id, decision]
+      properties:
+        approval_id: { type: string, minLength: 1 }
+        decision: { type: string, enum: [approve, deny] }
+        reason: { type: string }
+        permanent: { type: boolean, description: 僅能搭配 approve；持久化核准到目前 Session，後續不再逐次詢問。 }
+    ToolDefinition:
+      type: object
+      required: [name, description]
+      properties:
+        name: { type: string }
+        label: { type: string }
+        version: { type: string }
+        category: { type: string }
+        description: { type: string }
+        input_schema: { type: object, additionalProperties: true }
+        platforms: { type: array, items: { type: string } }
+        capabilities: { type: array, items: { type: string } }
+        read_only: { type: boolean }
+        requires_permission: { type: boolean }
+    ToolCatalogEntry:
+      type: object
+      required: [definition, allowed, available]
+      properties:
+        definition: { $ref: "#/components/schemas/ToolDefinition" }
+        allowed: { type: boolean }
+        available: { type: boolean }
+        unavailable_reason: { type: string }
+    ServiceStatus:
+      type: object
+      required: [name, version, instance_id, started_at, ready]
+      properties:
+        name: { type: string }
+        version: { type: string }
+        instance_id: { type: string }
+        started_at: { type: string, format: date-time }
+        ready: { type: boolean }
+    Problem:
+      type: object
+      required: [type, title, status, detail, code]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string }
+        request_id: { type: string }
+    SessionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/Session" }
+    ProjectEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/Project" }
+    WorkspaceEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/Workspace" }
+    RunEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/Run" }
+    ServiceStatusEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ServiceStatus" }
+    ServiceSettingsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ServiceSettings" }
+    ProviderSettingsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderSettings" }
+    ProviderModelsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderModels" }
+    ProviderTestResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderTestResult" }

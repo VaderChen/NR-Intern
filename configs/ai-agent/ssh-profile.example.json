@@ -1,0 +1,75 @@
+{
+  "service_name": "聰明的實習生",
+  "listen_address": "127.0.0.1:8787",
+  "data_dir": "data/ai-agent",
+  "allowed_tools": [
+    "directory_list",
+    "directory_create",
+    "file_read",
+    "file_search",
+    "file_compare",
+    "file_write",
+    "file_edit",
+    "document_inspect",
+    "document_read",
+    "shell_exec",
+    "ssh_exec",
+    "memory_search",
+    "memory_remember",
+    "memory_forget"
+  ],
+  "allow_elevated_tools": true,
+  "tool_call_mode": "instruction",
+  "max_turns": 96,
+  "max_autonomous_tool_turns": 16,
+  "max_wall_clock_seconds": 7200,
+  "max_tokens": 10000000,
+  "max_tool_calls": 512,
+  "max_tool_output_bytes": 524288,
+  "max_file_input_bytes": 8388608,
+  "context": {
+    "max_estimated_tokens": 524288,
+    "retain_messages": 16,
+    "max_tool_result_characters": 24000,
+    "max_summary_input_characters": 120000,
+    "max_summary_characters": 16000,
+    "summary_provider_id": "local",
+    "summary_model": "your-openai-compatible-model"
+  },
+  "memory": {
+    "enabled": true,
+    "auto_recall": true,
+    "recall_limit": 8,
+    "max_injected_characters": 8000,
+    "allow_writes": true
+  },
+  "default_provider_id": "local",
+  "providers": {
+    "local": {
+      "type": "openai-compatible",
+      "openai_compatible": {
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "your-openai-compatible-model",
+        "instruction_role": "system",
+        "disable_streaming": false,
+        "stream_include_usage": true,
+        "omit_tool_choice": false,
+        "max_attempts": 3,
+        "timeout_seconds": 1800,
+        "connect_timeout_seconds": 20,
+        "response_header_timeout_seconds": 120
+      }
+    }
+  },
+  "ssh_profiles": {
+    "development": {
+      "address": "server.example.com:22",
+      "user": "deploy",
+      "private_key_path": "secrets/id_ed25519",
+      "known_hosts_file": "secrets/known_hosts",
+      "connect_timeout_seconds": 15,
+      "connect_attempts": 3,
+      "keep_alive_seconds": 15
+    }
+  }
+}
