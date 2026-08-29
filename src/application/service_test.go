@@ -169,10 +169,15 @@ func (fakeProviders) Stream(context.Context, domain.ModelRequest, ports.ModelEve
 func (fakeProviders) Capabilities(string, string) domain.ModelCapabilities {
 	return domain.ModelCapabilities{}
 }
-func (fakeProviders) DefaultProviderID() string  { return "openai-compatible" }
-func (fakeProviders) HasProvider(id string) bool { return id == "openai-compatible" }
+func (fakeProviders) DefaultProviderID() string { return "openai-compatible" }
+func (fakeProviders) HasProvider(id string) bool {
+	return id == "openai-compatible" || id == "secondary"
+}
 func (fakeProviders) ListProviders() []domain.ProviderDescriptor {
-	return []domain.ProviderDescriptor{{ID: "openai-compatible", DefaultModel: "provider-model"}}
+	return []domain.ProviderDescriptor{
+		{ID: "openai-compatible", DefaultModel: "provider-model"},
+		{ID: "secondary", DefaultModel: "secondary-model"},
+	}
 }
 
 func newTestService(t *testing.T, policy domain.PermissionPolicy) (*Service, *fakeEngine) {
@@ -282,6 +287,57 @@ func TestCreateSessionKeepsExplicitProviderAndModel(t *testing.T) {
 	}
 	if session.ProviderID != "openai-compatible" || session.Model != "explicit-model" {
 		t.Fatalf("provider/model = %q/%q, want openai-compatible/explicit-model", session.ProviderID, session.Model)
+	}
+}
+
+func TestCreateSessionAllowsEnabledProviderOutsideWorkspaceDefaults(t *testing.T) {
+	service, _ := newTestService(t, lockedPolicy())
+
+	session, err := service.CreateSession(context.Background(), "agent_test", domain.CreateSessionInput{
+		WorkspaceID: "workspace_1",
+		ProviderID:  "secondary",
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if session.ProviderID != "secondary" || session.Model != "secondary-model" {
+		t.Fatalf("provider/model = %q/%q, want secondary/secondary-model", session.ProviderID, session.Model)
+	}
+}
+
+func TestUpdateSessionAllowsEnabledProviderOutsideWorkspaceDefaults(t *testing.T) {
+	service, _ := newTestService(t, lockedPolicy())
+	session, err := service.CreateSession(context.Background(), "agent_test", domain.CreateSessionInput{WorkspaceID: "workspace_1"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	providerID := "secondary"
+	updated, err := service.UpdateSession(context.Background(), session.ID, domain.UpdateSessionInput{ProviderID: &providerID})
+	if err != nil {
+		t.Fatalf("UpdateSession: %v", err)
+	}
+	if updated.ProviderID != "secondary" {
+		t.Fatalf("provider = %q, want secondary", updated.ProviderID)
+	}
+}
+
+func TestStartRunAllowsEnabledProviderOverrideOutsideWorkspaceDefaults(t *testing.T) {
+	service, _ := newTestService(t, lockedPolicy())
+	session, err := service.CreateSession(context.Background(), "agent_test", domain.CreateSessionInput{WorkspaceID: "workspace_1"})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	run, err := service.StartRun(context.Background(), domain.RunInput{
+		SessionID:  session.ID,
+		UserInput:  "使用另一個 Provider",
+		ProviderID: "secondary",
+		Model:      "secondary-model",
+	})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	if run.ProviderID != "secondary" || run.Model != "secondary-model" {
+		t.Fatalf("provider/model = %q/%q, want secondary/secondary-model", run.ProviderID, run.Model)
 	}
 }
 

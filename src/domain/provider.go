@@ -17,8 +17,10 @@ type UpdateProviderSettingsInput struct {
 // ProviderSetting 以 Type 決定具名設定區塊；目前只實作 openai-compatible。
 // 後續新增 Provider 類型時不需要改動 Workspace、Session 或 Harness schema。
 type ProviderSetting struct {
-	ID               string                           `json:"id"`
-	Type             string                           `json:"type"`
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	// Enabled=nil 供舊版 Client 省略欄位時維持啟用；管理 API 回應一律提供明確值。
+	Enabled          *bool                            `json:"enabled,omitempty"`
 	OpenAICompatible *OpenAICompatibleProviderSetting `json:"openai_compatible,omitempty"`
 }
 

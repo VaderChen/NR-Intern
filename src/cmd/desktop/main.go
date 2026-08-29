@@ -18,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -33,6 +34,8 @@ type options struct {
 	openBrowser   bool
 	backendChild  bool
 	backendListen string
+	workingDir    string
+	startupSignal string
 }
 
 func main() {
@@ -47,7 +50,14 @@ func main() {
 	flag.BoolVar(&value.openBrowser, "open", true, "原生視窗不可用時開啟預設瀏覽器")
 	flag.BoolVar(&value.backendChild, "backend-child", false, "內部後端子程序模式")
 	flag.StringVar(&value.backendListen, "backend-listen", "", "內部後端子程序監聽位址")
+	flag.StringVar(&value.workingDir, "working-dir", "", "桌面程式與後端使用的工作目錄")
+	flag.StringVar(&value.startupSignal, "startup-signal", "", "內部啟動畫面就緒訊號檔")
 	flag.Parse()
+	if value.workingDir != "" {
+		if err := os.Chdir(value.workingDir); err != nil {
+			fatal(fmt.Errorf("切換工作目錄: %w", err))
+		}
+	}
 
 	if value.backendChild {
 		runBackendChild(value)
@@ -59,6 +69,8 @@ func main() {
 }
 
 func runDesktop(value options) error {
+	notifyStartupReady := startupReadyNotifier(value.startupSignal)
+	defer notifyStartupReady()
 	if !loopbackAddress(value.uiListen) {
 		return fmt.Errorf("桌面 UI 僅允許監聽 loopback 位址")
 	}
@@ -101,13 +113,6 @@ func runDesktop(value options) error {
 	if err != nil {
 		return err
 	}
-	if value.autoStart {
-		startupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if err := manager.Start(startupContext); err != nil {
-			slog.Warn("backend auto-start failed; console will remain available", "error", err)
-		}
-		cancel()
-	}
 	ui, err := httpui.New(httpui.Config{Supervisor: manager, BackendToken: value.backendToken})
 	if err != nil {
 		return err
@@ -126,13 +131,25 @@ func runDesktop(value options) error {
 	}()
 	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if value.autoStart {
+		// UI listener 與原生視窗不應等待完整後端初始化；前端已有啟動狀態，
+		// 後端就緒後會自動載入 Workspace 與 Session。
+		go func() {
+			startupContext, cancel := context.WithTimeout(stopContext, 30*time.Second)
+			defer cancel()
+			if err := manager.Start(startupContext); err != nil && stopContext.Err() == nil {
+				slog.Warn("backend auto-start failed; console will remain available", "error", err)
+			}
+		}()
+	}
 	visibleUI := false
 	if value.nativeWindow {
 		if err := window.Run(stopContext, window.Options{
-			Title:  "NR-Intern Agent Console",
-			URL:    uiURL,
-			Width:  1280,
-			Height: 820,
+			Title:   "NR-Intern Agent Console",
+			URL:     uiURL,
+			Width:   1280,
+			Height:  820,
+			OnReady: notifyStartupReady,
 		}); err != nil {
 			if !errors.Is(err, window.ErrUnavailable) {
 				slog.Warn("native desktop window failed", "error", err)
@@ -148,9 +165,12 @@ func runDesktop(value options) error {
 		if value.openBrowser {
 			if err := launcher.OpenURL(uiURL); err != nil {
 				slog.Warn("unable to open browser", "error", err)
+			} else {
+				notifyStartupReady()
 			}
 		} else {
 			slog.Info("desktop console is running without a visible UI", "url", uiURL)
+			notifyStartupReady()
 		}
 		<-stopContext.Done()
 	}
@@ -159,6 +179,55 @@ func runDesktop(value options) error {
 	_ = server.Shutdown(shutdownContext)
 	if err := manager.Stop(shutdownContext); err != nil && !errors.Is(err, supervisor.ErrExternalBackend) {
 		slog.Warn("owned backend stop failed", "error", err)
+	}
+	return nil
+}
+
+func startupReadyNotifier(rawPath string) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			path := strings.TrimSpace(rawPath)
+			if path == "" {
+				return
+			}
+			if err := writeStartupReady(path); err != nil {
+				slog.Warn("unable to notify startup splash", "error", err)
+			}
+		})
+	}
+}
+
+func writeStartupReady(path string) error {
+	absolutePath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("解析啟動訊號檔: %w", err)
+	}
+	temporaryRoot, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return fmt.Errorf("解析暫存目錄: %w", err)
+	}
+	relativePath, err := filepath.Rel(temporaryRoot, absolutePath)
+	if err != nil || relativePath == "." || relativePath == ".." || filepath.IsAbs(relativePath) || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("啟動訊號檔必須位於系統暫存目錄")
+	}
+	if !strings.HasPrefix(filepath.Base(absolutePath), "nr-intern-startup.") {
+		return fmt.Errorf("啟動訊號檔名稱無效")
+	}
+	info, err := os.Lstat(absolutePath)
+	if err != nil {
+		return fmt.Errorf("讀取啟動訊號檔: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("啟動訊號檔不是一般檔案")
+	}
+	file, err := os.OpenFile(absolutePath, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		return fmt.Errorf("開啟啟動訊號檔: %w", err)
+	}
+	defer file.Close()
+	if _, err := file.WriteString("ready\n"); err != nil {
+		return fmt.Errorf("寫入啟動訊號檔: %w", err)
 	}
 	return nil
 }

@@ -49,7 +49,7 @@ Project 的 `sandbox_roots` 可以經由 `POST /api/v1/projects` 與 `PATCH /api
 ## Provider 與秘密
 
 - Provider adapter 只由後端設定註冊，模型不能新增 endpoint。Workspace 只能引用已註冊 Provider ID。
-- Workspace 保存 `provider_ids` 集合與其中一個 `default_provider_id`；Session／Run override 必須是已註冊且屬於該 Workspace 集合的 ID。仍被 Session 引用的 Provider 不可直接移出集合。
+- Workspace 保存自己的 `provider_ids` 集合與其中一個 `default_provider_id`，用來提供新對話及未指定 override 時的預設值；Session／Run override 可選擇任一全域已啟用 Provider。仍被 Workspace 或 Session 引用的 Provider 不可停用或刪除。
 - Diagnostics 只回傳 endpoint、協定、預設模型、串流能力與「API key 是否存在」，不回傳 API key、額外 header 值或 token。
 - API key 應由環境變數或權限受限的設定檔提供；不要把真實秘密提交到版本控制。
 

@@ -61,6 +61,7 @@ type RunCounts struct {
 
 type RedactedConfig struct {
 	ServiceName         string                      `json:"service_name"`
+	UILanguage          string                      `json:"ui_language"`
 	ListenAddress       string                      `json:"listen_address"`
 	DataDir             string                      `json:"data_dir"`
 	APITokenConfigured  bool                        `json:"api_token_configured"`
@@ -222,15 +223,10 @@ func Build(config Config) (*Runtime, error) {
 			Config:       config.Context,
 			Logger:       logger,
 		},
-		Memory:    memoryManager,
-		Logger:    logger,
-		Approvals: approvalCoordinator,
-		Budget: domain.RunBudget{
-			MaxTurns:     config.MaxTurns,
-			MaxWallClock: time.Duration(config.MaxWallClockSeconds) * time.Second,
-			MaxTokens:    config.MaxTokens,
-			MaxToolCalls: config.MaxToolCalls,
-		},
+		Memory:                 memoryManager,
+		Logger:                 logger,
+		Approvals:              approvalCoordinator,
+		Budget:                 runBudgetFromConfig(config),
 		MaxAutonomousToolTurns: config.MaxAutonomousToolTurns,
 		MaxCompletionChecks:    config.MaxCompletionChecks,
 		SystemPrompt:           systemPrompt(),
@@ -317,7 +313,7 @@ func (r *Runtime) ServiceSettings(ctx context.Context) (domain.ServiceSettings, 
 	}
 	r.configMu.RLock()
 	defer r.configMu.RUnlock()
-	return domain.ServiceSettings{ServiceName: r.Config.ServiceName}, nil
+	return serviceSettingsFromConfig(r.Config), nil
 }
 
 func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error) {
@@ -334,14 +330,61 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 
 	r.configMu.Lock()
 	defer r.configMu.Unlock()
-	if err := persistServiceSettings(r.Config.DataDir, serviceName); err != nil {
+	updatedConfig := r.Config
+	updatedConfig.ServiceName = serviceName
+	updatedConfig.UILanguage, _ = normalizeUILanguage(updatedConfig.UILanguage)
+	if input.UILanguage != nil {
+		uiLanguage, valid := normalizeUILanguage(*input.UILanguage)
+		if !valid {
+			return domain.ServiceSettings{}, fmt.Errorf("%w: ui_language must be auto, zh-TW, en, ja or ko", domain.ErrInvalidInput)
+		}
+		updatedConfig.UILanguage = uiLanguage
+	}
+	if input.MaxWallClockSeconds != nil {
+		updatedConfig.MaxWallClockSeconds = *input.MaxWallClockSeconds
+	}
+	if input.MaxTokens != nil {
+		updatedConfig.MaxTokens = *input.MaxTokens
+	}
+	if input.MaxToolCalls != nil {
+		updatedConfig.MaxToolCalls = *input.MaxToolCalls
+	}
+	if err := validateAdjustableRunLimits(updatedConfig.MaxWallClockSeconds, updatedConfig.MaxTokens, updatedConfig.MaxToolCalls); err != nil {
+		return domain.ServiceSettings{}, fmt.Errorf("%w: %v", domain.ErrInvalidInput, err)
+	}
+	settings := serviceSettingsFromConfig(updatedConfig)
+	if err := persistServiceSettings(updatedConfig.DataDir, settings); err != nil {
 		return domain.ServiceSettings{}, err
 	}
-	r.Config.ServiceName = serviceName
+	r.Config = updatedConfig
 	if r.Agent != nil {
 		r.Agent.SetName(serviceName)
+		r.Agent.SetRunBudget(runBudgetFromConfig(updatedConfig))
 	}
-	return domain.ServiceSettings{ServiceName: serviceName}, nil
+	return settings, nil
+}
+
+func serviceSettingsFromConfig(config Config) domain.ServiceSettings {
+	uiLanguage, valid := normalizeUILanguage(config.UILanguage)
+	if !valid {
+		uiLanguage = DefaultUILanguage
+	}
+	return domain.ServiceSettings{
+		ServiceName:         config.ServiceName,
+		UILanguage:          uiLanguage,
+		MaxWallClockSeconds: config.MaxWallClockSeconds,
+		MaxTokens:           config.MaxTokens,
+		MaxToolCalls:        config.MaxToolCalls,
+	}
+}
+
+func runBudgetFromConfig(config Config) domain.RunBudget {
+	return domain.RunBudget{
+		MaxTurns:     config.MaxTurns,
+		MaxWallClock: time.Duration(config.MaxWallClockSeconds) * time.Second,
+		MaxTokens:    config.MaxTokens,
+		MaxToolCalls: config.MaxToolCalls,
+	}
 }
 
 // ensurePlanningTools 讓舊版明確 allowlist 升級後仍具備 Harness 計畫控制能力。
@@ -362,6 +405,9 @@ func ensurePlanningTools(values []string) []string {
 func buildProviderValues(config Config, logger *slog.Logger) (map[string]modelrouter.Provider, error) {
 	values := make(map[string]modelrouter.Provider, len(config.Providers))
 	for id, providerConfig := range config.Providers {
+		if !providerConfig.IsEnabled() {
+			continue
+		}
 		switch strings.ToLower(strings.TrimSpace(providerConfig.Type)) {
 		case "openai-compatible":
 			if providerConfig.OpenAICompatible == nil {
@@ -428,7 +474,7 @@ func validateStoredStructure(ctx context.Context, sessions ports.SessionReposito
 		return err
 	}
 	for _, session := range sessionValues {
-		workspace, exists := workspaceByID[session.WorkspaceID]
+		_, exists := workspaceByID[session.WorkspaceID]
 		if !exists {
 			return fmt.Errorf("stored session %q references missing workspace %q", session.ID, session.WorkspaceID)
 		}
@@ -438,8 +484,8 @@ func validateStoredStructure(ctx context.Context, sessions ports.SessionReposito
 				return fmt.Errorf("stored session %q has an invalid project relationship", session.ID)
 			}
 		}
-		if session.ProviderID != "" && !containsString(workspace.ProviderIDs, session.ProviderID) {
-			return fmt.Errorf("stored session %q references provider %q outside workspace %q", session.ID, session.ProviderID, workspace.ID)
+		if session.ProviderID != "" && !providers.HasProvider(session.ProviderID) {
+			return fmt.Errorf("stored session %q references unavailable provider %q", session.ID, session.ProviderID)
 		}
 	}
 	return nil
@@ -617,6 +663,10 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			return domain.ProviderSettings{}, fmt.Errorf("%w: duplicate provider id %q", domain.ErrConflict, id)
 		}
 		typeName := strings.ToLower(strings.TrimSpace(value.Type))
+		enabled := true
+		if value.Enabled != nil {
+			enabled = *value.Enabled
+		}
 		switch typeName {
 		case "openai-compatible":
 			if value.OpenAICompatible == nil {
@@ -645,7 +695,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 				settings.APIKey = strings.TrimSpace(*provided.APIKey)
 			}
 			applyOpenAICompatibleDefaults(&settings)
-			candidate.Providers[id] = ProviderConfig{Type: typeName, OpenAICompatible: &settings}
+			candidate.Providers[id] = ProviderConfig{Type: typeName, Enabled: boolPointer(enabled), OpenAICompatible: &settings}
 		default:
 			return domain.ProviderSettings{}, fmt.Errorf("%w: unsupported provider type %q", domain.ErrInvalidInput, value.Type)
 		}
@@ -659,8 +709,31 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 	}
 	for _, workspace := range workspaces {
 		for _, providerID := range workspace.ProviderIDs {
-			if _, exists := candidate.Providers[providerID]; !exists {
+			provider, exists := candidate.Providers[providerID]
+			if !exists {
 				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q is still used by workspace %q", domain.ErrConflict, providerID, workspace.Name)
+			}
+			if !provider.IsEnabled() {
+				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q must remain enabled while used by workspace %q", domain.ErrConflict, providerID, workspace.Name)
+			}
+		}
+	}
+	for _, agent := range r.Application.ListAgents() {
+		sessions, listErr := r.Application.ListSessions(ctx, agent.ID)
+		if listErr != nil {
+			return domain.ProviderSettings{}, listErr
+		}
+		for _, session := range sessions {
+			providerID := strings.TrimSpace(session.ProviderID)
+			if providerID == "" {
+				continue
+			}
+			provider, exists := candidate.Providers[providerID]
+			if !exists {
+				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q is still used by session %q", domain.ErrConflict, providerID, session.ID)
+			}
+			if !provider.IsEnabled() {
+				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q must remain enabled while used by session %q", domain.ErrConflict, providerID, session.ID)
 			}
 		}
 	}
@@ -687,7 +760,7 @@ func providerSettingsView(config Config) domain.ProviderSettings {
 	values := make([]domain.ProviderSetting, 0, len(ids))
 	for _, id := range ids {
 		provider := config.Providers[id]
-		value := domain.ProviderSetting{ID: id, Type: provider.Type}
+		value := domain.ProviderSetting{ID: id, Type: provider.Type, Enabled: boolPointer(provider.IsEnabled())}
 		if provider.OpenAICompatible != nil {
 			settings := provider.OpenAICompatible
 			value.OpenAICompatible = &domain.OpenAICompatibleProviderSetting{
@@ -709,6 +782,10 @@ func providerSettingsView(config Config) domain.ProviderSettings {
 		values = append(values, value)
 	}
 	return domain.ProviderSettings{DefaultProviderID: config.DefaultProviderID, Providers: values}
+}
+
+func boolPointer(value bool) *bool {
+	return &value
 }
 
 func validateProviderSettingsID(id string) error {
@@ -787,6 +864,7 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 		Status: r.Status(),
 		Config: RedactedConfig{
 			ServiceName:         config.ServiceName,
+			UILanguage:          config.UILanguage,
 			ListenAddress:       config.ListenAddress,
 			DataDir:             config.DataDir,
 			APITokenConfigured:  strings.TrimSpace(config.APIToken) != "",
@@ -834,6 +912,10 @@ func (r *Runtime) Status() domain.ServiceStatus {
 
 func systemPrompt() string {
 	return `你是一個可持續執行工作的 AI Agent。根據目前對話、實際工具結果與錯誤，決定此刻下一個必要動作。
+
+## 回覆語言
+
+自動判斷並優先使用使用者的慣用語言回答。綜合目前訊息、近期對話與使用者明確表達的語言偏好判斷；不要因為介面語言、程式碼、路徑、引用文字或偶爾夾用其他語言就改變主要回答語言。若使用者在目前要求中明確指定語言，以最新指示為準。
 
 不要把所有問題都先拆成固定計畫：簡單任務直接執行。遇到多個相依動作、預期需要多輪工具、跨多個檔案，或 Session 已有計畫的長任務時，使用 Harness 提供的結構化計畫並依序執行、驗證。需要資訊時直接使用合適工具；工具結果不足或失敗時，依新狀態調整。
 

@@ -104,7 +104,7 @@ Harness 就會攔截模型過早產生的 final answer，要求繼續執行與�
 
 計畫工具屬於 Harness 控制工具，在 Shell-first 與內建備援階段都可使用；實際檔案、系統或
 外部狀態仍由當輪公開的工作工具處理。只有計畫工具的回合不消耗 autonomous work-tool
-turn 配額，但仍受整體 `max_turns` 與 `max_tool_calls` 限制。
+turn 配額，但仍受整體 `max_turns` 與已啟用的 `max_tool_calls` 限制。
 
 Harness 另有結構化重複操作防護：已成功的相同副作用工具呼叫不會執行第二次；具
 `atomic-replace` 能力的工具對同一資源成功改寫三次後，下一輪會停用工具並強制整理
@@ -112,11 +112,15 @@ Harness 另有結構化重複操作防護：已成功的相同副作用工具呼
 
 ### Run budget
 
-每個 Run 同時受 `max_turns`、`max_wall_clock_seconds`、`max_tokens` 與
-`max_tool_calls` 限制。wall-clock 使用可取消的 context，會中止仍在等待的模型或工具；
-token 依 Provider 回傳的 usage 逐輪累計。達到上限不是系統錯誤：Run 以 `completed`
-收尾，`result.budget_exceeded` 與 `metadata.termination=budget_exceeded` 說明終止原因，
-並保留最後一則 assistant 訊息。
+每個 Run 可受 `max_turns`、`max_wall_clock_seconds`、`max_tokens` 與
+`max_tool_calls` 限制。`max_tokens` 與 `max_tool_calls` 設為 `0` 時不限制，預設採此模式，
+避免長任務因累計用量提前停止；兩者仍可從系統管理或設定檔重新啟用限制。
+`max_wall_clock_seconds` 保留正整數上限，並可在系統管理調整。wall-clock 使用可取消的
+context，會中止仍在等待的模型或工具；token 依 Provider 回傳的 usage 逐輪累計。
+管理設定只套用到之後開始的 Run，執行中的 Run 保留啟動時快照。
+
+達到已啟用的上限不是系統錯誤：Run 以 `completed` 收尾，`result.budget_exceeded` 與
+`metadata.termination=budget_exceeded` 說明終止原因，並保留最後一則 assistant 訊息。
 
 如果上限觸發時仍有尚未執行的 tool call，Harness 會寫入帶
 `metadata.synthesized=true` 的 budget 工具結果。這些結果不代表工具曾執行，目的在於
@@ -167,7 +171,12 @@ Workspace Provider 採「集合＋預設值」：
 - `default_provider_id`：目前未指定 Session／Run override 時使用的 Provider，必須存在於集合。
 - `model`：Workspace 預設模型。
 
-目前前端仍是 Provider 單選，會寫入單元素集合；資料與 API 已可直接擴充成多選。Session／Run 的 `provider_id` override 必須屬於 Workspace 的 `provider_ids`，移除仍被 Session 引用的 Provider 會回傳 conflict；留空時每次 Run 即時取得 Workspace 預設值。`model` 同樣可由 Session／Run override。Provider Router 依 ID 選擇 adapter；同一 Session 維持 single-writer，不同 Workspace／Session 可並行。
+目前 Workspace 前端仍是 Provider 單選，會寫入單元素集合；資料與 API 已可直接擴充成多選。
+Workspace 的集合只負責自身預設，不限制對話選項。Session／Run 的 `provider_id` override 可選擇
+任一全域已啟用 Provider；留空時使用 Workspace 預設值。`model` 同樣可由 Session／Run
+override。停用或刪除仍被 Session 明確引用的 Provider 會回傳 conflict，必須先將該對話切換至
+其他 Provider 或恢復 Workspace 預設。Provider Router 依 ID 選擇 adapter；同一 Session 維持
+single-writer，不同 Workspace／Session 可並行。
 
 Project 與 Workspace 刪除都不做級聯操作：只要還有子 Project 或 Session 就回傳 conflict，避免 UI 管理動作隱含遺失對話。
 
@@ -345,7 +354,11 @@ Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具�
 
 ## Provider Router 與 OpenAI-compatible Adapter
 
-`modelrouter.Router` 實作 `ports.ProviderCatalog`，以 Provider ID 路由至任意 `ports.Model`。設定以 `providers.<id>.type` 選擇 bootstrap adapter 工廠；目前唯一已實作的 type 是 `openai-compatible`，使用 `POST /v1/chat/completions`：
+`modelrouter.Router` 實作 `ports.ProviderCatalog`，以 Provider ID 路由至任意 `ports.Model`。設定以 `providers.<id>.type` 選擇 bootstrap adapter 工廠；目前唯一已實作的 type 是 `openai-compatible`，使用 `POST /v1/chat/completions`。
+
+Provider 可透過管理頁右上角的啟用 Switch 或 `providers.<id>.enabled` 停用。停用只會從 Router、Workspace、Session 與對話選單移除，原設定與憑證仍保留，管理頁也仍可測試連線。為保持資料一致，系統預設 Provider 及仍被 Workspace 使用的 Provider 不可停用；舊設定未提供 `enabled` 時視為啟用。
+
+OpenAI-compatible adapter 行為如下：
 
 - system/developer、user、assistant、tool message。
 - function tools schema。

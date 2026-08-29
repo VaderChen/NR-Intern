@@ -8,11 +8,12 @@ import (
 var ErrUnavailable = errors.New("native desktop window is unavailable")
 
 type Options struct {
-	Title  string
-	URL    string
-	Width  int
-	Height int
-	Debug  bool
+	Title   string
+	URL     string
+	Width   int
+	Height  int
+	Debug   bool
+	OnReady func()
 }
 
 // Run 會阻塞直到使用者關閉視窗或 context 被取消。

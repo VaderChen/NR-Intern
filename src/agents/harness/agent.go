@@ -41,6 +41,14 @@ func (a *Agent) SetName(name string) {
 	a.descriptorMu.Unlock()
 }
 
+// SetRunBudget 讓管理設定只影響之後開始的工作；Runner 會在每次 Run 啟動時取得快照。
+func (a *Agent) SetRunBudget(budget domain.RunBudget) {
+	if a == nil || a.runner == nil {
+		return
+	}
+	a.runner.SetBudget(budget)
+}
+
 func (a *Agent) CreateSession(ctx context.Context, input domain.CreateSessionInput) (domain.Session, error) {
 	return a.sessions.Create(ctx, a.descriptor.ID, input)
 }

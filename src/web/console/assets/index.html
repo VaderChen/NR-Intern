@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>聰明的實習生</title>
+  <title>永不休息的實習生</title>
   <link rel="icon" type="image/png" href="/app-icon.png">
   <script>
     (() => {
@@ -16,6 +16,14 @@
       const systemDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
       document.documentElement.dataset.displayMode = mode;
       document.documentElement.dataset.theme = mode === "auto" ? (systemDark ? "dark" : "light") : mode;
+
+      const supportedLanguages = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
+      let uiLanguage = "auto";
+      try {
+        const storedLanguage = localStorage.getItem("uiLanguage");
+        if (supportedLanguages.has(storedLanguage)) uiLanguage = storedLanguage;
+      } catch (_) {}
+      document.documentElement.dataset.uiLanguage = uiLanguage;
     })();
   </script>
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
@@ -26,7 +34,7 @@
     <aside class="sidebar">
       <div class="brand">
         <img id="brandMark" class="brand-mark" src="/app-icon.png" alt="">
-        <div class="brand-copy"><strong id="brandName">聰明的實習生</strong><small><span id="statusDot" class="dot"></span><span id="backendState">檢查中</span></small></div>
+        <div class="brand-copy"><strong id="brandName">永不休息的實習生</strong><small><span id="statusDot" class="dot"></span><span id="backendState">檢查中</span></small></div>
       </div>
       <div class="workspace-switcher">
         <select id="workspaceSelect" aria-label="切換 Workspace" disabled></select>
@@ -96,7 +104,7 @@
       <form id="composer" class="composer">
         <div id="attachmentTray" class="attachment-tray hidden" aria-label="待送出附件"></div>
         <div class="composer-input-row">
-          <textarea id="prompt" rows="2" placeholder="請輸入任務…（Enter 送出，Shift+Enter 換行）" disabled></textarea>
+          <textarea id="prompt" rows="2" placeholder="輸入想做的事 或 請 Agent 幫你制定一個計畫" disabled></textarea>
           <button id="send" class="send" type="button" aria-label="送出訊息" title="送出訊息" disabled>
             <svg id="sendIcon" class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 19V5m0 0-6 6m6-6 6 6" />
@@ -106,7 +114,6 @@
             </svg>
           </button>
         </div>
-        <small class="composer-drop-hint">可從系統剪貼簿貼上，或拖放檔案與媒體到對話區域</small>
       </form>
     </main>
 
@@ -115,19 +122,31 @@
         <button id="closeManagement" class="ghost back-button">← 返回</button>
         <div><strong>系統管理</strong><small id="managementSubtitle">後端與 Session</small></div>
       </div>
-      <div class="panel-tabs" role="tablist">
-        <button class="panel-tab active" data-panel="overview" role="tab">概況</button>
-        <button class="panel-tab" data-panel="providers" role="tab">Provider 設定</button>
-        <button class="panel-tab" data-panel="tools" role="tab">工具</button>
-        <button class="panel-tab" data-panel="audit" role="tab">稽核</button>
+      <div class="panel-tabs" role="tablist" aria-label="系統管理功能" aria-orientation="vertical">
+        <button id="overviewManagementTab" class="panel-tab active" data-panel="overview" role="tab" aria-selected="true" aria-controls="overviewPanel">一般設定</button>
+        <button id="providersManagementTab" class="panel-tab" data-panel="providers" role="tab" aria-selected="false" aria-controls="providersPanel">Provider 設定</button>
+        <button id="toolsManagementTab" class="panel-tab" data-panel="tools" role="tab" aria-selected="false" aria-controls="toolsPanel">工具</button>
+        <button id="auditManagementTab" class="panel-tab" data-panel="audit" role="tab" aria-selected="false" aria-controls="auditPanel">稽核</button>
       </div>
 
-      <div id="overviewPanel" class="panel-content">
+      <div id="overviewPanel" class="panel-content" role="tabpanel" aria-labelledby="overviewManagementTab">
         <form id="serviceSettings" class="management-section">
-          <div class="section-head"><h2>介面設定</h2><span id="serviceSettingsState" class="save-state"></span></div>
+          <div class="section-head"><h2>服務與執行設定</h2><span id="serviceSettingsState" class="save-state"></span></div>
           <label>顯示名稱<input id="settingServiceName" maxlength="80" autocomplete="off" required></label>
-          <p class="hint">名稱會套用到左上角品牌、網頁標題與 Agent 顯示名稱。</p>
-          <button id="saveServiceSettings" class="primary" type="submit">儲存介面設定</button>
+          <label><span>介面語言</span>
+            <select id="settingUILanguage" data-i18n-ignore>
+              <option value="auto">AUTO</option>
+              <option value="zh-TW">繁體中文</option>
+              <option value="en">English</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+            </select>
+          </label>
+          <label>單次工作時間上限（分鐘）<input id="settingMaxWallClockMinutes" type="number" min="1" max="1440" step="1" inputmode="numeric" required></label>
+          <label>單次工作 Token 上限<input id="settingMaxTokens" type="number" min="0" step="1000" inputmode="numeric" required></label>
+          <label>單次工作工具呼叫上限<input id="settingMaxToolCalls" type="number" min="0" max="10000" step="1" inputmode="numeric" required></label>
+          <p class="hint">Token 與工具呼叫填 0 表示不限制；時間上限為 1～1440 分鐘。新數值會套用到之後開始的工作，不影響正在執行中的工作。</p>
+          <button id="saveServiceSettings" class="primary" type="submit">儲存服務設定</button>
         </form>
         <section class="management-section backend-card">
           <div class="section-head"><h2>後端程序</h2><span class="status-line"><span id="managementStatusDot" class="dot"></span><strong id="managementBackendState">檢查中</strong></span></div>
@@ -176,7 +195,7 @@
         <section id="noSessionManagement" class="management-section quiet">選擇 Session 後可管理模型、權限與記憶 scope。</section>
       </div>
 
-      <div id="providersPanel" class="panel-content hidden">
+      <div id="providersPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="providersManagementTab">
         <div class="provider-settings-layout">
           <section class="management-section provider-settings-sidebar">
             <div class="section-head">
@@ -189,7 +208,14 @@
           <form id="providerSettingsForm" class="management-section provider-settings-editor hidden">
             <div class="section-head">
               <div><h2 id="providerSettingsEditorTitle">Provider 設定</h2><p class="hint">設定儲存後會直接套用到新的模型請求。</p></div>
-              <span id="providerSettingsState" class="save-state"></span>
+              <div class="provider-editor-head-actions">
+                <label id="providerSettingEnabledLabel" class="switch-label">
+                  <input id="providerSettingEnabled" type="checkbox" role="switch" aria-label="啟用 Provider">
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>啟用</span>
+                </label>
+                <span id="providerSettingsState" class="save-state"></span>
+              </div>
             </div>
             <div class="provider-field-grid">
               <label>Provider ID<input id="providerSettingID" maxlength="80" autocomplete="off" required></label>
@@ -243,7 +269,7 @@
         </div>
       </div>
 
-      <div id="toolsPanel" class="panel-content hidden">
+      <div id="toolsPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="toolsManagementTab">
         <section class="management-section">
           <div class="section-head"><h2>原生工具</h2><button id="refreshTools" class="small ghost">重新整理</button></div>
           <p class="hint">可用性同時由後端 allowlist、elevated tools 設定與 Session 權限判斷。</p>
@@ -251,7 +277,7 @@
         </section>
       </div>
 
-      <div id="auditPanel" class="panel-content hidden">
+      <div id="auditPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="auditManagementTab">
         <section class="management-section">
           <div class="section-head"><h2>Harness 稽核</h2><button id="refreshAudit" class="small ghost">重新整理</button></div>
           <p class="hint">依 sequence 顯示 operation、turn 與 tool call 的持久化生命週期。</p>
@@ -477,6 +503,7 @@
   <script src="/vendor/katex/katex.min.js" defer></script>
   <script src="/vendor/katex/auto-render.min.js" defer></script>
   <script src="/rich-text.js" defer></script>
+  <script src="/i18n.js" defer></script>
   <script src="/app.js" defer></script>
 </body>
 </html>

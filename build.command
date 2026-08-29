@@ -50,7 +50,9 @@ for command_dir in "$COMMAND_ROOT"/*; do
 	command_name="${command_dir:t}"
 	output_name="nr-intern-$command_name"
 	print "  建置 $command_name"
-	go build -trimpath -o "$BUILD_STAGE/$output_name" "./src/cmd/$command_name"
+	# 專案可能位於另一套 VCS 的工作副本中（例如 Git 專案放在 SVN 目錄下）。
+	# 發行版本由本腳本注入，不依賴 Go 自動寫入 VCS 資訊。
+	go build -buildvcs=false -trimpath -o "$BUILD_STAGE/$output_name" "./src/cmd/$command_name"
 	built_files+=("$output_name")
 done
 
@@ -82,6 +84,6 @@ release_arguments=(
 
 print "開始建置跨平台發行檔：$RELEASE_TARGETS"
 print "發行版本：$RELEASE_VERSION"
-go run ./src/cmd/release "${release_arguments[@]}"
+go run -buildvcs=false ./src/cmd/release "${release_arguments[@]}"
 
 print "跨平台建置完成：$DIST_OUTPUT_DIR"

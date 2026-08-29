@@ -97,44 +97,6 @@ go test -run '^$' ./src/...
 
 ## 跨平台發行
 
-執行根目錄的 `build.command` 會保留 `run.command` 使用的本機 `bin/` 執行檔，並建置 Windows x64、Windows ARM64 與 macOS ARM64 發行內容。版本會依台北時間自動產生為 `1.YY.MMDD build HHmm`：
+專案支援 Windows x64、Windows ARM64 與 macOS ARM64。發行封裝、版本產生、安裝檔建立、完整性清單與簽章均由維護者的內部流程處理；公開文件不提供封裝命令、參數、工具位置或簽章設定。
 
-```bash
-./build.command
-```
-
-輸出位於 `dist/1.YY.MMDD-build-HHmm/`，每個平台使用獨立目錄：
-
-```text
-dist/1.YY.MMDD-build-HHmm/
-├── windows-x64/
-│   ├── nr-intern-desktop.exe
-│   ├── nr-intern-server.exe
-│   └── NR-Intern-*.msi
-├── windows-arm64/
-│   ├── nr-intern-desktop.exe
-│   ├── nr-intern-server.exe
-│   └── NR-Intern-*.msi
-└── macos-arm64/
-    ├── nr-intern-desktop
-    ├── nr-intern-server
-    └── NR-Intern.app/
-```
-
-Windows 原生環境使用 WiX CLI 產生 MSI，也可用 `NR_INTERN_WIX` 指定執行檔路徑。macOS／Linux 交叉封裝使用 msitools 的 `wixl` 與 `msibuild`，macOS 可執行 `brew install msitools` 安裝，也可用 `NR_INTERN_WIXL` 指定 `wixl`。開發建置預設為 `NR_INTERN_MSI_MODE=optional`，未安裝封裝器時會保留 Windows 執行檔並略過 MSI，讓 `run.command` 維持可用；正式發行應設定 `NR_INTERN_MSI_MODE=required`，缺少任一 MSI 就讓建置失敗。若只需要驗證交叉編譯與 `.app` 結構，可明確設定 `NR_INTERN_MSI_MODE=skip`。
-
-可用環境變數覆寫版本與 target：
-
-```bash
-NR_INTERN_VERSION='1.26.0828 build 1430' \
-NR_INTERN_BUILD_TARGETS='darwin/arm64,windows/amd64' \
-./build.command
-```
-
-release builder 也可直接執行，預設 target 即為上述三種平台：
-
-```bash
-go run ./src/cmd/release -output ./dist
-```
-
-每個平台目錄與版本根目錄都會產生 `SHA256SUMS`。執行檔不內嵌設定、Provider API key 或 SSH 憑證；部署時另外提供 JSON 設定或環境變數。
+發行產物不得內嵌實際設定、Provider API Key、SSH 憑證或開發者電腦的絕對路徑。部署時應另外提供受保護的本機設定，並在發布前檢查產物與版本庫是否含有敏感資訊。

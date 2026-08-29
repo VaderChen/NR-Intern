@@ -97,7 +97,7 @@ curl -X POST http://127.0.0.1:8787/api/v1/workspaces \
   -d '{"name":"產品開發","provider_ids":["openai-compatible"],"default_provider_id":"openai-compatible","model":"gpt-5.4"}'
 ```
 
-`default_provider_id` 必須存在於 `provider_ids`。Session／Run 的 Provider override 也必須屬於該 Workspace 集合；仍有 Session 引用時不能移除該 Provider。目前 Provider 工廠只實作 `openai-compatible`，Router、Workspace 與 Harness 介面則允許日後註冊其他協定類型。
+`default_provider_id` 必須存在於 `provider_ids`，這個集合只管理 Workspace 自己的預設來源。Session／Run 的 Provider override 可選擇任一全域已啟用 Provider；未指定時才沿用 Workspace 預設。仍被 Workspace 或 Session 引用的 Provider 不可停用或刪除。目前 Provider 工廠只實作 `openai-compatible`，Router、Workspace 與 Harness 介面則允許日後註冊其他協定類型。
 
 建立 Project 時可透過 `sandbox_roots` 指定多個既有的絕對目錄。Session 屬於該 Project 時，原生檔案工具與 Shell 的工作目錄只能落在其中一個根目錄內；空陣列則使用 Session 私有工作目錄：
 

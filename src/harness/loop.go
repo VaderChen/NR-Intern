@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,6 +51,24 @@ type Runner struct {
 	SystemPrompt        string
 	BeforeTool          BeforeToolHook
 	AfterTool           AfterToolHook
+	budgetMu            sync.RWMutex
+}
+
+// SetBudget 更新後續 Run 使用的限制；已開始的 Run 保留啟動時快照，避免執行中途
+// 改變上限造成不一致，也避免管理介面更新與背景工作形成資料競爭。
+func (r *Runner) SetBudget(budget domain.RunBudget) {
+	if r == nil {
+		return
+	}
+	r.budgetMu.Lock()
+	r.Budget = budget
+	r.budgetMu.Unlock()
+}
+
+func (r *Runner) budgetSnapshot() domain.RunBudget {
+	r.budgetMu.RLock()
+	defer r.budgetMu.RUnlock()
+	return r.Budget
 }
 
 type Input struct {
@@ -74,7 +93,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		operationID = domain.NewID("operation")
 	}
 	operationStartedAt := time.Now().UTC()
-	budget := newRunBudgetTracker(r.Budget, operationStartedAt)
+	budget := newRunBudgetTracker(r.budgetSnapshot(), operationStartedAt)
 	runContext, cancelRunBudget := budget.context(ctx)
 	defer cancelRunBudget()
 	ctx = runContext
@@ -335,6 +354,13 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		}); err != nil {
 			return domain.RunResult{}, err
 		}
+		var instructionStream *instructionTextStream
+		if toolCallMode == ToolCallModeInstruction {
+			instructionStream = &instructionTextStream{}
+		}
+		emitAssistantDelta := func(delta string) error {
+			return emitEvent(emit, "message.delta", map[string]any{"message_id": assistantID, "delta": delta})
+		}
 		response, err := r.Model.Stream(ctx, domain.ModelRequest{
 			SessionID:     input.Session.ID,
 			ProviderID:    providerID,
@@ -352,12 +378,10 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		}, func(event domain.ModelEvent) error {
 			switch event.Type {
 			case domain.ModelEventTextDelta:
-				// instruction 模式必須先確認整段輸出是工具 JSON 或最終答案，
-				// 不把內部工具指令以一般 Agent 回覆洩漏到畫面。
-				if toolCallMode == ToolCallModeInstruction {
-					return nil
+				if instructionStream != nil {
+					return instructionStream.Push(event.Delta, emitAssistantDelta)
 				}
-				return emitEvent(emit, "message.delta", map[string]any{"message_id": assistantID, "delta": event.Delta})
+				return emitAssistantDelta(event.Delta)
 			case domain.ModelEventThinkingDelta:
 				return emitEvent(emit, "message.thinking_delta", map[string]any{"message_id": assistantID, "delta": event.Delta})
 			case domain.ModelEventToolCallDelta:
@@ -464,7 +488,9 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			if matched && forceFinalization {
 				response.Content = forcedFinalizationFallback(toolTurns, loopGuardReason)
 				response.StopReason = "stop"
-			} else if matched {
+				matched = false
+			}
+			if matched {
 				response.ToolCalls = []domain.ToolCall{call}
 				response.Content = ""
 				response.StopReason = "tool_calls"
@@ -479,7 +505,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 					return domain.RunResult{}, err
 				}
 			} else if strings.TrimSpace(response.Content) != "" {
-				if err := emitEvent(emit, "message.delta", map[string]any{"message_id": assistantID, "delta": response.Content}); err != nil {
+				if err := instructionStream.Finish(response.Content, emitAssistantDelta); err != nil {
 					return domain.RunResult{}, err
 				}
 			}
@@ -1255,7 +1281,7 @@ func progressPresentationPrompt() string {
 	return `## 使用者可見的工作進度
 
 若 Provider 會輸出 reasoning／thinking，該欄位是顯示給使用者看的進度摘要，不是內部思考草稿。請遵守：
-- 自動跟隨使用者目前使用的語言與語系，採第一人稱與自然口語；不得固定綁定中文、英文或任何單一語言。
+- 自動跟隨使用者目前使用的語言與語系，並參考近期對話判斷慣用語言；採第一人稱與自然口語，不得固定綁定中文、英文或任何單一語言。
 - 第一次先簡短說明預計分幾個步驟及現在要做什麼，例如：「我打算分三個步驟完成：先確認目錄結構，再建立檔案，最後檢查結果；我先盤點目前內容。」
 - 後續只交代已確認的進度與下一個動作，例如：「目錄已確認，我接下來會建立檔案並檢查內容。」
 - 每次最多一小段，不使用 Markdown 粗體串接，不輸出英語內部階段名稱、Awaiting tool execution results、工具 JSON、Prompt、協定或逐步推理細節。

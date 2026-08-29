@@ -1,5 +1,6 @@
 {
-  "service_name": "聰明的實習生",
+  "service_name": "永不休息的實習生",
+  "ui_language": "auto",
   "listen_address": "127.0.0.1:8787",
   "data_dir": "data/ai-agent",
   "allowed_tools": [
@@ -23,8 +24,8 @@
   "max_turns": 96,
   "max_autonomous_tool_turns": 16,
   "max_wall_clock_seconds": 7200,
-  "max_tokens": 10000000,
-  "max_tool_calls": 512,
+  "max_tokens": 0,
+  "max_tool_calls": 0,
   "max_tool_output_bytes": 524288,
   "max_file_input_bytes": 8388608,
   "context": {
@@ -47,6 +48,7 @@
   "providers": {
     "local": {
       "type": "openai-compatible",
+      "enabled": true,
       "openai_compatible": {
         "base_url": "http://127.0.0.1:11434/v1",
         "model": "your-openai-compatible-model",

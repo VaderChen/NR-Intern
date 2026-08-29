@@ -87,6 +87,7 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	s.mu.Unlock()
 
 	command := exec.Command(s.config.Executable, s.config.Arguments...)
+	configureChildProcess(command)
 	command.Dir = s.config.WorkingDir
 	if len(s.config.Environment) > 0 {
 		command.Env = append(os.Environ(), s.config.Environment...)

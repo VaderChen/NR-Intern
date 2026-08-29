@@ -153,7 +153,7 @@ func (s *Service) CreateSession(ctx context.Context, agentID string, input domai
 			input.Model = s.defaultModelForProvider(input.ProviderID)
 		}
 	}
-	if err := s.validateWorkspaceProvider(ctx, input.WorkspaceID, input.ProviderID); err != nil {
+	if err := s.validateSessionProvider(input.ProviderID); err != nil {
 		return domain.Session{}, err
 	}
 	profile, err := s.permissions.Resolve(input.PermissionProfile)
@@ -224,7 +224,7 @@ func (s *Service) UpdateSession(ctx context.Context, sessionID string, input dom
 		input.ProviderID = &providerID
 	}
 	if input.WorkspaceID != nil || input.ProviderID != nil {
-		if err := s.validateWorkspaceProvider(ctx, workspaceID, providerID); err != nil {
+		if err := s.validateSessionProvider(providerID); err != nil {
 			return domain.Session{}, err
 		}
 	}
@@ -331,19 +331,6 @@ func (s *Service) UpdateWorkspace(ctx context.Context, workspaceID string, input
 	if err := s.validateProvider(defaultProviderID); err != nil {
 		return domain.Workspace{}, err
 	}
-	if input.ProviderIDs != nil {
-		for _, engine := range s.registry.Engines() {
-			sessions, err := engine.ListSessions(ctx)
-			if err != nil {
-				return domain.Workspace{}, err
-			}
-			for _, session := range sessions {
-				if session.WorkspaceID == current.ID && session.ProviderID != "" && !contains(providerIDs, session.ProviderID) {
-					return domain.Workspace{}, fmt.Errorf("%w: provider %q is still referenced by session %q", domain.ErrConflict, session.ProviderID, session.ID)
-				}
-			}
-		}
-	}
 	return s.workspaces.Update(ctx, strings.TrimSpace(workspaceID), input)
 }
 
@@ -429,22 +416,14 @@ func (s *Service) defaultModelForProvider(providerID string) string {
 	return ""
 }
 
-func (s *Service) validateWorkspaceProvider(ctx context.Context, workspaceID, providerID string) error {
+// validateSessionProvider 只檢查 Provider 是否為全域已啟用項目。Workspace 提供
+// Session 的預設值，但不限制對話可使用的 Provider 範圍。
+func (s *Service) validateSessionProvider(providerID string) error {
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
 		return nil
 	}
-	if err := s.validateProvider(providerID); err != nil {
-		return err
-	}
-	workspace, err := s.workspaces.Get(ctx, strings.TrimSpace(workspaceID))
-	if err != nil {
-		return err
-	}
-	if !contains(workspace.ProviderIDs, providerID) {
-		return fmt.Errorf("%w: provider %q does not belong to workspace %q", domain.ErrInvalidInput, providerID, workspace.ID)
-	}
-	return nil
+	return s.validateProvider(providerID)
 }
 
 func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]domain.Message, error) {
@@ -555,7 +534,7 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	if input.ProviderID == "" {
 		input.ProviderID = s.providers.DefaultProviderID()
 	}
-	if err := s.validateWorkspaceProvider(ctx, session.WorkspaceID, input.ProviderID); err != nil {
+	if err := s.validateSessionProvider(input.ProviderID); err != nil {
 		return domain.Run{}, err
 	}
 

@@ -43,3 +43,7 @@ void nr_install_standard_menus(void) {
   editRoot.submenu = editMenu;
   [mainMenu addItem:editRoot];
 }
+
+void nr_activate_application(void) {
+  [NSApplication.sharedApplication activateIgnoringOtherApps:YES];
+}

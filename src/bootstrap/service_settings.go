@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"AgenticService/src/domain"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,11 @@ import (
 const serviceSettingsFilename = "service-settings.json"
 
 type storedServiceSettings struct {
-	ServiceName string `json:"service_name"`
+	ServiceName         string `json:"service_name"`
+	UILanguage          string `json:"ui_language,omitempty"`
+	MaxWallClockSeconds *int   `json:"max_wall_clock_seconds,omitempty"`
+	MaxTokens           *int   `json:"max_tokens,omitempty"`
+	MaxToolCalls        *int   `json:"max_tool_calls,omitempty"`
 }
 
 func loadPersistedServiceSettings(config *Config) error {
@@ -34,15 +39,38 @@ func loadPersistedServiceSettings(config *Config) error {
 	if closeErr != nil {
 		return fmt.Errorf("close service settings: %w", closeErr)
 	}
-	config.ServiceName = stored.ServiceName
+	if stored.ServiceName != "" {
+		config.ServiceName = stored.ServiceName
+		if config.ServiceName == legacyDefaultServiceName {
+			config.ServiceName = DefaultServiceName
+		}
+	}
+	if stored.UILanguage != "" {
+		config.UILanguage = stored.UILanguage
+	}
+	if stored.MaxWallClockSeconds != nil {
+		config.MaxWallClockSeconds = *stored.MaxWallClockSeconds
+	}
+	if stored.MaxTokens != nil {
+		config.MaxTokens = *stored.MaxTokens
+	}
+	if stored.MaxToolCalls != nil {
+		config.MaxToolCalls = *stored.MaxToolCalls
+	}
 	return nil
 }
 
-func persistServiceSettings(dataDir, serviceName string) error {
+func persistServiceSettings(dataDir string, settings domain.ServiceSettings) error {
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return fmt.Errorf("create service settings directory: %w", err)
 	}
-	data, err := json.MarshalIndent(storedServiceSettings{ServiceName: serviceName}, "", "  ")
+	data, err := json.MarshalIndent(storedServiceSettings{
+		ServiceName:         settings.ServiceName,
+		UILanguage:          settings.UILanguage,
+		MaxWallClockSeconds: intPointer(settings.MaxWallClockSeconds),
+		MaxTokens:           intPointer(settings.MaxTokens),
+		MaxToolCalls:        intPointer(settings.MaxToolCalls),
+	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode service settings: %w", err)
 	}
@@ -73,4 +101,8 @@ func persistServiceSettings(dataDir, serviceName string) error {
 		return fmt.Errorf("replace service settings: %w", err)
 	}
 	return nil
+}
+
+func intPointer(value int) *int {
+	return &value
 }

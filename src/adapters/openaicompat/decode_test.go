@@ -105,6 +105,55 @@ data: [DONE]
 	}
 }
 
+func TestDecodeStreamSeparatesClosingOnlyThinkContent(t *testing.T) {
+	payload := `data: {"choices":[{"index":0,"delta":{"content":"The user is greeting me.\n</think>\n你好！"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	response, events := collect(t, payload)
+
+	if response.Content != "你好！" {
+		t.Fatalf("content = %q, want final answer only", response.Content)
+	}
+	if response.Reasoning != "The user is greeting me." {
+		t.Fatalf("reasoning = %q, want THINK prefix", response.Reasoning)
+	}
+	thinking := eventsOfType(events, domain.ModelEventThinkingDelta)
+	text := eventsOfType(events, domain.ModelEventTextDelta)
+	if len(thinking) != 1 || thinking[0].Delta != "The user is greeting me.\n" {
+		t.Fatalf("thinking events = %+v", thinking)
+	}
+	if len(text) != 1 || text[0].Delta != "\n你好！" {
+		t.Fatalf("text events = %+v", text)
+	}
+}
+
+func TestDecodeStreamSeparatesThinkTagAcrossChunks(t *testing.T) {
+	payload := `data: {"choices":[{"index":0,"delta":{"content":"<thi"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"nk>先思"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"考</think>正式回答"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+	response, events := collect(t, payload)
+
+	if response.Content != "正式回答" || response.Reasoning != "先思考" {
+		t.Fatalf("response = content %q, reasoning %q", response.Content, response.Reasoning)
+	}
+	thinking := eventsOfType(events, domain.ModelEventThinkingDelta)
+	if len(thinking) != 2 || thinking[0].Delta+thinking[1].Delta != "先思考" {
+		t.Fatalf("thinking events = %+v", thinking)
+	}
+	text := eventsOfType(events, domain.ModelEventTextDelta)
+	if len(text) != 1 || text[0].Delta != "正式回答" {
+		t.Fatalf("text events = %+v", text)
+	}
+}
+
 func TestDecodeJSONResponsePreservesReasoning(t *testing.T) {
 	payload := `{"model":"m","choices":[{"message":{"content":"完成","reasoning_content":"先整理證據"},"finish_reason":"stop"}]}`
 	events := []domain.ModelEvent{}
@@ -120,6 +169,27 @@ func TestDecodeJSONResponsePreservesReasoning(t *testing.T) {
 	}
 	if len(eventsOfType(events, domain.ModelEventThinkingDelta)) != 1 {
 		t.Fatal("reasoning event was not emitted")
+	}
+}
+
+func TestDecodeJSONResponseSeparatesEmbeddedThinkContent(t *testing.T) {
+	payload := `{"model":"m","choices":[{"message":{"content":"<think>先整理證據</think>完成"},"finish_reason":"stop"}]}`
+	events := []domain.ModelEvent{}
+	response, err := decodeJSONResponse(strings.NewReader(payload), "fallback", "req_1", "client_1", func(event domain.ModelEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("decodeJSONResponse: %v", err)
+	}
+	if response.Content != "完成" || response.Reasoning != "先整理證據" {
+		t.Fatalf("response = content %q, reasoning %q", response.Content, response.Reasoning)
+	}
+	if len(eventsOfType(events, domain.ModelEventThinkingDelta)) != 1 {
+		t.Fatal("embedded THINK was not emitted as reasoning")
+	}
+	if len(eventsOfType(events, domain.ModelEventTextDelta)) != 1 {
+		t.Fatal("final answer was not emitted as text")
 	}
 }
 

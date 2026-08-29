@@ -15,6 +15,7 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 	result := domain.ModelResponse{ProviderID: "openai-compatible", ProviderRequestID: requestID, Model: fallbackModel}
 	var content strings.Builder
 	var reasoning strings.Builder
+	var taggedStream taggedThinkingStream
 	partials := map[int]*partialCall{}
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -58,9 +59,17 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 			if delta != "" {
 				content.WriteString(delta)
 				if sink != nil {
-					if err := sink(domain.ModelEvent{Type: domain.ModelEventTextDelta, Delta: delta}); err != nil {
-						return err
+					for _, fragment := range taggedStream.Push(delta, false) {
+						eventType := domain.ModelEventTextDelta
+						if fragment.Thinking {
+							eventType = domain.ModelEventThinkingDelta
+						}
+						if err := sink(domain.ModelEvent{Type: eventType, Delta: fragment.Text}); err != nil {
+							return err
+						}
 					}
+				} else {
+					taggedStream.Push(delta, false)
 				}
 			}
 			if thinking := firstRawText(choice.Delta.ReasoningContent, choice.Delta.Reasoning); thinking != "" {
@@ -137,14 +146,28 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 	if !sawTerminal {
 		return domain.ModelResponse{}, &ProviderError{Operation: "stream read", Message: "stream ended before [DONE] or finish_reason", RequestID: requestID, ClientRequestID: clientRequestID, Retryable: true}
 	}
+	if sink != nil {
+		for _, fragment := range taggedStream.Push("", true) {
+			eventType := domain.ModelEventTextDelta
+			if fragment.Thinking {
+				eventType = domain.ModelEventThinkingDelta
+			}
+			if err := sink(domain.ModelEvent{Type: eventType, Delta: fragment.Text}); err != nil {
+				return domain.ModelResponse{}, err
+			}
+		}
+	} else {
+		taggedStream.Push("", true)
+	}
 	if sink != nil && (result.Usage.TotalTokens > 0 || result.Usage.InputTokens > 0 || result.Usage.OutputTokens > 0) {
 		usage := result.Usage
 		if err := sink(domain.ModelEvent{Type: domain.ModelEventUsage, Usage: &usage}); err != nil {
 			return domain.ModelResponse{}, err
 		}
 	}
-	result.Content = strings.TrimSpace(content.String())
-	result.Reasoning = strings.TrimSpace(reasoning.String())
+	taggedContent, taggedReasoning, _ := splitTaggedThinking(content.String())
+	result.Content = taggedContent
+	result.Reasoning = mergeReasoning(reasoning.String(), taggedReasoning)
 	calls, err := finalizeCalls(partials)
 	if err != nil {
 		return domain.ModelResponse{}, err
@@ -180,11 +203,12 @@ func decodeJSONResponse(reader io.Reader, fallbackModel, requestID, clientReques
 		return domain.ModelResponse{}, fmt.Errorf("chat completion response contains no choices")
 	}
 	choice := response.Choices[0]
-	content := contentText(choice.Message.Content)
-	if content == "" {
-		content = choice.Message.Refusal
+	rawContent := contentText(choice.Message.Content)
+	if rawContent == "" {
+		rawContent = choice.Message.Refusal
 	}
-	reasoning := firstText(choice.Message.ReasoningContent, choice.Message.Reasoning)
+	content, taggedReasoning, _ := splitTaggedThinking(rawContent)
+	reasoning := mergeReasoning(firstText(choice.Message.ReasoningContent, choice.Message.Reasoning), taggedReasoning)
 	if sink != nil && reasoning != "" {
 		if err := sink(domain.ModelEvent{Type: domain.ModelEventThinkingDelta, Delta: reasoning}); err != nil {
 			return domain.ModelResponse{}, err

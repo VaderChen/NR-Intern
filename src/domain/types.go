@@ -175,6 +175,7 @@ const (
 
 // RunBudget 是單次 Harness 工作的安全上限。MaxTurns、MaxWallClock 與
 // MaxToolCalls 用來避免工作長時間佔用資源，和模型 Context 容量及其自動壓縮無關。
+// MaxTokens 與 MaxToolCalls 為 0 時表示不限制。
 type RunBudget struct {
 	MaxTurns     int           `json:"max_turns,omitempty"`
 	MaxWallClock time.Duration `json:"-"`

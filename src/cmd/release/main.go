@@ -225,8 +225,10 @@ func resolveReleaseAssets(paths releaseAssets) (releaseAssets, error) {
 }
 
 func buildProgram(packagePath, output, version string, value target) error {
-	linkerFlags := fmt.Sprintf("-s -w -X 'AgenticService/src/bootstrap.Version=%s'", version)
-	command := exec.Command("go", "build", "-trimpath", "-ldflags", linkerFlags, "-o", output, packagePath)
+	linkerFlags := buildLinkerFlags(packagePath, version, value)
+	// 發行版本由 linker flags 明確注入；停用 Go VCS stamping，讓專案即使位於
+	// 另一套版本控制工作副本內仍能以相同方式建置。
+	command := exec.Command("go", "build", "-buildvcs=false", "-trimpath", "-ldflags", linkerFlags, "-o", output, packagePath)
 	command.Env = buildEnvironment(value)
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
@@ -234,6 +236,16 @@ func buildProgram(packagePath, output, version string, value target) error {
 		return fmt.Errorf("建置 %s/%s %s: %w", value.os, value.arch, packagePath, err)
 	}
 	return nil
+}
+
+func buildLinkerFlags(packagePath, version string, value target) string {
+	flags := fmt.Sprintf("-s -w -X 'AgenticService/src/bootstrap.Version=%s'", version)
+	// Windows 桌面程式使用 GUI subsystem，避免從捷徑或 MSI 啟動時額外顯示
+	// CMD 視窗；server 必須保留 console subsystem 以輸出診斷資訊。
+	if value.os == "windows" && strings.HasSuffix(filepath.ToSlash(packagePath), "/desktop") {
+		flags += " -H=windowsgui"
+	}
+	return flags
 }
 
 func buildMacApplication(platformDirectory string, version releaseVersion, value target, assets releaseAssets) error {

@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: 聰明的實習生 HTTP API
+  title: 永不休息的實習生 HTTP API
   version: 0.1.0
   description: 後端可獨立執行的 Harness AI Agent API；Run 採非同步執行，事件可持久化重播。
 servers:
@@ -786,7 +786,7 @@ components:
         title: { type: string }
         workspace_id: { type: string }
         project_id: { type: string }
-        provider_id: { type: string, description: 未指定或空字串時，建立的 Session 會複製 Workspace 預設 Provider；指定時必須屬於 Workspace 的 provider_ids。 }
+        provider_id: { type: string, description: 未指定或空字串時，建立的 Session 會複製 Workspace 預設 Provider；指定時可使用任一全域已啟用 Provider。 }
         model: { type: string, description: 未指定或空字串時，建立的 Session 會複製 Workspace 預設模型，再回退至 Provider 預設模型。 }
         permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。留空時套用後端預設 profile。 }
         pinned: { type: boolean }
@@ -798,7 +798,7 @@ components:
         title: { type: string, minLength: 1 }
         workspace_id: { type: string, description: 搬移時 project_id 必須同屬此 Workspace。 }
         project_id: { type: string, description: 空字串表示未分類。 }
-        provider_id: { type: string, description: 空字串恢復 Workspace 預設；指定時必須屬於 Workspace 的 provider_ids。 }
+        provider_id: { type: string, description: 空字串恢復 Workspace 預設；指定時可使用任一全域已啟用 Provider。 }
         model: { type: string }
         permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。 }
         memory_scope: { type: string, description: 空字串會恢復 Agent 預設 scope。 }
@@ -904,8 +904,8 @@ components:
         id: { type: string }
         name: { type: string }
         description: { type: string }
-        provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
-        default_provider_id: { type: string, description: 必須存在於 provider_ids。 }
+        provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string }, description: Workspace 自己管理的 Provider 集合與預設來源，不限制 Session override。 }
+        default_provider_id: { type: string, description: 必須存在於 provider_ids；作為新對話與未指定 override 時的預設值。 }
         model: { type: string }
         position: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
@@ -941,12 +941,33 @@ components:
         has_api_key: { type: boolean }
     ServiceSettings:
       type: object
+      required: [service_name, ui_language, max_wall_clock_seconds, max_tokens, max_tool_calls]
+      properties:
+        service_name: { type: string, minLength: 1, maxLength: 80 }
+        ui_language: { type: string, enum: [auto, zh-TW, en, ja, ko] }
+        max_wall_clock_seconds:
+          type: integer
+          minimum: 1
+          maximum: 86400
+          description: 單次工作的牆鐘時間上限（秒）。
+        max_tokens:
+          type: integer
+          minimum: 0
+          description: 單次工作累計 Token 上限；0 表示不限制。
+        max_tool_calls:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: 單次工作工具呼叫上限；0 表示不限制。
+    UpdateServiceSettingsInput:
+      type: object
       required: [service_name]
       properties:
         service_name: { type: string, minLength: 1, maxLength: 80 }
-    UpdateServiceSettingsInput:
-      allOf:
-        - $ref: "#/components/schemas/ServiceSettings"
+        ui_language: { type: string, enum: [auto, zh-TW, en, ja, ko] }
+        max_wall_clock_seconds: { type: integer, minimum: 1, maximum: 86400 }
+        max_tokens: { type: integer, minimum: 0 }
+        max_tool_calls: { type: integer, minimum: 0, maximum: 10000 }
     ProviderSettings:
       type: object
       required: [default_provider_id, providers]
@@ -961,10 +982,11 @@ components:
         - $ref: "#/components/schemas/ProviderSettings"
     ProviderSetting:
       type: object
-      required: [id, type]
+      required: [id, type, enabled]
       properties:
         id: { type: string, minLength: 1, maxLength: 80 }
         type: { type: string, enum: [openai-compatible] }
+        enabled: { type: boolean, description: 停用後保留設定，但不提供給 Workspace、Session 或新模型請求使用。 }
         openai_compatible: { $ref: "#/components/schemas/OpenAICompatibleProviderSetting" }
     OpenAICompatibleProviderSetting:
       type: object
@@ -1026,7 +1048,7 @@ components:
           maxItems: 16
           uniqueItems: true
           items: { type: string }
-        provider_id: { type: string, description: Run override；必須屬於 Session 所在 Workspace 的 provider_ids。 }
+        provider_id: { type: string, description: Run override；可指定任一全域已啟用 Provider，未指定時沿用 Session／Workspace 預設。 }
         model: { type: string }
         metadata: { type: object, additionalProperties: true }
     Run:

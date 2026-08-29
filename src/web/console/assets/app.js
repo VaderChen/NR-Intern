@@ -23,6 +23,7 @@ const state = {
   activePlanID: "",
   planDragID: "",
   backendHealthy: false,
+  backendLifecycleState: "stopped",
   refreshingBackend: false,
   running: false,
   runningSessionId: "",
@@ -34,6 +35,7 @@ const state = {
   pendingApproval: null,
   pendingApprovalSessionId: "",
   liveMessage: null,
+  runDraft: null,
   entriesAfter: 0,
   entriesHasMore: false,
   newProjectSandboxRoots: [],
@@ -49,13 +51,28 @@ const state = {
   runStartedAt: new Map(),
   sessionSelectionVersion: 0,
   sessionRuntimeSaving: false,
+  messageAutoScroll: true,
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("collapsedProjects") || "[]")),
 };
 
 const $ = (id) => document.getElementById(id);
-const defaultServiceName = "聰明的實習生";
+const defaultServiceNames = Object.freeze({
+  "zh-TW": "永不休息的實習生",
+  en: "Tireless Intern",
+  ja: "休まないインターン",
+  ko: "쉬지 않는 인턴",
+});
+const defaultServiceName = defaultServiceNames["zh-TW"];
+const knownDefaultServiceNames = new Set([
+  ...Object.values(defaultServiceNames),
+  "聰明的實習生",
+  "Smart Intern",
+  "賢いインターン",
+  "똑똑한 인턴",
+]);
 const transientStatuses = new Set([502, 503, 504]);
 const displayModes = new Set(["auto", "light", "dark"]);
+const uiLanguagePreferences = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
 const systemColorScheme = window.matchMedia("(prefers-color-scheme: dark)");
 const applePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
 const renderRichContent = window.RichTextRenderer.render;
@@ -63,6 +80,9 @@ const scheduleRichContent = window.RichTextRenderer.schedule;
 const richContentSource = window.RichTextRenderer.source;
 const maxPendingAttachments = 16;
 const maxAttachmentBytes = 8 * 1024 * 1024;
+const messageAutoScrollThresholdRatio = 0.03;
+const backendRefreshIntervalMilliseconds = 4000;
+const backendStartupRefreshIntervalMilliseconds = 200;
 const contextCompactionActivity = "本輪已達上下文上限，自動整理資料後將繼續處理。";
 const promptComposition = {
   active: false,
@@ -71,6 +91,9 @@ const promptComposition = {
   resetTimer: null,
 };
 let chatDragDepth = 0;
+let messageScrollFrame = 0;
+let backendRefreshTimer = 0;
+let backendFastPollUntil = Date.now() + 5000;
 const dialogPointerGesture = {
   dialog: null,
   inputKind: "",
@@ -87,6 +110,73 @@ function applyServiceName(value) {
   document.title = serviceName;
   if ($("settingServiceName")) $("settingServiceName").value = serviceName;
   if (state.agent) state.agent.name = serviceName;
+}
+
+function normalizedUILanguage(value) {
+  return uiLanguagePreferences.has(value) ? value : "auto";
+}
+
+function localizedDefaultServiceName() {
+  const language = window.NRInternI18n?.language || "zh-TW";
+  return defaultServiceNames[language] || defaultServiceName;
+}
+
+function syncLocalizedDefaultServiceName() {
+  const displayedName = String($("settingServiceName")?.value || $("brandName")?.textContent || "").trim();
+  const usesDefault = state.serviceSettings
+    ? state.serviceSettings.service_name_is_default
+    : knownDefaultServiceNames.has(displayedName);
+  if (!usesDefault) return;
+  const serviceName = localizedDefaultServiceName();
+  if (state.serviceSettings) state.serviceSettings.service_name = serviceName;
+  applyServiceName(serviceName);
+}
+
+function applyUILanguage(value, persist = true) {
+  const uiLanguage = normalizedUILanguage(value);
+  if (persist) localStorage.setItem("uiLanguage", uiLanguage);
+  window.NRInternI18n?.setLanguage(uiLanguage);
+  if ($("settingUILanguage")) $("settingUILanguage").value = uiLanguage;
+  syncLocalizedDefaultServiceName();
+  return uiLanguage;
+}
+
+function notifyNativeStartupReady() {
+  if (typeof window.nrInternStartupReady !== "function") return;
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      Promise.resolve(window.nrInternStartupReady()).catch(() => {});
+    });
+  });
+}
+
+function normalizedServiceSettings(value = {}) {
+  const current = state.serviceSettings || {};
+  const wallClockSeconds = Number(value.max_wall_clock_seconds ?? current.max_wall_clock_seconds ?? 7200);
+  const maxTokens = Number(value.max_tokens ?? current.max_tokens ?? 0);
+  const maxToolCalls = Number(value.max_tool_calls ?? current.max_tool_calls ?? 0);
+  const serviceName = String(value.service_name || current.service_name || state.agent?.name || defaultServiceName).trim() || defaultServiceName;
+  const serviceNameIsDefault = value.service_name_is_default
+    ?? current.service_name_is_default
+    ?? knownDefaultServiceNames.has(serviceName);
+  return {
+    service_name: serviceName,
+    service_name_is_default: Boolean(serviceNameIsDefault),
+    ui_language: normalizedUILanguage(value.ui_language ?? current.ui_language ?? "auto"),
+    max_wall_clock_seconds: Number.isInteger(wallClockSeconds) && wallClockSeconds > 0 ? wallClockSeconds : 7200,
+    max_tokens: Number.isInteger(maxTokens) && maxTokens >= 0 ? maxTokens : 0,
+    max_tool_calls: Number.isInteger(maxToolCalls) && maxToolCalls >= 0 ? maxToolCalls : 0,
+  };
+}
+
+function applyServiceSettings(value) {
+  const settings = normalizedServiceSettings(value);
+  state.serviceSettings = settings;
+  applyUILanguage(settings.ui_language);
+  applyServiceName(settings.service_name_is_default ? localizedDefaultServiceName() : settings.service_name);
+  if ($("settingMaxWallClockMinutes")) $("settingMaxWallClockMinutes").value = String(Math.ceil(settings.max_wall_clock_seconds / 60));
+  if ($("settingMaxTokens")) $("settingMaxTokens").value = String(settings.max_tokens);
+  if ($("settingMaxToolCalls")) $("settingMaxToolCalls").value = String(settings.max_tool_calls);
 }
 
 function installDialogDragGuards() {
@@ -182,6 +272,7 @@ function refreshAutomaticDisplayMode() {
 }
 
 applyDisplayMode(document.documentElement.dataset.displayMode || "auto", false);
+applyUILanguage(document.documentElement.dataset.uiLanguage || "auto", false);
 if (typeof systemColorScheme.addEventListener === "function") {
   systemColorScheme.addEventListener("change", refreshAutomaticDisplayMode);
 } else {
@@ -245,9 +336,10 @@ async function refreshBackend() {
     const status = await desktop("status");
     const wasHealthy = state.backendHealthy;
     state.backendHealthy = status.healthy;
+    state.backendLifecycleState = status.state || "stopped";
     const label = status.healthy
       ? (status.owned ? "後端執行中" : "已連接外部後端")
-      : status.state === "starting" ? "啟動中" : "後端未啟動";
+      : ["starting", "running"].includes(status.state) ? "啟動中" : "後端未啟動";
     $("backendState").textContent = label;
     $("managementBackendState").textContent = label;
     $("backendURL").textContent = status.backend_url;
@@ -259,7 +351,7 @@ async function refreshBackend() {
     }
     $("stopBackend").disabled = !status.owned;
     $("restartBackend").disabled = !status.owned;
-    $("startBackend").disabled = status.healthy;
+    $("startBackend").disabled = status.healthy || ["starting", "running"].includes(status.state);
     $("newWorkspace").disabled = !status.healthy || state.running;
     $("workspaceSelect").disabled = !status.healthy || state.running;
     $("newProject").disabled = !status.healthy || !state.workspace || state.running;
@@ -270,7 +362,16 @@ async function refreshBackend() {
     toast(error.message);
   } finally {
     state.refreshingBackend = false;
+    scheduleBackendRefresh();
   }
+}
+
+function scheduleBackendRefresh() {
+  clearTimeout(backendRefreshTimer);
+  const starting = !state.backendHealthy
+    && (["starting", "running"].includes(state.backendLifecycleState) || Date.now() < backendFastPollUntil);
+  backendRefreshTimer = window.setTimeout(refreshBackend,
+    starting ? backendStartupRefreshIntervalMilliseconds : backendRefreshIntervalMilliseconds);
 }
 
 function resetWorkspace() {
@@ -320,6 +421,7 @@ function resetWorkspace() {
 
 async function controlBackend(action) {
   try {
+    if (["start", "restart"].includes(action)) backendFastPollUntil = Date.now() + 30000;
     await desktop(action, { method: "POST", body: "{}" });
     await refreshBackend();
   } catch (error) {
@@ -335,8 +437,7 @@ async function loadApplicationState() {
     request("/api/v1/admin/diagnostics"),
   ]);
   state.agent = agents[0] || null;
-  state.serviceSettings = { service_name: diagnostics.config?.service_name || state.agent?.name || defaultServiceName };
-  applyServiceName(state.serviceSettings.service_name);
+  applyServiceSettings(diagnostics.config || {});
   state.providers = providers;
   state.workspaces = workspaces;
   state.permissions = diagnostics.config?.permissions || null;
@@ -669,11 +770,20 @@ function renderProjectOptions() {
   }
 }
 
+// 執行用選單只顯示已啟用 Provider。一般 Provider API 本身只回傳執行路由中
+// 的啟用項目；管理設定若已載入，再額外防止尚未刷新完成的停用項目短暫出現。
+function selectableProviders() {
+  const disabledIDs = new Set((state.providerSettings?.providers || [])
+    .filter((provider) => provider.enabled === false)
+    .map((provider) => provider.id));
+  return state.providers.filter((provider) => provider.enabled !== false && !disabledIDs.has(provider.id));
+}
+
 function renderProviderOptions() {
   for (const select of [$("newWorkspaceProvider"), $("settingWorkspaceProvider")]) {
     const selected = select.value;
     select.replaceChildren();
-    for (const provider of state.providers) {
+    for (const provider of selectableProviders()) {
       select.add(new Option(provider.id, provider.id));
     }
     if ([...select.options].some((option) => option.value === selected)) select.value = selected;
@@ -683,18 +793,17 @@ function renderProviderOptions() {
 function renderSessionProviderOptions() {
   for (const select of [$("newProvider"), $("settingProvider")]) {
     const selected = select.value;
-    select.replaceChildren(new Option("使用 Workspace 預設", ""));
-    for (const providerID of state.workspace?.provider_ids || []) {
-      const provider = state.providers.find((item) => item.id === providerID);
-      const label = provider?.id || providerID;
-      select.add(new Option(label, providerID));
+    const workspaceDefault = state.workspace?.default_provider_id || "";
+    select.replaceChildren(new Option(workspaceDefault ? `使用 Workspace 預設（${workspaceDefault}）` : "使用 Workspace 預設", ""));
+    for (const provider of selectableProviders()) {
+      select.add(new Option(provider.id, provider.id));
     }
     if ([...select.options].some((option) => option.value === selected)) select.value = selected;
   }
 }
 
 function providerDescriptor(providerID) {
-  return state.providers.find((provider) => provider.id === providerID) || null;
+  return selectableProviders().find((provider) => provider.id === providerID) || null;
 }
 
 function defaultModelForProvider(providerID) {
@@ -782,11 +891,8 @@ function syncSessionRuntimeControls({ loadModels = true } = {}) {
   const providerID = session.provider_id || state.workspace?.default_provider_id || "";
   const providerSelect = $("sessionProviderSelect");
   providerSelect.replaceChildren();
-  for (const value of state.workspace?.provider_ids || []) {
-    providerSelect.add(new Option(value, value));
-  }
-  if (providerID && ![...providerSelect.options].some((option) => option.value === providerID)) {
-    providerSelect.add(new Option(providerID, providerID));
+  for (const provider of selectableProviders()) {
+    providerSelect.add(new Option(provider.id, provider.id));
   }
   providerSelect.value = providerID;
 
@@ -912,6 +1018,7 @@ async function switchWorkspace(workspaceID) {
 }
 
 function clearSessionUI() {
+	state.messageAutoScroll = true;
 	state.plans = [];
 	state.planTab = "active";
 	state.planEditingID = "";
@@ -952,6 +1059,7 @@ function syncWorkspaceSettings() {
 async function selectSession(session) {
   const selectionVersion = ++state.sessionSelectionVersion;
   state.liveMessage = null;
+  state.messageAutoScroll = true;
   if (session?.id && session.id !== state.attachmentSessionId) clearPendingAttachments();
   try {
     const selected = await request(`/api/v1/sessions/${encodeURIComponent(session.id)}`);
@@ -1487,11 +1595,48 @@ async function loadMessages() {
   }
   $("emptyState").classList.toggle("hidden", visibleEntries > 0);
   container.classList.toggle("hidden", visibleEntries === 0);
-  scrollMessages();
+  scrollMessages({ force: true });
+}
+
+function splitTaggedThinkingContent(value) {
+  const source = String(value || "");
+  const matches = [...source.matchAll(/<\/?think\s*>/gi)];
+  if (matches.length === 0) return { content: source, reasoning: "", found: false };
+  let content = "";
+  let reasoning = "";
+  let cursor = 0;
+  let inThinking = false;
+  let sawMarker = false;
+  for (const match of matches) {
+    const segment = source.slice(cursor, match.index);
+    const closing = /^<\//.test(match[0]);
+    if (closing && !inThinking && !sawMarker) reasoning += segment;
+    else if (inThinking) reasoning += segment;
+    else content += segment;
+    sawMarker = true;
+    inThinking = !closing;
+    cursor = match.index + match[0].length;
+  }
+  if (inThinking) reasoning += source.slice(cursor);
+  else content += source.slice(cursor);
+  return { content: content.trim(), reasoning: reasoning.trim(), found: true };
+}
+
+function normalizeAssistantThinking(message) {
+  if (!message || message.role !== "assistant") return message;
+  const tagged = splitTaggedThinkingContent(message.content);
+  if (!tagged.found) return message;
+  const existing = String(message.reasoning || "").trim();
+  const reasoning = !existing ? tagged.reasoning
+    : !tagged.reasoning || tagged.reasoning === existing ? existing
+    : `${existing}\n\n${tagged.reasoning}`;
+  return { ...message, content: tagged.content, reasoning };
 }
 
 function appendMessage(message, options = {}) {
-  if (!message || (!message.content && !message.reasoning && message.role !== "assistant")) return null;
+  if (!message) return null;
+  message = normalizeAssistantThinking(message);
+  if (!message.content && !message.reasoning && message.role !== "assistant") return null;
   // tool 與內部階段訊息是 Harness transcript，不是對使用者顯示的聊天內容。
   // 它們仍保留在後端稽核與下一輪 LLM context 中。
   if (message.role === "tool") return null;
@@ -1740,6 +1885,52 @@ function selectedSessionIsRunning() {
   return Boolean(state.running && state.session?.id && state.session.id === state.runningSessionId);
 }
 
+function ensureRunDraft(sessionID, operationID = "", messageID = "") {
+  const current = state.runDraft;
+  const startsNewMessage = Boolean(messageID && current?.messageId && current.messageId !== messageID);
+  if (!current || current.sessionId !== sessionID || startsNewMessage) {
+    state.runDraft = {
+      sessionId: sessionID,
+      operationId: operationID,
+      messageId: messageID,
+      content: "",
+      reasoning: "",
+      processing: true,
+    };
+    return state.runDraft;
+  }
+  if (operationID) current.operationId = operationID;
+  if (messageID) current.messageId = messageID;
+  return current;
+}
+
+function renderSelectedRunDraft() {
+  if (!selectedSessionIsRunning()) return null;
+  const draft = ensureRunDraft(state.runningSessionId, state.currentRunId);
+  const messageID = draft.messageId || `active-run-${draft.operationId || draft.sessionId}`;
+  let messageNode = findMessage(messageID);
+  if (!messageNode
+    && state.liveMessage?.isConnected
+    && state.liveMessage.dataset.runDraftPlaceholder === "true") {
+    messageNode = state.liveMessage;
+    messageNode.dataset.messageId = messageID;
+  }
+  if (!messageNode) {
+    messageNode = appendMessage({ role: "assistant", id: messageID, content: "" }, { operationId: draft.operationId });
+  }
+  if (!messageNode) return null;
+  messageNode.dataset.runDraftPlaceholder = draft.messageId ? "false" : "true";
+  if (draft.operationId) messageNode.dataset.operationId = draft.operationId;
+  const content = messageNode.querySelector(".content");
+  if (content && richContentSource(content) !== draft.content) scheduleRichContent(content, draft.content);
+  if (draft.reasoning) setMessageReasoning(messageNode, draft.reasoning);
+  setAgentProcessing(messageNode, draft.processing);
+  state.liveMessage = messageNode;
+  $("emptyState").classList.add("hidden");
+  $("messages").classList.remove("hidden");
+  return messageNode;
+}
+
 function setRunActivity(text, sessionID = state.runningSessionId) {
   if (!sessionID || sessionID !== state.runningSessionId) return;
   state.runActivityText = text || "";
@@ -1755,6 +1946,7 @@ function syncSelectedRunUI() {
 		// 一般執行狀態由訊息區動畫與停止按鈕表達；這一列只保留給斷線
 		// 重連等需要使用者注意的狀態。
 		showActivity(state.runActivityText);
+    renderSelectedRunDraft();
     if (state.pendingApproval && state.pendingApprovalSessionId === state.session?.id && !$("approvalDialog").open) {
       $("approvalDialog").show();
     }
@@ -1950,6 +2142,14 @@ async function sendPrompt(event) {
   state.retryableSessionId = "";
   state.pendingApproval = null;
   state.pendingApprovalSessionId = "";
+  state.runDraft = {
+    sessionId: sessionID,
+    operationId: "",
+    messageId: "",
+    content: "",
+    reasoning: "",
+    processing: true,
+  };
   syncRunActionButton();
   $("prompt").disabled = true;
   $("newProject").disabled = true;
@@ -1963,7 +2163,8 @@ async function sendPrompt(event) {
     $("prompt").value = "";
     if (pending.length) clearPendingAttachments();
     appendMessage({ role: "user", content: input, metadata: { attachments }, id: `local-${Date.now()}` });
-    scrollMessages();
+    renderSelectedRunDraft();
+    scrollMessages({ force: true });
     await runWithReconnect({
       sessionId: sessionID,
       input,
@@ -1982,6 +2183,7 @@ async function sendPrompt(event) {
     state.currentRunId = "";
     setAgentProcessing(state.liveMessage, false);
     state.liveMessage = null;
+    state.runDraft = null;
     state.pendingApproval = null;
     state.pendingApprovalSessionId = "";
     if ($("approvalDialog").open) $("approvalDialog").close();
@@ -2106,6 +2308,9 @@ function handleEvent(event, sessionID) {
 	if (event.type === "run.started" && operationID && !state.runStartedAt.has(operationID)) {
 	  const startedAt = Date.parse(event.created_at);
 	  state.runStartedAt.set(operationID, Number.isFinite(startedAt) ? startedAt : Date.now());
+	  const draft = ensureRunDraft(sessionID, operationID);
+	  draft.processing = true;
+	  if (visible) renderSelectedRunDraft();
 	}
 	if (visible && event.type === "context.compacted") {
 	  setRunActivity(contextCompactionActivity, sessionID);
@@ -2115,31 +2320,46 @@ function handleEvent(event, sessionID) {
 	  setRunActivity("", sessionID);
 	}
 	if (event.type === "message.start" && payload.message?.role === "assistant") {
-    if (!visible) return;
-    state.liveMessage = findMessage(payload.message.id) || appendMessage(payload.message, { operationId: operationID });
-    const hasContent = Boolean(richContentSource(state.liveMessage?.querySelector(".content")).trim());
-    setAgentProcessing(state.liveMessage, !hasContent);
-    scrollMessages();
+    const message = normalizeAssistantThinking(payload.message);
+    const draft = ensureRunDraft(sessionID, operationID, message.id);
+    draft.content = message.content || "";
+    draft.reasoning = message.reasoning || "";
+    draft.processing = true;
+    if (visible) {
+      renderSelectedRunDraft();
+      scrollMessages();
+    }
   } else if (event.type === "message.delta") {
-    if (!visible) return;
-    if (!state.liveMessage) state.liveMessage = appendMessage({ role: "assistant", id: payload.message_id, content: "" }, { operationId: operationID });
-    const content = state.liveMessage.querySelector(".content");
-    scheduleRichContent(content, `${richContentSource(content)}${payload.delta || ""}`);
-    if (payload.delta) setAgentProcessing(state.liveMessage, false);
-    scrollMessages();
+    const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
+    draft.content += payload.delta || "";
+    if (payload.delta) draft.processing = false;
+    if (visible) {
+      renderSelectedRunDraft();
+      scrollMessages();
+    }
   } else if (event.type === "message.thinking_delta") {
-    if (!visible) return;
-    if (!state.liveMessage) state.liveMessage = appendMessage({ role: "assistant", id: payload.message_id, content: "" }, { operationId: operationID });
-    setMessageReasoning(state.liveMessage, payload.delta || "", true);
-    if (payload.delta) setAgentProcessing(state.liveMessage, false);
-    scrollMessages();
+    const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
+    draft.reasoning += payload.delta || "";
+    if (payload.delta) draft.processing = false;
+    if (visible) {
+      renderSelectedRunDraft();
+      scrollMessages();
+    }
   } else if (event.type === "message.end" && payload.message?.role === "assistant") {
-    if (!visible) return;
-    state.liveMessage = findMessage(payload.message.id) || state.liveMessage;
+    const message = normalizeAssistantThinking(payload.message);
+    const draft = ensureRunDraft(sessionID, operationID, message.id);
+    draft.content = message.content || draft.content;
+    draft.reasoning = message.reasoning || draft.reasoning;
+    draft.processing = false;
+    if (!visible) {
+      if (message.metadata?.internal === true || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)) state.runDraft = null;
+      return;
+    }
+    state.liveMessage = renderSelectedRunDraft() || findMessage(message.id) || state.liveMessage;
     if (state.liveMessage && operationID) state.liveMessage.dataset.operationId = operationID;
-    if (payload.message.metadata?.internal === true || (Array.isArray(payload.message.tool_calls) && payload.message.tool_calls.length > 0)) {
-      if (payload.message.reasoning && state.liveMessage) {
-        setMessageReasoning(state.liveMessage, payload.message.reasoning);
+    if (message.metadata?.internal === true || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)) {
+      if (message.reasoning && state.liveMessage) {
+        setMessageReasoning(state.liveMessage, message.reasoning);
         state.liveMessage.classList.add("reasoning-only");
         renderRichContent(state.liveMessage.querySelector(".content"), "");
         setAgentProcessing(state.liveMessage, false);
@@ -2148,12 +2368,13 @@ function handleEvent(event, sessionID) {
         state.liveMessage?.remove();
       }
       state.liveMessage = null;
+      state.runDraft = null;
     } else {
       if (state.liveMessage) {
         const content = state.liveMessage.querySelector(".content");
-        renderRichContent(content, payload.message.content || richContentSource(content));
-        if (payload.message.reasoning) setMessageReasoning(state.liveMessage, payload.message.reasoning);
-        if (payload.message.reasoning) mergeReasoningIntoPrevious(state.liveMessage, operationID);
+        renderRichContent(content, message.content || richContentSource(content));
+        if (message.reasoning) setMessageReasoning(state.liveMessage, message.reasoning);
+        if (message.reasoning) mergeReasoningIntoPrevious(state.liveMessage, operationID);
       }
       setAgentProcessing(state.liveMessage, false);
     }
@@ -2207,9 +2428,19 @@ async function retryCurrentRun() {
   state.canceling = false;
   state.retryableRunId = "";
   state.retryableSessionId = "";
+  state.runDraft = {
+    sessionId: sessionID,
+    operationId: "",
+    messageId: "",
+    content: "",
+    reasoning: "",
+    processing: true,
+  };
   $("prompt").disabled = true;
   syncRunActionButton();
   $("retryRun").disabled = true;
+  renderSelectedRunDraft();
+  scrollMessages({ force: true });
   try {
     const run = await request(`/api/v1/runs/${encodeURIComponent(sourceRunId)}/retry`, {
       method: "POST",
@@ -2233,6 +2464,7 @@ async function retryCurrentRun() {
     state.currentRunId = "";
     setAgentProcessing(state.liveMessage, false);
     state.liveMessage = null;
+    state.runDraft = null;
     $("retryRun").disabled = false;
     syncSelectedRunUI();
     renderNavigation();
@@ -2301,8 +2533,38 @@ function findMessage(id) {
   return [...$("messages").querySelectorAll(".message")].find((element) => element.dataset.messageId === id) || null;
 }
 
-function scrollMessages() {
-  $("messages").scrollTop = $("messages").scrollHeight;
+function messageDistanceFromBottom(container = $("messages")) {
+  return Math.max(0, container.scrollHeight - container.clientHeight - container.scrollTop);
+}
+
+function messageAutoScrollThreshold(container = $("messages")) {
+  return container.clientHeight * messageAutoScrollThresholdRatio;
+}
+
+function updateMessageAutoScroll() {
+  const container = $("messages");
+  state.messageAutoScroll = messageDistanceFromBottom(container) <= messageAutoScrollThreshold(container);
+}
+
+function moveMessagesToBottom(container) {
+  // 避免 CSS smooth scrolling 產生的中途 scroll 事件被誤判為使用者向上捲動。
+  const previousBehavior = container.style.scrollBehavior;
+  container.style.scrollBehavior = "auto";
+  container.scrollTop = container.scrollHeight;
+  container.style.scrollBehavior = previousBehavior;
+}
+
+function scrollMessages({ force = false } = {}) {
+  const container = $("messages");
+  if (force) state.messageAutoScroll = true;
+  if (!state.messageAutoScroll) return;
+  moveMessagesToBottom(container);
+  if (messageScrollFrame) return;
+  // Markdown 會在下一個 animation frame 才完成版面更新；更新後再校正一次底部。
+  messageScrollFrame = requestAnimationFrame(() => {
+    messageScrollFrame = 0;
+    if (state.messageAutoScroll) moveMessagesToBottom(container);
+  });
 }
 
 function defaultSessionTitle(value = new Date()) {
@@ -2406,6 +2668,7 @@ function renderSessionContent(messages) {
 }
 
 function sessionContentNode(message) {
+  message = normalizeAssistantThinking(message);
   const article = document.createElement("article");
   article.className = "session-content-item message";
   const header = document.createElement("header");
@@ -2756,15 +3019,34 @@ async function saveWorkspaceSettings(event) {
 async function saveServiceSettings(event) {
   event.preventDefault();
   const serviceName = $("settingServiceName").value.trim();
+  const serviceNameIsDefault = serviceName === localizedDefaultServiceName()
+    || (state.serviceSettings?.service_name_is_default && knownDefaultServiceNames.has(serviceName));
+  if (state.serviceSettings) state.serviceSettings.service_name_is_default = serviceNameIsDefault;
+  const uiLanguage = normalizedUILanguage($("settingUILanguage").value);
+  const wallClockMinutes = $("settingMaxWallClockMinutes").valueAsNumber;
+  const maxTokens = $("settingMaxTokens").valueAsNumber;
+  const maxToolCalls = $("settingMaxToolCalls").valueAsNumber;
+  if (!Number.isInteger(wallClockMinutes) || wallClockMinutes < 1 || wallClockMinutes > 1440
+      || !Number.isInteger(maxTokens) || maxTokens < 0
+      || !Number.isInteger(maxToolCalls) || maxToolCalls < 0 || maxToolCalls > 10000) {
+    $("serviceSettingsState").textContent = "設定值無效";
+    toast("請確認時間、Token 與工具呼叫上限的數值範圍");
+    return;
+  }
   $("saveServiceSettings").disabled = true;
   $("serviceSettingsState").textContent = "儲存中…";
   try {
     const updated = await request("/api/v1/admin/service-settings", {
       method: "PUT",
-      body: JSON.stringify({ service_name: serviceName }),
+      body: JSON.stringify({
+        service_name: serviceName,
+        ui_language: uiLanguage,
+        max_wall_clock_seconds: wallClockMinutes * 60,
+        max_tokens: maxTokens,
+        max_tool_calls: maxToolCalls,
+      }),
     });
-    state.serviceSettings = updated;
-    applyServiceName(updated.service_name);
+    applyServiceSettings(updated);
     $("serviceSettingsState").textContent = "已儲存";
   } catch (error) {
     $("serviceSettingsState").textContent = "儲存失敗";
@@ -2879,7 +3161,11 @@ function closeManagement() {
 }
 
 async function activatePanel(name) {
-  for (const button of document.querySelectorAll(".panel-tab")) button.classList.toggle("active", button.dataset.panel === name);
+  for (const button of document.querySelectorAll(".panel-tab")) {
+    const selected = button.dataset.panel === name;
+    button.classList.toggle("active", selected);
+    button.setAttribute("aria-selected", String(selected));
+  }
   for (const value of ["overview", "providers", "tools", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
   if (name === "overview") await loadDiagnostics();
   if (name === "providers") await loadProviderSettings();
@@ -2890,8 +3176,7 @@ async function activatePanel(name) {
 async function loadDiagnostics() {
   try {
     const value = await request("/api/v1/admin/diagnostics");
-    state.serviceSettings = { service_name: value.config?.service_name || state.serviceSettings?.service_name || defaultServiceName };
-    applyServiceName(state.serviceSettings.service_name);
+    applyServiceSettings(value.config || {});
     state.permissions = value.config?.permissions || state.permissions;
     renderPermissionOptions();
     const cards = [
@@ -2961,6 +3246,7 @@ function newProviderSetting() {
   return {
     id: "",
     type: "openai-compatible",
+    enabled: true,
     openai_compatible: {
       base_url: "https://api.openai.com/v1",
       has_api_key: false,
@@ -2987,7 +3273,8 @@ function renderProviderSettings() {
     const settings = provider.openai_compatible || {};
     const button = document.createElement("button");
     button.type = "button";
-    button.className = `provider-setting-card ${!state.providerSettingsDraft && provider.id === state.selectedProviderSettingsID ? "active" : ""}`;
+    const enabled = provider.enabled !== false;
+    button.className = `provider-setting-card ${enabled ? "" : "provider-disabled"} ${!state.providerSettingsDraft && provider.id === state.selectedProviderSettingsID ? "active" : ""}`;
     const title = document.createElement("strong");
     title.textContent = provider.id;
     const detail = document.createElement("small");
@@ -2997,6 +3284,11 @@ function renderProviderSettings() {
       const badge = document.createElement("span");
       badge.className = "provider-default-badge";
       badge.textContent = "預設";
+      button.append(badge);
+    } else if (!enabled) {
+      const badge = document.createElement("span");
+      badge.className = "provider-disabled-badge";
+      badge.textContent = "已停用";
       button.append(badge);
     }
     button.append(detail);
@@ -3029,6 +3321,11 @@ function renderProviderSettings() {
   $("providerSettingID").value = selected.id || "";
   $("providerSettingID").disabled = !isNew;
   $("providerSettingType").value = selected.type || "openai-compatible";
+  const isDefault = selected.id === state.providerSettings?.default_provider_id;
+  $("providerSettingEnabled").checked = selected.enabled !== false;
+  $("providerSettingEnabled").disabled = !isNew && isDefault;
+  $("providerSettingEnabledLabel").classList.toggle("switch-disabled", !isNew && isDefault);
+  $("providerSettingEnabledLabel").title = !isNew && isDefault ? "請先將其他 Provider 設為系統預設" : "";
   $("providerSettingBaseURL").value = settings.base_url || "";
   $("providerSettingAPIKey").value = "";
   $("providerSettingAPIKey").placeholder = settings.has_api_key ? "已設定；留空表示保留" : "尚未設定";
@@ -3040,7 +3337,7 @@ function renderProviderSettings() {
   renderProviderModelOptions(isNew ? "" : selected.id);
   $("providerSettingInstructionRole").value = settings.instruction_role || "system";
   $("providerSettingMaxAttempts").value = settings.max_attempts || 3;
-  $("providerSettingDefault").checked = selected.id === state.providerSettings?.default_provider_id;
+  $("providerSettingDefault").checked = isDefault;
   $("providerSettingDisableStreaming").checked = Boolean(settings.disable_streaming);
   $("providerSettingStreamUsage").checked = Boolean(settings.stream_include_usage);
   $("providerSettingOmitToolChoice").checked = Boolean(settings.omit_tool_choice);
@@ -3131,6 +3428,7 @@ function providerSettingFormValue() {
   const provider = {
     id: $("providerSettingID").value.trim(),
     type: $("providerSettingType").value,
+    enabled: $("providerSettingDefault").checked || $("providerSettingEnabled").checked,
     openai_compatible: {
       base_url: $("providerSettingBaseURL").value.trim(),
       model: $("providerSettingModel").value.trim(),
@@ -3195,15 +3493,19 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
     await refreshProviderCatalog();
     renderProviderSettings();
     let models = null;
-    if (refreshModels) {
+    if (refreshModels && provider.enabled) {
       $("providerSettingsState").textContent = "已套用，更新模型列表中…";
       models = await loadProviderModels(provider.id, { notify: false });
     }
-    $("providerSettingsState").textContent = models
+    $("providerSettingsState").textContent = !provider.enabled
+      ? "已停用"
+      : models
       ? `已套用 · ${models.models.length} 個模型`
       : refreshModels ? "已套用 · 模型列表需手動更新" : "已套用";
     if (showToast) {
-      toast(models
+      toast(!provider.enabled
+        ? `Provider ${provider.id} 已停用並從使用選單移除`
+        : models
         ? "Provider 設定已儲存，模型列表已更新"
         : "Provider 設定已儲存；模型名稱仍可手動輸入");
     }
@@ -3413,7 +3715,7 @@ $("planForm").addEventListener("submit", savePlan);
 $("workspaceSelect").addEventListener("change", (event) => switchWorkspace(event.target.value));
 $("newWorkspace").addEventListener("click", async () => {
   renderProviderOptions();
-  const provider = state.providers[0];
+  const provider = selectableProviders()[0];
   if (provider) {
     await loadProviderModels(provider.id, { notify: false });
     $("newWorkspaceProvider").value = provider.id;
@@ -3425,8 +3727,14 @@ $("cancelWorkspace").addEventListener("click", () => $("workspaceDialog").close(
 $("workspaceForm").addEventListener("submit", createWorkspace);
 $("workspaceSettings").addEventListener("submit", saveWorkspaceSettings);
 $("serviceSettings").addEventListener("submit", saveServiceSettings);
+$("settingServiceName").addEventListener("input", (event) => {
+  if (state.serviceSettings) {
+    state.serviceSettings.service_name_is_default = event.target.value.trim() === localizedDefaultServiceName();
+  }
+});
+$("settingUILanguage").addEventListener("change", (event) => applyUILanguage(event.target.value));
 $("newWorkspaceProvider").addEventListener("change", async (event) => {
-  const provider = state.providers.find((item) => item.id === event.target.value);
+  const provider = selectableProviders().find((item) => item.id === event.target.value);
   if (provider) {
     await loadProviderModels(provider.id, { notify: false });
     $("newWorkspaceModel").value = displayedModelForProvider(provider.id);
@@ -3508,6 +3816,7 @@ $("newProvider").addEventListener("change", (event) => {
 });
 $("composer").addEventListener("submit", sendPrompt);
 $("send").addEventListener("click", activateRunAction);
+$("messages").addEventListener("scroll", updateMessageAutoScroll, { passive: true });
 $("prompt").addEventListener("paste", (event) => {
   if (!state.session || state.running) return;
   const files = [...(event.clipboardData?.files || [])];
@@ -3595,6 +3904,12 @@ $("providerSettingsForm").addEventListener("submit", saveProviderSetting);
 $("deleteProviderSetting").addEventListener("click", deleteProviderSetting);
 $("refreshProviderModels").addEventListener("click", () => loadProviderModels(state.selectedProviderSettingsID));
 $("testProviderSetting").addEventListener("click", testProviderSetting);
+$("providerSettingDefault").addEventListener("change", (event) => {
+  if (event.target.checked) $("providerSettingEnabled").checked = true;
+});
+$("providerSettingEnabled").addEventListener("change", (event) => {
+  if (!event.target.checked && $("providerSettingDefault").checked) event.target.checked = true;
+});
 $("providerSettingModelCatalog").addEventListener("change", (event) => {
   if (event.target.value === "__custom_model__") {
     event.target.classList.add("hidden");
@@ -3653,6 +3968,6 @@ window.addEventListener("blur", () => {
 });
 
 installDialogDragGuards();
+notifyNativeStartupReady();
 refreshBackend();
-setInterval(refreshBackend, 4000);
 setInterval(updateLiveReasoningDurations, 1000);

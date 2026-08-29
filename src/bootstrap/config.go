@@ -18,10 +18,15 @@ import (
 
 var Version = "0.1.0"
 
-const DefaultServiceName = "聰明的實習生"
+const (
+	DefaultServiceName       = "永不休息的實習生"
+	legacyDefaultServiceName = "聰明的實習生"
+	DefaultUILanguage        = "auto"
+)
 
 type Config struct {
 	ServiceName        string                  `json:"service_name"`
+	UILanguage         string                  `json:"ui_language,omitempty"`
 	ListenAddress      string                  `json:"listen_address"`
 	DataDir            string                  `json:"data_dir"`
 	APIToken           string                  `json:"api_token,omitempty"`
@@ -37,29 +42,37 @@ type Config struct {
 	// MaxAutonomousToolTurns 到達後會停止擴張工具範圍，強制整理最終答案。
 	MaxAutonomousToolTurns int `json:"max_autonomous_tool_turns"`
 	// MaxCompletionChecks 是模型宣稱完成、但仍有未解決工具失敗時的追問次數上限。
-	MaxCompletionChecks int                          `json:"max_completion_checks"`
-	MaxWallClockSeconds int                          `json:"max_wall_clock_seconds"`
-	MaxTokens           int                          `json:"max_tokens"`
-	MaxToolCalls        int                          `json:"max_tool_calls"`
-	MaxToolOutputBytes  int                          `json:"max_tool_output_bytes"`
-	MaxFileInputBytes   int                          `json:"max_file_input_bytes"`
-	Context             harness.ContextConfig        `json:"context"`
-	Memory              memory.Config                `json:"memory"`
-	DefaultProviderID   string                       `json:"default_provider_id"`
-	Providers           map[string]ProviderConfig    `json:"providers"`
-	SSHProfiles         map[string]nativessh.Profile `json:"ssh_profiles,omitempty"`
+	MaxCompletionChecks int `json:"max_completion_checks"`
+	MaxWallClockSeconds int `json:"max_wall_clock_seconds"`
+	// MaxTokens 與 MaxToolCalls 設為 0 時不限制，仍可由設定或環境變數重新啟用。
+	MaxTokens          int                          `json:"max_tokens"`
+	MaxToolCalls       int                          `json:"max_tool_calls"`
+	MaxToolOutputBytes int                          `json:"max_tool_output_bytes"`
+	MaxFileInputBytes  int                          `json:"max_file_input_bytes"`
+	Context            harness.ContextConfig        `json:"context"`
+	Memory             memory.Config                `json:"memory"`
+	DefaultProviderID  string                       `json:"default_provider_id"`
+	Providers          map[string]ProviderConfig    `json:"providers"`
+	SSHProfiles        map[string]nativessh.Profile `json:"ssh_profiles,omitempty"`
 }
 
 // ProviderConfig 以 type 作為 adapter 工廠的辨識欄位；目前只實作 openai-compatible。
 // 後續 Provider 類型應新增自己的具名設定區塊，不改動 Harness 或 Workspace schema。
 type ProviderConfig struct {
-	Type             string               `json:"type"`
+	Type string `json:"type"`
+	// Enabled=nil 視為啟用，讓既有設定檔與持久化資料可直接升級。
+	Enabled          *bool                `json:"enabled,omitempty"`
 	OpenAICompatible *openaicompat.Config `json:"openai_compatible,omitempty"`
+}
+
+func (config ProviderConfig) IsEnabled() bool {
+	return config.Enabled == nil || *config.Enabled
 }
 
 func DefaultConfig() Config {
 	return Config{
 		ServiceName:            DefaultServiceName,
+		UILanguage:             DefaultUILanguage,
 		ListenAddress:          "127.0.0.1:8787",
 		DataDir:                filepath.Join("data", "ai-agent"),
 		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "shell_exec", "ssh_exec", "memory_search", "memory_remember", "memory_forget"},
@@ -69,8 +82,8 @@ func DefaultConfig() Config {
 		ToolCallMode:           string(harness.ToolCallModeInstruction),
 		MaxCompletionChecks:    harness.DefaultMaxCompletionChecks,
 		MaxWallClockSeconds:    2 * 60 * 60,
-		MaxTokens:              10_000_000,
-		MaxToolCalls:           512,
+		MaxTokens:              0,
+		MaxToolCalls:           0,
 		// 單機 Harness 預設允許 Sandbox 內的寫入與 Shell，但每次高風險工具仍須人工 Approval。
 		// 不開放 Client 自行指定 profile；對外部署可將 AllowElevatedTools 關閉以停用全部寫入型工具。
 		Permissions: domain.PermissionPolicy{
@@ -157,6 +170,7 @@ func applyEnvironment(config *Config) {
 		}
 	}
 	setString("AI_AGENT_SERVICE_NAME", &config.ServiceName)
+	setString("AI_AGENT_UI_LANGUAGE", &config.UILanguage)
 	setString("AI_AGENT_LISTEN", &config.ListenAddress)
 	setString("AI_AGENT_DATA_DIR", &config.DataDir)
 	setString("AI_AGENT_API_TOKEN", &config.APIToken)
@@ -246,6 +260,11 @@ func applyEnvironment(config *Config) {
 
 func validateConfig(config *Config) error {
 	config.ServiceName = strings.TrimSpace(config.ServiceName)
+	uiLanguage, validUILanguage := normalizeUILanguage(config.UILanguage)
+	if !validUILanguage {
+		return fmt.Errorf("ui_language must be auto, zh-TW, en, ja or ko")
+	}
+	config.UILanguage = uiLanguage
 	config.ListenAddress = strings.TrimSpace(config.ListenAddress)
 	config.DataDir = strings.TrimSpace(config.DataDir)
 	if config.ServiceName == "" || config.ListenAddress == "" || config.DataDir == "" {
@@ -281,14 +300,8 @@ func validateConfig(config *Config) error {
 	if config.MaxCompletionChecks < 0 || config.MaxCompletionChecks > 5 {
 		return fmt.Errorf("max_completion_checks must be between 0 and 5")
 	}
-	if config.MaxWallClockSeconds <= 0 || config.MaxWallClockSeconds > 24*60*60 {
-		return fmt.Errorf("max_wall_clock_seconds must be between 1 and 86400")
-	}
-	if config.MaxTokens <= 0 {
-		return fmt.Errorf("max_tokens must be greater than zero")
-	}
-	if config.MaxToolCalls <= 0 || config.MaxToolCalls > 10_000 {
-		return fmt.Errorf("max_tool_calls must be between 1 and 10000")
+	if err := validateAdjustableRunLimits(config.MaxWallClockSeconds, config.MaxTokens, config.MaxToolCalls); err != nil {
+		return err
 	}
 	config.Permissions = config.Permissions.Normalize()
 	if config.AllowElevatedTools && len(config.Permissions.ElevatedProfiles) == 0 {
@@ -304,8 +317,12 @@ func validateConfig(config *Config) error {
 	if config.DefaultProviderID == "" || len(config.Providers) == 0 {
 		return fmt.Errorf("default_provider_id and providers are required")
 	}
-	if _, exists := config.Providers[config.DefaultProviderID]; !exists {
+	defaultProvider, exists := config.Providers[config.DefaultProviderID]
+	if !exists {
 		return fmt.Errorf("default provider %q is not configured", config.DefaultProviderID)
+	}
+	if !defaultProvider.IsEnabled() {
+		return fmt.Errorf("default provider %q must be enabled", config.DefaultProviderID)
 	}
 	for id, provider := range config.Providers {
 		if strings.TrimSpace(id) == "" || strings.TrimSpace(provider.Type) == "" {
@@ -359,6 +376,32 @@ func validateConfig(config *Config) error {
 		return fmt.Errorf("resolve data_dir: %w", err)
 	}
 	config.DataDir = filepath.Clean(absolute)
+	return nil
+}
+
+func normalizeUILanguage(value string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto":
+		return DefaultUILanguage, true
+	case "zh", "zh-tw", "zh_tw", "zh-hant", "zh_hant":
+		return "zh-TW", true
+	case "en", "ja", "ko":
+		return strings.ToLower(strings.TrimSpace(value)), true
+	default:
+		return "", false
+	}
+}
+
+func validateAdjustableRunLimits(maxWallClockSeconds, maxTokens, maxToolCalls int) error {
+	if maxWallClockSeconds <= 0 || maxWallClockSeconds > 24*60*60 {
+		return fmt.Errorf("max_wall_clock_seconds must be between 1 and 86400")
+	}
+	if maxTokens < 0 {
+		return fmt.Errorf("max_tokens must be zero (unlimited) or greater than zero")
+	}
+	if maxToolCalls < 0 || maxToolCalls > 10_000 {
+		return fmt.Errorf("max_tool_calls must be zero (unlimited) or between 1 and 10000")
+	}
 	return nil
 }
 

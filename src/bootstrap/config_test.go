@@ -1,10 +1,13 @@
 package bootstrap
 
-import "testing"
+import (
+	"log/slog"
+	"testing"
+)
 
 func TestDefaultConfigAllowsSandboxedWriteTools(t *testing.T) {
 	config := DefaultConfig()
-	if config.ServiceName != "聰明的實習生" {
+	if config.ServiceName != "永不休息的實習生" {
 		t.Fatalf("default service name = %q", config.ServiceName)
 	}
 	if !config.AllowElevatedTools {
@@ -13,6 +16,70 @@ func TestDefaultConfigAllowsSandboxedWriteTools(t *testing.T) {
 	policy := config.Permissions.Normalize()
 	if !policy.IsElevated(policy.DefaultProfile) {
 		t.Fatalf("default profile %q must be elevated when local write tools are enabled", policy.DefaultProfile)
+	}
+	if config.MaxTokens != 0 || config.MaxToolCalls != 0 {
+		t.Fatalf("long-task count limits must default to unlimited, got tokens=%d tool_calls=%d", config.MaxTokens, config.MaxToolCalls)
+	}
+}
+
+func TestValidateAdjustableRunLimitsAllowsUnlimitedCounts(t *testing.T) {
+	if err := validateAdjustableRunLimits(2*60*60, 0, 0); err != nil {
+		t.Fatalf("unlimited count settings were rejected: %v", err)
+	}
+	for _, test := range []struct {
+		name      string
+		wallClock int
+		tokens    int
+		toolCalls int
+	}{
+		{name: "zero wall clock", wallClock: 0},
+		{name: "negative tokens", wallClock: 1, tokens: -1},
+		{name: "negative tool calls", wallClock: 1, toolCalls: -1},
+		{name: "tool calls too large", wallClock: 1, toolCalls: 10_001},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := validateAdjustableRunLimits(test.wallClock, test.tokens, test.toolCalls); err == nil {
+				t.Fatal("invalid run limits were accepted")
+			}
+		})
+	}
+}
+
+func TestProviderEnabledDefaultsToTrue(t *testing.T) {
+	if !(ProviderConfig{}).IsEnabled() {
+		t.Fatal("provider without enabled field must remain enabled for backward compatibility")
+	}
+	disabled := false
+	if (ProviderConfig{Enabled: &disabled}).IsEnabled() {
+		t.Fatal("explicitly disabled provider was treated as enabled")
+	}
+}
+
+func TestValidateConfigRejectsDisabledDefaultProvider(t *testing.T) {
+	config := DefaultConfig()
+	disabled := false
+	provider := config.Providers[config.DefaultProviderID]
+	provider.Enabled = &disabled
+	config.Providers[config.DefaultProviderID] = provider
+	if err := validateConfig(&config); err == nil {
+		t.Fatal("disabled default provider was accepted")
+	}
+}
+
+func TestBuildProviderValuesExcludesDisabledProviders(t *testing.T) {
+	config := DefaultConfig()
+	disabled := config.Providers[config.DefaultProviderID]
+	disabled.Enabled = boolPointer(false)
+	config.Providers["disabled-provider"] = disabled
+	values, err := buildProviderValues(config, slog.Default())
+	if err != nil {
+		t.Fatalf("buildProviderValues: %v", err)
+	}
+	if _, exists := values["disabled-provider"]; exists {
+		t.Fatal("disabled provider was registered in the runtime router")
+	}
+	if _, exists := values[config.DefaultProviderID]; !exists {
+		t.Fatal("enabled default provider is missing from the runtime router")
 	}
 }
 
