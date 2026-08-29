@@ -55,6 +55,18 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 	if agentID == "" {
 		return domain.Session{}, fmt.Errorf("%w: agent id is required", domain.ErrInvalidInput)
 	}
+	position := 0
+	existing, err := r.List(ctx, agentID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	workspaceID := strings.TrimSpace(input.WorkspaceID)
+	projectID := strings.TrimSpace(input.ProjectID)
+	for _, value := range existing {
+		if value.WorkspaceID == workspaceID && value.ProjectID == projectID && value.Position >= position {
+			position = value.Position + 1
+		}
+	}
 	localNow := time.Now()
 	now := localNow.UTC()
 	sessionID := domain.NewID("session")
@@ -79,13 +91,14 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 	session := domain.Session{
 		ID:                sessionID,
 		AgentID:           agentID,
-		WorkspaceID:       strings.TrimSpace(input.WorkspaceID),
-		ProjectID:         strings.TrimSpace(input.ProjectID),
+		WorkspaceID:       workspaceID,
+		ProjectID:         projectID,
 		Title:             valueutil.FirstNonEmpty(input.Title, localNow.Format("01/02 15:04")),
 		ProviderID:        strings.TrimSpace(input.ProviderID),
 		Model:             strings.TrimSpace(input.Model),
 		PermissionProfile: permissionProfile,
 		Pinned:            input.Pinned,
+		Position:          position,
 		Metadata:          metadata,
 		CreatedAt:         now,
 		UpdatedAt:         now,

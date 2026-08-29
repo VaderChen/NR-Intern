@@ -43,7 +43,16 @@ func (c *Coordinator) Required(toolName string) bool {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.required[strings.TrimSpace(toolName)]
+	toolName = strings.TrimSpace(toolName)
+	if c.required[toolName] {
+		return true
+	}
+	for pattern := range c.required {
+		if strings.HasSuffix(pattern, "*") && strings.HasPrefix(toolName, strings.TrimSuffix(pattern, "*")) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Coordinator) Begin(request domain.ToolApprovalRequest) error {

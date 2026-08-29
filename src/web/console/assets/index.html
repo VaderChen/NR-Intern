@@ -52,7 +52,42 @@
         <nav id="projectList" class="project-list" aria-label="專案與對話"></nav>
       </section>
       <div class="sidebar-actions">
-        <button id="openManagement" class="ghost full" disabled>系統管理</button>
+        <div class="sidebar-action-row">
+          <button id="openManagement" class="ghost full" disabled>系統管理</button>
+          <button id="providerUsageButton" class="usage-icon-button" type="button" title="查看用量" aria-label="查看用量" aria-expanded="false" aria-controls="providerUsagePopover" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="8"></circle>
+              <path d="M12 4a8 8 0 0 1 8 8"></path>
+              <path d="M12 8v4l3 2"></path>
+            </svg>
+          </button>
+        </div>
+        <section id="providerUsagePopover" class="provider-usage-popover hidden" role="dialog" aria-label="Provider 用量">
+          <div class="provider-usage-row">
+            <div class="provider-usage-copy">
+              <strong>5 小時使用情況限制</strong>
+              <small><span>重設時間</span> <span id="providerUsageFiveHourReset">-</span></small>
+            </div>
+            <div class="provider-usage-meter-group">
+              <div id="providerUsageFiveHourTrack" class="provider-usage-track unknown" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="-">
+                <span id="providerUsageFiveHourBar"></span>
+              </div>
+              <span class="provider-usage-remaining"><span>剩餘</span> <strong id="providerUsageFiveHourValue">-</strong></span>
+            </div>
+          </div>
+          <div class="provider-usage-row">
+            <div class="provider-usage-copy">
+              <strong>每週使用上限</strong>
+              <small><span>重設時間</span> <span id="providerUsageSevenDayReset">-</span></small>
+            </div>
+            <div class="provider-usage-meter-group">
+              <div id="providerUsageSevenDayTrack" class="provider-usage-track unknown" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="-">
+                <span id="providerUsageSevenDayBar"></span>
+              </div>
+              <span class="provider-usage-remaining"><span>剩餘</span> <strong id="providerUsageSevenDayValue">-</strong></span>
+            </div>
+          </div>
+        </section>
       </div>
     </aside>
 
@@ -91,17 +126,45 @@
         <p>Agent 不會先固定拆解問題，而會依目前狀態、記憶與原生工具結果持續運作。</p>
       </section>
       <section id="messages" class="messages hidden" aria-live="polite"></section>
+      <section id="contextCompactionIndicator" class="context-compaction-indicator hidden" role="status" aria-live="assertive">
+        <span class="context-compaction-spinner" aria-hidden="true"></span>
+        <strong>正在壓縮上下文</strong>
+        <span class="context-compaction-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      </section>
 
       <section id="activity" class="activity hidden" aria-live="polite">
         <span id="activityText"></span>
         <button id="retryRun" class="small hidden" type="button">重試 Run</button>
       </section>
       <div class="conversation-actions">
+        <div id="contextUsageControl" class="context-usage-control hidden">
+          <button id="contextUsageButton" class="context-usage-trigger ghost" type="button" aria-haspopup="true" aria-expanded="false" title="查看上下文用量" aria-label="查看上下文用量">
+            <span>上下文</span><strong id="contextUsagePercent">-</strong>
+          </button>
+          <section id="contextUsagePopover" class="context-usage-popover hidden" aria-label="上下文用量">
+            <div class="context-usage-head">
+              <div><strong>上下文用量</strong><small>最近一次模型請求</small></div>
+              <strong id="contextUsageDetailPercent">-</strong>
+            </div>
+            <div id="contextUsageTrack" class="context-usage-track unknown" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuetext="-">
+              <span id="contextUsageBar"></span>
+            </div>
+            <dl class="context-usage-details">
+              <dt>Provider</dt><dd id="contextUsageProvider">-</dd>
+              <dt>模型</dt><dd id="contextUsageModel">-</dd>
+              <dt>目前輸入</dt><dd id="contextUsageInput">-</dd>
+              <dt>上下文上限</dt><dd id="contextUsageLimit">-</dd>
+              <dt>最大輸出</dt><dd id="contextUsageOutputLimit">-</dd>
+              <dt>剩餘空間</dt><dd id="contextUsageRemaining">-</dd>
+            </dl>
+          </section>
+        </div>
         <button id="openPlan" class="plan-trigger ghost hidden" type="button" aria-haspopup="dialog" title="檢視或建立工作計畫">
           <span>計畫</span><strong id="planProgress">建立</strong>
         </button>
       </div>
       <form id="composer" class="composer">
+        <div id="promptQueue" class="prompt-queue hidden" aria-label="待送出訊息佇列" aria-live="polite"></div>
         <div id="attachmentTray" class="attachment-tray hidden" aria-label="待送出附件"></div>
         <div class="composer-input-row">
           <textarea id="prompt" rows="2" placeholder="輸入想做的事 或 請 Agent 幫你制定一個計畫" disabled></textarea>
@@ -109,7 +172,9 @@
             <svg id="sendIcon" class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 19V5m0 0-6 6m6-6 6 6" />
             </svg>
-            <svg id="stopIcon" class="run-action-icon hidden" viewBox="0 0 24 24" aria-hidden="true">
+          </button>
+          <button id="stopRun" class="send stop-run hidden" type="button" aria-label="停止 Run" title="停止 Run">
+            <svg class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
               <rect x="7" y="7" width="10" height="10" rx="1.5" />
             </svg>
           </button>
@@ -125,8 +190,10 @@
       <div class="panel-tabs" role="tablist" aria-label="系統管理功能" aria-orientation="vertical">
         <button id="overviewManagementTab" class="panel-tab active" data-panel="overview" role="tab" aria-selected="true" aria-controls="overviewPanel">一般設定</button>
         <button id="providersManagementTab" class="panel-tab" data-panel="providers" role="tab" aria-selected="false" aria-controls="providersPanel">Provider 設定</button>
-        <button id="toolsManagementTab" class="panel-tab" data-panel="tools" role="tab" aria-selected="false" aria-controls="toolsPanel">工具</button>
-        <button id="auditManagementTab" class="panel-tab" data-panel="audit" role="tab" aria-selected="false" aria-controls="auditPanel">稽核</button>
+        <button id="mcpManagementTab" class="panel-tab" data-panel="mcp" role="tab" aria-selected="false" aria-controls="mcpPanel">使用 MCP</button>
+        <button id="reverseProxyManagementTab" class="panel-tab" data-panel="reverseProxy" role="tab" aria-selected="false" aria-controls="reverseProxyPanel">反向代理</button>
+        <button id="toolsManagementTab" class="panel-tab" data-panel="tools" role="tab" aria-selected="false" aria-controls="toolsPanel">工具列表</button>
+        <button id="auditManagementTab" class="panel-tab hidden" data-panel="audit" role="tab" aria-selected="false" aria-controls="auditPanel">稽核</button>
       </div>
 
       <div id="overviewPanel" class="panel-content" role="tabpanel" aria-labelledby="overviewManagementTab">
@@ -219,13 +286,29 @@
             </div>
             <div class="provider-field-grid">
               <label>Provider ID<input id="providerSettingID" maxlength="80" autocomplete="off" required></label>
-              <label>類型<select id="providerSettingType"><option value="openai-compatible">openai-compatible</option></select></label>
-              <label class="provider-field-full">Base URL<input id="providerSettingBaseURL" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" required></label>
-              <label class="provider-field-full">API Key
-                <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
-                <small id="providerSettingAPIKeyState"></small>
-              </label>
-              <label id="providerSettingClearKeyRow" class="check-label provider-field-full hidden"><input id="providerSettingClearKey" type="checkbox">清除目前已儲存的 API Key</label>
+              <label>類型<select id="providerSettingType">
+                <option value="openai-compatible">OpenAI Compatible</option>
+                <option value="openai-codex-responses">OpenAI Codex Responses</option>
+              </select></label>
+              <label class="provider-field-full">顯示名稱<input id="providerSettingDisplayName" maxlength="80" autocomplete="off"></label>
+              <label id="providerSettingBaseURLField" class="provider-field-full">Base URL<input id="providerSettingBaseURL" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" required></label>
+              <div id="providerAPIKeyFields" class="provider-field-full provider-auth-fields">
+                <label>API Key
+                  <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
+                  <small id="providerSettingAPIKeyState"></small>
+                </label>
+                <label id="providerSettingClearKeyRow" class="check-label hidden"><input id="providerSettingClearKey" type="checkbox">清除目前已儲存的 API Key</label>
+              </div>
+              <div id="providerOAuthFields" class="provider-field-full provider-auth-fields hidden">
+                <small>將開啟 ChatGPT 登入頁，登入與帳號選擇都在瀏覽器中完成。</small>
+                <small>回呼網址：<code>http://localhost:1455/auth/callback</code></small>
+                <small>驗證期間才會啟動本機 HTTP Server；Token 僅儲存在本機權限限制檔案中。</small>
+                <div class="provider-oauth-actions">
+                  <span id="providerOAuthState" class="hint">尚未連線</span>
+                  <button id="connectProviderOAuth" class="ghost" type="button">使用 ChatGPT 帳號登入</button>
+                  <button id="disconnectProviderOAuth" class="danger ghost hidden" type="button">中斷 OAuth</button>
+                </div>
+              </div>
               <label class="provider-field-full">預設模型
                 <div class="provider-model-control">
                   <div class="provider-model-value">
@@ -234,16 +317,16 @@
                   </div>
                   <button id="refreshProviderModels" class="small ghost" type="button">更新列表</button>
                 </div>
-                <small id="providerModelState">模型列表尚未載入，仍可手動輸入模型名稱。</small>
+                <small id="providerModelState">模型列表尚未載入。</small>
               </label>
-              <label>Instruction role<select id="providerSettingInstructionRole"><option value="system">system</option><option value="developer">developer</option></select></label>
+              <label id="providerSettingInstructionRoleField">Instruction role<select id="providerSettingInstructionRole"><option value="system">system</option><option value="developer">developer</option></select></label>
               <label>重試次數<input id="providerSettingMaxAttempts" type="number" min="1" max="3" required></label>
             </div>
             <div class="provider-check-grid">
               <label class="check-label"><input id="providerSettingDefault" type="checkbox">設為系統預設</label>
-              <label class="check-label"><input id="providerSettingDisableStreaming" type="checkbox">停用 Streaming</label>
-              <label class="check-label"><input id="providerSettingStreamUsage" type="checkbox">串流包含 Usage</label>
-              <label class="check-label"><input id="providerSettingOmitToolChoice" type="checkbox">省略 tool_choice</label>
+              <label id="providerSettingDisableStreamingField" class="check-label"><input id="providerSettingDisableStreaming" type="checkbox">停用 Streaming</label>
+              <label id="providerSettingStreamUsageField" class="check-label"><input id="providerSettingStreamUsage" type="checkbox">串流包含 Usage</label>
+              <label id="providerSettingOmitToolChoiceField" class="check-label"><input id="providerSettingOmitToolChoice" type="checkbox">省略 tool_choice</label>
             </div>
             <details class="provider-advanced">
               <summary>進階設定</summary>
@@ -269,10 +352,145 @@
         </div>
       </div>
 
+      <div id="mcpPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="mcpManagementTab">
+        <div class="provider-settings-layout">
+          <section class="management-section provider-settings-sidebar">
+            <div class="section-head">
+              <div><h2>MCP Server 清單</h2><p class="hint">主系統會連線到這些 MCP Server，並把其工具提供給 Agent 使用。</p></div>
+              <button id="addMCPSetting" class="icon-button" type="button" title="新增 MCP Server" aria-label="新增 MCP Server">＋</button>
+            </div>
+            <div id="mcpSettingsList" class="provider-settings-list"></div>
+          </section>
+
+          <form id="mcpSettingsForm" class="management-section provider-settings-editor hidden">
+            <div class="section-head">
+              <div><h2 id="mcpSettingsEditorTitle">MCP Server 設定</h2><p class="hint">支援本機 stdio 與遠端 Streamable HTTP；儲存後會在背景建立連線。</p></div>
+              <div class="provider-editor-head-actions">
+                <label class="switch-label">
+                  <input id="mcpSettingEnabled" type="checkbox" role="switch" aria-label="啟用 MCP Server">
+                  <span class="switch-track" aria-hidden="true"></span>
+                  <span>啟用</span>
+                </label>
+                <span id="mcpSettingsState" class="save-state"></span>
+              </div>
+            </div>
+            <div class="provider-field-grid">
+              <label>MCP ID<input id="mcpSettingID" maxlength="80" pattern="[A-Za-z0-9_-]+" autocomplete="off" required></label>
+              <label>傳輸方式<select id="mcpSettingTransport">
+                <option value="stdio">Stdio</option>
+                <option value="streamable-http">Streamable HTTP</option>
+              </select></label>
+              <label class="provider-field-full">顯示名稱<input id="mcpSettingDisplayName" maxlength="80" autocomplete="off"></label>
+              <div id="mcpStdioFields" class="provider-field-full provider-field-grid mcp-nested-fields">
+                <label class="provider-field-full">啟動命令<input id="mcpSettingCommand" autocomplete="off" placeholder="npx" required></label>
+                <label class="provider-field-full">參數（JSON 陣列）<textarea id="mcpSettingArgs" rows="3" spellcheck="false" placeholder='["-y", "@example/mcp-server"]'></textarea></label>
+                <label class="provider-field-full">工作目錄<input id="mcpSettingWorkDir" autocomplete="off" placeholder="留空使用 APP 工作目錄"></label>
+                <label class="provider-field-full">環境變數（JSON 物件）
+                  <textarea id="mcpSettingEnvironment" rows="3" spellcheck="false" placeholder='{"API_TOKEN":"..."}'></textarea>
+                  <small id="mcpEnvironmentState">敏感內容不會從後端讀回；留空會保留目前設定，輸入 {} 會清除。</small>
+                </label>
+              </div>
+              <div id="mcpHTTPFields" class="provider-field-full provider-field-grid mcp-nested-fields hidden">
+                <label class="provider-field-full">Server URL<input id="mcpSettingURL" type="url" autocomplete="off" placeholder="https://example.com/mcp"></label>
+                <div class="provider-field-full provider-auth-fields">
+                  <label>金鑰（Bearer Token）
+                    <input id="mcpSettingAPIKey" type="password" autocomplete="new-password" placeholder="輸入 MCP Server 金鑰">
+                    <small id="mcpAPIKeyState">金鑰不會從後端讀回；留空會保留目前設定。</small>
+                  </label>
+                  <label id="mcpSettingClearKeyRow" class="check-label hidden"><input id="mcpSettingClearKey" type="checkbox">清除目前已儲存的 MCP 金鑰</label>
+                </div>
+                <label class="provider-field-full">HTTP Headers（JSON 物件）
+                  <textarea id="mcpSettingHeaders" rows="3" spellcheck="false" placeholder='{"Authorization":"Bearer ..."}'></textarea>
+                  <small id="mcpHeadersState">敏感內容不會從後端讀回；留空會保留目前設定，輸入 {} 會清除。</small>
+                </label>
+              </div>
+              <label>啟動逾時（秒）<input id="mcpSettingStartupTimeout" type="number" min="1" max="300" required></label>
+              <label>工具呼叫逾時（秒）<input id="mcpSettingCallTimeout" type="number" min="1" max="86400" required></label>
+            </div>
+            <label class="check-label"><input id="mcpSettingTrustAnnotations" type="checkbox">信任 Server 宣告的唯讀工具屬性</label>
+            <section class="mcp-runtime-status">
+              <div class="section-head"><strong>連線狀態</strong><span id="mcpConnectionState" class="tool-status">未連線</span></div>
+              <small id="mcpConnectionError" class="hint"></small>
+              <div id="mcpToolList" class="mcp-tool-list"></div>
+            </section>
+            <div class="provider-editor-actions">
+              <button id="deleteMCPSetting" class="danger ghost" type="button">刪除 MCP Server</button>
+              <div class="provider-editor-action-group">
+                <span id="mcpTestState" class="hint"></span>
+                <button id="testMCPSetting" class="ghost" type="button">測試連線</button>
+                <button id="saveMCPSetting" class="primary" type="submit">儲存 MCP Server</button>
+              </div>
+            </div>
+          </form>
+
+          <section id="noMCPSettings" class="management-section quiet provider-settings-empty">請選擇 MCP Server，或建立新的設定。</section>
+        </div>
+      </div>
+
+      <div id="reverseProxyPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="reverseProxyManagementTab">
+        <form id="reverseProxySettingsForm" class="management-section reverse-proxy-card">
+          <div class="section-head">
+            <div>
+              <h2>NetPass 反向代理</h2>
+              <p class="hint">透過受控的 NetPassClient，將後端 API 提供給外部網路存取。</p>
+            </div>
+            <span id="reverseProxyConnectionBadge" class="tool-status">未啟動</span>
+          </div>
+
+          <div class="provider-field-grid">
+            <label class="provider-field-full">NetPass Server
+              <input id="reverseProxyEndpoint" type="url" readonly>
+            </label>
+            <div class="provider-field-full provider-auth-fields">
+              <label>NetPass API Key
+                <input id="reverseProxyAPIKey" type="password" autocomplete="new-password" placeholder="輸入 NetPass API Key">
+                <small id="reverseProxyAPIKeyState">API Key 不會從後端讀回；留空會保留目前設定。</small>
+              </label>
+              <label id="reverseProxyClearKeyRow" class="check-label hidden"><input id="reverseProxyClearKey" type="checkbox">清除目前已儲存的 NetPass API Key</label>
+            </div>
+            <label>裝置名稱（選填）
+              <input id="reverseProxyName" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,62}[A-Za-z0-9]" autocomplete="off" placeholder="nr-intern">
+            </label>
+            <label>後端 API Port
+              <input id="reverseProxyTargetPort" readonly>
+            </label>
+          </div>
+
+          <section class="reverse-proxy-runtime">
+            <div class="section-head"><strong>執行狀態</strong><button id="refreshReverseProxy" class="small ghost" type="button">重新整理</button></div>
+            <dl class="summary-list reverse-proxy-summary">
+              <div><dt>NetPassClient Runtime</dt><dd id="reverseProxyRuntimeState">檢查中</dd></div>
+              <div><dt>連線</dt><dd id="reverseProxyConnectedState">未連線</dd></div>
+              <div><dt>PID</dt><dd id="reverseProxyPID">—</dd></div>
+              <div><dt>Client ID</dt><dd id="reverseProxyClientID">—</dd></div>
+            </dl>
+            <div id="reverseProxyPublicURLRow" class="reverse-proxy-public-url hidden">
+              <label>公開網址<input id="reverseProxyPublicURL" readonly></label>
+              <button id="copyReverseProxyURL" class="small ghost" type="button">複製</button>
+              <button id="openReverseProxyURL" class="small ghost" type="button">開啟</button>
+            </div>
+            <p id="reverseProxyError" class="error-text hidden"></p>
+          </section>
+
+          <label class="check-label reverse-proxy-policy">
+            <input id="reverseProxyAcceptPolicy" type="checkbox">
+            我了解這會把後端 API 暴露到公共網路，必須妥善保管公開網址與 NetPass 金鑰，並自行承擔服務使用風險。
+          </label>
+          <p class="hint">只會轉送後端 API，不會公開桌面控制 UI。NetPassClient 是獨立 Runtime，正式安裝包必須包含對應平台版本。</p>
+
+          <div class="reverse-proxy-actions">
+            <span id="reverseProxySettingsState" class="save-state"></span>
+            <button id="stopReverseProxy" class="danger ghost hidden" type="button">停止反向代理</button>
+            <button id="saveReverseProxy" class="ghost" type="submit">儲存設定</button>
+            <button id="startReverseProxy" class="primary" type="button">啟動反向代理</button>
+          </div>
+        </form>
+      </div>
+
       <div id="toolsPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="toolsManagementTab">
         <section class="management-section">
-          <div class="section-head"><h2>原生工具</h2><button id="refreshTools" class="small ghost">重新整理</button></div>
-          <p class="hint">可用性同時由後端 allowlist、elevated tools 設定與 Session 權限判斷。</p>
+          <div class="section-head"><h2>工具目錄</h2><button id="refreshTools" class="small ghost">重新整理</button></div>
+          <p class="hint">包含內建與 MCP 工具；可用性由後端設定、MCP 連線與 Session 權限共同判斷。</p>
           <div id="toolList" class="tool-list"></div>
         </section>
       </div>
@@ -287,6 +505,26 @@
       </div>
     </section>
 
+  </div>
+
+  <div id="projectContextMenu" class="context-menu hidden" role="menu" aria-label="專案操作">
+    <button id="openContextProjectDirectory" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5h6l2 2h9v8.25A1.75 1.75 0 0 1 18.75 19.5H5.25a1.75 1.75 0 0 1-1.75-1.75Z"/><path d="m14 14 2-2 2 2m-2-2v5"/></svg>
+      <span>開啟專案目錄</span>
+    </button>
+    <button id="manageContextProject" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V2.8h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+      <span>專案設定</span>
+    </button>
+    <button id="newContextProjectSession" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5.75h14v9.5H10l-4.5 3v-3H5Z"/><path d="M12 8v5m-2.5-2.5h5"/></svg>
+      <span>新增對話</span>
+    </button>
+    <div class="context-menu-separator" role="separator"></div>
+    <button id="deleteContextProject" class="danger" type="button" role="menuitem">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg>
+      <span>刪除專案</span>
+    </button>
   </div>
 
   <div id="sessionContextMenu" class="context-menu hidden" role="menu" aria-label="對話操作">

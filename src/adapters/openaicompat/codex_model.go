@@ -3,56 +3,30 @@ package openaicompat
 import (
 	"AgenticService/src/domain"
 	"AgenticService/src/ports"
+	"AgenticService/src/providerauth"
 	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
 )
 
-func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink ports.ModelEventSink) (domain.ModelResponse, error) {
-	if m == nil || m.client == nil {
-		return domain.ModelResponse{}, fmt.Errorf("OpenAI-compatible model is unavailable")
-	}
-	if m.authMode == "oauth" {
-		return m.streamCodex(ctx, request, sink)
-	}
+func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, sink ports.ModelEventSink) (domain.ModelResponse, error) {
 	modelName := strings.TrimSpace(request.Model)
 	if modelName == "" {
 		modelName = m.defaultModel
 	}
-	streaming := !m.disableStreaming
-	payload := chatRequest{
-		Model:           modelName,
-		Messages:        m.messages(request),
-		Tools:           functionTools(request.Tools),
-		Stream:          streaming,
-		ReasoningEffort: strings.TrimSpace(request.ThinkingMode),
-	}
-	toolChoice := strings.ToLower(strings.TrimSpace(request.ToolChoice))
-	if toolChoice != "" && toolChoice != "auto" && toolChoice != "required" && toolChoice != "none" {
-		return domain.ModelResponse{}, fmt.Errorf("invalid tool choice %q: expected auto, required, or none", request.ToolChoice)
-	}
-	if len(payload.Tools) == 0 && toolChoice != "" && toolChoice != "none" {
-		return domain.ModelResponse{}, fmt.Errorf("tool choice %q requires at least one tool definition", toolChoice)
-	}
-	if len(payload.Tools) > 0 && !m.omitToolChoice {
-		if toolChoice == "" {
-			toolChoice = "auto"
-		}
-		payload.ToolChoice = toolChoice
-	}
-	if streaming && m.streamIncludeUsage {
-		payload.StreamOptions = &streamOptions{IncludeUsage: true}
+	payload, err := buildCodexRequest(request, modelName)
+	if err != nil {
+		return domain.ModelResponse{}, err
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return domain.ModelResponse{}, fmt.Errorf("encode chat completion request: %w", err)
+		return domain.ModelResponse{}, fmt.Errorf("encode Codex Responses request: %w", err)
 	}
 
 	var lastErr error
@@ -70,7 +44,7 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 				return nil
 			}
 		}
-		result, retryAfter, attemptErr := m.executeAttempt(ctx, body, modelName, streaming, attemptSink)
+		result, retryAfter, attemptErr := m.executeCodexAttempt(ctx, body, modelName, request.SessionID, attemptSink)
 		if attemptErr == nil {
 			return result, nil
 		}
@@ -93,7 +67,7 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 		if retryAfter > 30*time.Second {
 			retryAfter = 30 * time.Second
 		}
-		m.logger.Warn("retrying provider request",
+		m.logger.Warn("retrying Codex provider request",
 			"attempt", attempt,
 			"max_attempts", m.maxAttempts,
 			"retry_after_ms", retryAfter.Milliseconds(),
@@ -112,16 +86,7 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 	return domain.ModelResponse{}, lastErr
 }
 
-func observableModelOutput(eventType string) bool {
-	switch eventType {
-	case domain.ModelEventTextDelta, domain.ModelEventThinkingDelta, domain.ModelEventToolCallDelta:
-		return true
-	default:
-		return false
-	}
-}
-
-func (m *Model) executeAttempt(ctx context.Context, body []byte, modelName string, streaming bool, sink ports.ModelEventSink) (domain.ModelResponse, time.Duration, error) {
+func (m *Model) executeCodexAttempt(ctx context.Context, body []byte, modelName, sessionID string, sink ports.ModelEventSink) (domain.ModelResponse, time.Duration, error) {
 	clientRequestID := domain.NewID("llmreq")
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, m.endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -131,9 +96,14 @@ func (m *Model) executeAttempt(ctx context.Context, body []byte, modelName strin
 		httpRequest.Header.Set(name, value)
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
-	httpRequest.Header.Set("Accept", "text/event-stream, application/json")
-	httpRequest.Header.Set("User-Agent", "AgenticService/openai-compatible")
+	httpRequest.Header.Set("Accept", "text/event-stream")
+	httpRequest.Header.Set("User-Agent", "NR-Intern/codex")
 	httpRequest.Header.Set("X-Client-Request-Id", clientRequestID)
+	httpRequest.Header.Set("OpenAI-Beta", "responses=experimental")
+	httpRequest.Header.Set("Originator", providerauth.DefaultOriginator)
+	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+		httpRequest.Header.Set("session_id", sessionID)
+	}
 	if err := m.applyAuthorization(ctx, httpRequest); err != nil {
 		return domain.ModelResponse{}, 0, &ProviderError{
 			Operation:       "authorization",
@@ -154,39 +124,12 @@ func (m *Model) executeAttempt(ctx context.Context, body []byte, modelName strin
 		}
 	}
 	defer response.Body.Close()
+	m.recordProviderUsage(response.Header)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		providerErr, retryAfter := providerHTTPError(response, clientRequestID)
 		return domain.ModelResponse{}, retryAfter, providerErr
 	}
 	requestID := strings.TrimSpace(response.Header.Get("X-Request-ID"))
-	reader := bufio.NewReader(response.Body)
-	contentType := strings.ToLower(response.Header.Get("Content-Type"))
-	if responseIsJSON(reader, contentType, streaming) {
-		result, err := decodeJSONResponse(reader, modelName, requestID, clientRequestID, sink)
-		return result, 0, err
-	}
-	result, err := decodeStream(reader, modelName, requestID, clientRequestID, sink)
+	result, err := decodeCodexStream(bufio.NewReader(response.Body), modelName, requestID, clientRequestID, sink)
 	return result, 0, err
-}
-
-func responseIsJSON(reader *bufio.Reader, contentType string, streaming bool) bool {
-	if !streaming {
-		return true
-	}
-	data, err := reader.Peek(64)
-	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, bufio.ErrBufferFull) {
-		return false
-	}
-	trimmed := bytes.TrimSpace(data)
-	if bytes.HasPrefix(trimmed, []byte("data:")) {
-		return false
-	}
-	if len(trimmed) > 0 && trimmed[0] == '{' {
-		text := string(trimmed)
-		if strings.Contains(text, `"delta"`) || strings.Contains(text, `chat.completion.chunk`) {
-			return false
-		}
-		return true
-	}
-	return strings.Contains(contentType, "application/json")
 }

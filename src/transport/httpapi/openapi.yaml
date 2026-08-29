@@ -73,7 +73,7 @@ paths:
   /api/v1/admin/provider-settings:
     get:
       summary: 取得可編輯的 Provider 設定
-      description: API Key 僅以 has_api_key 回報，永遠不傳回明文。
+      description: API Key 與 ChatGPT/Codex OAuth Token 僅以 has_api_key／has_oauth_token 回報，永遠不傳回明文。
       responses:
         "200":
           description: Provider 設定
@@ -85,6 +85,7 @@ paths:
       summary: 驗證、持久化並立即套用完整 Provider 集合
       description: >-
         openai_compatible.api_key 省略時保留既有值，空字串表示清除。
+        ChatGPT/Codex OAuth 使用內建公開 Client ID；Token 由獨立的權限限制檔案管理。
         仍被 Workspace 引用的 Provider 不可移除。
       requestBody:
         required: true
@@ -101,7 +102,7 @@ paths:
   /api/v1/admin/provider-settings/{provider_id}/models:
     get:
       summary: 更新指定 Provider 的可用模型列表
-      description: 呼叫 OpenAI-compatible 的 models 端點；不支援模型目錄時會回傳可讀取的錯誤，設定仍可手動輸入模型。
+      description: OpenAI-compatible 會呼叫 models 端點；OpenAI Codex Responses 不提供模型目錄並回傳空清單，UI 以「-」表示。
       parameters:
         - name: provider_id
           in: path
@@ -117,7 +118,7 @@ paths:
   /api/v1/admin/provider-settings/{provider_id}/test:
     post:
       summary: 測試指定 Provider 的實際模型請求
-      description: 使用已儲存設定執行最小 Chat Completions 請求，成功後一併嘗試更新模型列表。
+      description: 依 Provider 類型執行最小 Chat Completions 或 Codex Responses 請求，成功後一併嘗試更新模型列表。
       parameters:
         - name: provider_id
           in: path
@@ -130,9 +131,146 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ProviderTestResultEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/oauth/start:
+    post:
+      summary: 啟動 ChatGPT/Codex OAuth PKCE 驗證
+      description: 啟動僅監聽 loopback 的臨時 HTTP callback server，再開啟 ChatGPT 登入頁。此 API 不回傳任何 Token。
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OAuth 驗證已啟動
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderOAuthStartEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/oauth/status:
+    get:
+      summary: 取得脫敏的 ChatGPT/Codex OAuth 狀態
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OAuth 狀態，不包含 access token 或 refresh token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderOAuthStatusEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/oauth:
+    delete:
+      summary: 中斷 ChatGPT/Codex OAuth 並刪除該 Provider 的 Token
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: 已中斷 OAuth }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/mcp-settings:
+    get:
+      summary: 取得 MCP Client 設定與連線狀態
+      description: Environment 與 HTTP Headers 只回報是否已設定，不傳回明文。
+      responses:
+        "200":
+          description: MCP Server 設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPSettingsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    put:
+      summary: 驗證、持久化並立即套用完整 MCP Server 集合
+      description: API Key、Environment 與 Headers 省略時保留既有值；API Key 傳入空字串、其餘傳入空物件時清除。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateMCPSettingsInput" }
+      responses:
+        "200":
+          description: 已套用的脫敏 MCP 設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPSettingsEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/mcp-settings/{mcp_id}/test:
+    post:
+      summary: 重新連線 MCP Server 並刷新工具清單
+      parameters:
+        - name: mcp_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: MCP 連線測試結果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPTestResultEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/reverse-proxy:
+    get:
+      summary: 取得 NetPass 反向代理設定與執行狀態
+      description: 僅回傳脫敏狀態，不包含 NetPass API Key、Runtime 路徑或子程序輸出。
+      responses:
+        "200":
+          description: 反向代理狀態
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReverseProxyStatusEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    put:
+      summary: 儲存 NetPass 反向代理設定
+      description: API Key 留白時保留既有值；clear_api_key 為 true 時清除。執行中不可修改設定。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateReverseProxyInput" }
+      responses:
+        "200":
+          description: 已儲存的脫敏設定
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReverseProxyStatusEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/reverse-proxy/start:
+    post:
+      summary: 啟動 NetPass 反向代理
+      description: >-
+        只將後端 API Port 暴露到 NetPass，不公開桌面 UI。
+        呼叫前必須已設定 NetPass API Key，並明確接受使用政策。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/StartReverseProxyInput" }
+      responses:
+        "200":
+          description: NetPassClient 已啟動
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReverseProxyStatusEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/reverse-proxy/stop:
+    post:
+      summary: 停止 NetPass 反向代理
+      responses:
+        "200":
+          description: NetPassClient 已停止
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ReverseProxyStatusEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/tools:
     get:
-      summary: 查詢原生工具目錄與可用性
+      summary: 查詢內建與 MCP 工具目錄及可用性
       parameters:
         - name: session_id
           in: query
@@ -154,9 +292,44 @@ paths:
   /api/v1/providers:
     get:
       summary: 列出已註冊 Provider adapters
-      description: 目前工廠只實作 openai-compatible，但回應與 Router 可容納多種 protocol。
+      description: 回傳目前已啟用且可供 Workspace 與 Session 使用的 Provider。
       responses:
         "200": { $ref: "#/components/responses/JSONData" }
+  /api/v1/providers/{provider_id}/capabilities:
+    parameters:
+      - in: path
+        name: provider_id
+        required: true
+        schema: { type: string }
+      - in: query
+        name: model
+        schema: { type: string }
+    get:
+      summary: 取得指定 Provider 與模型的能力限制
+      description: 回傳實際套用的 context window、最大輸出、Streaming 與工具支援設定；0 代表未宣告。
+      responses:
+        "200":
+          description: 模型能力限制
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ModelCapabilitiesEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/providers/{provider_id}/usage:
+    parameters:
+      - in: path
+        name: provider_id
+        required: true
+        schema: { type: string }
+    get:
+      summary: 取得 Provider 最近一次配額快照
+      description: 僅回傳上游實際提供的 5 小時與 7 天視窗；available=false 代表沒有資料。
+      responses:
+        "200":
+          description: Provider 用量快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderUsageEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/workspaces:
     get:
       summary: 列出 Workspaces
@@ -303,6 +476,20 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SessionEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/agents/{agent_id}/sessions/order:
+    parameters:
+      - $ref: "#/components/parameters/AgentID"
+    put:
+      summary: 調整同一專案內的對話順序
+      description: 必須提交同一 Workspace、同一 Project 內全部未釘選 Session ID；此操作不會搬移 Session。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ReorderSessionsInput" }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
         default: { $ref: "#/components/responses/Problem" }
   /api/v1/sessions/{session_id}:
     parameters:
@@ -763,7 +950,7 @@ components:
         capabilities: { type: array, items: { type: string } }
     Session:
       type: object
-      required: [id, agent_id, workspace_id, title, created_at, updated_at]
+      required: [id, agent_id, workspace_id, title, position, created_at, updated_at]
       properties:
         id: { type: string }
         agent_id: { type: string }
@@ -776,6 +963,7 @@ components:
         permanent_tool_approval: { type: boolean, description: 目前 Session 是否已經由有效人工決策開啟永久工具核准；唯讀狀態，不能透過 Session PATCH 設定。 }
         pinned: { type: boolean }
         pinned_at: { type: string, format: date-time }
+        position: { type: integer, minimum: 0 }
         metadata: { type: object, additionalProperties: true }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -791,6 +979,17 @@ components:
         permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。留空時套用後端預設 profile。 }
         pinned: { type: boolean }
         metadata: { type: object, additionalProperties: true }
+    ReorderSessionsInput:
+      type: object
+      required: [workspace_id, session_ids]
+      properties:
+        workspace_id: { type: string, minLength: 1 }
+        project_id: { type: string, description: 空字串或省略表示未分類。 }
+        session_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items: { type: string, minLength: 1 }
     UpdateSessionInput:
       type: object
       minProperties: 1
@@ -803,6 +1002,7 @@ components:
         permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。 }
         memory_scope: { type: string, description: 空字串會恢復 Agent 預設 scope。 }
         pinned: { type: boolean }
+        position: { type: integer, minimum: 0 }
     Plan:
       type: object
       required: [id, session_id, title, status, position, created_by, steps, created_at, updated_at]
@@ -931,14 +1131,18 @@ components:
         position: { type: integer, minimum: 0 }
     ProviderDescriptor:
       type: object
-      required: [id, protocol, endpoint, default_model, streaming, has_api_key]
+      required: [id, display_name, protocol, endpoint, default_model, streaming, has_api_key, supports_native_tool_calls]
       properties:
         id: { type: string }
+        display_name: { type: string, minLength: 1, maxLength: 80 }
         protocol: { type: string }
         endpoint: { type: string, format: uri }
         default_model: { type: string }
         streaming: { type: boolean }
         has_api_key: { type: boolean }
+        supports_native_tool_calls:
+          type: boolean
+          description: Provider 是否能可靠使用協定原生的工具呼叫欄位。
     ServiceSettings:
       type: object
       required: [service_name, ui_language, max_wall_clock_seconds, max_tokens, max_tool_calls]
@@ -980,14 +1184,107 @@ components:
     UpdateProviderSettingsInput:
       allOf:
         - $ref: "#/components/schemas/ProviderSettings"
+    MCPSettings:
+      type: object
+      required: [servers]
+      properties:
+        servers:
+          type: array
+          items: { $ref: "#/components/schemas/MCPServerSetting" }
+    UpdateMCPSettingsInput:
+      allOf:
+        - $ref: "#/components/schemas/MCPSettings"
+    MCPServerSetting:
+      type: object
+      required: [id, enabled, transport, startup_timeout_seconds, call_timeout_seconds]
+      properties:
+        id: { type: string, pattern: "^[A-Za-z0-9_-]+$", maxLength: 80 }
+        display_name: { type: string, maxLength: 80 }
+        enabled: { type: boolean }
+        transport: { type: string, enum: [stdio, streamable-http] }
+        command: { type: string }
+        args: { type: array, items: { type: string } }
+        environment: { type: object, additionalProperties: { type: string }, writeOnly: true }
+        has_environment: { type: boolean, readOnly: true }
+        work_dir: { type: string }
+        url: { type: string, format: uri }
+        api_key: { type: string, writeOnly: true, description: Streamable HTTP Bearer Token；省略時保留，空字串清除。 }
+        has_api_key: { type: boolean, readOnly: true }
+        headers: { type: object, additionalProperties: { type: string }, writeOnly: true }
+        has_headers: { type: boolean, readOnly: true }
+        startup_timeout_seconds: { type: integer, minimum: 1, maximum: 300 }
+        call_timeout_seconds: { type: integer, minimum: 1, maximum: 86400 }
+        trust_annotations: { type: boolean }
+        status: { type: string, readOnly: true }
+        error: { type: string, readOnly: true }
+        tool_count: { type: integer, readOnly: true }
+        tools:
+          type: array
+          readOnly: true
+          items: { $ref: "#/components/schemas/MCPToolSetting" }
+        updated_at: { type: string, format: date-time, readOnly: true }
+    MCPToolSetting:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        display_name: { type: string }
+    MCPTestResult:
+      type: object
+      required: [id, ok, status, tool_count]
+      properties:
+        id: { type: string }
+        ok: { type: boolean }
+        status: { type: string }
+        tool_count: { type: integer }
+        tools: { type: array, items: { $ref: "#/components/schemas/MCPToolSetting" } }
+        error: { type: string }
+    ReverseProxyStatus:
+      type: object
+      required:
+        - runtime_checked
+        - available
+        - running
+        - connected
+        - endpoint
+        - api_key_set
+        - target_port
+      properties:
+        runtime_checked: { type: boolean }
+        available: { type: boolean, description: 目前平台的 NetPassClient Runtime 是否存在且可執行。 }
+        running: { type: boolean }
+        connected: { type: boolean }
+        endpoint: { type: string, format: uri }
+        api_key_set: { type: boolean }
+        name: { type: string }
+        target_port: { type: integer, minimum: 1, maximum: 65535, description: 受 Bearer Token 保護的後端 API Port。 }
+        pid: { type: integer }
+        client_id: { type: string }
+        public_url: { type: string, format: uri }
+        started_at: { type: string, format: date-time }
+        last_error: { type: string }
+    UpdateReverseProxyInput:
+      type: object
+      properties:
+        endpoint: { type: string, format: uri, default: "https://netpass.mars-cloud.com" }
+        api_key: { type: string, writeOnly: true, description: 留白時保留既有值。 }
+        clear_api_key: { type: boolean, default: false }
+        name: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{1,62}[A-Za-z0-9]$" }
+    StartReverseProxyInput:
+      type: object
+      required: [accept_usage_policy]
+      properties:
+        accept_usage_policy: { type: boolean, description: 必須為 true，表示已理解公共網路暴露風險。 }
     ProviderSetting:
       type: object
       required: [id, type, enabled]
       properties:
         id: { type: string, minLength: 1, maxLength: 80 }
-        type: { type: string, enum: [openai-compatible] }
+        display_name: { type: string, maxLength: 80, description: 顯示於清單與選擇器的名稱；空白時使用 Provider ID。 }
+        type: { type: string, enum: [openai-compatible, openai-codex-responses] }
         enabled: { type: boolean, description: 停用後保留設定，但不提供給 Workspace、Session 或新模型請求使用。 }
         openai_compatible: { $ref: "#/components/schemas/OpenAICompatibleProviderSetting" }
+        openai_codex_responses: { $ref: "#/components/schemas/OpenAICodexResponsesProviderSetting" }
     OpenAICompatibleProviderSetting:
       type: object
       required: [base_url, model, instruction_role, max_attempts]
@@ -1006,12 +1303,32 @@ components:
         response_header_timeout_seconds: { type: integer, minimum: 1 }
         context_window: { type: integer, minimum: 0 }
         max_output_tokens: { type: integer, minimum: 0 }
+    OpenAICodexResponsesProviderSetting:
+      type: object
+      required: [model, max_attempts]
+      properties:
+        has_oauth_token: { type: boolean, readOnly: true }
+        model: { type: string, minLength: 1, default: gpt-5.2-codex }
+        max_attempts: { type: integer, minimum: 1, maximum: 3 }
+        timeout_seconds: { type: integer, minimum: 1 }
+        connect_timeout_seconds: { type: integer, minimum: 1 }
+        response_header_timeout_seconds: { type: integer, minimum: 1 }
+        context_window: { type: integer, minimum: 0 }
+        max_output_tokens: { type: integer, minimum: 0 }
     Usage:
       type: object
       properties:
         input_tokens: { type: integer, minimum: 0 }
         output_tokens: { type: integer, minimum: 0 }
         total_tokens: { type: integer, minimum: 0 }
+    ModelCapabilities:
+      type: object
+      required: [supports_tools, streaming]
+      properties:
+        context_window: { type: integer, minimum: 0 }
+        max_output_tokens: { type: integer, minimum: 0 }
+        supports_tools: { type: boolean }
+        streaming: { type: boolean }
     ProviderModels:
       type: object
       required: [provider_id, models]
@@ -1021,6 +1338,22 @@ components:
           type: array
           uniqueItems: true
           items: { type: string }
+    ProviderUsageWindow:
+      type: object
+      required: [available, remaining_percent]
+      properties:
+        available: { type: boolean }
+        remaining_percent: { type: number, minimum: 0, maximum: 100 }
+        window_minutes: { type: integer, minimum: 1 }
+        reset_at: { type: string, format: date-time }
+    ProviderUsage:
+      type: object
+      required: [provider_id, five_hour, seven_day]
+      properties:
+        provider_id: { type: string }
+        updated_at: { type: string, format: date-time }
+        five_hour: { $ref: "#/components/schemas/ProviderUsageWindow" }
+        seven_day: { $ref: "#/components/schemas/ProviderUsageWindow" }
     ProviderTestResult:
       type: object
       required: [ok, tool_calling, provider_id, model, duration_milliseconds, usage]
@@ -1038,6 +1371,26 @@ components:
           uniqueItems: true
           items: { type: string }
         warning: { type: string }
+    ProviderOAuthStartResult:
+      type: object
+      required: [provider_id, status, authorization_url, callback_uri, browser_opened, expires_at]
+      properties:
+        provider_id: { type: string }
+        status: { type: string, enum: [pending] }
+        authorization_url: { type: string, format: uri }
+        callback_uri: { type: string, format: uri }
+        browser_opened: { type: boolean }
+        expires_at: { type: string, format: date-time }
+    ProviderOAuthStatus:
+      type: object
+      required: [provider_id, status]
+      properties:
+        provider_id: { type: string }
+        status: { type: string, enum: [idle, pending, connected, failed] }
+        message: { type: string }
+        account_email: { type: string }
+        account_name: { type: string }
+        expires_at: { type: string, format: date-time }
     RunInput:
       type: object
       required: [input]
@@ -1258,13 +1611,48 @@ components:
       required: [data]
       properties:
         data: { $ref: "#/components/schemas/ProviderSettings" }
+    MCPSettingsEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/MCPSettings" }
+    MCPTestResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/MCPTestResult" }
+    ReverseProxyStatusEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ReverseProxyStatus" }
     ProviderModelsEnvelope:
       type: object
       required: [data]
       properties:
         data: { $ref: "#/components/schemas/ProviderModels" }
+    ModelCapabilitiesEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ModelCapabilities" }
+    ProviderUsageEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderUsage" }
     ProviderTestResultEnvelope:
       type: object
       required: [data]
       properties:
         data: { $ref: "#/components/schemas/ProviderTestResult" }
+    ProviderOAuthStartEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderOAuthStartResult" }
+    ProviderOAuthStatusEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderOAuthStatus" }

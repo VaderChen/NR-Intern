@@ -46,7 +46,7 @@
   "max_tool_output_bytes": 524288,
   "max_file_input_bytes": 8388608,
   "context": {
-    "max_estimated_tokens": 524288,
+    "max_estimated_tokens": 262144,
     "reserved_output_tokens": 4096,
     "retain_messages": 16,
     "max_tool_result_characters": 24000,

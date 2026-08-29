@@ -76,7 +76,7 @@ func (a *Agent) DeleteSession(ctx context.Context, sessionID string) error {
 }
 
 func (a *Agent) UpdateSession(ctx context.Context, sessionID string, input domain.UpdateSessionInput) (domain.Session, error) {
-	if input.Title == nil && input.WorkspaceID == nil && input.ProjectID == nil && input.ProviderID == nil && input.Model == nil && input.PermissionProfile == nil && input.MemoryScope == nil && input.Pinned == nil {
+	if input.Title == nil && input.WorkspaceID == nil && input.ProjectID == nil && input.ProviderID == nil && input.Model == nil && input.PermissionProfile == nil && input.MemoryScope == nil && input.Pinned == nil && input.Position == nil {
 		return domain.Session{}, fmt.Errorf("%w: at least one session field is required", domain.ErrInvalidInput)
 	}
 	session, err := a.GetSession(ctx, sessionID)
@@ -127,6 +127,12 @@ func (a *Agent) UpdateSession(ctx context.Context, sessionID string, input domai
 		} else {
 			session.PinnedAt = nil
 		}
+	}
+	if input.Position != nil {
+		if *input.Position < 0 {
+			return domain.Session{}, fmt.Errorf("%w: session position cannot be negative", domain.ErrInvalidInput)
+		}
+		session.Position = *input.Position
 	}
 	if err := a.sessions.Update(ctx, session); err != nil {
 		return domain.Session{}, err

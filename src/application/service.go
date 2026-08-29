@@ -172,6 +172,71 @@ func (s *Service) ListSessions(ctx context.Context, agentID string) ([]domain.Se
 	return engine.ListSessions(ctx)
 }
 
+// ReorderSessions 只接受同一 Workspace、同一 Project 內完整且不重複的未釘選
+// Session ID。ProjectID 是空字串時代表未分類；排序不具備搬移語意。
+func (s *Service) ReorderSessions(ctx context.Context, agentID string, input domain.ReorderSessionsInput) ([]domain.Session, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	agentID = strings.TrimSpace(agentID)
+	engine, err := s.registry.Get(agentID)
+	if err != nil {
+		return nil, err
+	}
+	input.WorkspaceID = strings.TrimSpace(input.WorkspaceID)
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	if err := s.validateSessionPlacement(ctx, input.WorkspaceID, input.ProjectID); err != nil {
+		return nil, err
+	}
+	values, err := engine.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make(map[string]domain.Session)
+	for _, session := range values {
+		if session.WorkspaceID == input.WorkspaceID && session.ProjectID == input.ProjectID && !session.Pinned {
+			candidates[session.ID] = session
+		}
+	}
+	if len(input.SessionIDs) == 0 || len(input.SessionIDs) != len(candidates) {
+		return nil, fmt.Errorf("%w: session order must contain every unpinned session in the same project", domain.ErrInvalidInput)
+	}
+	seen := make(map[string]struct{}, len(input.SessionIDs))
+	for _, rawID := range input.SessionIDs {
+		sessionID := strings.TrimSpace(rawID)
+		if sessionID == "" {
+			return nil, fmt.Errorf("%w: session id cannot be empty", domain.ErrInvalidInput)
+		}
+		if _, duplicate := seen[sessionID]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate session id %q", domain.ErrConflict, sessionID)
+		}
+		if _, exists := candidates[sessionID]; !exists {
+			return nil, fmt.Errorf("%w: session %q does not belong to the requested project", domain.ErrInvalidInput, sessionID)
+		}
+		seen[sessionID] = struct{}{}
+	}
+
+	updated := make([]domain.Session, 0, len(input.SessionIDs))
+	changed := make([]domain.Session, 0, len(input.SessionIDs))
+	for position, sessionID := range input.SessionIDs {
+		current := candidates[sessionID]
+		if current.Position == position {
+			updated = append(updated, current)
+			continue
+		}
+		value, updateErr := engine.UpdateSession(ctx, sessionID, domain.UpdateSessionInput{Position: &position})
+		if updateErr != nil {
+			for _, previous := range changed {
+				originalPosition := previous.Position
+				_, _ = engine.UpdateSession(context.WithoutCancel(ctx), previous.ID, domain.UpdateSessionInput{Position: &originalPosition})
+			}
+			return nil, updateErr
+		}
+		changed = append(changed, current)
+		updated = append(updated, value)
+	}
+	return updated, nil
+}
+
 func (s *Service) GetSession(ctx context.Context, sessionID string) (domain.Session, error) {
 	_, session, err := s.resolveSession(ctx, sessionID)
 	return session, err
@@ -371,6 +436,16 @@ func (s *Service) DeleteWorkspace(ctx context.Context, workspaceID string) error
 
 func (s *Service) ListProviders() []domain.ProviderDescriptor {
 	return s.providers.ListProviders()
+}
+
+// ProviderCapabilities 回傳指定 Provider／Model 實際套用的 context 與輸出限制。
+// 個別模型覆寫由 ProviderCatalog 統一解析，前端不必複製模型名稱比對規則。
+func (s *Service) ProviderCapabilities(providerID, model string) (domain.ModelCapabilities, error) {
+	providerID = strings.TrimSpace(providerID)
+	if err := s.validateProvider(providerID); err != nil {
+		return domain.ModelCapabilities{}, err
+	}
+	return s.providers.Capabilities(providerID, strings.TrimSpace(model)), nil
 }
 
 func (s *Service) validateSessionPlacement(ctx context.Context, workspaceID, projectID string) error {

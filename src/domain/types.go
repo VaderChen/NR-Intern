@@ -26,6 +26,7 @@ type Session struct {
 	PermanentToolApproval bool           `json:"permanent_tool_approval,omitempty"`
 	Pinned                bool           `json:"pinned,omitempty"`
 	PinnedAt              *time.Time     `json:"pinned_at,omitempty"`
+	Position              int            `json:"position"`
 	Metadata              map[string]any `json:"metadata,omitempty"`
 	CreatedAt             time.Time      `json:"created_at"`
 	UpdatedAt             time.Time      `json:"updated_at"`
@@ -83,6 +84,13 @@ type UpdateSessionInput struct {
 	PermissionProfile *string `json:"permission_profile,omitempty"`
 	MemoryScope       *string `json:"memory_scope,omitempty"`
 	Pinned            *bool   `json:"pinned,omitempty"`
+	Position          *int    `json:"position,omitempty"`
+}
+
+type ReorderSessionsInput struct {
+	WorkspaceID string   `json:"workspace_id"`
+	ProjectID   string   `json:"project_id,omitempty"`
+	SessionIDs  []string `json:"session_ids"`
 }
 
 type Project struct {
@@ -141,11 +149,15 @@ type UpdateWorkspaceInput struct {
 
 type ProviderDescriptor struct {
 	ID           string `json:"id"`
+	DisplayName  string `json:"display_name"`
 	Protocol     string `json:"protocol"`
 	Endpoint     string `json:"endpoint"`
 	DefaultModel string `json:"default_model"`
 	Streaming    bool   `json:"streaming"`
 	HasAPIKey    bool   `json:"has_api_key"`
+	// SupportsNativeToolCalls 表示 Provider 能可靠地以協定原生欄位回傳工具呼叫。
+	// Harness 會優先採用原生模式；未宣告時仍可使用 instruction 相容模式。
+	SupportsNativeToolCalls bool `json:"supports_native_tool_calls"`
 	// ContextWindow 與 MaxOutputTokens 是該 Provider 預設模型的宣告限制；0 代表未宣告。
 	ContextWindow   int `json:"context_window,omitempty"`
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`

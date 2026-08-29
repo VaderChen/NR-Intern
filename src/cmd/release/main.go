@@ -166,6 +166,13 @@ func build(rawVersion, output, rawTargets string, windowsMSI msiMode, assetPaths
 					name, value.os, value.arch)
 			}
 		}
+		netPassPackaged, err := stageNetPassClient(platformDirectory, value)
+		if err != nil {
+			return err
+		}
+		if !netPassPackaged {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: %s 尚無對應的 NetPassClient Runtime，反向代理頁面會顯示 Runtime 不可用\n", value.directoryName())
+		}
 		switch value.os {
 		case "darwin":
 			if err := buildMacApplication(platformDirectory, version, value, assets); err != nil {
@@ -238,6 +245,47 @@ func buildProgram(packagePath, output, version string, value target) error {
 	return nil
 }
 
+func stageNetPassClient(platformDirectory string, value target) (bool, error) {
+	sourceName := map[string]string{
+		"darwin/arm64":  "NetPassClient_darwin_arm64",
+		"linux/amd64":   "NetPassClient_linux_x64",
+		"linux/arm64":   "NetPassClient_linux_arm64",
+		"windows/amd64": "NetPassClient_windows_x64.exe",
+	}[value.os+"/"+value.arch]
+	if sourceName == "" {
+		return false, nil
+	}
+	sourceRoot := strings.TrimSpace(os.Getenv("NR_INTERN_NETPASS_SOURCE"))
+	if sourceRoot == "" {
+		workingDirectory, err := os.Getwd()
+		if err != nil {
+			return false, fmt.Errorf("解析 NetPassClient 預設來源目錄: %w", err)
+		}
+		sourceRoot = filepath.Join(workingDirectory, "..", "NetPassService", "Client", "bin")
+	}
+	sourceRoot, err := filepath.Abs(sourceRoot)
+	if err != nil {
+		return false, fmt.Errorf("解析 NetPassClient 來源目錄: %w", err)
+	}
+	source := filepath.Join(sourceRoot, sourceName)
+	if info, err := os.Stat(source); err != nil || !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%s 缺少 NetPassClient Runtime；請設定 NR_INTERN_NETPASS_SOURCE 指向外部預編譯檔目錄", value.directoryName())
+	}
+	destinationDirectory := filepath.Join(platformDirectory, "netpass-client")
+	if err := os.MkdirAll(destinationDirectory, 0o750); err != nil {
+		return false, fmt.Errorf("建立 %s NetPassClient 目錄: %w", value.directoryName(), err)
+	}
+	destinationName := "NetPassClient"
+	if value.os == "windows" {
+		destinationName += ".exe"
+	}
+	if err := copyFile(source, filepath.Join(destinationDirectory, destinationName), 0o755); err != nil {
+		return false, fmt.Errorf("封裝 %s NetPassClient: %w", value.directoryName(), err)
+	}
+	_, _ = fmt.Fprintf(os.Stdout, "packaged %s NetPassClient runtime\n", value.directoryName())
+	return true, nil
+}
+
 func buildLinkerFlags(packagePath, version string, value target) string {
 	flags := fmt.Sprintf("-s -w -X 'AgenticService/src/bootstrap.Version=%s'", version)
 	// Windows 桌面程式使用 GUI subsystem，避免從捷徑或 MSI 啟動時額外顯示
@@ -269,6 +317,18 @@ func buildMacApplication(platformDirectory string, version releaseVersion, value
 	}
 	if err := copyFile(assets.macIcon, filepath.Join(resourcesDirectory, "AppIcon.icns"), 0o644); err != nil {
 		return fmt.Errorf("封裝 macOS App 圖示: %w", err)
+	}
+	netPassSource := filepath.Join(platformDirectory, "netpass-client", "NetPassClient")
+	if _, err := os.Stat(netPassSource); err == nil {
+		netPassDirectory := filepath.Join(resourcesDirectory, "netpass-client")
+		if err := os.MkdirAll(netPassDirectory, 0o750); err != nil {
+			return fmt.Errorf("建立 macOS NetPassClient 資源目錄: %w", err)
+		}
+		if err := copyFile(netPassSource, filepath.Join(netPassDirectory, "NetPassClient"), 0o755); err != nil {
+			return fmt.Errorf("封裝 macOS NetPassClient: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("檢查 macOS NetPassClient: %w", err)
 	}
 	plist := macInfoPlist(version)
 	if err := os.WriteFile(filepath.Join(contentsDirectory, "Info.plist"), []byte(plist), 0o644); err != nil {
@@ -407,6 +467,7 @@ func windowsInstallerTool() (kind, path string) {
 
 func windowsInstallerSource(platformDirectory string, version releaseVersion, value target, iconPath string) string {
 	escape := html.EscapeString
+	netPassDirectory, netPassFeature := windowsNetPassInstallerFragments(platformDirectory, true)
 	upgradeCode := "8BFA111E-7AF2-45CE-A85E-270118822277"
 	if value.arch == "arm64" {
 		upgradeCode = "7F20A37E-76B5-48B4-BD68-F485EC6925B4"
@@ -428,11 +489,13 @@ func windowsInstallerSource(platformDirectory string, version releaseVersion, va
         <Component Id="ServerExecutableComponent" Guid="*" Bitness="always64">
           <File Id="ServerExecutable" Source="%s" KeyPath="yes" />
         </Component>
+%s
       </Directory>
     </StandardDirectory>
     <Feature Id="ProductFeature" Title="NR-Intern" Level="1">
       <ComponentRef Id="DesktopExecutableComponent" />
       <ComponentRef Id="ServerExecutableComponent" />
+%s
     </Feature>
   </Package>
 </Wix>
@@ -444,11 +507,14 @@ func windowsInstallerSource(platformDirectory string, version releaseVersion, va
 		escape(iconPath),
 		escape(filepath.Join(platformDirectory, "nr-intern-desktop.exe")),
 		escape(filepath.Join(platformDirectory, "nr-intern-server.exe")),
+		netPassDirectory,
+		netPassFeature,
 	)
 }
 
 func windowsInstallerSourceWiX3(platformDirectory string, version releaseVersion, value target, iconPath string) string {
 	escape := html.EscapeString
+	netPassDirectory, netPassFeature := windowsNetPassInstallerFragments(platformDirectory, false)
 	upgradeCode := "{8BFA111E-7AF2-45CE-A85E-270118822277}"
 	if value.arch == "arm64" {
 		upgradeCode = "{7F20A37E-76B5-48B4-BD68-F485EC6925B4}"
@@ -471,12 +537,14 @@ func windowsInstallerSourceWiX3(platformDirectory string, version releaseVersion
           <Component Id="ServerExecutableComponent" Guid="*" Win64="yes">
             <File Id="ServerExecutable" Source="%s" KeyPath="yes" />
           </Component>
+%s
         </Directory>
       </Directory>
     </Directory>
     <Feature Id="ProductFeature" Title="NR-Intern" Level="1">
       <ComponentRef Id="DesktopExecutableComponent" />
       <ComponentRef Id="ServerExecutableComponent" />
+%s
     </Feature>
   </Product>
 </Wix>
@@ -488,7 +556,32 @@ func windowsInstallerSourceWiX3(platformDirectory string, version releaseVersion
 		escape(iconPath),
 		escape(filepath.Join(platformDirectory, "nr-intern-desktop.exe")),
 		escape(filepath.Join(platformDirectory, "nr-intern-server.exe")),
+		netPassDirectory,
+		netPassFeature,
 	)
+}
+
+func windowsNetPassInstallerFragments(platformDirectory string, wix4 bool) (directory, feature string) {
+	path := filepath.Join(platformDirectory, "netpass-client", "NetPassClient.exe")
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", ""
+	}
+	escapedPath := html.EscapeString(path)
+	if wix4 {
+		directory = fmt.Sprintf(`        <Directory Id="NetPassClientDirectory" Name="netpass-client">
+          <Component Id="NetPassClientComponent" Guid="*" Bitness="always64">
+            <File Id="NetPassClientExecutable" Source="%s" KeyPath="yes" />
+          </Component>
+        </Directory>`, escapedPath)
+	} else {
+		directory = fmt.Sprintf(`          <Directory Id="NetPassClientDirectory" Name="netpass-client">
+            <Component Id="NetPassClientComponent" Guid="*" Win64="yes">
+              <File Id="NetPassClientExecutable" Source="%s" KeyPath="yes" />
+            </Component>
+          </Directory>`, escapedPath)
+	}
+	return directory, `      <ComponentRef Id="NetPassClientComponent" />`
 }
 
 func buildEnvironment(value target) []string {

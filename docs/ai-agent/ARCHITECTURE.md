@@ -266,7 +266,7 @@ Workspace、Session 與 Run 三層都能覆寫 model，而不同模型的 contex
 budget = context_window − max(context.reserved_output_tokens, model 的 max_output_tokens)
 ```
 
-`context_window` 未宣告（0）時退回 `context.max_estimated_tokens`，預設為 524,288（512K budget）。相容端點無法可靠探測，
+`context_window` 未宣告（0）時退回 `context.max_estimated_tokens`，預設為 262,144（256K budget）。相容端點無法可靠探測，
 用模型名稱字串比對又太脆弱，因此限制由設定提供：Provider 層級的 `context_window` /
 `max_output_tokens`，以及覆寫個別模型的 `model_limits`。
 

@@ -71,7 +71,7 @@ func TestBuildProviderValuesExcludesDisabledProviders(t *testing.T) {
 	disabled := config.Providers[config.DefaultProviderID]
 	disabled.Enabled = boolPointer(false)
 	config.Providers["disabled-provider"] = disabled
-	values, err := buildProviderValues(config, slog.Default())
+	values, err := buildProviderValues(config, slog.Default(), nil)
 	if err != nil {
 		t.Fatalf("buildProviderValues: %v", err)
 	}

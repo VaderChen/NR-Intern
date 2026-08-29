@@ -23,6 +23,28 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT INT TERM
 
+reset_dist_output() {
+	local expected_dist="$PROJECT_ROOT/dist"
+	local output_path
+	if [[ -z "$DIST_OUTPUT_DIR" || "$DIST_OUTPUT_DIR" != "$expected_dist" || "$DIST_OUTPUT_DIR" == "$PROJECT_ROOT" || "$DIST_OUTPUT_DIR" == "/" ]]; then
+		print -u2 "錯誤：拒絕清理非預期的 dist 目錄：$DIST_OUTPUT_DIR"
+		exit 1
+	fi
+	if [[ -L "$DIST_OUTPUT_DIR" ]]; then
+		print -u2 "錯誤：dist 不可為符號連結：$DIST_OUTPUT_DIR"
+		exit 1
+	fi
+	if [[ -e "$DIST_OUTPUT_DIR" && ! -d "$DIST_OUTPUT_DIR" ]]; then
+		print -u2 "錯誤：dist 路徑存在但不是目錄：$DIST_OUTPUT_DIR"
+		exit 1
+	fi
+	mkdir -p "$DIST_OUTPUT_DIR"
+	for output_path in "$DIST_OUTPUT_DIR"/*(DN); do
+		/bin/rm -rf -- "$output_path"
+	done
+	print "已清空發行輸出目錄：$DIST_OUTPUT_DIR"
+}
+
 if ! command -v go >/dev/null 2>&1; then
 	print -u2 "錯誤：找不到 Go，請先安裝 Go 並確認 go 指令位於 PATH。"
 	exit 1
@@ -37,6 +59,7 @@ if [[ -z "$RELEASE_VERSION" ]]; then
 	RELEASE_VERSION="$(TZ=Asia/Taipei date '+1.%y.%m%d build %H%M')"
 fi
 
+reset_dist_output
 BUILD_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/nr-intern-build.XXXXXX")"
 typeset -a built_files
 built_files=()

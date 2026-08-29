@@ -59,6 +59,49 @@ func TestInstructionTextStreamKeepsToolJSONPrivate(t *testing.T) {
 	}
 }
 
+func TestInstructionTextStreamSuppressesToolJSONAfterProviderPreface(t *testing.T) {
+	stream := &instructionTextStream{}
+	emitted := []string{}
+	emit := func(delta string) error {
+		emitted = append(emitted, delta)
+		return nil
+	}
+	for _, delta := range []string{
+		"我會先更新檔案，再驗證結果。",
+		`{"ty`,
+		`pe":"tool_use","tool":"shell_exec",`,
+		`"input":{"command":"printf ok"}}`,
+	} {
+		if err := stream.Push(delta, emit); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	visible := strings.Join(emitted, "")
+	if visible != "我會先更新檔案，再驗證結果。" || strings.Contains(visible, "tool_use") {
+		t.Fatalf("embedded tool instruction leaked as answer: %q", visible)
+	}
+}
+
+func TestInstructionTextStreamReleasesOrdinaryJSON(t *testing.T) {
+	stream := &instructionTextStream{}
+	emitted := []string{}
+	emit := func(delta string) error {
+		emitted = append(emitted, delta)
+		return nil
+	}
+	for _, delta := range []string{`結果：{`, `"status":"ok"}`} {
+		if err := stream.Push(delta, emit); err != nil {
+			t.Fatalf("Push: %v", err)
+		}
+	}
+	if err := stream.Finish(`結果：{"status":"ok"}`, emit); err != nil {
+		t.Fatalf("Finish: %v", err)
+	}
+	if visible := strings.Join(emitted, ""); visible != `結果：{"status":"ok"}` {
+		t.Fatalf("ordinary JSON was not streamed intact: %q", visible)
+	}
+}
+
 func TestRunInstructionModeEmitsProviderTextDeltas(t *testing.T) {
 	session := testSession()
 	sessions := newMemorySessions(session)

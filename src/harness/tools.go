@@ -114,7 +114,7 @@ func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback 
 	result := make([]domain.ToolDefinition, 0, 4)
 	for _, definition := range definitions {
 		name := strings.ToLower(strings.TrimSpace(definition.Name))
-		if name == systemShellToolName || strings.HasPrefix(name, "plan_") {
+		if name == systemShellToolName || strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__") {
 			result = append(result, definition)
 		}
 	}

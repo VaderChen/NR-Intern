@@ -8,9 +8,12 @@ import (
 	"AgenticService/src/approval"
 	"AgenticService/src/domain"
 	"AgenticService/src/harness"
+	"AgenticService/src/mcpclient"
 	"AgenticService/src/memory"
 	"AgenticService/src/modelrouter"
+	"AgenticService/src/netpass"
 	"AgenticService/src/ports"
+	"AgenticService/src/providerauth"
 	"AgenticService/src/tokens"
 	"AgenticService/src/tools"
 	nativedocuments "AgenticService/src/tools/native/documents"
@@ -23,9 +26,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,20 +39,27 @@ import (
 )
 
 type Runtime struct {
-	Config      Config
-	Application *application.Service
-	HTTPHandler http.Handler
-	NativeTools *tools.Registry
-	StartedAt   time.Time
-	InstanceID  string
-	Model       *modelrouter.Router
-	Memory      ports.MemoryRepository
-	Events      ports.RunEventRepository
-	Plans       ports.PlanRepository
-	Agent       *harnessagent.Agent
+	Config       Config
+	Application  *application.Service
+	HTTPHandler  http.Handler
+	NativeTools  *tools.Registry
+	Tools        *tools.Runtime
+	MCP          *mcpclient.Manager
+	ReverseProxy *netpass.Manager
+	StartedAt    time.Time
+	InstanceID   string
+	Model        *modelrouter.Router
+	Memory       ports.MemoryRepository
+	Events       ports.RunEventRepository
+	Plans        ports.PlanRepository
+	Agent        *harnessagent.Agent
+	ProviderAuth *providerauth.Manager
 
-	configMu sync.RWMutex
-	logger   *slog.Logger
+	configMu               sync.RWMutex
+	providerUsageContext   context.Context
+	providerUsageCancel    context.CancelFunc
+	providerUsageRefreshMu sync.Mutex
+	logger                 *slog.Logger
 }
 
 type RunCounts struct {
@@ -78,6 +91,7 @@ type RedactedConfig struct {
 	DefaultProviderID   string                      `json:"default_provider_id"`
 	Providers           []domain.ProviderDescriptor `json:"providers"`
 	SSHProfiles         []string                    `json:"ssh_profiles,omitempty"`
+	MCPServers          []string                    `json:"mcp_servers,omitempty"`
 }
 
 type ManagementDiagnostics struct {
@@ -98,6 +112,19 @@ func Build(config Config) (*Runtime, error) {
 	logger := slog.Default().With("service", config.ServiceName)
 	if err := os.MkdirAll(config.DataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
+	}
+	_, backendPortText, err := net.SplitHostPort(config.ListenAddress)
+	if err != nil {
+		return nil, fmt.Errorf("parse backend listen address for NetPass: %w", err)
+	}
+	backendPort, err := strconv.Atoi(backendPortText)
+	if err != nil || backendPort < 1 || backendPort > 65535 {
+		return nil, fmt.Errorf("invalid backend port for NetPass: %q", backendPortText)
+	}
+	reverseProxy := netpass.NewManager(filepath.Join(config.DataDir, "netpass.json"), backendPort)
+	providerAuth, err := providerauth.New(filepath.Join(config.DataDir, "provider-oauth-tokens.json"), logger.With("component", "provider-oauth"))
+	if err != nil {
+		return nil, err
 	}
 	sessions, err := filestore.NewSessionRepository(config.DataDir)
 	if err != nil {
@@ -127,7 +154,7 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	providerValues, err := buildProviderValues(config, logger)
+	providerValues, err := buildProviderValues(config, logger, providerAuth)
 	if err != nil {
 		return nil, err
 	}
@@ -202,16 +229,27 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	mcpConfigs := make([]mcpclient.ServerConfig, 0, len(config.MCPServers))
+	for _, mcpConfig := range config.MCPServers {
+		mcpConfigs = append(mcpConfigs, mcpConfig)
+	}
+	sort.Slice(mcpConfigs, func(i, j int) bool { return mcpConfigs[i].ID < mcpConfigs[j].ID })
+	mcpManager, err := mcpclient.New(mcpConfigs, "nr-intern", Version, config.MaxToolOutputBytes, logger.With("component", "mcp-client"))
+	if err != nil {
+		return nil, err
+	}
+	toolRuntime := &tools.Runtime{Native: nativeTools, MCP: mcpManager}
 	approvalToolNames := []string{}
 	for _, nativeTool := range nativeToolValues {
 		if definition := nativeTool.Definition(); definition.RequiresPermission {
 			approvalToolNames = append(approvalToolNames, definition.Name)
 		}
 	}
+	approvalToolNames = append(approvalToolNames, "mcp__*")
 	approvalCoordinator := approval.NewCoordinator(approvalToolNames)
 	runner := &harness.Runner{
 		Model:        model,
-		Tools:        nativeTools,
+		Tools:        toolRuntime,
 		Sessions:     sessions,
 		Plans:        plans,
 		ToolCallMode: harness.NormalizeToolCallMode(config.ToolCallMode),
@@ -245,6 +283,7 @@ func Build(config Config) (*Runtime, error) {
 			"long-term-memory",
 			"native-tools",
 			"native-file-editing",
+			"mcp-client",
 			"cancellation",
 		},
 	}, sessions, runner)
@@ -273,38 +312,66 @@ func Build(config Config) (*Runtime, error) {
 		return nil, err
 	}
 	runtime := &Runtime{
-		Config:      config,
-		Application: service,
-		NativeTools: nativeTools,
-		StartedAt:   time.Now().UTC(),
-		InstanceID:  domain.NewID("instance"),
-		Model:       model,
-		Memory:      memoryRepository,
-		Events:      events,
-		Plans:       plans,
-		Agent:       agent,
-		logger:      logger,
+		Config:       config,
+		Application:  service,
+		NativeTools:  nativeTools,
+		Tools:        toolRuntime,
+		MCP:          mcpManager,
+		ReverseProxy: reverseProxy,
+		StartedAt:    time.Now().UTC(),
+		InstanceID:   domain.NewID("instance"),
+		Model:        model,
+		Memory:       memoryRepository,
+		Events:       events,
+		Plans:        plans,
+		Agent:        agent,
+		ProviderAuth: providerAuth,
+		logger:       logger,
 	}
 	handler, err := httpapi.New(service, httpapi.Config{
-		APIToken:               config.APIToken,
-		AllowedOrigins:         config.AllowedOrigins,
-		Attachments:            attachments,
-		MaxAttachmentBytes:     int64(config.MaxFileInputBytes),
-		Status:                 runtime.Status,
-		ToolCatalog:            runtime.ToolCatalog,
-		Diagnostics:            runtime.Diagnostics,
-		ServiceSettings:        runtime.ServiceSettings,
-		UpdateServiceSettings:  runtime.UpdateServiceSettings,
-		ProviderSettings:       runtime.ProviderSettings,
-		UpdateProviderSettings: runtime.UpdateProviderSettings,
-		ProviderModels:         runtime.ProviderModels,
-		TestProvider:           runtime.TestProvider,
+		APIToken:                config.APIToken,
+		AllowedOrigins:          config.AllowedOrigins,
+		Attachments:             attachments,
+		MaxAttachmentBytes:      int64(config.MaxFileInputBytes),
+		Status:                  runtime.Status,
+		ToolCatalog:             runtime.ToolCatalog,
+		Diagnostics:             runtime.Diagnostics,
+		ServiceSettings:         runtime.ServiceSettings,
+		UpdateServiceSettings:   runtime.UpdateServiceSettings,
+		ProviderSettings:        runtime.ProviderSettings,
+		UpdateProviderSettings:  runtime.UpdateProviderSettings,
+		MCPSettings:             runtime.MCPSettings,
+		UpdateMCPSettings:       runtime.UpdateMCPSettings,
+		TestMCP:                 runtime.TestMCP,
+		ReverseProxyStatus:      runtime.ReverseProxyStatus,
+		UpdateReverseProxy:      runtime.UpdateReverseProxy,
+		StartReverseProxy:       runtime.StartReverseProxy,
+		StopReverseProxy:        runtime.StopReverseProxy,
+		ProviderModels:          runtime.ProviderModels,
+		ProviderUsage:           runtime.ProviderUsage,
+		TestProvider:            runtime.TestProvider,
+		StartProviderOAuth:      runtime.StartProviderOAuth,
+		ProviderOAuthStatus:     runtime.ProviderOAuthStatus,
+		DisconnectProviderOAuth: runtime.DisconnectProviderOAuth,
 	})
 	if err != nil {
 		return nil, err
 	}
 	runtime.HTTPHandler = handler
+	runtime.startProviderUsageRefresher()
+	mcpManager.Warm(context.Background())
 	return runtime, nil
+}
+
+// ProviderUsage 回傳指定 Provider 最近一次由上游回應標頭提供的配額快照。
+func (r *Runtime) ProviderUsage(ctx context.Context, providerID string) (domain.ProviderUsage, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.ProviderUsage{}, err
+	}
+	if r == nil || r.Model == nil {
+		return domain.ProviderUsage{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
+	}
+	return r.Model.ProviderUsage(providerID)
 }
 
 func (r *Runtime) ServiceSettings(ctx context.Context) (domain.ServiceSettings, error) {
@@ -402,7 +469,7 @@ func ensurePlanningTools(values []string) []string {
 	return result
 }
 
-func buildProviderValues(config Config, logger *slog.Logger) (map[string]modelrouter.Provider, error) {
+func buildProviderValues(config Config, logger *slog.Logger, providerAuth *providerauth.Manager) (map[string]modelrouter.Provider, error) {
 	values := make(map[string]modelrouter.Provider, len(config.Providers))
 	for id, providerConfig := range config.Providers {
 		if !providerConfig.IsEnabled() {
@@ -414,31 +481,74 @@ func buildProviderValues(config Config, logger *slog.Logger) (map[string]modelro
 				return nil, fmt.Errorf("create provider %q: openai_compatible settings are required", id)
 			}
 			settings := *providerConfig.OpenAICompatible
+			applyOpenAICompatibleDefaults(&settings)
 			settings.Logger = logger.With("provider_id", id)
+			if err := configureProviderAuthorization(id, &settings, providerAuth); err != nil {
+				return nil, fmt.Errorf("create provider %q: %w", id, err)
+			}
 			adapter, err := openaicompat.New(settings)
 			if err != nil {
 				return nil, fmt.Errorf("create provider %q: %w", id, err)
 			}
-			diagnostics := adapter.Diagnostics()
-			values[id] = modelrouter.Provider{
-				Descriptor: domain.ProviderDescriptor{
-					ID:              id,
-					Protocol:        "openai-compatible",
-					Endpoint:        diagnostics.Endpoint,
-					DefaultModel:    diagnostics.DefaultModel,
-					Streaming:       diagnostics.Streaming,
-					HasAPIKey:       diagnostics.HasAPIKey,
-					ContextWindow:   diagnostics.ContextWindow,
-					MaxOutputTokens: diagnostics.MaxOutputTokens,
-				},
-				Model:  adapter,
-				Limits: adapter.Capabilities,
+			values[id] = providerRouterValue(id, providerConfig.DisplayName, "openai-compatible", adapter)
+		case "openai-codex-responses":
+			if providerConfig.OpenAICodexResponses == nil {
+				return nil, fmt.Errorf("create provider %q: openai_codex_responses settings are required", id)
 			}
+			settings := *providerConfig.OpenAICodexResponses
+			applyOpenAICodexResponsesDefaults(&settings)
+			settings.Logger = logger.With("provider_id", id)
+			if err := configureProviderAuthorization(id, &settings, providerAuth); err != nil {
+				return nil, fmt.Errorf("create provider %q: %w", id, err)
+			}
+			adapter, err := openaicompat.New(settings)
+			if err != nil {
+				return nil, fmt.Errorf("create provider %q: %w", id, err)
+			}
+			values[id] = providerRouterValue(id, providerConfig.DisplayName, "openai-codex-responses", adapter)
 		default:
 			return nil, fmt.Errorf("unsupported provider type %q", providerConfig.Type)
 		}
 	}
 	return values, nil
+}
+
+func providerRouterValue(id, displayName, protocol string, adapter *openaicompat.Model) modelrouter.Provider {
+	diagnostics := adapter.Diagnostics()
+	return modelrouter.Provider{
+		Descriptor: domain.ProviderDescriptor{
+			ID:                      id,
+			DisplayName:             effectiveProviderDisplayName(displayName, id),
+			Protocol:                protocol,
+			Endpoint:                diagnostics.Endpoint,
+			DefaultModel:            diagnostics.DefaultModel,
+			Streaming:               diagnostics.Streaming,
+			HasAPIKey:               diagnostics.HasAPIKey,
+			SupportsNativeToolCalls: strings.EqualFold(strings.TrimSpace(protocol), "openai-codex-responses"),
+			ContextWindow:           diagnostics.ContextWindow,
+			MaxOutputTokens:         diagnostics.MaxOutputTokens,
+		},
+		Model:  adapter,
+		Limits: adapter.Capabilities,
+	}
+}
+
+func configureProviderAuthorization(providerID string, settings *openaicompat.Config, providerAuth *providerauth.Manager) error {
+	if settings == nil {
+		return fmt.Errorf("OpenAI-compatible settings are required")
+	}
+	if settings.AuthMode != "oauth" {
+		settings.TokenSource = nil
+		return nil
+	}
+	if providerAuth == nil {
+		return fmt.Errorf("ChatGPT/Codex OAuth manager is unavailable")
+	}
+	oauthConfig := settings.OAuth
+	settings.TokenSource = func(ctx context.Context) (string, error) {
+		return providerAuth.AccessToken(ctx, providerID, oauthConfig)
+	}
+	return nil
 }
 
 func validateStoredStructure(ctx context.Context, sessions ports.SessionRepository, projects ports.ProjectRepository, workspaces ports.WorkspaceRepository, providers ports.ProviderCatalog) error {
@@ -501,18 +611,18 @@ func containsString(values []string, wanted string) bool {
 }
 
 func (r *Runtime) ToolCatalog(ctx context.Context, sessionID string) ([]domain.ToolCatalogEntry, error) {
-	if r == nil || r.NativeTools == nil {
-		return nil, fmt.Errorf("native tool registry is unavailable")
+	if r == nil || r.Tools == nil {
+		return nil, fmt.Errorf("tool runtime is unavailable")
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return r.NativeTools.Catalog(nil), nil
+		return r.Tools.Catalog(nil), nil
 	}
 	session, err := r.Application.GetSession(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	return r.NativeTools.Catalog(&session), nil
+	return r.Tools.Catalog(&session), nil
 }
 
 // ProviderSettings 回傳可供管理介面編輯的脫敏設定。
@@ -522,7 +632,7 @@ func (r *Runtime) ProviderSettings(ctx context.Context) (domain.ProviderSettings
 	}
 	r.configMu.RLock()
 	defer r.configMu.RUnlock()
-	return providerSettingsView(r.Config), nil
+	return providerSettingsView(r.Config, r.ProviderAuth), nil
 }
 
 // ProviderModels 透過已儲存的 Provider 憑證讀取遠端模型目錄。
@@ -531,15 +641,111 @@ func (r *Runtime) ProviderModels(ctx context.Context, providerID string) (domain
 	if err := validateProviderSettingsID(providerID); err != nil {
 		return domain.ProviderModels{}, err
 	}
-	adapter, err := r.providerProbeAdapter(providerID)
-	if err != nil {
-		return domain.ProviderModels{}, err
+	var models []string
+	var err error
+	if r.Model.HasProvider(providerID) {
+		models, err = r.Model.ListProviderModels(ctx, providerID)
+	} else {
+		// 停用中的 Provider 不在執行路由內，管理頁仍可用脫離路由的 adapter
+		// 檢查模型目錄；只有實際路由內的 Provider 會保留回報的限制供推理使用。
+		var adapter *openaicompat.Model
+		adapter, err = r.providerProbeAdapter(providerID)
+		if err == nil {
+			models, err = adapter.ListModels(ctx)
+		}
 	}
-	models, err := adapter.ListModels(ctx)
 	if err != nil {
 		return domain.ProviderModels{}, fmt.Errorf("%w: load models for provider %q: %v", domain.ErrInvalidInput, providerID, err)
 	}
 	return domain.ProviderModels{ProviderID: providerID, Models: models}, nil
+}
+
+// StartProviderOAuth 啟動短效的 loopback callback server 並開啟 ChatGPT 登入頁。
+// Token 不會回傳給 UI。
+func (r *Runtime) StartProviderOAuth(ctx context.Context, providerID string) (domain.ProviderOAuthStartResult, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.ProviderOAuthStartResult{}, err
+	}
+	providerID, oauthConfig, err := r.providerOAuthConfiguration(providerID)
+	if err != nil {
+		return domain.ProviderOAuthStartResult{}, err
+	}
+	if r.ProviderAuth == nil {
+		return domain.ProviderOAuthStartResult{}, fmt.Errorf("ChatGPT/Codex OAuth is unavailable")
+	}
+	result, err := r.ProviderAuth.Start(providerID, oauthConfig)
+	if err != nil {
+		return domain.ProviderOAuthStartResult{}, fmt.Errorf("%w: start ChatGPT/Codex OAuth for provider %q: %v", domain.ErrInvalidInput, providerID, err)
+	}
+	return domain.ProviderOAuthStartResult{
+		ProviderID:       result.ProviderID,
+		Status:           result.Status,
+		AuthorizationURL: result.AuthorizationURL,
+		CallbackURI:      result.CallbackURI,
+		BrowserOpened:    result.BrowserOpened,
+		ExpiresAt:        result.ExpiresAt,
+	}, nil
+}
+
+func (r *Runtime) ProviderOAuthStatus(ctx context.Context, providerID string) (domain.ProviderOAuthStatus, error) {
+	providerID, oauthConfig, err := r.providerOAuthConfiguration(providerID)
+	if err != nil {
+		return domain.ProviderOAuthStatus{}, err
+	}
+	if r.ProviderAuth == nil {
+		return domain.ProviderOAuthStatus{}, fmt.Errorf("ChatGPT/Codex OAuth is unavailable")
+	}
+	status, err := r.ProviderAuth.Status(ctx, providerID, oauthConfig)
+	if err != nil {
+		return domain.ProviderOAuthStatus{}, fmt.Errorf("%w: read ChatGPT/Codex OAuth status for provider %q: %v", domain.ErrInvalidInput, providerID, err)
+	}
+	if status.Status == "connected" {
+		r.requestProviderUsageRefresh()
+	}
+	return domain.ProviderOAuthStatus{
+		ProviderID:   status.ProviderID,
+		Status:       status.Status,
+		Message:      status.Message,
+		AccountEmail: status.AccountEmail,
+		AccountName:  status.AccountName,
+		ExpiresAt:    status.ExpiresAt,
+	}, nil
+}
+
+func (r *Runtime) DisconnectProviderOAuth(ctx context.Context, providerID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	providerID, _, err := r.providerOAuthConfiguration(providerID)
+	if err != nil {
+		return err
+	}
+	if r.ProviderAuth == nil {
+		return fmt.Errorf("ChatGPT/Codex OAuth is unavailable")
+	}
+	if err := r.ProviderAuth.Disconnect(providerID); err != nil {
+		return fmt.Errorf("disconnect ChatGPT/Codex OAuth for provider %q: %w", providerID, err)
+	}
+	return nil
+}
+
+func (r *Runtime) providerOAuthConfiguration(providerID string) (string, providerauth.Config, error) {
+	providerID = strings.TrimSpace(providerID)
+	if err := validateProviderSettingsID(providerID); err != nil {
+		return "", providerauth.Config{}, err
+	}
+	r.configMu.RLock()
+	defer r.configMu.RUnlock()
+	provider, exists := r.Config.Providers[providerID]
+	if !exists {
+		return "", providerauth.Config{}, fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
+	}
+	if strings.ToLower(strings.TrimSpace(provider.Type)) != "openai-codex-responses" || provider.OpenAICodexResponses == nil {
+		return "", providerauth.Config{}, fmt.Errorf("%w: provider %q does not support ChatGPT/Codex OAuth", domain.ErrInvalidInput, providerID)
+	}
+	settings := *provider.OpenAICodexResponses
+	applyOpenAICodexResponsesDefaults(&settings)
+	return providerID, settings.OAuth, nil
 }
 
 // TestProvider 執行無副作用的原生工具呼叫，確認驗證、模型、串流與 Agent tool call 可實際運作。
@@ -586,7 +792,7 @@ func (r *Runtime) TestProvider(ctx context.Context, providerID string) (domain.P
 		}
 	}
 	if !toolCalling {
-		return domain.ProviderTestResult{}, fmt.Errorf("%w: provider %q completed a model request but did not return the required native tool call; verify that the endpoint and model support OpenAI-compatible tools", domain.ErrInvalidInput, providerID)
+		return domain.ProviderTestResult{}, fmt.Errorf("%w: provider %q completed a model request but did not return the required native tool call; verify that its protocol and model support native tools", domain.ErrInvalidInput, providerID)
 	}
 	modelName := strings.TrimSpace(response.Model)
 	if modelName == "" {
@@ -618,11 +824,27 @@ func (r *Runtime) providerProbeAdapter(providerID string) (*openaicompat.Model, 
 	if !exists {
 		return nil, fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
 	}
-	if strings.ToLower(strings.TrimSpace(provider.Type)) != "openai-compatible" || provider.OpenAICompatible == nil {
-		return nil, fmt.Errorf("%w: provider %q does not support OpenAI-compatible probes", domain.ErrInvalidInput, providerID)
+	var settings openaicompat.Config
+	switch strings.ToLower(strings.TrimSpace(provider.Type)) {
+	case "openai-compatible":
+		if provider.OpenAICompatible == nil {
+			return nil, fmt.Errorf("%w: provider %q has no openai_compatible settings", domain.ErrInvalidInput, providerID)
+		}
+		settings = *provider.OpenAICompatible
+		applyOpenAICompatibleDefaults(&settings)
+	case "openai-codex-responses":
+		if provider.OpenAICodexResponses == nil {
+			return nil, fmt.Errorf("%w: provider %q has no openai_codex_responses settings", domain.ErrInvalidInput, providerID)
+		}
+		settings = *provider.OpenAICodexResponses
+		applyOpenAICodexResponsesDefaults(&settings)
+	default:
+		return nil, fmt.Errorf("%w: provider %q does not support model probes", domain.ErrInvalidInput, providerID)
 	}
-	settings := *provider.OpenAICompatible
 	settings.Logger = r.logger.With("provider_id", providerID, "operation", "settings-probe")
+	if err := configureProviderAuthorization(providerID, &settings, r.ProviderAuth); err != nil {
+		return nil, fmt.Errorf("%w: configure provider %q authorization: %v", domain.ErrInvalidInput, providerID, err)
+	}
 	adapter, err := openaicompat.New(settings)
 	if err != nil {
 		return nil, fmt.Errorf("%w: create provider %q probe: %v", domain.ErrInvalidInput, providerID, err)
@@ -663,6 +885,10 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			return domain.ProviderSettings{}, fmt.Errorf("%w: duplicate provider id %q", domain.ErrConflict, id)
 		}
 		typeName := strings.ToLower(strings.TrimSpace(value.Type))
+		displayName := strings.TrimSpace(value.DisplayName)
+		if utf8.RuneCountInString(displayName) > 80 {
+			return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q display name must not exceed 80 characters", domain.ErrInvalidInput, id)
+		}
 		enabled := true
 		if value.Enabled != nil {
 			enabled = *value.Enabled
@@ -695,7 +921,26 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 				settings.APIKey = strings.TrimSpace(*provided.APIKey)
 			}
 			applyOpenAICompatibleDefaults(&settings)
-			candidate.Providers[id] = ProviderConfig{Type: typeName, Enabled: boolPointer(enabled), OpenAICompatible: &settings}
+			candidate.Providers[id] = ProviderConfig{Type: typeName, DisplayName: displayName, Enabled: boolPointer(enabled), OpenAICompatible: &settings}
+		case "openai-codex-responses":
+			if value.OpenAICodexResponses == nil {
+				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q requires openai_codex_responses settings", domain.ErrInvalidInput, id)
+			}
+			settings := openaicompat.Config{}
+			if existing, exists := r.Config.Providers[id]; exists && existing.OpenAICodexResponses != nil {
+				settings.ExtraHeaders = existing.OpenAICodexResponses.ExtraHeaders
+				settings.ModelLimits = existing.OpenAICodexResponses.ModelLimits
+			}
+			provided := value.OpenAICodexResponses
+			settings.Model = strings.TrimSpace(provided.Model)
+			settings.MaxAttempts = provided.MaxAttempts
+			settings.TimeoutSeconds = provided.TimeoutSeconds
+			settings.ConnectTimeoutSeconds = provided.ConnectTimeoutSeconds
+			settings.ResponseHeaderTimeoutSeconds = provided.ResponseHeaderTimeoutSeconds
+			settings.ContextWindow = provided.ContextWindow
+			settings.MaxOutputTokens = provided.MaxOutputTokens
+			applyOpenAICodexResponsesDefaults(&settings)
+			candidate.Providers[id] = ProviderConfig{Type: typeName, DisplayName: displayName, Enabled: boolPointer(enabled), OpenAICodexResponses: &settings}
 		default:
 			return domain.ProviderSettings{}, fmt.Errorf("%w: unsupported provider type %q", domain.ErrInvalidInput, value.Type)
 		}
@@ -737,7 +982,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			}
 		}
 	}
-	values, err := buildProviderValues(candidate, r.logger)
+	values, err := buildProviderValues(candidate, r.logger, r.ProviderAuth)
 	if err != nil {
 		return domain.ProviderSettings{}, fmt.Errorf("%w: %v", domain.ErrInvalidInput, err)
 	}
@@ -747,11 +992,23 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 	if err := r.Model.Replace(candidate.DefaultProviderID, values); err != nil {
 		return domain.ProviderSettings{}, err
 	}
+	r.requestProviderUsageRefresh()
+	if r.ProviderAuth != nil {
+		for providerID, existingProvider := range r.Config.Providers {
+			nextProvider, stillConfigured := candidate.Providers[providerID]
+			wasCodexOAuth := strings.EqualFold(strings.TrimSpace(existingProvider.Type), "openai-codex-responses")
+			isCodexOAuth := stillConfigured && strings.EqualFold(strings.TrimSpace(nextProvider.Type), "openai-codex-responses")
+			credentialsChanged := !stillConfigured || wasCodexOAuth != isCodexOAuth
+			if credentialsChanged {
+				_ = r.ProviderAuth.Disconnect(providerID)
+			}
+		}
+	}
 	r.Config = candidate
-	return providerSettingsView(r.Config), nil
+	return providerSettingsView(r.Config, r.ProviderAuth), nil
 }
 
-func providerSettingsView(config Config) domain.ProviderSettings {
+func providerSettingsView(config Config, providerAuth *providerauth.Manager) domain.ProviderSettings {
 	ids := make([]string, 0, len(config.Providers))
 	for id := range config.Providers {
 		ids = append(ids, id)
@@ -760,8 +1017,12 @@ func providerSettingsView(config Config) domain.ProviderSettings {
 	values := make([]domain.ProviderSetting, 0, len(ids))
 	for _, id := range ids {
 		provider := config.Providers[id]
-		value := domain.ProviderSetting{ID: id, Type: provider.Type, Enabled: boolPointer(provider.IsEnabled())}
-		if provider.OpenAICompatible != nil {
+		value := domain.ProviderSetting{ID: id, DisplayName: effectiveProviderDisplayName(provider.DisplayName, id), Type: provider.Type, Enabled: boolPointer(provider.IsEnabled())}
+		switch strings.ToLower(strings.TrimSpace(provider.Type)) {
+		case "openai-compatible":
+			if provider.OpenAICompatible == nil {
+				break
+			}
 			settings := provider.OpenAICompatible
 			value.OpenAICompatible = &domain.OpenAICompatibleProviderSetting{
 				BaseURL:                      settings.BaseURL,
@@ -771,6 +1032,21 @@ func providerSettingsView(config Config) domain.ProviderSettings {
 				DisableStreaming:             settings.DisableStreaming,
 				StreamIncludeUsage:           settings.StreamIncludeUsage,
 				OmitToolChoice:               settings.OmitToolChoice,
+				MaxAttempts:                  settings.MaxAttempts,
+				TimeoutSeconds:               settings.TimeoutSeconds,
+				ConnectTimeoutSeconds:        settings.ConnectTimeoutSeconds,
+				ResponseHeaderTimeoutSeconds: settings.ResponseHeaderTimeoutSeconds,
+				ContextWindow:                settings.ContextWindow,
+				MaxOutputTokens:              settings.MaxOutputTokens,
+			}
+		case "openai-codex-responses":
+			if provider.OpenAICodexResponses == nil {
+				break
+			}
+			settings := provider.OpenAICodexResponses
+			value.OpenAICodexResponses = &domain.OpenAICodexResponsesProviderSetting{
+				HasOAuthToken:                providerAuth != nil && providerAuth.HasToken(id),
+				Model:                        settings.Model,
 				MaxAttempts:                  settings.MaxAttempts,
 				TimeoutSeconds:               settings.TimeoutSeconds,
 				ConnectTimeoutSeconds:        settings.ConnectTimeoutSeconds,
@@ -788,6 +1064,14 @@ func boolPointer(value bool) *bool {
 	return &value
 }
 
+func effectiveProviderDisplayName(displayName, id string) string {
+	displayName = strings.TrimSpace(displayName)
+	if displayName != "" {
+		return displayName
+	}
+	return strings.TrimSpace(id)
+}
+
 func validateProviderSettingsID(id string) error {
 	if id == "" || len(id) > 80 || strings.ContainsAny(id, "/\\?#") {
 		return fmt.Errorf("%w: provider id must be 1-80 characters and cannot contain /, \\, ? or #", domain.ErrInvalidInput)
@@ -796,8 +1080,36 @@ func validateProviderSettingsID(id string) error {
 }
 
 func applyOpenAICompatibleDefaults(settings *openaicompat.Config) {
+	settings.AuthMode = "api_key"
+	settings.OAuth = providerauth.Config{}
+	settings.TokenSource = nil
 	if settings.InstructionRole == "" {
 		settings.InstructionRole = "system"
+	}
+	if settings.MaxAttempts == 0 {
+		settings.MaxAttempts = 3
+	}
+	if settings.TimeoutSeconds <= 0 {
+		settings.TimeoutSeconds = 1800
+	}
+	if settings.ConnectTimeoutSeconds <= 0 {
+		settings.ConnectTimeoutSeconds = 20
+	}
+	if settings.ResponseHeaderTimeoutSeconds <= 0 {
+		settings.ResponseHeaderTimeoutSeconds = 120
+	}
+}
+
+func applyOpenAICodexResponsesDefaults(settings *openaicompat.Config) {
+	settings.AuthMode = "oauth"
+	settings.OAuth = providerauth.DefaultConfig()
+	settings.APIKey = ""
+	settings.BaseURL = ""
+	settings.InstructionRole = "system"
+	settings.DisableStreaming = false
+	settings.StreamIncludeUsage = true
+	if strings.TrimSpace(settings.Model) == "" {
+		settings.Model = "gpt-5.2-codex"
 	}
 	if settings.MaxAttempts == 0 {
 		settings.MaxAttempts = 3
@@ -851,7 +1163,12 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 		profileNames = append(profileNames, name)
 	}
 	sort.Strings(profileNames)
-	tools := r.NativeTools.Catalog(nil)
+	mcpServerNames := make([]string, 0, len(config.MCPServers))
+	for id := range config.MCPServers {
+		mcpServerNames = append(mcpServerNames, id)
+	}
+	sort.Strings(mcpServerNames)
+	tools := r.Tools.Catalog(nil)
 	projects, err := r.Application.ListProjects(ctx)
 	if err != nil {
 		return nil, err
@@ -881,6 +1198,7 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 			DefaultProviderID:   r.Model.DefaultProviderID(),
 			Providers:           r.Model.ListProviders(),
 			SSHProfiles:         profileNames,
+			MCPServers:          mcpServerNames,
 		},
 		SessionCount:   sessionCount,
 		ProjectCount:   len(projects),
@@ -891,10 +1209,32 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 }
 
 func (r *Runtime) Close(ctx context.Context) error {
-	if r == nil || r.Application == nil {
+	if r == nil {
 		return nil
 	}
-	return r.Application.Close(ctx)
+	var result error
+	if r.providerUsageCancel != nil {
+		r.providerUsageCancel()
+	}
+	if r.ProviderAuth != nil {
+		result = r.ProviderAuth.Close(ctx)
+	}
+	if r.MCP != nil {
+		if err := r.MCP.Close(); result == nil {
+			result = err
+		}
+	}
+	if r.ReverseProxy != nil {
+		if err := r.ReverseProxy.Close(); result == nil {
+			result = err
+		}
+	}
+	if r.Application != nil {
+		if err := r.Application.Close(ctx); result == nil {
+			result = err
+		}
+	}
+	return result
 }
 
 func (r *Runtime) Status() domain.ServiceStatus {

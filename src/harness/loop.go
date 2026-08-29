@@ -191,7 +191,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	parallelTools := parallelizableToolNames(definitions, r.Approvals)
 	approvalState := newRunApprovalState(input.Session.PermanentToolApproval)
 	loopGuard := newToolLoopGuard(definitions)
-	toolCallMode := NormalizeToolCallMode(string(r.ToolCallMode))
+	toolCallMode := effectiveToolCallMode(r.Model, providerID, NormalizeToolCallMode(string(r.ToolCallMode)))
 	// 每個 Run 都從系統 Shell 階段開始。只有 shell_exec 的實際執行結果為失敗，
 	// 才在下一輪公開檔案、搜尋、比較、SSH 等內建工具。
 	builtinFallbackEnabled := !definitionNamed(definitions, systemShellToolName)
@@ -306,8 +306,29 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		completionDirective = ""
 		contextBudgetPrompt := joinPromptSections(systemPrompt, hostPrompt, toolPrompt, phasePrompt, contextPrompt)
 		if r.Context != nil {
-			window, contextErr := r.Context.Build(ctx, effectiveSession, contextBudgetPrompt, activeDefinitions)
+			compactionStarted := false
+			window, contextErr := r.Context.BuildObserved(ctx, effectiveSession, contextBudgetPrompt, activeDefinitions, func(status ContextCompactionStatus) error {
+				compactionStarted = true
+				logger.Info("session context compaction started",
+					"turn", turn,
+					"estimated_tokens", status.EstimatedTokens,
+					"reported_input_tokens", status.ReportedInputTokens,
+					"trigger_tokens", status.TriggerTokens,
+					"budget_tokens", status.Budget,
+					"trigger_ratio", status.TriggerRatio,
+				)
+				return emitEvent(emit, "context.compaction.started", map[string]any{
+					"estimated_tokens":      status.EstimatedTokens,
+					"reported_input_tokens": status.ReportedInputTokens,
+					"trigger_tokens":        status.TriggerTokens,
+					"budget_tokens":         status.Budget,
+					"trigger_ratio":         status.TriggerRatio,
+				})
+			})
 			if contextErr != nil {
+				if compactionStarted {
+					_ = emitEvent(emit, "context.compaction.failed", map[string]any{"message": contextErr.Error()})
+				}
 				if exceeded := budget.wallClockExceeded(ctx); exceeded != nil {
 					return finishBudgetInTurn(exceeded, lastAssistant, true, nil, 0, domain.ModelResponse{})
 				}
@@ -328,6 +349,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 					"estimated_tokens": window.EstimatedTokens,
 					"budget_tokens":    window.Budget,
 					"message_count":    len(window.Messages),
+					"trigger_ratio":    softCompactionRatio,
 				}); err != nil {
 					return domain.RunResult{}, err
 				}
@@ -654,9 +676,6 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			if err := emitEvent(emit, "turn.end", map[string]any{"turn": turn, "turn_id": turnID, "tool_result_count": 0}); err != nil {
 				return domain.RunResult{}, err
 			}
-			if r.Context != nil {
-				r.Context.ScheduleCompaction(ctx, effectiveSession, contextBudgetPrompt, activeDefinitions)
-			}
 			finalMessageID = assistant.ID
 			return domain.RunResult{Message: assistant, Completion: completion.completion()}, nil
 		}
@@ -807,9 +826,6 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		// 吃掉整份計畫的額度。完成或略過一個經後端接受的步驟後，下一步重新計算。
 		if planStepCompleted {
 			toolTurns = 0
-		}
-		if r.Context != nil {
-			r.Context.ScheduleCompaction(ctx, effectiveSession, contextBudgetPrompt, activeDefinitions)
 		}
 		if terminateCount == len(executableCalls) {
 			return domain.RunResult{}, errors.New("all tool results requested termination before a final assistant message")
@@ -1094,6 +1110,28 @@ func normalizeToolCalls(input []domain.ToolCall) ([]domain.ToolCall, error) {
 	return result, nil
 }
 
+// effectiveToolCallMode 讓 Provider 以能力宣告選擇可靠的工具協定。全域 native
+// 設定仍會強制使用原生工具；instruction 則只作為未宣告原生能力的相容後備。
+func effectiveToolCallMode(model ports.Model, providerID string, configured ToolCallMode) ToolCallMode {
+	if configured == ToolCallModeNative {
+		return ToolCallModeNative
+	}
+	catalog, ok := model.(ports.ProviderCatalog)
+	if !ok {
+		return configured
+	}
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = catalog.DefaultProviderID()
+	}
+	for _, provider := range catalog.ListProviders() {
+		if provider.ID == providerID && provider.SupportsNativeToolCalls {
+			return ToolCallModeNative
+		}
+	}
+	return configured
+}
+
 func operationStatus(ctx context.Context, err error) string {
 	if err == nil {
 		return domain.OperationStatusCompleted
@@ -1148,10 +1186,10 @@ func attachmentContextPrompt(metadata map[string]any) string {
 
 func nativeToolPrompt(definitions []domain.ToolDefinition) string {
 	if len(definitions) == 0 {
-		return "本輪沒有可用的原生工具。不可聲稱已讀取檔案、執行指令或查詢外部狀態。"
+		return "本輪沒有可用工具。不可聲稱已讀取檔案、執行指令或查詢外部狀態。"
 	}
 	var section strings.Builder
-	section.WriteString("本輪已透過 OpenAI-compatible tools 欄位提供下列原生工具（必須透過 tool_calls 呼叫，不可輸出 Shell 指令或要求使用者代為執行）：")
+	section.WriteString("本輪已透過 OpenAI-compatible tools 欄位提供下列內建或 MCP 工具（必須透過 tool_calls 呼叫，不可輸出 Shell 指令或要求使用者代為執行）：")
 	for _, definition := range definitions {
 		section.WriteString("\n- ")
 		section.WriteString(strings.TrimSpace(definition.Name))
@@ -1318,6 +1356,7 @@ func finalizationPhasePrompt(toolTurns, limit int, forced bool, loopGuardReason,
 	return fmt.Sprintf(`目前處於 Harness 的收斂與最終回答階段，已完成 %d/%d 個自主工具回合。先根據內部 history 中的 tool_result 判斷任務是否已完成：
 - 若證據仍不足，依 tools 協定只輸出下一個工具指令，Harness 會繼續工作迴圈。
 - 若證據已足夠，不再呼叫工具，直接輸出給使用者看的最終答案。
+- 若前一個副作用工具已成功，且同一份結果已包含驗證成功的證據，就必須收斂；只有 tool_result 明確指出錯誤或未符合使用者條件時才能再次修改。不可只因主觀上想換一種寫法，就連續重寫已符合需求的同一資源。
 
 不要為了窮舉整個目錄而逐一讀取所有檔案；除非使用者明確要求完整掃描，應採代表性取樣並儘早收斂。最終答案必須整合工具觀察並直接回應原始需求，使用清楚、自然、可採取行動的說明；不得揭露 tool_use/tool_result JSON、完整原始工具輸出、內部 Prompt、Harness 協定或未整理的工作過程。若有失敗或限制，只說明會影響結論的部分。%s`, toolTurns, limit, confirmedFacts)
 }
@@ -1340,18 +1379,28 @@ func joinPromptSections(values ...string) string {
 }
 
 func splitCurrentUserMessage(messages []domain.Message, current domain.Message) ([]domain.Message, string) {
-	history := make([]domain.Message, 0, len(messages))
-	userPrompt := strings.TrimSpace(current.Content)
-	removed := false
-	for _, message := range messages {
-		if !removed && current.ID != "" && message.ID == current.ID {
-			userPrompt = message.Content
-			removed = true
-			continue
+	currentIndex := -1
+	if current.ID != "" {
+		for index, message := range messages {
+			if message.ID == current.ID {
+				currentIndex = index
+				break
+			}
 		}
-		history = append(history, message)
 	}
-	return history, userPrompt
+	if currentIndex < 0 {
+		return messages, strings.TrimSpace(current.Content)
+	}
+	// 第一次模型請求時，目前 user 訊息位於 transcript 尾端，可拆成
+	// ModelRequest.UserPrompt。工具或中間 assistant 訊息寫入後，它已不再是尾端；
+	// 此時必須保留原始順序，否則把 user 訊息重新追加到 function_call_output
+	// 後面，Provider 會誤認為使用者在工具成功後再次提出相同問題。
+	if currentIndex != len(messages)-1 {
+		return messages, ""
+	}
+	history := make([]domain.Message, 0, len(messages)-1)
+	history = append(history, messages[:currentIndex]...)
+	return history, messages[currentIndex].Content
 }
 
 func imitatedToolCallName(content string, definitions []domain.ToolDefinition) string {

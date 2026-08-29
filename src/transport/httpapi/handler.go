@@ -21,22 +21,33 @@ var (
 )
 
 type Handler struct {
-	service                *application.Service
-	apiToken               string
-	allowedOrigins         []string
-	maxBodyBytes           int64
-	maxAttachmentBytes     int64
-	attachments            ports.AttachmentRepository
-	status                 func() domain.ServiceStatus
-	toolCatalog            func(context.Context, string) ([]domain.ToolCatalogEntry, error)
-	diagnostics            func(context.Context) (any, error)
-	serviceSettings        func(context.Context) (domain.ServiceSettings, error)
-	updateServiceSettings  func(context.Context, domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error)
-	providerSettings       func(context.Context) (domain.ProviderSettings, error)
-	updateProviderSettings func(context.Context, domain.UpdateProviderSettingsInput) (domain.ProviderSettings, error)
-	providerModels         func(context.Context, string) (domain.ProviderModels, error)
-	testProvider           func(context.Context, string) (domain.ProviderTestResult, error)
-	mux                    *http.ServeMux
+	service                 *application.Service
+	apiToken                string
+	allowedOrigins          []string
+	maxBodyBytes            int64
+	maxAttachmentBytes      int64
+	attachments             ports.AttachmentRepository
+	status                  func() domain.ServiceStatus
+	toolCatalog             func(context.Context, string) ([]domain.ToolCatalogEntry, error)
+	diagnostics             func(context.Context) (any, error)
+	serviceSettings         func(context.Context) (domain.ServiceSettings, error)
+	updateServiceSettings   func(context.Context, domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error)
+	providerSettings        func(context.Context) (domain.ProviderSettings, error)
+	updateProviderSettings  func(context.Context, domain.UpdateProviderSettingsInput) (domain.ProviderSettings, error)
+	mcpSettings             func(context.Context) (domain.MCPSettings, error)
+	updateMCPSettings       func(context.Context, domain.UpdateMCPSettingsInput) (domain.MCPSettings, error)
+	testMCP                 func(context.Context, string) (domain.MCPTestResult, error)
+	reverseProxyStatus      func(context.Context) (domain.ReverseProxyStatus, error)
+	updateReverseProxy      func(context.Context, domain.UpdateReverseProxyInput) (domain.ReverseProxyStatus, error)
+	startReverseProxy       func(context.Context, domain.StartReverseProxyInput) (domain.ReverseProxyStatus, error)
+	stopReverseProxy        func(context.Context) (domain.ReverseProxyStatus, error)
+	providerModels          func(context.Context, string) (domain.ProviderModels, error)
+	providerUsage           func(context.Context, string) (domain.ProviderUsage, error)
+	testProvider            func(context.Context, string) (domain.ProviderTestResult, error)
+	startProviderOAuth      func(context.Context, string) (domain.ProviderOAuthStartResult, error)
+	providerOAuthStatus     func(context.Context, string) (domain.ProviderOAuthStatus, error)
+	disconnectProviderOAuth func(context.Context, string) error
+	mux                     *http.ServeMux
 }
 
 func New(service *application.Service, config Config) (*Handler, error) {
@@ -52,22 +63,33 @@ func New(service *application.Service, config Config) (*Handler, error) {
 		maxAttachmentBytes = 8 * 1024 * 1024
 	}
 	handler := &Handler{
-		service:                service,
-		apiToken:               strings.TrimSpace(config.APIToken),
-		allowedOrigins:         append([]string(nil), config.AllowedOrigins...),
-		maxBodyBytes:           maxBodyBytes,
-		maxAttachmentBytes:     maxAttachmentBytes,
-		attachments:            config.Attachments,
-		status:                 config.Status,
-		toolCatalog:            config.ToolCatalog,
-		diagnostics:            config.Diagnostics,
-		serviceSettings:        config.ServiceSettings,
-		updateServiceSettings:  config.UpdateServiceSettings,
-		providerSettings:       config.ProviderSettings,
-		updateProviderSettings: config.UpdateProviderSettings,
-		providerModels:         config.ProviderModels,
-		testProvider:           config.TestProvider,
-		mux:                    http.NewServeMux(),
+		service:                 service,
+		apiToken:                strings.TrimSpace(config.APIToken),
+		allowedOrigins:          append([]string(nil), config.AllowedOrigins...),
+		maxBodyBytes:            maxBodyBytes,
+		maxAttachmentBytes:      maxAttachmentBytes,
+		attachments:             config.Attachments,
+		status:                  config.Status,
+		toolCatalog:             config.ToolCatalog,
+		diagnostics:             config.Diagnostics,
+		serviceSettings:         config.ServiceSettings,
+		updateServiceSettings:   config.UpdateServiceSettings,
+		providerSettings:        config.ProviderSettings,
+		updateProviderSettings:  config.UpdateProviderSettings,
+		mcpSettings:             config.MCPSettings,
+		updateMCPSettings:       config.UpdateMCPSettings,
+		testMCP:                 config.TestMCP,
+		reverseProxyStatus:      config.ReverseProxyStatus,
+		updateReverseProxy:      config.UpdateReverseProxy,
+		startReverseProxy:       config.StartReverseProxy,
+		stopReverseProxy:        config.StopReverseProxy,
+		providerModels:          config.ProviderModels,
+		providerUsage:           config.ProviderUsage,
+		testProvider:            config.TestProvider,
+		startProviderOAuth:      config.StartProviderOAuth,
+		providerOAuthStatus:     config.ProviderOAuthStatus,
+		disconnectProviderOAuth: config.DisconnectProviderOAuth,
+		mux:                     http.NewServeMux(),
 	}
 	handler.routes()
 	return handler, nil
@@ -89,8 +111,20 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("PUT /api/v1/admin/provider-settings", h.putProviderSettings)
 	h.mux.HandleFunc("GET /api/v1/admin/provider-settings/{provider_id}/models", h.getProviderModels)
 	h.mux.HandleFunc("POST /api/v1/admin/provider-settings/{provider_id}/test", h.postProviderTest)
+	h.mux.HandleFunc("POST /api/v1/admin/provider-settings/{provider_id}/oauth/start", h.postProviderOAuthStart)
+	h.mux.HandleFunc("GET /api/v1/admin/provider-settings/{provider_id}/oauth/status", h.getProviderOAuthStatus)
+	h.mux.HandleFunc("DELETE /api/v1/admin/provider-settings/{provider_id}/oauth", h.deleteProviderOAuth)
+	h.mux.HandleFunc("GET /api/v1/admin/mcp-settings", h.getMCPSettings)
+	h.mux.HandleFunc("PUT /api/v1/admin/mcp-settings", h.putMCPSettings)
+	h.mux.HandleFunc("POST /api/v1/admin/mcp-settings/{mcp_id}/test", h.postMCPTest)
+	h.mux.HandleFunc("GET /api/v1/admin/reverse-proxy", h.getReverseProxy)
+	h.mux.HandleFunc("PUT /api/v1/admin/reverse-proxy", h.putReverseProxy)
+	h.mux.HandleFunc("POST /api/v1/admin/reverse-proxy/start", h.postReverseProxyStart)
+	h.mux.HandleFunc("POST /api/v1/admin/reverse-proxy/stop", h.postReverseProxyStop)
 	h.mux.HandleFunc("GET /api/v1/tools", h.listTools)
 	h.mux.HandleFunc("GET /api/v1/providers", h.listProviders)
+	h.mux.HandleFunc("GET /api/v1/providers/{provider_id}/capabilities", h.getProviderCapabilities)
+	h.mux.HandleFunc("GET /api/v1/providers/{provider_id}/usage", h.getProviderUsage)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}/export", h.exportSession)
 	h.mux.HandleFunc("GET /api/v1/memories", h.listMemories)
 	h.mux.HandleFunc("POST /api/v1/memories", h.createMemory)
@@ -110,6 +144,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/agents/{agent_id}", h.getAgent)
 	h.mux.HandleFunc("GET /api/v1/agents/{agent_id}/sessions", h.listSessions)
 	h.mux.HandleFunc("POST /api/v1/agents/{agent_id}/sessions", h.createSession)
+	h.mux.HandleFunc("PUT /api/v1/agents/{agent_id}/sessions/order", h.reorderSessions)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}", h.getSession)
 	h.mux.HandleFunc("PATCH /api/v1/sessions/{session_id}", h.updateSession)
 	h.mux.HandleFunc("DELETE /api/v1/sessions/{session_id}", h.deleteSession)
@@ -227,6 +262,114 @@ func (h *Handler) putProviderSettings(writer http.ResponseWriter, request *http.
 	writeData(writer, http.StatusOK, value)
 }
 
+func (h *Handler) getMCPSettings(writer http.ResponseWriter, request *http.Request) {
+	if h.mcpSettings == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: MCP settings are unavailable", errUnavailable))
+		return
+	}
+	value, err := h.mcpSettings(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) putMCPSettings(writer http.ResponseWriter, request *http.Request) {
+	if h.updateMCPSettings == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: MCP settings are unavailable", errUnavailable))
+		return
+	}
+	var input domain.UpdateMCPSettingsInput
+	if err := h.decodeJSON(writer, request, &input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	value, err := h.updateMCPSettings(request.Context(), input)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) postMCPTest(writer http.ResponseWriter, request *http.Request) {
+	if h.testMCP == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: MCP connection test is unavailable", errUnavailable))
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), 5*time.Minute)
+	defer cancel()
+	value, err := h.testMCP(ctx, request.PathValue("mcp_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) getReverseProxy(writer http.ResponseWriter, request *http.Request) {
+	if h.reverseProxyStatus == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: reverse proxy status is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.reverseProxyStatus(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) putReverseProxy(writer http.ResponseWriter, request *http.Request) {
+	if h.updateReverseProxy == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: reverse proxy settings are unavailable", errUnavailable))
+		return
+	}
+	var input domain.UpdateReverseProxyInput
+	if err := h.decodeJSON(writer, request, &input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	value, err := h.updateReverseProxy(request.Context(), input)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) postReverseProxyStart(writer http.ResponseWriter, request *http.Request) {
+	if h.startReverseProxy == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: reverse proxy start is unavailable", errUnavailable))
+		return
+	}
+	var input domain.StartReverseProxyInput
+	if err := h.decodeJSON(writer, request, &input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	value, err := h.startReverseProxy(request.Context(), input)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) postReverseProxyStop(writer http.ResponseWriter, request *http.Request) {
+	if h.stopReverseProxy == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: reverse proxy stop is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.stopReverseProxy(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
 func (h *Handler) getProviderModels(writer http.ResponseWriter, request *http.Request) {
 	if h.providerModels == nil {
 		writeProblem(writer, request, fmt.Errorf("%w: provider model catalog is unavailable", errUnavailable))
@@ -255,6 +398,46 @@ func (h *Handler) postProviderTest(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) postProviderOAuthStart(writer http.ResponseWriter, request *http.Request) {
+	if h.startProviderOAuth == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: ChatGPT/Codex OAuth is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.startProviderOAuth(request.Context(), request.PathValue("provider_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) getProviderOAuthStatus(writer http.ResponseWriter, request *http.Request) {
+	if h.providerOAuthStatus == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: ChatGPT/Codex OAuth status is unavailable", errUnavailable))
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), 35*time.Second)
+	defer cancel()
+	value, err := h.providerOAuthStatus(ctx, request.PathValue("provider_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) deleteProviderOAuth(writer http.ResponseWriter, request *http.Request) {
+	if h.disconnectProviderOAuth == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: ChatGPT/Codex OAuth is unavailable", errUnavailable))
+		return
+	}
+	if err := h.disconnectProviderOAuth(request.Context(), request.PathValue("provider_id")); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) listTools(writer http.ResponseWriter, request *http.Request) {
@@ -299,6 +482,28 @@ func (h *Handler) listProjects(writer http.ResponseWriter, request *http.Request
 
 func (h *Handler) listProviders(writer http.ResponseWriter, _ *http.Request) {
 	writeData(writer, http.StatusOK, h.service.ListProviders())
+}
+
+func (h *Handler) getProviderCapabilities(writer http.ResponseWriter, request *http.Request) {
+	value, err := h.service.ProviderCapabilities(request.PathValue("provider_id"), request.URL.Query().Get("model"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) getProviderUsage(writer http.ResponseWriter, request *http.Request) {
+	if h.providerUsage == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: provider usage is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.providerUsage(request.Context(), request.PathValue("provider_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
 }
 
 func (h *Handler) listWorkspaces(writer http.ResponseWriter, request *http.Request) {
@@ -445,6 +650,20 @@ func (h *Handler) createSession(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	writeData(writer, http.StatusCreated, value)
+}
+
+func (h *Handler) reorderSessions(writer http.ResponseWriter, request *http.Request) {
+	var input domain.ReorderSessionsInput
+	if err := h.decodeJSON(writer, request, &input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	value, err := h.service.ReorderSessions(request.Context(), request.PathValue("agent_id"), input)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
 }
 
 func (h *Handler) getSession(writer http.ResponseWriter, request *http.Request) {

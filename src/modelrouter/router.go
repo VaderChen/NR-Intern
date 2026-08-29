@@ -38,6 +38,9 @@ func New(defaultID string, values map[string]Provider) (*Router, error) {
 			return nil, fmt.Errorf("%w: provider id and model are required", domain.ErrInvalidInput)
 		}
 		value.Descriptor.ID = id
+		if strings.TrimSpace(value.Descriptor.DisplayName) == "" {
+			value.Descriptor.DisplayName = id
+		}
 		providers[id] = value
 	}
 	if _, exists := providers[defaultID]; !exists {
@@ -96,6 +99,77 @@ func (r *Router) HasProvider(providerID string) bool {
 	defer r.mu.RUnlock()
 	_, exists := r.providers[strings.TrimSpace(providerID)]
 	return exists
+}
+
+// ProviderUsage 回傳指定 Provider 最近一次由上游明確提供的用量快照。
+// 不支援或尚未收到資料的 Provider 仍回傳 provider_id，但兩個視窗皆為不可用。
+func (r *Router) ProviderUsage(providerID string) (domain.ProviderUsage, error) {
+	if r == nil {
+		return domain.ProviderUsage{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
+	}
+	r.mu.RLock()
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = r.defaultID
+	}
+	provider, exists := r.providers[providerID]
+	r.mu.RUnlock()
+	if !exists {
+		return domain.ProviderUsage{}, fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
+	}
+	usage := domain.ProviderUsage{ProviderID: providerID}
+	if source, ok := provider.Model.(ports.ProviderUsageSource); ok {
+		usage = source.ProviderUsage()
+		usage.ProviderID = providerID
+	}
+	return usage, nil
+}
+
+// RefreshProviderUsage 要求指定 Provider 透過專用唯讀端點更新配額快照。
+func (r *Router) RefreshProviderUsage(ctx context.Context, providerID string) error {
+	if r == nil {
+		return fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
+	}
+	r.mu.RLock()
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = r.defaultID
+	}
+	provider, exists := r.providers[providerID]
+	r.mu.RUnlock()
+	if !exists {
+		return fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
+	}
+	refresher, ok := provider.Model.(ports.ProviderUsageRefresher)
+	if !ok {
+		return nil
+	}
+	return refresher.RefreshProviderUsage(ctx)
+}
+
+// ListProviderModels 使用目前實際路由中的 Provider adapter 讀取模型目錄。
+// adapter 可同步保留後端回傳的模型限制，讓後續 Capabilities 與推理共用同一份資料。
+func (r *Router) ListProviderModels(ctx context.Context, providerID string) ([]string, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
+	}
+	r.mu.RLock()
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = r.defaultID
+	}
+	provider, exists := r.providers[providerID]
+	r.mu.RUnlock()
+	if !exists {
+		return nil, fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
+	}
+	source, ok := provider.Model.(interface {
+		ListModels(context.Context) ([]string, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("%w: provider %q does not expose a model catalog", domain.ErrInvalidInput, providerID)
+	}
+	return source.ListModels(ctx)
 }
 
 // Capabilities 回報實際會被使用的模型限制。ContextWindow 為 0 代表未宣告。

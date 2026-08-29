@@ -19,6 +19,8 @@ func run(ctx context.Context, options Options) error {
 		return fmt.Errorf("%w: cannot create macOS WebKit window", ErrUnavailable)
 	}
 	defer view.Destroy()
+	installWindowLifecycle(view.Window())
+	defer uninstallWindowLifecycle()
 
 	installSystemEditShortcuts()
 	view.SetTitle(options.Title)
@@ -39,6 +41,14 @@ func run(ctx context.Context, options Options) error {
 		}); err != nil {
 			return fmt.Errorf("bind startup ready callback: %w", err)
 		}
+	}
+	if err := view.Bind("nrInternSetConversationActive", func(active bool) string {
+		view.Dispatch(func() {
+			setConversationActive(active)
+		})
+		return ""
+	}); err != nil {
+		return fmt.Errorf("bind conversation activity callback: %w", err)
 	}
 	readyTimer := time.AfterFunc(nativeStartupReadyTimeout, notifyReady)
 	defer readyTimer.Stop()

@@ -4,6 +4,7 @@ import (
 	"AgenticService/src/adapters/openaicompat"
 	"AgenticService/src/domain"
 	"AgenticService/src/harness"
+	"AgenticService/src/mcpclient"
 	"AgenticService/src/memory"
 	nativessh "AgenticService/src/tools/native/ssh"
 	"encoding/json"
@@ -45,24 +46,27 @@ type Config struct {
 	MaxCompletionChecks int `json:"max_completion_checks"`
 	MaxWallClockSeconds int `json:"max_wall_clock_seconds"`
 	// MaxTokens 與 MaxToolCalls 設為 0 時不限制，仍可由設定或環境變數重新啟用。
-	MaxTokens          int                          `json:"max_tokens"`
-	MaxToolCalls       int                          `json:"max_tool_calls"`
-	MaxToolOutputBytes int                          `json:"max_tool_output_bytes"`
-	MaxFileInputBytes  int                          `json:"max_file_input_bytes"`
-	Context            harness.ContextConfig        `json:"context"`
-	Memory             memory.Config                `json:"memory"`
-	DefaultProviderID  string                       `json:"default_provider_id"`
-	Providers          map[string]ProviderConfig    `json:"providers"`
-	SSHProfiles        map[string]nativessh.Profile `json:"ssh_profiles,omitempty"`
+	MaxTokens          int                               `json:"max_tokens"`
+	MaxToolCalls       int                               `json:"max_tool_calls"`
+	MaxToolOutputBytes int                               `json:"max_tool_output_bytes"`
+	MaxFileInputBytes  int                               `json:"max_file_input_bytes"`
+	Context            harness.ContextConfig             `json:"context"`
+	Memory             memory.Config                     `json:"memory"`
+	DefaultProviderID  string                            `json:"default_provider_id"`
+	Providers          map[string]ProviderConfig         `json:"providers"`
+	MCPServers         map[string]mcpclient.ServerConfig `json:"mcp_servers,omitempty"`
+	SSHProfiles        map[string]nativessh.Profile      `json:"ssh_profiles,omitempty"`
 }
 
-// ProviderConfig 以 type 作為 adapter 工廠的辨識欄位；目前只實作 openai-compatible。
-// 後續 Provider 類型應新增自己的具名設定區塊，不改動 Harness 或 Workspace schema。
+// ProviderConfig 以 type 作為 adapter 工廠的辨識欄位。每種協定使用自己的具名
+// 設定區塊，不把 Chat Completions 與 Codex Responses 的驗證欄位混在一起。
 type ProviderConfig struct {
-	Type string `json:"type"`
+	Type        string `json:"type"`
+	DisplayName string `json:"display_name,omitempty"`
 	// Enabled=nil 視為啟用，讓既有設定檔與持久化資料可直接升級。
-	Enabled          *bool                `json:"enabled,omitempty"`
-	OpenAICompatible *openaicompat.Config `json:"openai_compatible,omitempty"`
+	Enabled              *bool                `json:"enabled,omitempty"`
+	OpenAICompatible     *openaicompat.Config `json:"openai_compatible,omitempty"`
+	OpenAICodexResponses *openaicompat.Config `json:"openai_codex_responses,omitempty"`
 }
 
 func (config ProviderConfig) IsEnabled() bool {
@@ -111,7 +115,8 @@ func DefaultConfig() Config {
 		DefaultProviderID: "openai-compatible",
 		Providers: map[string]ProviderConfig{
 			"openai-compatible": {
-				Type: "openai-compatible",
+				Type:        "openai-compatible",
+				DisplayName: "OpenAI Compatible",
 				OpenAICompatible: &openaicompat.Config{
 					BaseURL:                      "https://api.openai.com/v1",
 					Model:                        "gpt-4o-mini",
@@ -124,6 +129,7 @@ func DefaultConfig() Config {
 				},
 			},
 		},
+		MCPServers:  map[string]mcpclient.ServerConfig{},
 		SSHProfiles: map[string]nativessh.Profile{},
 	}
 }
@@ -155,6 +161,9 @@ func LoadConfig(path string) (Config, error) {
 	if err := loadPersistedProviderSettings(&config); err != nil {
 		return Config{}, err
 	}
+	if err := loadPersistedMCPSettings(&config); err != nil {
+		return Config{}, err
+	}
 	// 環境變數永遠具有最高優先權；持久化設定不得蓋過部署環境注入的值。
 	applyEnvironment(&config)
 	if err := validateConfig(&config); err != nil {
@@ -178,12 +187,26 @@ func applyEnvironment(config *Config) {
 	setString("AI_AGENT_TOOL_CALL_MODE", &config.ToolCallMode)
 	providerID := strings.TrimSpace(config.DefaultProviderID)
 	provider := config.Providers[providerID]
-	if provider.OpenAICompatible == nil {
-		provider.OpenAICompatible = &openaicompat.Config{}
+	var llm *openaicompat.Config
+	if strings.EqualFold(strings.TrimSpace(provider.Type), "openai-codex-responses") {
+		if provider.OpenAICodexResponses == nil {
+			provider.OpenAICodexResponses = &openaicompat.Config{}
+		}
+		llm = provider.OpenAICodexResponses
+	} else {
+		if provider.OpenAICompatible == nil {
+			provider.OpenAICompatible = &openaicompat.Config{}
+		}
+		llm = provider.OpenAICompatible
+		setString("AI_AGENT_LLM_BASE_URL", &llm.BaseURL)
+		setString("AI_AGENT_LLM_API_KEY", &llm.APIKey)
+		if llm.APIKey == "" {
+			setString("OPENAI_API_KEY", &llm.APIKey)
+		}
+		if _, exists := os.LookupEnv("AI_AGENT_LLM_BASE_URL"); !exists {
+			setString("OPENAI_BASE_URL", &llm.BaseURL)
+		}
 	}
-	llm := provider.OpenAICompatible
-	setString("AI_AGENT_LLM_BASE_URL", &llm.BaseURL)
-	setString("AI_AGENT_LLM_API_KEY", &llm.APIKey)
 	setString("AI_AGENT_LLM_MODEL", &llm.Model)
 	setString("AI_AGENT_LLM_INSTRUCTION_ROLE", &llm.InstructionRole)
 	if value, exists := os.LookupEnv("AI_AGENT_LLM_MAX_ATTEMPTS"); exists {
@@ -192,13 +215,11 @@ func applyEnvironment(config *Config) {
 		}
 	}
 	applyBoolEnvironment("AI_AGENT_LLM_DISABLE_STREAMING", &llm.DisableStreaming)
-	if llm.APIKey == "" {
-		setString("OPENAI_API_KEY", &llm.APIKey)
+	if strings.EqualFold(strings.TrimSpace(provider.Type), "openai-codex-responses") {
+		provider.OpenAICodexResponses = llm
+	} else {
+		provider.OpenAICompatible = llm
 	}
-	if _, exists := os.LookupEnv("AI_AGENT_LLM_BASE_URL"); !exists {
-		setString("OPENAI_BASE_URL", &llm.BaseURL)
-	}
-	provider.OpenAICompatible = llm
 	config.Providers[providerID] = provider
 	if value, exists := os.LookupEnv("AI_AGENT_ALLOWED_ORIGINS"); exists {
 		config.AllowedOrigins = splitCSV(value)
@@ -324,9 +345,27 @@ func validateConfig(config *Config) error {
 	if !defaultProvider.IsEnabled() {
 		return fmt.Errorf("default provider %q must be enabled", config.DefaultProviderID)
 	}
+	normalizedMCP := make(map[string]mcpclient.ServerConfig, len(config.MCPServers))
+	for id, value := range config.MCPServers {
+		if strings.TrimSpace(value.ID) == "" {
+			value.ID = id
+		}
+		normalized, err := value.Normalize()
+		if err != nil {
+			return err
+		}
+		if normalized.ID != strings.TrimSpace(id) {
+			return fmt.Errorf("MCP map key %q must match id %q", id, normalized.ID)
+		}
+		normalizedMCP[normalized.ID] = normalized
+	}
+	config.MCPServers = normalizedMCP
 	for id, provider := range config.Providers {
 		if strings.TrimSpace(id) == "" || strings.TrimSpace(provider.Type) == "" {
 			return fmt.Errorf("provider id and type are required")
+		}
+		if utf8.RuneCountInString(strings.TrimSpace(provider.DisplayName)) > 80 {
+			return fmt.Errorf("provider %q display_name must not exceed 80 characters", id)
 		}
 		switch strings.ToLower(strings.TrimSpace(provider.Type)) {
 		case "openai-compatible":
@@ -334,8 +373,24 @@ func validateConfig(config *Config) error {
 				return fmt.Errorf("provider %q requires openai_compatible settings", id)
 			}
 			llm := provider.OpenAICompatible
-			if strings.TrimSpace(llm.BaseURL) == "" || strings.TrimSpace(llm.Model) == "" {
-				return fmt.Errorf("provider %q base_url and model are required", id)
+			applyOpenAICompatibleDefaults(llm)
+			if strings.TrimSpace(llm.Model) == "" {
+				return fmt.Errorf("provider %q model is required", id)
+			}
+			if strings.TrimSpace(llm.BaseURL) == "" {
+				return fmt.Errorf("provider %q base_url is required for API key authentication", id)
+			}
+			if llm.MaxAttempts <= 0 || llm.MaxAttempts > 3 {
+				return fmt.Errorf("provider %q max_attempts must be between 1 and 3", id)
+			}
+		case "openai-codex-responses":
+			if provider.OpenAICodexResponses == nil {
+				return fmt.Errorf("provider %q requires openai_codex_responses settings", id)
+			}
+			llm := provider.OpenAICodexResponses
+			applyOpenAICodexResponsesDefaults(llm)
+			if strings.TrimSpace(llm.Model) == "" {
+				return fmt.Errorf("provider %q model is required", id)
 			}
 			if llm.MaxAttempts <= 0 || llm.MaxAttempts > 3 {
 				return fmt.Errorf("provider %q max_attempts must be between 1 and 3", id)

@@ -3,6 +3,7 @@ package harness
 import (
 	"AgenticService/src/approval"
 	"AgenticService/src/domain"
+	"AgenticService/src/ports"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,30 @@ func newTestRunner(sessions *memorySessions, model *scriptedModel, tools *fakeTo
 	}
 }
 
+type nativeCapableProviderModel struct {
+	ports.Model
+}
+
+func (nativeCapableProviderModel) Capabilities(string, string) domain.ModelCapabilities {
+	return domain.ModelCapabilities{}
+}
+
+func (nativeCapableProviderModel) DefaultProviderID() string  { return "native-provider" }
+func (nativeCapableProviderModel) HasProvider(id string) bool { return id == "native-provider" }
+func (nativeCapableProviderModel) ListProviders() []domain.ProviderDescriptor {
+	return []domain.ProviderDescriptor{{ID: "native-provider", SupportsNativeToolCalls: true}}
+}
+
+func TestEffectiveToolCallModePrefersProviderNativeCapability(t *testing.T) {
+	model := nativeCapableProviderModel{Model: &scriptedModel{}}
+	if mode := effectiveToolCallMode(model, "native-provider", ToolCallModeInstruction); mode != ToolCallModeNative {
+		t.Fatalf("effective mode = %q, want native", mode)
+	}
+	if mode := effectiveToolCallMode(&scriptedModel{}, "", ToolCallModeInstruction); mode != ToolCallModeInstruction {
+		t.Fatalf("fallback mode = %q, want instruction", mode)
+	}
+}
+
 func TestRunReturnsFinalAssistantMessage(t *testing.T) {
 	sessions := newMemorySessions(testSession())
 	model := &scriptedModel{responses: []domain.ModelResponse{{Content: "完成了"}}}
@@ -34,6 +59,40 @@ func TestRunReturnsFinalAssistantMessage(t *testing.T) {
 	}
 	if result.Message.Content != "完成了" {
 		t.Errorf("content = %q, want 完成了", result.Message.Content)
+	}
+}
+
+func TestRunPreservesUserToolResultOrderOnFollowUpTurn(t *testing.T) {
+	sessions := newMemorySessions(testSession())
+	model := &scriptedModel{responses: []domain.ModelResponse{
+		{ToolCalls: []domain.ToolCall{{ID: "call_1", Name: "shell_exec", Arguments: map[string]any{"command": "update"}}}},
+		{Content: "已完成更新。"},
+	}}
+	tools := &fakeTools{
+		definitions: []domain.ToolDefinition{{Name: "shell_exec"}},
+		execute: func(_ context.Context, _ domain.Session, call domain.ToolCall) (domain.ToolExecution, error) {
+			return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: "exit_code: 0"}, nil
+		},
+	}
+	runner := newTestRunner(sessions, model, tools)
+
+	if _, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "更新檔案"}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(model.requests))
+	}
+	followUp := model.requests[1]
+	if followUp.UserPrompt != "" {
+		t.Fatalf("follow-up user prompt = %q, want empty because it already precedes tool output in history", followUp.UserPrompt)
+	}
+	if len(followUp.History) != 3 {
+		t.Fatalf("follow-up history = %+v, want user, assistant tool call, and tool result", followUp.History)
+	}
+	if followUp.History[0].Role != "user" || followUp.History[0].Content != "更新檔案" ||
+		followUp.History[1].Role != "assistant" || len(followUp.History[1].ToolCalls) != 1 ||
+		followUp.History[2].Role != "tool" || followUp.History[2].ToolCallID != "call_1" {
+		t.Fatalf("follow-up history order is invalid: %+v", followUp.History)
 	}
 }
 

@@ -1,9 +1,12 @@
-// Package openaicompat 實作單一 OpenAI Chat Completions 相容模型介面。
+// Package openaicompat 實作 OpenAI Chat Completions 相容介面，並在
+// ChatGPT/Codex OAuth 模式下切換為 Codex Responses 協定。
 package openaicompat
 
 import (
 	"AgenticService/src/domain"
 	"AgenticService/src/internal/logging"
+	"AgenticService/src/providerauth"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -11,24 +14,33 @@ import (
 	"net/textproto"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
+const (
+	CodexResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses"
+	CodexUsageEndpoint     = "https://chatgpt.com/backend-api/wham/usage"
+)
+
 type Config struct {
-	BaseURL                      string            `json:"base_url"`
-	APIKey                       string            `json:"api_key,omitempty"`
-	Model                        string            `json:"model"`
-	InstructionRole              string            `json:"instruction_role,omitempty"`
-	ExtraHeaders                 map[string]string `json:"extra_headers,omitempty"`
-	DisableStreaming             bool              `json:"disable_streaming,omitempty"`
-	StreamIncludeUsage           bool              `json:"stream_include_usage"`
-	OmitToolChoice               bool              `json:"omit_tool_choice,omitempty"`
-	MaxAttempts                  int               `json:"max_attempts,omitempty"`
-	TimeoutSeconds               int               `json:"timeout_seconds,omitempty"`
-	ConnectTimeoutSeconds        int               `json:"connect_timeout_seconds,omitempty"`
-	ResponseHeaderTimeoutSeconds int               `json:"response_header_timeout_seconds,omitempty"`
-	Timeout                      time.Duration     `json:"-"`
-	Logger                       *slog.Logger      `json:"-"`
+	BaseURL                      string                                `json:"base_url"`
+	APIKey                       string                                `json:"api_key,omitempty"`
+	AuthMode                     string                                `json:"auth_mode,omitempty"`
+	OAuth                        providerauth.Config                   `json:"oauth,omitempty"`
+	Model                        string                                `json:"model"`
+	InstructionRole              string                                `json:"instruction_role,omitempty"`
+	ExtraHeaders                 map[string]string                     `json:"extra_headers,omitempty"`
+	DisableStreaming             bool                                  `json:"disable_streaming,omitempty"`
+	StreamIncludeUsage           bool                                  `json:"stream_include_usage"`
+	OmitToolChoice               bool                                  `json:"omit_tool_choice,omitempty"`
+	MaxAttempts                  int                                   `json:"max_attempts,omitempty"`
+	TimeoutSeconds               int                                   `json:"timeout_seconds,omitempty"`
+	ConnectTimeoutSeconds        int                                   `json:"connect_timeout_seconds,omitempty"`
+	ResponseHeaderTimeoutSeconds int                                   `json:"response_header_timeout_seconds,omitempty"`
+	Timeout                      time.Duration                         `json:"-"`
+	Logger                       *slog.Logger                          `json:"-"`
+	TokenSource                  func(context.Context) (string, error) `json:"-"`
 
 	// ContextWindow 與 MaxOutputTokens 是這個 Provider 預設模型的限制。
 	// 相容端點無法可靠探測，而用模型名稱字串比對又太脆弱，所以由設定宣告；
@@ -53,34 +65,55 @@ type Diagnostics struct {
 	StreamIncludeUsage bool   `json:"stream_include_usage"`
 	MaxAttempts        int    `json:"max_attempts"`
 	HasAPIKey          bool   `json:"has_api_key"`
+	AuthMode           string `json:"auth_mode"`
 	ContextWindow      int    `json:"context_window,omitempty"`
 	MaxOutputTokens    int    `json:"max_output_tokens,omitempty"`
 }
 
 type Model struct {
-	endpoint           string
-	apiKey             string
-	defaultModel       string
-	instructionRole    string
-	extraHeaders       map[string]string
-	disableStreaming   bool
-	streamIncludeUsage bool
-	omitToolChoice     bool
-	maxAttempts        int
-	contextWindow      int
-	maxOutputTokens    int
-	modelLimits        map[string]ModelLimits
-	logger             *slog.Logger
-	client             *http.Client
+	endpoint            string
+	apiKey              string
+	authMode            string
+	tokenSource         func(context.Context) (string, error)
+	defaultModel        string
+	instructionRole     string
+	extraHeaders        map[string]string
+	disableStreaming    bool
+	streamIncludeUsage  bool
+	omitToolChoice      bool
+	maxAttempts         int
+	contextWindow       int
+	maxOutputTokens     int
+	modelLimits         map[string]ModelLimits
+	limitsMu            sync.RWMutex
+	reportedModelLimits map[string]ModelLimits
+	logger              *slog.Logger
+	client              *http.Client
+	usageMu             sync.RWMutex
+	providerUsage       domain.ProviderUsage
 }
 
 func New(config Config) (*Model, error) {
-	endpoint, err := completionEndpoint(config.BaseURL)
-	if err != nil {
-		return nil, err
+	authMode := strings.ToLower(strings.TrimSpace(config.AuthMode))
+	if authMode == "" {
+		authMode = "api_key"
+	}
+	if authMode != "api_key" && authMode != "oauth" {
+		return nil, fmt.Errorf("auth_mode must be api_key or oauth")
+	}
+	if authMode == "oauth" && config.TokenSource == nil {
+		return nil, fmt.Errorf("ChatGPT/Codex OAuth token source is required")
+	}
+	endpoint := CodexResponsesEndpoint
+	if authMode != "oauth" {
+		var err error
+		endpoint, err = completionEndpoint(config.BaseURL)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if strings.TrimSpace(config.Model) == "" {
-		return nil, fmt.Errorf("OpenAI-compatible model is required")
+		return nil, fmt.Errorf("provider model is required")
 	}
 	role := strings.ToLower(strings.TrimSpace(config.InstructionRole))
 	if role == "" {
@@ -130,10 +163,12 @@ func New(config Config) (*Model, error) {
 	return &Model{
 		endpoint:           endpoint,
 		apiKey:             strings.TrimSpace(config.APIKey),
+		authMode:           authMode,
+		tokenSource:        config.TokenSource,
 		defaultModel:       strings.TrimSpace(config.Model),
 		instructionRole:    role,
 		extraHeaders:       headers,
-		disableStreaming:   config.DisableStreaming,
+		disableStreaming:   config.DisableStreaming && authMode != "oauth",
 		streamIncludeUsage: config.StreamIncludeUsage,
 		omitToolChoice:     config.OmitToolChoice,
 		maxAttempts:        maxAttempts,
@@ -157,9 +192,39 @@ func (m *Model) Diagnostics() Diagnostics {
 		StreamIncludeUsage: m.streamIncludeUsage,
 		MaxAttempts:        m.maxAttempts,
 		HasAPIKey:          m.apiKey != "",
+		AuthMode:           m.authMode,
 		ContextWindow:      m.contextWindow,
 		MaxOutputTokens:    m.maxOutputTokens,
 	}
+}
+
+func (m *Model) applyAuthorization(ctx context.Context, request *http.Request) error {
+	if m == nil || request == nil {
+		return fmt.Errorf("OpenAI-compatible authorization is unavailable")
+	}
+	token := strings.TrimSpace(m.apiKey)
+	if m.authMode == "oauth" {
+		if m.tokenSource == nil {
+			return fmt.Errorf("ChatGPT/Codex OAuth token source is unavailable")
+		}
+		value, err := m.tokenSource(ctx)
+		if err != nil {
+			return err
+		}
+		token = strings.TrimSpace(value)
+		if token == "" {
+			return fmt.Errorf("ChatGPT/Codex OAuth returned an empty access token")
+		}
+		accountID := codexAccountID(token)
+		if accountID == "" {
+			return fmt.Errorf("ChatGPT/Codex OAuth token is missing chatgpt_account_id")
+		}
+		request.Header.Set("chatgpt-account-id", accountID)
+	}
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
 }
 
 // Capabilities 回報指定模型的宣告限制；未指定模型時使用 Provider 預設模型。
@@ -175,7 +240,7 @@ func (m *Model) Capabilities(model string) domain.ModelCapabilities {
 		ContextWindow:   m.contextWindow,
 		MaxOutputTokens: m.maxOutputTokens,
 		SupportsTools:   true,
-		Streaming:       !m.disableStreaming,
+		Streaming:       m.authMode == "oauth" || !m.disableStreaming,
 	}
 	if limits, exists := m.modelLimits[model]; exists {
 		if limits.ContextWindow > 0 {
@@ -185,7 +250,29 @@ func (m *Model) Capabilities(model string) domain.ModelCapabilities {
 			capabilities.MaxOutputTokens = limits.MaxOutputTokens
 		}
 	}
+	// Provider 模型目錄回傳的限制是實際後端參考值，優先於人工設定。
+	// 人工設定只在目錄沒有提供對應欄位時作為後備。
+	m.limitsMu.RLock()
+	reported, reportedExists := m.reportedModelLimits[model]
+	m.limitsMu.RUnlock()
+	if reportedExists {
+		if reported.ContextWindow > 0 {
+			capabilities.ContextWindow = reported.ContextWindow
+		}
+		if reported.MaxOutputTokens > 0 {
+			capabilities.MaxOutputTokens = reported.MaxOutputTokens
+		}
+	}
 	return capabilities
+}
+
+func (m *Model) replaceReportedModelLimits(values map[string]ModelLimits) {
+	if m == nil {
+		return
+	}
+	m.limitsMu.Lock()
+	m.reportedModelLimits = cloneModelLimits(values)
+	m.limitsMu.Unlock()
 }
 
 func cloneModelLimits(input map[string]ModelLimits) map[string]ModelLimits {

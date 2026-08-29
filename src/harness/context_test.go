@@ -6,7 +6,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestRepairToolCallPairsSynthesizesMissingResult(t *testing.T) {
@@ -178,9 +177,9 @@ func TestBudgetFallsBackWhenModelWindowUnknown(t *testing.T) {
 	}
 }
 
-func TestDefaultBudgetIs512K(t *testing.T) {
+func TestDefaultBudgetIs256K(t *testing.T) {
 	config := normalizeContextConfig(ContextConfig{})
-	if got, want := config.MaxEstimatedTokens, 512*1024; got != want {
+	if got, want := config.MaxEstimatedTokens, 256*1024; got != want {
 		t.Fatalf("default budget = %d, want %d", got, want)
 	}
 }
@@ -343,8 +342,8 @@ func TestSummaryUsesDeterministicFallbackWhenAllProvidersFail(t *testing.T) {
 	}
 }
 
-// TestSoftCompactionStartsBeforeHardBudget 驗證 80% soft limit 具有實際效果：
-// context 尚未超過硬上限時就先產生摘要，下一輪不必同步等待摘要模型。
+// TestSoftCompactionStartsBeforeHardBudget 驗證 90% soft limit 具有實際效果：
+// context 尚未超過硬上限時就先產生摘要。
 func TestSoftCompactionStartsBeforeHardBudget(t *testing.T) {
 	session := testSession()
 	sessions := newMemorySessions(session)
@@ -353,15 +352,22 @@ func TestSoftCompactionStartsBeforeHardBudget(t *testing.T) {
 	model := &scriptedModel{responses: []domain.ModelResponse{{Content: "背景摘要"}}}
 	manager := &ContextManager{
 		Model: model, Sessions: sessions,
-		Config: ContextConfig{MaxEstimatedTokens: 250, RetainMessages: 1},
+		Config: ContextConfig{MaxEstimatedTokens: 220, RetainMessages: 1},
 	}
 
-	compacted, err := manager.compactIfNeeded(context.Background(), session, "system", nil, softCompactionRatio)
+	started := false
+	window, err := manager.BuildObserved(context.Background(), session, "system", nil, func(status ContextCompactionStatus) error {
+		started = true
+		if status.TriggerRatio != softCompactionRatio {
+			t.Fatalf("trigger ratio = %v, want %v", status.TriggerRatio, softCompactionRatio)
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("compactIfNeeded: %v", err)
+		t.Fatalf("BuildObserved: %v", err)
 	}
-	if !compacted {
-		t.Fatal("context above 80% was not compacted before the hard limit")
+	if !started || !window.Compacted {
+		t.Fatal("context above 90% was not compacted before the hard limit")
 	}
 	entry, err := sessions.LatestEntryOfType(context.Background(), session.ID, domain.SessionEntryCompaction)
 	if err != nil || entry.Data["summary"] != "背景摘要" || entry.Data["reason"] != "context_budget" {
@@ -369,43 +375,33 @@ func TestSoftCompactionStartsBeforeHardBudget(t *testing.T) {
 	}
 }
 
-func TestScheduleCompactionRunsInBackgroundAndDeduplicatesSession(t *testing.T) {
+func TestCompactionUsesLatestProviderInputUsage(t *testing.T) {
 	session := testSession()
 	sessions := newMemorySessions(session)
-	appendTestMessage(t, sessions, domain.Message{Role: "user", Content: strings.Repeat("中", 100)})
-	appendTestMessage(t, sessions, domain.Message{Role: "assistant", Content: strings.Repeat("文", 100)})
-	entered := make(chan struct{}, 1)
-	release := make(chan struct{})
-	model := &scriptedModel{
-		responses: []domain.ModelResponse{{Content: "非同步摘要"}},
-		onStream: func(int) {
-			entered <- struct{}{}
-			<-release
-		},
-	}
+	appendTestMessage(t, sessions, domain.Message{Role: "user", Content: "較早訊息"})
+	appendTestMessage(t, sessions, domain.Message{
+		Role:    "assistant",
+		Content: "最近回答",
+		Usage:   &domain.Usage{InputTokens: 920},
+	})
 	manager := &ContextManager{
-		Model: model, Sessions: sessions,
-		Config: ContextConfig{MaxEstimatedTokens: 250, RetainMessages: 1},
+		Model:    &scriptedModel{responses: []domain.ModelResponse{{Content: "依實際用量壓縮"}}},
+		Sessions: sessions,
+		Config:   ContextConfig{MaxEstimatedTokens: 1_000, RetainMessages: 1},
 	}
 
-	if !manager.ScheduleCompaction(context.Background(), session, "system", nil) {
-		t.Fatal("first background compaction was not scheduled")
-	}
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("background compaction did not reach the model")
-	}
-	if manager.ScheduleCompaction(context.Background(), session, "system", nil) {
-		t.Fatal("duplicate background compaction was scheduled for the same session")
-	}
-	close(release)
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if entry, err := sessions.LatestEntryOfType(context.Background(), session.ID, domain.SessionEntryCompaction); err == nil && entry.Data["summary"] == "非同步摘要" {
-			return
+	started := false
+	window, err := manager.BuildObserved(context.Background(), session, "system", nil, func(status ContextCompactionStatus) error {
+		started = true
+		if status.ReportedInputTokens != 920 || status.TriggerTokens != 920 {
+			t.Fatalf("status = %+v, want reported/trigger tokens 920", status)
 		}
-		time.Sleep(time.Millisecond)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("BuildObserved: %v", err)
 	}
-	t.Fatal("background compaction did not persist its summary")
+	if !started || !window.Compacted {
+		t.Fatal("provider-reported input above 90% did not trigger compaction")
+	}
 }

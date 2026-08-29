@@ -85,6 +85,9 @@ func (e *fakeEngine) UpdateSession(_ context.Context, sessionID string, input do
 	if input.PermissionProfile != nil {
 		session.PermissionProfile = *input.PermissionProfile
 	}
+	if input.Position != nil {
+		session.Position = *input.Position
+	}
 	if input.ProviderID != nil {
 		session.ProviderID = *input.ProviderID
 	}

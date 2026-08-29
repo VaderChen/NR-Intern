@@ -9,6 +9,12 @@ const state = {
   providerModelLoads: {},
   providerModelErrors: {},
   providerTestedModels: {},
+  mcpSettings: null,
+  selectedMCPSettingsID: "",
+  mcpSettingsDraft: null,
+  reverseProxy: null,
+  reverseProxyHydrated: false,
+  reverseProxyLoading: false,
   permissions: null,
   workspaces: [],
   workspace: null,
@@ -22,6 +28,9 @@ const state = {
   planExpansionInitialized: false,
   activePlanID: "",
   planDragID: "",
+  sessionDragID: "",
+  sessionDragProjectID: "",
+  sessionOrderSaving: false,
   backendHealthy: false,
   backendLifecycleState: "stopped",
   refreshingBackend: false,
@@ -42,18 +51,29 @@ const state = {
   editingProject: null,
   editProjectSandboxRoots: [],
   contextSession: null,
+  contextProject: null,
   contextResource: null,
   renamingSession: null,
   inspectingSession: null,
   deletingSession: null,
   pendingAttachments: [],
   attachmentSessionId: "",
+  promptQueue: [],
+  queueDraining: false,
   runStartedAt: new Map(),
   sessionSelectionVersion: 0,
   sessionRuntimeSaving: false,
   messageAutoScroll: true,
+  providerUsageRequest: 0,
+  contextUsage: null,
+  contextCapabilities: null,
+  contextCapabilitiesRequest: 0,
+  contextCapabilityCache: {},
+  contextCompactionSessionId: "",
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("collapsedProjects") || "[]")),
 };
+
+let nativeConversationActivity = null;
 
 const $ = (id) => document.getElementById(id);
 const defaultServiceNames = Object.freeze({
@@ -81,9 +101,11 @@ const richContentSource = window.RichTextRenderer.source;
 const maxPendingAttachments = 16;
 const maxAttachmentBytes = 8 * 1024 * 1024;
 const messageAutoScrollThresholdRatio = 0.03;
+const fallbackContextWindowTokens = 256 * 1024;
 const backendRefreshIntervalMilliseconds = 4000;
 const backendStartupRefreshIntervalMilliseconds = 200;
-const contextCompactionActivity = "本輪已達上下文上限，自動整理資料後將繼續處理。";
+const providerUsageUIRefreshIntervalMilliseconds = 30_000;
+const reverseProxyRefreshIntervalMilliseconds = 3_000;
 const promptComposition = {
   active: false,
   enterObserved: false,
@@ -93,6 +115,7 @@ const promptComposition = {
 let chatDragDepth = 0;
 let messageScrollFrame = 0;
 let backendRefreshTimer = 0;
+let providerOAuthPollTimer = 0;
 let backendFastPollUntil = Date.now() + 5000;
 const dialogPointerGesture = {
   dialog: null,
@@ -356,6 +379,8 @@ async function refreshBackend() {
     $("workspaceSelect").disabled = !status.healthy || state.running;
     $("newProject").disabled = !status.healthy || !state.workspace || state.running;
     $("openManagement").disabled = !status.healthy;
+    $("providerUsageButton").disabled = !status.healthy;
+    if (!status.healthy) closeProviderUsagePopover();
     if (status.healthy && (!wasHealthy || !state.agent)) await loadApplicationState();
     if (!status.healthy && wasHealthy) resetWorkspace();
   } catch (error) {
@@ -376,6 +401,7 @@ function scheduleBackendRefresh() {
 
 function resetWorkspace() {
   clearPendingAttachments();
+  clearPromptQueue();
   state.agent = null;
   state.providers = [];
   state.providerSettings = null;
@@ -396,6 +422,9 @@ function resetWorkspace() {
   state.planExpansionInitialized = false;
   state.activePlanID = "";
   state.planDragID = "";
+  state.sessionDragID = "";
+  state.sessionDragProjectID = "";
+  state.sessionOrderSaving = false;
   state.sessionRuntimeSaving = false;
   state.runningSessionId = "";
   state.runActivityText = "";
@@ -405,6 +434,10 @@ function resetWorkspace() {
   state.pendingApprovalSessionId = "";
   state.liveMessage = null;
   state.runStartedAt.clear();
+  state.contextUsage = null;
+  state.contextCapabilities = null;
+  state.contextCapabilitiesRequest += 1;
+  state.contextCapabilityCache = {};
   $("sessionTitle").textContent = "選擇或建立對話";
   $("agentLabel").textContent = "後端目前離線";
   $("prompt").disabled = true;
@@ -412,6 +445,7 @@ function resetWorkspace() {
   $("workspaceSelect").replaceChildren();
   syncSessionRuntimeControls({ loadModels: false });
   syncPlanButton();
+  renderContextUsage();
   $("workspaceSettings").classList.add("hidden");
   $("messages").replaceChildren();
   $("messages").classList.add("hidden");
@@ -511,10 +545,10 @@ function renderNavigation() {
   const projectList = $("projectList");
   projectList.replaceChildren();
   for (const project of state.projects) {
-    const sessions = state.sessions.filter((session) => session.project_id === project.id && !session.pinned);
+    const sessions = orderedProjectSessions(state.sessions.filter((session) => session.project_id === project.id && !session.pinned));
     projectList.append(projectNode(project, sessions));
   }
-  const ungrouped = state.sessions.filter((session) => !session.project_id && !session.pinned);
+  const ungrouped = orderedProjectSessions(state.sessions.filter((session) => !session.project_id && !session.pinned));
   if (ungrouped.length > 0) projectList.append(projectNode(null, ungrouped));
   if (state.projects.length === 0 && ungrouped.length === 0 && state.backendHealthy) {
     const empty = document.createElement("p");
@@ -524,10 +558,22 @@ function renderNavigation() {
   }
 }
 
+function orderedProjectSessions(sessions) {
+  return sessions
+    .map((session, index) => ({ session, index }))
+    .sort((left, right) => {
+      const leftPosition = Number.isFinite(Number(left.session.position)) ? Number(left.session.position) : 0;
+      const rightPosition = Number.isFinite(Number(right.session.position)) ? Number(right.session.position) : 0;
+      return leftPosition - rightPosition || left.index - right.index;
+    })
+    .map((value) => value.session);
+}
+
 function projectNode(project, sessions) {
   const projectID = project?.id || "uncategorized";
   const group = document.createElement("section");
   group.className = "project-group";
+  group.dataset.projectId = project?.id || "";
   const header = document.createElement("div");
   header.className = "project-head";
   const toggle = document.createElement("button");
@@ -541,6 +587,15 @@ function projectNode(project, sessions) {
   name.textContent = project?.name || "未分類";
   toggle.append(caret, icon, name);
   toggle.addEventListener("click", () => toggleProject(projectID));
+  if (project) {
+    header.addEventListener("contextmenu", (event) => openProjectContextMenu(event, project));
+    toggle.addEventListener("keydown", (event) => {
+      if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+      event.preventDefault();
+      const bounds = header.getBoundingClientRect();
+      showProjectContextMenu(project, bounds.left + Math.min(bounds.width, 180), bounds.top + 12, true);
+    });
+  }
   header.append(toggle);
   if (project) {
     const actions = document.createElement("div");
@@ -556,6 +611,7 @@ function projectNode(project, sessions) {
   }
   const children = document.createElement("div");
   children.className = "project-sessions";
+  children.dataset.projectId = project?.id || "";
   children.classList.toggle("hidden", state.collapsedProjects.has(projectID));
   if (sessions.length === 0) {
     const empty = document.createElement("small");
@@ -574,6 +630,15 @@ function sessionNode(session, pinnedContext) {
   const running = state.running && state.runningSessionId === session.id;
   row.className = `session-row ${state.session?.id === session.id ? "active" : ""} ${running ? "running" : ""}`;
   row.dataset.sessionId = session.id;
+  row.dataset.projectId = session.project_id || "";
+  row.draggable = !pinnedContext && !state.running && !state.sessionOrderSaving;
+  if (row.draggable) {
+    row.addEventListener("dragstart", (event) => startSessionDrag(event, row, session));
+    row.addEventListener("dragend", clearSessionDragState);
+    row.addEventListener("dragover", (event) => markSessionDropTarget(event, row, session));
+    row.addEventListener("dragleave", (event) => clearSessionDropTarget(event, row));
+    row.addEventListener("drop", (event) => dropSession(event, row, session));
+  }
   row.addEventListener("contextmenu", (event) => openSessionContextMenu(event, session));
   const button = document.createElement("button");
   button.className = "session";
@@ -604,6 +669,123 @@ function sessionNode(session, pinnedContext) {
   if (pinnedContext) pin.classList.add("pinned");
   row.append(button, runIndicator, pin);
   return row;
+}
+
+function startSessionDrag(event, row, session) {
+  if (!row.draggable || state.sessionOrderSaving) {
+    event.preventDefault();
+    return;
+  }
+  state.sessionDragID = session.id;
+  state.sessionDragProjectID = session.project_id || "";
+  row.classList.add("dragging");
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", session.id);
+  }
+  for (const group of document.querySelectorAll(".project-group")) {
+    group.classList.toggle("session-drop-disabled", group.dataset.projectId !== state.sessionDragProjectID);
+  }
+}
+
+function validSessionDropTarget(session) {
+  return Boolean(
+    state.sessionDragID
+      && state.sessionDragID !== session.id
+      && state.sessionDragProjectID === (session.project_id || "")
+      && !state.sessionOrderSaving,
+  );
+}
+
+function clearSessionDropMarkers() {
+  for (const row of document.querySelectorAll(".session-row.drop-before, .session-row.drop-after")) {
+    row.classList.remove("drop-before", "drop-after");
+  }
+}
+
+function markSessionDropTarget(event, row, session) {
+  if (!validSessionDropTarget(session)) {
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
+    return;
+  }
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  clearSessionDropMarkers();
+  const bounds = row.getBoundingClientRect();
+  row.classList.add(event.clientY < bounds.top + bounds.height / 2 ? "drop-before" : "drop-after");
+}
+
+function clearSessionDropTarget(event, row) {
+  if (event.relatedTarget && row.contains(event.relatedTarget)) return;
+  row.classList.remove("drop-before", "drop-after");
+}
+
+function dropSession(event, row, session) {
+  if (!validSessionDropTarget(session)) return;
+  event.preventDefault();
+  const bounds = row.getBoundingClientRect();
+  const insertBefore = row.classList.contains("drop-before")
+    || (!row.classList.contains("drop-after") && event.clientY < bounds.top + bounds.height / 2);
+  void persistSessionOrder(session.id, insertBefore);
+}
+
+function clearSessionDragState() {
+  state.sessionDragID = "";
+  state.sessionDragProjectID = "";
+  clearSessionDropMarkers();
+  for (const group of document.querySelectorAll(".project-group.session-drop-disabled")) {
+    group.classList.remove("session-drop-disabled");
+  }
+  for (const row of document.querySelectorAll(".session-row.dragging")) row.classList.remove("dragging");
+}
+
+async function persistSessionOrder(targetSessionID, insertBefore) {
+  const sourceSessionID = state.sessionDragID;
+  const projectID = state.sessionDragProjectID;
+  const workspaceID = state.workspace?.id || "";
+  const originalSessions = state.sessions;
+  clearSessionDragState();
+  if (!sourceSessionID || !workspaceID || state.sessionOrderSaving) return;
+
+  const ordered = orderedProjectSessions(state.sessions.filter((session) => (
+    !session.pinned
+      && session.workspace_id === workspaceID
+      && (session.project_id || "") === projectID
+  )));
+  const source = ordered.find((session) => session.id === sourceSessionID);
+  const target = ordered.find((session) => session.id === targetSessionID);
+  if (!source || !target) return;
+  const reordered = ordered.filter((session) => session.id !== sourceSessionID);
+  let targetIndex = reordered.findIndex((session) => session.id === targetSessionID);
+  if (!insertBefore) targetIndex += 1;
+  reordered.splice(targetIndex, 0, source);
+  if (reordered.every((session, index) => session.id === ordered[index]?.id)) return;
+
+  const positionByID = new Map(reordered.map((session, index) => [session.id, index]));
+  state.sessionOrderSaving = true;
+  state.sessions = state.sessions.map((session) => positionByID.has(session.id)
+    ? { ...session, position: positionByID.get(session.id) }
+    : session);
+  renderNavigation();
+  try {
+    const values = await request(`/api/v1/agents/${encodeURIComponent(state.agent.id)}/sessions/order`, {
+      method: "PUT",
+      body: JSON.stringify({
+        workspace_id: workspaceID,
+        project_id: projectID,
+        session_ids: reordered.map((session) => session.id),
+      }),
+    });
+    const updatedByID = new Map(values.map((session) => [session.id, session]));
+    state.sessions = state.sessions.map((session) => updatedByID.get(session.id) || session);
+    if (state.session && updatedByID.has(state.session.id)) state.session = updatedByID.get(state.session.id);
+  } catch (error) {
+    state.sessions = originalSessions;
+    toast(error.message);
+  } finally {
+    state.sessionOrderSaving = false;
+    renderNavigation();
+  }
 }
 
 function iconButton(content, label, listener) {
@@ -678,8 +860,45 @@ function openSessionContextMenu(event, session) {
   showSessionContextMenu(session, event.clientX, event.clientY, false);
 }
 
+function openProjectContextMenu(event, project) {
+  event.preventDefault();
+  event.stopPropagation();
+  showProjectContextMenu(project, event.clientX, event.clientY, false);
+}
+
+function showProjectContextMenu(project, clientX, clientY, focusMenu) {
+  if (!project) return;
+  closeSessionContextMenu();
+  closeResourceContextMenu();
+  state.contextProject = project;
+  const menu = $("projectContextMenu");
+  const hasDirectory = Array.isArray(project.sandbox_roots) && project.sandbox_roots.some((root) => String(root || "").trim());
+  $("openContextProjectDirectory").disabled = !hasDirectory;
+  $("openContextProjectDirectory").title = hasDirectory ? "開啟專案目錄" : "此專案尚未設定 Sandbox 目錄";
+  $("manageContextProject").disabled = state.running || !state.backendHealthy;
+  $("deleteContextProject").disabled = state.running || !state.backendHealthy;
+  $("newContextProjectSession").disabled = state.running || !state.backendHealthy || !state.agent;
+  menu.style.left = "0px";
+  menu.style.top = "0px";
+  menu.classList.remove("hidden");
+  const bounds = menu.getBoundingClientRect();
+  const left = Math.max(8, Math.min(clientX, window.innerWidth - bounds.width - 8));
+  const top = Math.max(8, Math.min(clientY, window.innerHeight - bounds.height - 8));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+  if (focusMenu) menu.querySelector("button:not(:disabled)")?.focus();
+}
+
+function closeProjectContextMenu() {
+  const menu = $("projectContextMenu");
+  if (menu.classList.contains("hidden")) return;
+  menu.classList.add("hidden");
+  state.contextProject = null;
+}
+
 function showSessionContextMenu(session, clientX, clientY, focusMenu) {
   const menu = $("sessionContextMenu");
+  closeProjectContextMenu();
   closeResourceContextMenu();
   state.contextSession = session;
   $("pinContextSessionLabel").textContent = session.pinned ? "取消釘選" : "釘選對話";
@@ -717,6 +936,7 @@ function showResourceContextMenu(event, resource) {
   event.preventDefault();
   event.stopPropagation();
   closeSessionContextMenu();
+  closeProjectContextMenu();
   state.contextResource = resource;
   const menu = $("resourceContextMenu");
   const menuHost = event.target.closest?.("dialog[open]") || document.body;
@@ -779,12 +999,240 @@ function selectableProviders() {
   return state.providers.filter((provider) => provider.enabled !== false && !disabledIDs.has(provider.id));
 }
 
+function providerDisplayName(provider) {
+  if (typeof provider === "string") provider = state.providers.find((item) => item.id === provider);
+  return String(provider?.display_name || provider?.id || "").trim();
+}
+
+function activeProviderID() {
+  return String(state.session?.provider_id || state.workspace?.default_provider_id || "").trim();
+}
+
+function activeContextIdentity(session = state.session) {
+  const providerID = String(session?.provider_id || state.workspace?.default_provider_id || "").trim();
+  const provider = state.providers.find((item) => item.id === providerID);
+  const model = String(session?.model || state.workspace?.model || provider?.default_model || "").trim();
+  return {
+    sessionID: String(session?.id || ""),
+    providerID,
+    model,
+    key: `${providerID}\u0000${model}`,
+  };
+}
+
+function formatContextTokenCount(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return "-";
+  const language = window.NRInternI18n?.language || "zh-TW";
+  return new Intl.NumberFormat(language, { maximumFractionDigits: 0 }).format(number);
+}
+
+function contextUsageSnapshot() {
+  const identity = activeContextIdentity();
+  const usage = state.contextUsage;
+  const capabilities = state.contextCapabilities?.key === identity.key ? state.contextCapabilities : null;
+  const usageMatches = usage?.sessionID === identity.sessionID
+    && usage?.providerID === identity.providerID
+    && usage?.model === identity.model;
+  const inputTokens = usageMatches && Number.isFinite(Number(usage.inputTokens)) ? Number(usage.inputTokens) : null;
+  // 相容服務與 Codex 模型不一定提供 Context Window；未提供時以 256K
+  // 作為 UI 的保守上限，避免百分比與剩餘空間永遠無法計算。
+  const contextWindow = Number(capabilities?.context_window) > 0
+    ? Number(capabilities.context_window)
+    : fallbackContextWindowTokens;
+  const maxOutputTokens = Number(capabilities?.max_output_tokens) > 0 ? Number(capabilities.max_output_tokens) : null;
+  const percent = inputTokens !== null && contextWindow
+    ? Math.max(0, Math.min(100, (inputTokens / contextWindow) * 100))
+    : null;
+  return {
+    ...identity,
+    inputTokens,
+    contextWindow,
+    maxOutputTokens,
+    remainingTokens: inputTokens !== null && contextWindow ? Math.max(0, contextWindow - inputTokens) : null,
+    percent,
+  };
+}
+
+function renderContextUsage() {
+  const control = $("contextUsageControl");
+  if (!control) return;
+  const visible = Boolean(state.session);
+  control.classList.toggle("hidden", !visible);
+  if (!visible) {
+    closeContextUsagePopover();
+    return;
+  }
+  const snapshot = contextUsageSnapshot();
+  const percentText = snapshot.percent === null ? "-" : `${formatProviderUsagePercent(snapshot.percent)}%`;
+  $("contextUsagePercent").textContent = percentText;
+  $("contextUsageDetailPercent").textContent = percentText;
+  $("contextUsageProvider").textContent = providerDisplayName(snapshot.providerID) || snapshot.providerID || "-";
+  $("contextUsageModel").textContent = snapshot.model || "-";
+  $("contextUsageInput").textContent = formatContextTokenCount(snapshot.inputTokens);
+  $("contextUsageLimit").textContent = formatContextTokenCount(snapshot.contextWindow);
+  $("contextUsageOutputLimit").textContent = formatContextTokenCount(snapshot.maxOutputTokens);
+  $("contextUsageRemaining").textContent = formatContextTokenCount(snapshot.remainingTokens);
+  const track = $("contextUsageTrack");
+  const bar = $("contextUsageBar");
+  if (snapshot.percent === null) {
+    track.classList.add("unknown");
+    track.removeAttribute("aria-valuenow");
+    track.setAttribute("aria-valuetext", "-");
+    bar.style.width = "0%";
+  } else {
+    track.classList.remove("unknown");
+    track.setAttribute("aria-valuenow", String(snapshot.percent));
+    track.setAttribute("aria-valuetext", percentText);
+    bar.style.width = `${snapshot.percent}%`;
+  }
+}
+
+function recordContextUsage(usage, sessionID = state.session?.id, providerID = activeContextIdentity().providerID, model = activeContextIdentity().model) {
+  const inputTokens = Number(usage?.input_tokens);
+  if (!sessionID || !Number.isFinite(inputTokens) || inputTokens < 0) return;
+  state.contextUsage = {
+    sessionID: String(sessionID),
+    providerID: String(providerID || "").trim(),
+    model: String(model || "").trim(),
+    inputTokens,
+    outputTokens: Number(usage?.output_tokens) || 0,
+    totalTokens: Number(usage?.total_tokens) || 0,
+  };
+  renderContextUsage();
+}
+
+async function loadContextCapabilities(sessionID = state.session?.id) {
+  const identity = activeContextIdentity();
+  if (!sessionID || identity.sessionID !== sessionID || !identity.providerID) {
+    state.contextCapabilities = null;
+    renderContextUsage();
+    return;
+  }
+  const cached = state.contextCapabilityCache[identity.key];
+  if (cached) {
+    state.contextCapabilities = cached;
+    renderContextUsage();
+    return;
+  }
+  const requestID = ++state.contextCapabilitiesRequest;
+  state.contextCapabilities = null;
+  renderContextUsage();
+  try {
+    const query = identity.model ? `?model=${encodeURIComponent(identity.model)}` : "";
+    const value = await request(`/api/v1/providers/${encodeURIComponent(identity.providerID)}/capabilities${query}`);
+    const capabilities = { ...value, key: identity.key };
+    state.contextCapabilityCache[identity.key] = capabilities;
+    if (requestID !== state.contextCapabilitiesRequest || activeContextIdentity().key !== identity.key) return;
+    state.contextCapabilities = capabilities;
+  } catch (_) {
+    if (requestID === state.contextCapabilitiesRequest) state.contextCapabilities = { key: identity.key };
+  }
+  renderContextUsage();
+}
+
+function closeContextUsagePopover() {
+  $("contextUsagePopover")?.classList.add("hidden");
+  $("contextUsageButton")?.setAttribute("aria-expanded", "false");
+}
+
+function toggleContextUsagePopover() {
+  const popover = $("contextUsagePopover");
+  if (!popover) return;
+  const opening = popover.classList.contains("hidden");
+  popover.classList.toggle("hidden", !opening);
+  $("contextUsageButton").setAttribute("aria-expanded", String(opening));
+  if (opening) {
+    renderContextUsage();
+    void loadContextCapabilities();
+  }
+}
+
+function formatProviderUsagePercent(value) {
+  const number = Math.max(0, Math.min(100, Number(value)));
+  return Number.isInteger(number) ? String(number) : number.toFixed(1).replace(/\.0$/, "");
+}
+
+function formatProviderUsageReset(value, includeDate) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "-";
+  const language = window.NRInternI18n?.language || "zh-TW";
+  return new Intl.DateTimeFormat(language, includeDate
+    ? { year: "numeric", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" }
+    : { hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function renderProviderUsageWindow(prefix, windowValue, includeDate) {
+  const available = Boolean(windowValue?.available) && Number.isFinite(Number(windowValue?.remaining_percent));
+  const track = $(`providerUsage${prefix}Track`);
+  const bar = $(`providerUsage${prefix}Bar`);
+  const value = $(`providerUsage${prefix}Value`);
+  const reset = $(`providerUsage${prefix}Reset`);
+  if (!available) {
+    track.classList.add("unknown");
+    track.removeAttribute("aria-valuenow");
+    track.setAttribute("aria-valuetext", "-");
+    bar.style.width = "0%";
+    value.textContent = "-";
+    reset.textContent = "-";
+    return;
+  }
+  const remaining = Math.max(0, Math.min(100, Number(windowValue.remaining_percent)));
+  const text = `${formatProviderUsagePercent(remaining)}%`;
+  track.classList.remove("unknown");
+  track.setAttribute("aria-valuenow", String(remaining));
+  track.setAttribute("aria-valuetext", text);
+  bar.style.width = `${remaining}%`;
+  value.textContent = text;
+  reset.textContent = formatProviderUsageReset(windowValue.reset_at, includeDate);
+}
+
+function renderProviderUsage(usage) {
+  renderProviderUsageWindow("FiveHour", usage?.five_hour, false);
+  renderProviderUsageWindow("SevenDay", usage?.seven_day, true);
+}
+
+async function loadActiveProviderUsage() {
+  const providerID = activeProviderID();
+  const requestID = ++state.providerUsageRequest;
+  renderProviderUsage(null);
+  if (!providerID || !state.backendHealthy) return;
+  try {
+    const usage = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage`, { reconnects: 0 });
+    if (requestID !== state.providerUsageRequest || activeProviderID() !== providerID) return;
+    renderProviderUsage(usage);
+  } catch (_) {
+    if (requestID === state.providerUsageRequest) renderProviderUsage(null);
+  }
+}
+
+function closeProviderUsagePopover() {
+  $("providerUsagePopover").classList.add("hidden");
+  $("providerUsageButton").setAttribute("aria-expanded", "false");
+}
+
+function refreshOpenProviderUsage() {
+  if (!$("providerUsagePopover").classList.contains("hidden")) void loadActiveProviderUsage();
+}
+
+function toggleProviderUsagePopover() {
+  const popover = $("providerUsagePopover");
+  if (!popover.classList.contains("hidden")) {
+    closeProviderUsagePopover();
+    return;
+  }
+  popover.classList.remove("hidden");
+  $("providerUsageButton").setAttribute("aria-expanded", "true");
+  void loadActiveProviderUsage();
+}
+
 function renderProviderOptions() {
   for (const select of [$("newWorkspaceProvider"), $("settingWorkspaceProvider")]) {
     const selected = select.value;
     select.replaceChildren();
     for (const provider of selectableProviders()) {
-      select.add(new Option(provider.id, provider.id));
+      select.add(new Option(providerDisplayName(provider), provider.id));
     }
     if ([...select.options].some((option) => option.value === selected)) select.value = selected;
   }
@@ -794,9 +1242,10 @@ function renderSessionProviderOptions() {
   for (const select of [$("newProvider"), $("settingProvider")]) {
     const selected = select.value;
     const workspaceDefault = state.workspace?.default_provider_id || "";
-    select.replaceChildren(new Option(workspaceDefault ? `使用 Workspace 預設（${workspaceDefault}）` : "使用 Workspace 預設", ""));
+    const workspaceDefaultName = providerDisplayName(workspaceDefault) || workspaceDefault;
+    select.replaceChildren(new Option(workspaceDefaultName ? `使用 Workspace 預設（${workspaceDefaultName}）` : "使用 Workspace 預設", ""));
     for (const provider of selectableProviders()) {
-      select.add(new Option(provider.id, provider.id));
+      select.add(new Option(providerDisplayName(provider), provider.id));
     }
     if ([...select.options].some((option) => option.value === selected)) select.value = selected;
   }
@@ -892,7 +1341,7 @@ function syncSessionRuntimeControls({ loadModels = true } = {}) {
   const providerSelect = $("sessionProviderSelect");
   providerSelect.replaceChildren();
   for (const provider of selectableProviders()) {
-    providerSelect.add(new Option(provider.id, provider.id));
+    providerSelect.add(new Option(providerDisplayName(provider), provider.id));
   }
   providerSelect.value = providerID;
 
@@ -903,9 +1352,9 @@ function syncSessionRuntimeControls({ loadModels = true } = {}) {
   modelSelect.replaceChildren();
   for (const value of models) modelSelect.add(new Option(value, value));
   if (catalog === null) {
-    modelSelect.add(new Option(state.providerModelErrors[providerID] ? "無法取得模型列表" : "正在載入模型…", ""));
+    modelSelect.add(new Option(state.providerModelErrors[providerID] ? "-" : "正在載入模型…", ""));
   } else if (models.length === 0) {
-    modelSelect.add(new Option("沒有可用模型", ""));
+    modelSelect.add(new Option("-", ""));
   }
   const validModel = models.includes(model);
   modelSelect.value = validModel ? model : models[0] || "";
@@ -1026,13 +1475,18 @@ function clearSessionUI() {
 	state.planExpansionInitialized = false;
 	state.activePlanID = "";
 	state.planDragID = "";
+  state.contextUsage = null;
+  state.contextCapabilities = null;
+  state.contextCapabilitiesRequest += 1;
+  closeContextUsagePopover();
   $("sessionTitle").textContent = state.workspace?.name || "選擇或建立對話";
   const workspaceModel = displayedModelForProvider(state.workspace?.default_provider_id, state.workspace?.model);
   $("agentLabel").textContent = state.workspace
-    ? `${state.workspace.default_provider_id}${workspaceModel ? ` · ${workspaceModel}` : ""}`
+    ? `${providerDisplayName(state.workspace.default_provider_id) || state.workspace.default_provider_id}${workspaceModel ? ` · ${workspaceModel}` : ""}`
     : state.agent?.name || "General Harness Agent";
   syncSessionRuntimeControls({ loadModels: false });
   syncPlanButton();
+  renderContextUsage();
   $("sessionPermission").classList.add("hidden");
   $("prompt").disabled = true;
   syncRunActionButton();
@@ -1041,6 +1495,7 @@ function clearSessionUI() {
   $("emptyState").classList.remove("hidden");
   $("sessionSettings").classList.add("hidden");
   $("noSessionManagement").classList.remove("hidden");
+  refreshOpenProviderUsage();
 }
 
 function syncWorkspaceSettings() {
@@ -1072,6 +1527,8 @@ async function selectSession(session) {
     state.planExpansionInitialized = false;
     state.activePlanID = "";
     state.planDragID = "";
+    state.contextUsage = null;
+    state.contextCapabilities = null;
     syncSessionUI();
     renderNavigation();
     await Promise.all([loadMessages(), loadPlans(selected.id)]);
@@ -1089,11 +1546,18 @@ function syncSessionUI() {
   $("sessionTitle").textContent = session.title || "未命名";
   const providerID = session.provider_id || state.workspace?.default_provider_id || "";
   const model = displayedModelForProvider(providerID, session.model);
-  $("agentLabel").textContent = `${providerID}${model ? ` · ${model}` : ""}`;
+  $("agentLabel").textContent = `${providerDisplayName(providerID) || providerID}${model ? ` · ${model}` : ""}`;
   $("sessionPermission").textContent = session.permission_profile || "default";
   $("sessionPermission").classList.remove("hidden");
   syncSessionRuntimeControls();
   syncPlanButton();
+  const contextIdentity = activeContextIdentity(session);
+  if (state.contextUsage && (state.contextUsage.providerID !== contextIdentity.providerID || state.contextUsage.model !== contextIdentity.model)) {
+    state.contextUsage = null;
+  }
+  renderContextUsage();
+  renderContextCompactionState();
+  void loadContextCapabilities(session.id);
   syncSelectedRunUI();
   $("sessionSettings").classList.remove("hidden");
   $("noSessionManagement").classList.add("hidden");
@@ -1107,6 +1571,7 @@ function syncSessionUI() {
   $("settingMemoryScope").value = session.metadata?.memory_scope || "";
   $("settingPinned").checked = Boolean(session.pinned);
   $("managementSubtitle").textContent = session.title || "Session";
+  refreshOpenProviderUsage();
 }
 
 const planStatusLabels = {
@@ -1563,6 +2028,7 @@ async function loadMessages() {
   if (state.session?.id !== selectedID) return;
   const container = $("messages");
   container.replaceChildren();
+  state.contextUsage = null;
   let visibleEntries = 0;
   let activeOperationID = "";
   const operationStartedAt = new Map();
@@ -1573,6 +2039,15 @@ async function loadMessages() {
       continue;
     }
     if (entry.type === "message" && entry.message) {
+      if (entry.message.role === "assistant" && entry.message.usage) {
+        const identity = activeContextIdentity();
+        recordContextUsage(
+          entry.message.usage,
+          selectedID,
+          entry.message.provider_id || identity.providerID,
+          entry.message.model || identity.model,
+        );
+      }
       if (appendMessage(entry.message, { operationId: activeOperationID })) visibleEntries += 1;
       continue;
     }
@@ -1595,6 +2070,7 @@ async function loadMessages() {
   }
   $("emptyState").classList.toggle("hidden", visibleEntries > 0);
   container.classList.toggle("hidden", visibleEntries === 0);
+  renderContextUsage();
   scrollMessages({ force: true });
 }
 
@@ -1633,6 +2109,16 @@ function normalizeAssistantThinking(message) {
   return { ...message, content: tagged.content, reasoning };
 }
 
+function joinReasoningParts(...values) {
+  const parts = [];
+  for (const value of values) {
+    const normalized = String(value || "").trim();
+    if (!normalized || parts.includes(normalized)) continue;
+    parts.push(normalized);
+  }
+  return parts.join("\n\n");
+}
+
 function appendMessage(message, options = {}) {
   if (!message) return null;
   message = normalizeAssistantThinking(message);
@@ -1642,7 +2128,11 @@ function appendMessage(message, options = {}) {
   if (message.role === "tool") return null;
   const internalAssistant = message.role === "assistant"
     && (message.metadata?.internal === true || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0));
-  if (internalAssistant && !message.reasoning) return null;
+  if (internalAssistant) {
+    const intermediateReasoning = joinReasoningParts(message.reasoning, message.content);
+    if (!intermediateReasoning) return null;
+    message = { ...message, content: "", reasoning: intermediateReasoning };
+  }
   const article = document.createElement("article");
   article.className = `message ${message.role}`;
   if (message.variant) article.classList.add(message.variant);
@@ -1724,14 +2214,15 @@ function appendMessageAttachments(container, attachments) {
 function createReasoningBlock(value, className = "message-reasoning") {
   const block = document.createElement("details");
   block.className = className;
+  block.dataset.segmentCount = value ? "1" : "0";
   const summary = document.createElement("summary");
   summary.className = "reasoning-summary";
-  summary.textContent = "處理過程";
   const content = document.createElement("div");
   content.className = "reasoning-content";
   renderRichContent(content, normalizeReasoningMarkdown(value));
   block.append(summary, content);
   block.classList.toggle("hidden", !value);
+  updateReasoningSummary(block);
   return block;
 }
 
@@ -1743,10 +2234,18 @@ function setMessageReasoning(messageNode, value, append = false) {
     messageNode.prepend(block);
   }
   const content = block.querySelector(".reasoning-content");
-  const source = normalizeReasoningMarkdown(append ? `${richContentSource(content)}${value}` : value);
+  const existing = richContentSource(content).trim();
+  const hasExistingSegment = Boolean(existing);
+  const source = normalizeReasoningMarkdown(append && hasExistingSegment
+    ? `${existing}\n\n---\n\n${String(value).trim()}`
+    : value);
   if (append) scheduleRichContent(content, source);
   else renderRichContent(content, source);
+  const previousCount = Math.max(0, Number(block.dataset.segmentCount) || 0);
+  if (append && hasExistingSegment) block.dataset.segmentCount = String(previousCount + 1);
+  else if (value && previousCount === 0) block.dataset.segmentCount = "1";
   block.classList.remove("hidden");
+  updateReasoningSummary(block);
   updateLiveReasoningDuration(messageNode.dataset.operationId || "");
 }
 
@@ -1766,7 +2265,7 @@ function mergeReasoningIntoPrevious(messageNode, operationID = "") {
   if (operationID && previousOperationID && operationID !== previousOperationID) return messageNode;
   if (operationID && !previousOperationID) previous.dataset.operationId = operationID;
   const addition = richContentSource(content).trim();
-  if (addition) setMessageReasoning(previous, `\n\n${addition}`, true);
+  if (addition) setMessageReasoning(previous, addition, true);
   block.remove();
   if (messageNode.classList.contains("reasoning-only")) {
     messageNode.remove();
@@ -1779,23 +2278,36 @@ function finalizeReasoningGroup(operationID, durationMilliseconds) {
   if (!operationID || !Number.isFinite(durationMilliseconds) || durationMilliseconds < 0) return;
   for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
     if (node.dataset.operationId !== operationID) continue;
-    const summary = node.querySelector(".reasoning-summary");
-    if (summary) summary.textContent = `處理過程 · ${formatProcessingDuration(durationMilliseconds)}`;
     const block = node.querySelector(".message-reasoning");
-    if (block) block.dataset.durationMilliseconds = String(Math.round(durationMilliseconds));
+    if (block) {
+      block.dataset.durationMilliseconds = String(Math.round(durationMilliseconds));
+      updateReasoningSummary(block, durationMilliseconds);
+    }
   }
 }
 
 function updateLiveReasoningDuration(operationID, now = Date.now()) {
   const startedAt = state.runStartedAt.get(operationID);
   if (!operationID || !Number.isFinite(startedAt) || !Number.isFinite(now) || now < startedAt) return;
-  const label = `處理過程 · ${formatProcessingDuration(now - startedAt)}`;
   for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
     if (node.dataset.operationId !== operationID) continue;
     const block = node.querySelector(".message-reasoning:not(.hidden)");
-    const summary = block?.querySelector(".reasoning-summary");
-    if (summary) summary.textContent = label;
+    if (block) updateReasoningSummary(block, now - startedAt);
   }
+}
+
+function updateReasoningSummary(block, durationMilliseconds = null) {
+  const summary = block?.querySelector(".reasoning-summary");
+  if (!summary) return;
+  const segmentCount = Math.max(0, Number(block.dataset.segmentCount) || 0);
+  let label = "處理過程";
+  if (segmentCount > 0) label += ` · ${segmentCount}段`;
+  const storedDuration = Number(block.dataset.durationMilliseconds);
+  const duration = Number.isFinite(durationMilliseconds) && durationMilliseconds >= 0
+    ? durationMilliseconds
+    : storedDuration;
+  if (Number.isFinite(duration) && duration >= 0) label += ` · ${formatProcessingDuration(duration)}`;
+  summary.textContent = label;
 }
 
 function updateLiveReasoningDurations() {
@@ -1895,6 +2407,7 @@ function ensureRunDraft(sessionID, operationID = "", messageID = "") {
       messageId: messageID,
       content: "",
       reasoning: "",
+      internal: false,
       processing: true,
     };
     return state.runDraft;
@@ -1902,6 +2415,23 @@ function ensureRunDraft(sessionID, operationID = "", messageID = "") {
   if (operationID) current.operationId = operationID;
   if (messageID) current.messageId = messageID;
   return current;
+}
+
+function continueRunProcessing(sessionID, operationID = state.currentRunId) {
+  state.liveMessage = null;
+  state.runDraft = {
+    sessionId: sessionID,
+    operationId: operationID,
+    messageId: "",
+    content: "",
+    reasoning: "",
+    internal: false,
+    processing: true,
+  };
+  if (state.session?.id === sessionID) {
+    renderSelectedRunDraft();
+    scrollMessages();
+  }
 }
 
 function renderSelectedRunDraft() {
@@ -1924,6 +2454,7 @@ function renderSelectedRunDraft() {
   const content = messageNode.querySelector(".content");
   if (content && richContentSource(content) !== draft.content) scheduleRichContent(content, draft.content);
   if (draft.reasoning) setMessageReasoning(messageNode, draft.reasoning);
+  messageNode.classList.toggle("reasoning-only", Boolean(draft.internal));
   setAgentProcessing(messageNode, draft.processing);
   state.liveMessage = messageNode;
   $("emptyState").classList.add("hidden");
@@ -1939,9 +2470,12 @@ function setRunActivity(text, sessionID = state.runningSessionId) {
 
 function syncSelectedRunUI() {
   const selectedRunning = selectedSessionIsRunning();
-  $("prompt").disabled = !state.session || state.running;
+	// 同一對話執行期間仍可持續輸入；若目前 Run 在另一個對話背景執行，
+	// 則先維持停用，避免單一前端串流同時追蹤不同 Session。
+  $("prompt").disabled = !state.session || (state.running && !selectedRunning);
 	syncSessionRuntimeControlState();
 	syncRunActionButton();
+	renderPromptQueue();
 	if (selectedRunning) {
 		// 一般執行狀態由訊息區動畫與停止按鈕表達；這一列只保留給斷線
 		// 重連等需要使用者注意的狀態。
@@ -1963,25 +2497,48 @@ function syncSelectedRunUI() {
 function syncRunActionButton() {
   const button = $("send");
   if (!button) return;
-  const stopping = selectedSessionIsRunning();
-  const backgroundRun = state.running && !stopping;
-  const label = stopping ? "停止 Run" : "送出訊息";
-  button.classList.toggle("is-stop", stopping);
-  $("sendIcon").classList.toggle("hidden", stopping);
-  $("stopIcon").classList.toggle("hidden", !stopping);
+  const selectedRunning = selectedSessionIsRunning();
+  const backgroundRun = state.running && !selectedRunning;
+  const label = selectedRunning ? "加入待送佇列" : "送出訊息";
   button.setAttribute("aria-label", label);
   button.title = label;
-  button.disabled = stopping
-    ? !state.currentRunId || state.canceling
-    : !state.session || backgroundRun;
+  button.disabled = !state.session || backgroundRun;
+  // 執行中由停止按鈕占用同一個操作位置；使用者仍可按 Enter
+  // 送出輸入內容，讓 sendPrompt 將它加入目前對話的待送佇列。
+  button.classList.toggle("hidden", selectedRunning);
+  const stopButton = $("stopRun");
+  stopButton.classList.toggle("hidden", !selectedRunning);
+  stopButton.disabled = !selectedRunning || !state.currentRunId || state.canceling;
   syncPlanButton();
+  syncNativeConversationActivity();
+}
+
+function setContextCompactionState(sessionID, active) {
+  if (active) {
+    state.contextCompactionSessionId = sessionID;
+  } else if (!sessionID || state.contextCompactionSessionId === sessionID) {
+    state.contextCompactionSessionId = "";
+  }
+  renderContextCompactionState();
+}
+
+function renderContextCompactionState() {
+  const active = Boolean(state.contextCompactionSessionId && state.contextCompactionSessionId === state.session?.id);
+  $("contextCompactionIndicator")?.classList.toggle("hidden", !active);
+  $("contextUsageButton")?.classList.toggle("is-compacting", active);
+}
+
+function syncNativeConversationActivity() {
+  const active = Boolean(state.running || state.queueDraining || state.promptQueue.length > 0);
+  if (nativeConversationActivity === active) return;
+  nativeConversationActivity = active;
+  if (typeof window.nrInternSetConversationActive !== "function") return;
+  Promise.resolve(window.nrInternSetConversationActive(active)).catch(() => {
+    nativeConversationActivity = null;
+  });
 }
 
 function activateRunAction() {
-  if (selectedSessionIsRunning()) {
-    void cancelCurrentRun();
-    return;
-  }
   $("composer").requestSubmit();
 }
 
@@ -2020,7 +2577,7 @@ function defaultAttachmentName(file, index) {
 }
 
 function addPendingAttachments(files) {
-  if (!state.session || state.running) return;
+  if (!state.session || (state.running && !selectedSessionIsRunning())) return;
   const existing = new Set(state.pendingAttachments.map((item) => item.key));
   let rejectedSize = 0;
   let rejectedCount = 0;
@@ -2126,13 +2683,105 @@ function dataTransferHasFiles(dataTransfer) {
   return [...(dataTransfer?.types || [])].includes("Files") || (dataTransfer?.files?.length || 0) > 0;
 }
 
+function renderPromptQueue() {
+  const tray = $("promptQueue");
+  if (!tray) return;
+  tray.replaceChildren();
+  const sessionID = state.session?.id || "";
+  const queued = state.promptQueue.filter((item) => item.sessionId === sessionID);
+  for (const [index, item] of queued.entries()) {
+    const row = document.createElement("div");
+    row.className = "queued-prompt";
+    const status = document.createElement("span");
+    status.className = "queued-prompt-status";
+    status.textContent = `排隊 ${index + 1}`;
+    const content = document.createElement("span");
+    content.className = "queued-prompt-content";
+    const attachmentCount = item.attachments.length;
+    content.textContent = `${item.input}${attachmentCount ? ` · ${attachmentCount} 個附件` : ""}`;
+    content.title = content.textContent;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "remove-queued-prompt";
+    remove.textContent = "×";
+    remove.title = "移除待送訊息";
+    remove.setAttribute("aria-label", `移除排隊中的第 ${index + 1} 則訊息`);
+    remove.addEventListener("click", () => removeQueuedPrompt(item.id));
+    row.append(status, content, remove);
+    tray.append(row);
+  }
+  tray.classList.toggle("hidden", queued.length === 0);
+  syncNativeConversationActivity();
+}
+
+function removeQueuedPrompt(queueID) {
+  state.promptQueue = state.promptQueue.filter((item) => item.id !== queueID);
+  renderPromptQueue();
+}
+
+function clearPromptQueue() {
+  state.promptQueue = [];
+  if ($("promptQueue")) renderPromptQueue();
+}
+
 async function sendPrompt(event) {
   event.preventDefault();
   let input = normalizeFullwidthASCII($("prompt").value).trim();
   const pending = [...state.pendingAttachments];
-  if ((!input && pending.length === 0) || !state.session || state.running) return;
+  if ((!input && pending.length === 0) || !state.session) return;
+  if (state.running && !selectedSessionIsRunning()) {
+    toast("另一個對話正在執行，請回到該對話加入佇列");
+    return;
+  }
   if (!input) input = "請檢視附件。";
-  const sessionID = state.session.id;
+  const queued = state.running || state.promptQueue.length > 0;
+  state.promptQueue.push({
+    id: crypto.randomUUID(),
+    sessionId: state.session.id,
+    input,
+    attachments: pending,
+  });
+  $("prompt").value = "";
+  if (pending.length) clearPendingAttachments();
+  renderPromptQueue();
+  syncRunActionButton();
+  if (queued) toast(`已加入待送佇列（共 ${state.promptQueue.length} 則）`);
+  void drainPromptQueue();
+}
+
+async function drainPromptQueue() {
+  if (state.queueDraining || state.running) return;
+  state.queueDraining = true;
+  let finishedSessionID = "";
+  try {
+    while (true) {
+      while (state.promptQueue.length > 0) {
+        const item = state.promptQueue.shift();
+        finishedSessionID = item.sessionId;
+        renderPromptQueue();
+        await executePrompt(item);
+      }
+      if (finishedSessionID) {
+        const refreshSessionID = finishedSessionID;
+        finishedSessionID = "";
+        if (state.session?.id === refreshSessionID) await loadMessages().catch(() => {});
+        await loadSessions().catch(() => {});
+        refreshOpenProviderUsage();
+      }
+      if (state.promptQueue.length === 0) break;
+    }
+  } finally {
+    state.queueDraining = false;
+    renderPromptQueue();
+    syncRunActionButton();
+    if (state.promptQueue.length > 0) void drainPromptQueue();
+  }
+}
+
+async function executePrompt(item) {
+  const sessionID = item.sessionId;
+  const input = item.input;
+  const pending = item.attachments;
   state.running = true;
   state.runningSessionId = sessionID;
 	state.runActivityText = "";
@@ -2148,10 +2797,9 @@ async function sendPrompt(event) {
     messageId: "",
     content: "",
     reasoning: "",
+    internal: false,
     processing: true,
   };
-  syncRunActionButton();
-  $("prompt").disabled = true;
   $("newProject").disabled = true;
   $("newWorkspace").disabled = true;
   $("workspaceSelect").disabled = true;
@@ -2160,11 +2808,16 @@ async function sendPrompt(event) {
   renderNavigation();
   try {
     const attachments = await uploadPendingAttachments(sessionID, pending);
-    $("prompt").value = "";
-    if (pending.length) clearPendingAttachments();
-    appendMessage({ role: "user", content: input, metadata: { attachments }, id: `local-${Date.now()}` });
-    renderSelectedRunDraft();
-    scrollMessages({ force: true });
+    if (state.session?.id === sessionID) {
+      appendMessage({ role: "user", content: input, metadata: { attachments }, id: `local-${Date.now()}` });
+      // 使用者問題必須先進入 DOM，接著才建立本輪 assistant placeholder；
+      // 否則 syncSelectedRunUI 會先插入處理區塊，造成動畫出現在問題上方。
+      syncSelectedRunUI();
+      renderSelectedRunDraft();
+      scrollMessages({ force: true });
+    } else {
+      syncSelectedRunUI();
+    }
     await runWithReconnect({
       sessionId: sessionID,
       input,
@@ -2174,8 +2827,8 @@ async function sendPrompt(event) {
   } catch (error) {
     toast(error.message);
   } finally {
-    const finishedSessionID = state.runningSessionId;
     if (state.currentRunId) state.runStartedAt.delete(state.currentRunId);
+    setContextCompactionState(sessionID, false);
     state.running = false;
     state.runningSessionId = "";
     state.runActivityText = "";
@@ -2192,8 +2845,6 @@ async function sendPrompt(event) {
     $("newWorkspace").disabled = !state.backendHealthy;
     $("workspaceSelect").disabled = !state.backendHealthy;
     renderNavigation();
-    if (state.session?.id === finishedSessionID) await loadMessages().catch(() => {});
-    await loadSessions().catch(() => {});
   }
 }
 
@@ -2283,6 +2934,7 @@ function handleTerminalRun(run, sessionID) {
     finalizeReasoningGroup(run.id, completedAt - startedAt);
   }
   state.runStartedAt.delete(run.id);
+  setContextCompactionState(sessionID, false);
   if (visible) setAgentProcessing(state.liveMessage, false);
   if (run.status === "failed" || run.status === "canceled") {
     if (run.error?.retryable) {
@@ -2300,6 +2952,15 @@ function handleTerminalRun(run, sessionID) {
 function handleEvent(event, sessionID) {
   const payload = event.payload || {};
   const visible = state.session?.id === sessionID;
+	if (event.type === "context.compaction.started") {
+	  setContextCompactionState(sessionID, true);
+	} else if (["context.compacted", "context.compaction.failed"].includes(event.type)) {
+	  setContextCompactionState(sessionID, false);
+	}
+	if (visible && event.type === "turn.usage" && payload.usage) {
+	  const identity = activeContextIdentity();
+	  recordContextUsage(payload.usage, sessionID, identity.providerID, identity.model);
+	}
 	if (visible && event.type === "tool.execution.end" && String(payload.result?.tool_name || "").startsWith("plan_")) {
 	  loadPlans(sessionID).catch(() => {});
 	}
@@ -2312,27 +2973,22 @@ function handleEvent(event, sessionID) {
 	  draft.processing = true;
 	  if (visible) renderSelectedRunDraft();
 	}
-	if (visible && event.type === "context.compacted") {
-	  setRunActivity(contextCompactionActivity, sessionID);
-	} else if (visible
-	  && state.runActivityText === contextCompactionActivity
-	  && ["message.delta", "message.thinking_delta", "message.end", "tool.execution.start", "tool.execution.end"].includes(event.type)) {
-	  setRunActivity("", sessionID);
-	}
 	if (event.type === "message.start" && payload.message?.role === "assistant") {
     const message = normalizeAssistantThinking(payload.message);
     const draft = ensureRunDraft(sessionID, operationID, message.id);
     draft.content = message.content || "";
     draft.reasoning = message.reasoning || "";
-    draft.processing = true;
+    draft.processing = !draft.content;
     if (visible) {
       renderSelectedRunDraft();
       scrollMessages();
     }
   } else if (event.type === "message.delta") {
     const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
-    draft.content += payload.delta || "";
-    if (payload.delta) draft.processing = false;
+    const delta = payload.delta || "";
+    draft.content += delta;
+    // 第一個回答字元出現後，文字串流本身就是進度，不再同時顯示思考動畫。
+    if (delta.length > 0) draft.processing = false;
     if (visible) {
       renderSelectedRunDraft();
       scrollMessages();
@@ -2340,26 +2996,52 @@ function handleEvent(event, sessionID) {
   } else if (event.type === "message.thinking_delta") {
     const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
     draft.reasoning += payload.delta || "";
-    if (payload.delta) draft.processing = false;
+    draft.processing = true;
+    if (visible) {
+      renderSelectedRunDraft();
+      scrollMessages();
+    }
+  } else if (event.type === "tool_call.delta") {
+    // 收到工具呼叫片段後，可以確定目前 Response 只是 Run 的中間階段。
+    // 將先前已串流到主回答的文字即時移入處理過程，不等工具執行結束。
+    const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
+    draft.reasoning = joinReasoningParts(draft.reasoning, draft.content);
+    draft.content = "";
+    draft.internal = true;
+    draft.processing = true;
     if (visible) {
       renderSelectedRunDraft();
       scrollMessages();
     }
   } else if (event.type === "message.end" && payload.message?.role === "assistant") {
     const message = normalizeAssistantThinking(payload.message);
+    if (visible && message.usage) {
+      const identity = activeContextIdentity();
+      recordContextUsage(message.usage, sessionID, message.provider_id || identity.providerID, message.model || identity.model);
+    }
     const draft = ensureRunDraft(sessionID, operationID, message.id);
-    draft.content = message.content || draft.content;
-    draft.reasoning = message.reasoning || draft.reasoning;
-    draft.processing = false;
+    const internal = message.metadata?.internal === true
+      || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0);
+    if (internal) {
+      draft.reasoning = joinReasoningParts(draft.reasoning, message.reasoning, draft.content, message.content);
+      draft.content = "";
+      draft.internal = true;
+    } else {
+      draft.content = message.content || draft.content;
+      draft.reasoning = message.reasoning || draft.reasoning;
+      draft.internal = false;
+    }
+    // 一般回答已開始輸出時停止動畫；內部訊息結束後會建立下一個處理中區塊。
+    draft.processing = internal;
     if (!visible) {
-      if (message.metadata?.internal === true || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)) state.runDraft = null;
+      if (internal) continueRunProcessing(sessionID, operationID);
       return;
     }
     state.liveMessage = renderSelectedRunDraft() || findMessage(message.id) || state.liveMessage;
     if (state.liveMessage && operationID) state.liveMessage.dataset.operationId = operationID;
-    if (message.metadata?.internal === true || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0)) {
-      if (message.reasoning && state.liveMessage) {
-        setMessageReasoning(state.liveMessage, message.reasoning);
+    if (internal) {
+      if (draft.reasoning && state.liveMessage) {
+        setMessageReasoning(state.liveMessage, draft.reasoning);
         state.liveMessage.classList.add("reasoning-only");
         renderRichContent(state.liveMessage.querySelector(".content"), "");
         setAgentProcessing(state.liveMessage, false);
@@ -2369,6 +3051,7 @@ function handleEvent(event, sessionID) {
       }
       state.liveMessage = null;
       state.runDraft = null;
+      continueRunProcessing(sessionID, operationID);
     } else {
       if (state.liveMessage) {
         const content = state.liveMessage.querySelector(".content");
@@ -2379,17 +3062,21 @@ function handleEvent(event, sessionID) {
       setAgentProcessing(state.liveMessage, false);
     }
 	} else if (event.type === "run.approval_required" && payload.approval) {
+    if (visible) setAgentProcessing(state.liveMessage, false);
     showApproval(payload.approval, sessionID);
   } else if (event.type === "run.approval_resolved") {
     state.pendingApproval = null;
     state.pendingApprovalSessionId = "";
     if (visible && $("approvalDialog").open) $("approvalDialog").close();
 		setRunActivity("", sessionID);
+		continueRunProcessing(sessionID, operationID);
 	} else if (event.type === "run.completed") {
+    setContextCompactionState(sessionID, false);
     finalizeLiveReasoningDuration(event, operationID, visible);
     if (visible) setAgentProcessing(state.liveMessage, false);
     if (visible) loadPlans(sessionID).catch(() => {});
   } else if (event.type === "run.failed" || event.type === "run.canceled") {
+    setContextCompactionState(sessionID, false);
     finalizeLiveReasoningDuration(event, operationID, visible);
     if (visible) setAgentProcessing(state.liveMessage, false);
     if (payload.error?.retryable) {
@@ -2434,10 +3121,10 @@ async function retryCurrentRun() {
     messageId: "",
     content: "",
     reasoning: "",
+    internal: false,
     processing: true,
   };
-  $("prompt").disabled = true;
-  syncRunActionButton();
+  syncSelectedRunUI();
   $("retryRun").disabled = true;
   renderSelectedRunDraft();
   scrollMessages({ force: true });
@@ -2457,6 +3144,7 @@ async function retryCurrentRun() {
     toast(error.message);
   } finally {
     if (state.currentRunId) state.runStartedAt.delete(state.currentRunId);
+    setContextCompactionState(sessionID, false);
     state.running = false;
     state.runningSessionId = "";
     state.runActivityText = "";
@@ -2468,8 +3156,13 @@ async function retryCurrentRun() {
     $("retryRun").disabled = false;
     syncSelectedRunUI();
     renderNavigation();
-    if (state.session?.id === sessionID) await loadMessages().catch(() => {});
-    await loadSessions().catch(() => {});
+    if (state.promptQueue.length > 0) {
+      void drainPromptQueue();
+    } else {
+      if (state.session?.id === sessionID) await loadMessages().catch(() => {});
+      await loadSessions().catch(() => {});
+      refreshOpenProviderUsage();
+    }
   }
 }
 
@@ -3103,16 +3796,26 @@ async function saveProjectSettings(event) {
 
 async function deleteProjectSettings() {
   const project = state.editingProject;
-  if (!project || !window.confirm(`確定刪除專案「${project.name}」？含有對話時後端會拒絕。`)) return;
+  if (!project) return;
   $("deleteProjectSettings").disabled = true;
   try {
-    await request(`/api/v1/projects/${encodeURIComponent(project.id)}`, { method: "DELETE" });
-    closeProjectSettings();
-    await loadProjects();
-  } catch (error) {
-    toast(error.message);
+    await deleteProject(project, { closeSettings: true });
   } finally {
     $("deleteProjectSettings").disabled = false;
+  }
+}
+
+async function deleteProject(project, { closeSettings = false } = {}) {
+  if (!project || !window.confirm(`確定刪除專案「${project.name}」？含有對話時後端會拒絕。`)) return false;
+  try {
+    await request(`/api/v1/projects/${encodeURIComponent(project.id)}`, { method: "DELETE" });
+    if (closeSettings && state.editingProject?.id === project.id) closeProjectSettings();
+    await loadProjects();
+    toast(`已刪除專案「${project.name}」`);
+    return true;
+  } catch (error) {
+    toast(error.message);
+    return false;
   }
 }
 
@@ -3166,9 +3869,11 @@ async function activatePanel(name) {
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
   }
-  for (const value of ["overview", "providers", "tools", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
+  for (const value of ["overview", "providers", "mcp", "reverseProxy", "tools", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
   if (name === "overview") await loadDiagnostics();
   if (name === "providers") await loadProviderSettings();
+  if (name === "mcp") await loadMCPSettings();
+  if (name === "reverseProxy") await loadReverseProxyStatus({ hydrate: !state.reverseProxyHydrated });
   if (name === "tools") await loadTools();
   if (name === "audit") await loadAudit(true);
 }
@@ -3207,7 +3912,7 @@ async function loadDiagnostics() {
     const summary = $("providerSummary");
     summary.replaceChildren();
     appendSummary(summary, "目前 Workspace", state.workspace?.name || "—");
-    appendSummary(summary, "Provider", activeProvider.id || "—");
+    appendSummary(summary, "Provider", providerDisplayName(activeProvider) || "—");
     appendSummary(summary, "協定", activeProvider.protocol || "—");
     appendSummary(summary, "Endpoint", activeProvider.endpoint || "—");
     appendSummary(summary, "預設模型", activeProvider.default_model || "—");
@@ -3245,6 +3950,7 @@ async function loadProviderSettings(preferredID = state.selectedProviderSettings
 function newProviderSetting() {
   return {
     id: "",
+    display_name: "",
     type: "openai-compatible",
     enabled: true,
     openai_compatible: {
@@ -3270,15 +3976,16 @@ function renderProviderSettings() {
   const list = $("providerSettingsList");
   list.replaceChildren();
   for (const provider of providers) {
-    const settings = provider.openai_compatible || {};
+    const isCodex = provider.type === "openai-codex-responses";
+    const settings = isCodex ? provider.openai_codex_responses || {} : provider.openai_compatible || {};
     const button = document.createElement("button");
     button.type = "button";
     const enabled = provider.enabled !== false;
     button.className = `provider-setting-card ${enabled ? "" : "provider-disabled"} ${!state.providerSettingsDraft && provider.id === state.selectedProviderSettingsID ? "active" : ""}`;
     const title = document.createElement("strong");
-    title.textContent = provider.id;
+    title.textContent = provider.display_name || provider.id;
     const detail = document.createElement("small");
-    detail.textContent = `${settings.model || "未設定模型"} · ${settings.base_url || "未設定 URL"}`;
+    detail.textContent = `${settings.model || "未設定模型"} · ${isCodex ? "OpenAI Codex Responses" : settings.base_url || "未設定 URL"}`;
     button.append(title);
     if (provider.id === state.providerSettings.default_provider_id) {
       const badge = document.createElement("span");
@@ -3314,13 +4021,17 @@ function renderProviderSettings() {
   $("noProviderSettings").classList.toggle("hidden", Boolean(selected));
   if (!selected) return;
   const isNew = selected === state.providerSettingsDraft;
-  const settings = selected.openai_compatible || {};
-  $("providerSettingsEditorTitle").textContent = isNew ? "新增 Provider" : `編輯 ${selected.id}`;
+  const providerType = selected.type === "openai-codex-responses" ? "openai-codex-responses" : "openai-compatible";
+  const settings = providerType === "openai-codex-responses"
+    ? selected.openai_codex_responses || {}
+    : selected.openai_compatible || {};
+  $("providerSettingsEditorTitle").textContent = isNew ? "新增 Provider" : `編輯 ${selected.display_name || selected.id}`;
   $("providerSettingsState").textContent = "";
   $("providerTestState").textContent = "";
   $("providerSettingID").value = selected.id || "";
   $("providerSettingID").disabled = !isNew;
-  $("providerSettingType").value = selected.type || "openai-compatible";
+  $("providerSettingDisplayName").value = selected.display_name || selected.id || "";
+  $("providerSettingType").value = providerType;
   const isDefault = selected.id === state.providerSettings?.default_provider_id;
   $("providerSettingEnabled").checked = selected.enabled !== false;
   $("providerSettingEnabled").disabled = !isNew && isDefault;
@@ -3333,6 +4044,7 @@ function renderProviderSettings() {
   $("providerSettingClearKeyRow").classList.toggle("hidden", !settings.has_api_key || isNew);
   $("providerSettingClearKey").checked = false;
   $("providerSettingModel").value = settings.model || "";
+	$("providerSettingModel").dataset.configuredModel = settings.model || "";
   $("refreshProviderModels").disabled = isNew;
   renderProviderModelOptions(isNew ? "" : selected.id);
   $("providerSettingInstructionRole").value = settings.instruction_role || "system";
@@ -3347,20 +4059,39 @@ function renderProviderSettings() {
   $("providerSettingContextWindow").value = settings.context_window || 0;
   $("providerSettingMaxOutputTokens").value = settings.max_output_tokens || 0;
   $("deleteProviderSetting").classList.toggle("hidden", isNew);
+	renderProviderTypeFields(providerType, settings, isNew, selected.id || "");
+}
+
+function renderProviderTypeFields(providerType, settings, isNew, providerID) {
+	const isCodex = providerType === "openai-codex-responses";
+	$("providerAPIKeyFields").classList.toggle("hidden", isCodex);
+	$("providerOAuthFields").classList.toggle("hidden", !isCodex);
+	$("providerSettingBaseURLField").classList.toggle("hidden", isCodex);
+	$("providerSettingBaseURL").required = !isCodex;
+	$("providerSettingInstructionRoleField").classList.toggle("hidden", isCodex);
+	$("providerSettingDisableStreamingField").classList.toggle("hidden", isCodex);
+	$("providerSettingStreamUsageField").classList.toggle("hidden", isCodex);
+	$("providerSettingOmitToolChoiceField").classList.toggle("hidden", isCodex);
+	if (isCodex) $("providerSettingDisableStreaming").checked = false;
+	$("connectProviderOAuth").disabled = isNew;
+	const connected = Boolean(settings.has_oauth_token);
+	$("disconnectProviderOAuth").classList.toggle("hidden", !connected || isNew);
+	$("providerOAuthState").textContent = connected ? "已連線" : isNew ? "請先儲存 Provider" : "尚未連線";
+	if (isCodex && !isNew && providerID) void loadProviderOAuthStatus(providerID, { quiet: true });
 }
 
 function renderProviderModelOptions(providerID, preferredModel = "") {
-  // 管理頁可保留「實際測試成功」的模型供設定；對話頂部選單仍只讀取
-  // providerModelLists，也就是 Provider /models 的正式目錄。
-  const models = [...new Set([
-    ...(state.providerModelLists[providerID] || []),
-    ...(state.providerTestedModels[providerID] || []),
-  ].map((model) => String(model).trim()).filter(Boolean))];
+  // 所有模型選單只顯示 Provider /models 正式回傳的目錄；空目錄或讀取
+  // 失敗時統一顯示「-」，不以設定值或單次測試結果冒充模型目錄。
+  const models = [...new Set((state.providerModelLists[providerID] || [])
+    .map((model) => String(model).trim()).filter(Boolean))];
   const input = $("providerSettingModel");
   const catalog = $("providerSettingModelCatalog");
   catalog.replaceChildren();
   if (models.length > 0) {
-    const currentModel = input.value.trim();
+    const visibleModel = input.value.trim();
+    const configuredModel = String(input.dataset.configuredModel || "").trim();
+    const currentModel = visibleModel && visibleModel !== "-" ? visibleModel : configuredModel;
     const testedModel = String(preferredModel || "").trim();
     const selectedModel = models.includes(testedModel)
       ? testedModel
@@ -3376,21 +4107,29 @@ function renderProviderModelOptions(providerID, preferredModel = "") {
     custom.textContent = "手動輸入其他模型…";
     catalog.append(custom);
     input.value = selectedModel;
+	input.dataset.configuredModel = selectedModel;
+	input.disabled = false;
     catalog.value = selectedModel;
     input.classList.add("hidden");
     catalog.classList.remove("hidden");
   } else {
     catalog.classList.add("hidden");
     input.classList.remove("hidden");
+	const configuredModel = input.value.trim() && input.value.trim() !== "-"
+	  ? input.value.trim()
+	  : String(input.dataset.configuredModel || "").trim();
+	input.dataset.configuredModel = configuredModel;
+	input.value = "-";
+	input.disabled = true;
   }
   if (!providerID) {
-    $("providerModelState").textContent = "儲存 Provider 後會自動更新模型列表；模型名稱仍可手動輸入。";
+    $("providerModelState").textContent = "儲存 Provider 後會自動更新模型列表。";
   } else if (state.providerModelLists[providerID]) {
     $("providerModelState").textContent = models.length > 0
       ? `已載入 ${models.length} 個模型，可從輸入欄位選取。`
-      : "Provider 回傳空模型列表，仍可手動輸入模型名稱。";
+	  : "Provider 未回傳模型列表。";
   } else {
-    $("providerModelState").textContent = "模型列表尚未載入，仍可手動輸入模型名稱。";
+	$("providerModelState").textContent = "模型列表尚未載入。";
   }
 }
 
@@ -3405,6 +4144,7 @@ async function loadProviderModels(providerID, { notify = true } = {}) {
   try {
     const value = await request(`/api/v1/admin/provider-settings/${encodeURIComponent(providerID)}/models`);
     state.providerModelLists[providerID] = Array.isArray(value.models) ? value.models : [];
+    invalidateProviderContextCapabilities(providerID);
     delete state.providerModelErrors[providerID];
     if (!state.providerSettingsDraft && state.selectedProviderSettingsID === providerID) renderProviderModelOptions(providerID);
     if (notify) toast(`已更新 ${providerID} 的模型列表`);
@@ -3415,7 +4155,8 @@ async function loadProviderModels(providerID, { notify = true } = {}) {
       const retained = state.providerModelLists[providerID]?.length || 0;
       $("providerModelState").textContent = retained > 0
         ? `更新失敗，保留既有 ${retained} 個模型；仍可手動輸入。`
-        : "無法讀取模型列表，仍可手動輸入模型名稱。";
+        : "無法讀取模型列表。";
+	  renderProviderModelOptions(providerID);
     }
     if (notify) toast(error.message);
     return null;
@@ -3424,29 +4165,53 @@ async function loadProviderModels(providerID, { notify = true } = {}) {
   }
 }
 
+function invalidateProviderContextCapabilities(providerID) {
+  providerID = String(providerID || "").trim();
+  for (const key of Object.keys(state.contextCapabilityCache)) {
+    if (key.startsWith(`${providerID}\u0000`)) delete state.contextCapabilityCache[key];
+  }
+  if (activeContextIdentity().providerID !== providerID) return;
+  state.contextCapabilities = null;
+  if (state.session) void loadContextCapabilities(state.session.id);
+}
+
 function providerSettingFormValue() {
+  const providerType = $("providerSettingType").value === "openai-codex-responses"
+    ? "openai-codex-responses"
+    : "openai-compatible";
+  const model = $("providerSettingModel").value.trim() === "-"
+    ? String($("providerSettingModel").dataset.configuredModel || "").trim()
+    : $("providerSettingModel").value.trim();
+  const common = {
+    model,
+    max_attempts: Number($("providerSettingMaxAttempts").value),
+    timeout_seconds: Number($("providerSettingTimeout").value),
+    connect_timeout_seconds: Number($("providerSettingConnectTimeout").value),
+    response_header_timeout_seconds: Number($("providerSettingHeaderTimeout").value),
+    context_window: Number($("providerSettingContextWindow").value) || 0,
+    max_output_tokens: Number($("providerSettingMaxOutputTokens").value) || 0,
+  };
   const provider = {
     id: $("providerSettingID").value.trim(),
-    type: $("providerSettingType").value,
+    display_name: $("providerSettingDisplayName").value.trim(),
+    type: providerType,
     enabled: $("providerSettingDefault").checked || $("providerSettingEnabled").checked,
-    openai_compatible: {
+  };
+  if (providerType === "openai-codex-responses") {
+    provider.openai_codex_responses = common;
+  } else {
+    provider.openai_compatible = {
       base_url: $("providerSettingBaseURL").value.trim(),
-      model: $("providerSettingModel").value.trim(),
+      ...common,
       instruction_role: $("providerSettingInstructionRole").value,
       disable_streaming: $("providerSettingDisableStreaming").checked,
       stream_include_usage: $("providerSettingStreamUsage").checked,
       omit_tool_choice: $("providerSettingOmitToolChoice").checked,
-      max_attempts: Number($("providerSettingMaxAttempts").value),
-      timeout_seconds: Number($("providerSettingTimeout").value),
-      connect_timeout_seconds: Number($("providerSettingConnectTimeout").value),
-      response_header_timeout_seconds: Number($("providerSettingHeaderTimeout").value),
-      context_window: Number($("providerSettingContextWindow").value) || 0,
-      max_output_tokens: Number($("providerSettingMaxOutputTokens").value) || 0,
-    },
-  };
-  const apiKey = $("providerSettingAPIKey").value.trim();
-  if (apiKey) provider.openai_compatible.api_key = apiKey;
-  if ($("providerSettingClearKey").checked) provider.openai_compatible.api_key = "";
+    };
+    const apiKey = $("providerSettingAPIKey").value.trim();
+    if (apiKey) provider.openai_compatible.api_key = apiKey;
+    if ($("providerSettingClearKey").checked) provider.openai_compatible.api_key = "";
+  }
   return provider;
 }
 
@@ -3456,6 +4221,7 @@ function providerSettingsPayload(providers, defaultProviderID) {
     providers: providers.map((provider) => {
       const value = JSON.parse(JSON.stringify(provider));
       if (value.openai_compatible) delete value.openai_compatible.has_api_key;
+      if (value.openai_codex_responses) delete value.openai_codex_responses.has_oauth_token;
       return value;
     }),
   };
@@ -3466,7 +4232,11 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
   if (!$("providerSettingsForm").reportValidity()) return null;
   const provider = providerSettingFormValue();
   const isNew = Boolean(state.providerSettingsDraft);
-  if (!provider.id || !provider.openai_compatible.base_url || !provider.openai_compatible.model) return;
+  const settings = provider.type === "openai-codex-responses"
+    ? provider.openai_codex_responses
+    : provider.openai_compatible;
+  if (!provider.id || !settings?.model
+    || (provider.type === "openai-compatible" && !provider.openai_compatible.base_url)) return;
   if (isNew && state.providerSettings.providers.some((item) => item.id === provider.id)) {
     toast(`Provider ID ${provider.id} 已存在`);
     return null;
@@ -3487,6 +4257,8 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
     });
     state.providerSettingsDraft = null;
     state.selectedProviderSettingsID = provider.id;
+    state.contextCapabilities = null;
+    state.contextCapabilityCache = {};
     delete state.providerModelLists[provider.id];
     delete state.providerModelErrors[provider.id];
     delete state.providerTestedModels[provider.id];
@@ -3507,7 +4279,7 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
         ? `Provider ${provider.id} 已停用並從使用選單移除`
         : models
         ? "Provider 設定已儲存，模型列表已更新"
-        : "Provider 設定已儲存；模型名稱仍可手動輸入");
+        : "Provider 設定已儲存；模型列表需手動更新");
     }
     return provider;
   } catch (error) {
@@ -3541,7 +4313,7 @@ async function testProviderSetting() {
     state.providerTestedModels[provider.id] = result.model ? [String(result.model).trim()] : [];
     delete state.providerModelErrors[provider.id];
     renderProviderModelOptions(provider.id, result.model);
-    if (result.warning) $("providerModelState").textContent = "模型目錄無法讀取；已加入並選取本次測試成功的模型。";
+    if (result.warning) $("providerModelState").textContent = "模型測試成功，但未取得模型列表。";
     const duration = Number(result.duration_milliseconds) || 0;
     const toolState = result.tool_calling ? "原生工具正常" : "未驗證原生工具";
     $("providerTestState").textContent = result.warning
@@ -3581,6 +4353,8 @@ async function deleteProviderSetting() {
     delete state.providerModelLists[id];
     delete state.providerModelErrors[id];
     delete state.providerTestedModels[id];
+    state.contextCapabilities = null;
+    state.contextCapabilityCache = {};
     state.selectedProviderSettingsID = state.providerSettings.providers[0]?.id || "";
     await refreshProviderCatalog();
     renderProviderSettings();
@@ -3592,12 +4366,525 @@ async function deleteProviderSetting() {
   }
 }
 
+function updateProviderOAuthStatusUI(status = {}) {
+	const connected = status.status === "connected";
+	const pending = status.status === "pending";
+	const account = status.account_email || status.account_name || "";
+	$("providerOAuthState").textContent = connected
+	  ? `已連線${account ? ` · ${account}` : ""}`
+	  : pending ? "等待瀏覽器完成驗證…"
+	  : status.status === "failed" ? `驗證失敗${status.message ? ` · ${status.message}` : ""}`
+	  : "尚未連線";
+	$("connectProviderOAuth").disabled = pending;
+	$("connectProviderOAuth").textContent = connected ? "重新登入 ChatGPT／Codex" : "使用 ChatGPT 帳號登入";
+	$("disconnectProviderOAuth").classList.toggle("hidden", !connected);
+}
+
+async function loadProviderOAuthStatus(providerID, { quiet = false } = {}) {
+	providerID = String(providerID || "").trim();
+	if (!providerID) return null;
+	try {
+	  const status = await request(`/api/v1/admin/provider-settings/${encodeURIComponent(providerID)}/oauth/status`, { reconnects: 0 });
+	  if (!state.providerSettingsDraft && state.selectedProviderSettingsID === providerID && $("providerSettingType").value === "openai-codex-responses") {
+		updateProviderOAuthStatusUI(status);
+	  }
+	  const provider = state.providerSettings?.providers?.find((item) => item.id === providerID);
+	  if (provider?.openai_codex_responses) provider.openai_codex_responses.has_oauth_token = status.status === "connected";
+	  return status;
+	} catch (error) {
+	  if (!quiet) toast(error.message);
+	  return null;
+	}
+}
+
+function pollProviderOAuth(providerID, expiresAt) {
+	clearTimeout(providerOAuthPollTimer);
+	const deadline = Date.parse(expiresAt || "") || Date.now() + 10 * 60 * 1000;
+	const poll = async () => {
+	  if (Date.now() >= deadline) {
+		updateProviderOAuthStatusUI({ status: "failed", message: "驗證逾時" });
+		return;
+	  }
+	  const status = await loadProviderOAuthStatus(providerID, { quiet: true });
+	  if (status?.status === "connected") {
+		toast(`Provider ${providerID} 已完成 ChatGPT／Codex OAuth 驗證`);
+		await loadProviderModels(providerID, { notify: false });
+		return;
+	  }
+	  if (status?.status === "failed") {
+		toast(status.message || "ChatGPT／Codex OAuth 驗證失敗");
+		return;
+	  }
+	  providerOAuthPollTimer = window.setTimeout(poll, 1000);
+	};
+	void poll();
+}
+
+async function connectProviderOAuth() {
+	if ($("providerSettingType").value !== "openai-codex-responses") return;
+	const provider = await persistProviderSetting({ showToast: false, refreshModels: false });
+	if (!provider) return;
+	$("connectProviderOAuth").disabled = true;
+	updateProviderOAuthStatusUI({ status: "pending" });
+	try {
+	  const result = await request(`/api/v1/admin/provider-settings/${encodeURIComponent(provider.id)}/oauth/start`, { method: "POST" });
+	  if (!result.browser_opened) {
+		const opened = window.open(result.authorization_url, "_blank", "noopener,noreferrer");
+		if (!opened) toast("無法自動開啟瀏覽器，請允許彈出式視窗後重試");
+	  }
+	  pollProviderOAuth(provider.id, result.expires_at);
+	} catch (error) {
+	  updateProviderOAuthStatusUI({ status: "failed", message: error.message });
+	  toast(error.message);
+	}
+}
+
+async function disconnectProviderOAuth() {
+	const providerID = state.selectedProviderSettingsID;
+	if (!providerID) return;
+	$("disconnectProviderOAuth").disabled = true;
+	try {
+	  await request(`/api/v1/admin/provider-settings/${encodeURIComponent(providerID)}/oauth`, { method: "DELETE" });
+	  clearTimeout(providerOAuthPollTimer);
+	  const provider = state.providerSettings?.providers?.find((item) => item.id === providerID);
+	  if (provider?.openai_codex_responses) provider.openai_codex_responses.has_oauth_token = false;
+	  updateProviderOAuthStatusUI({ status: "idle" });
+	  delete state.providerModelLists[providerID];
+	  delete state.providerModelErrors[providerID];
+	  renderProviderModelOptions(providerID);
+	  toast(`Provider ${providerID} 已中斷 ChatGPT／Codex OAuth`);
+	} catch (error) {
+	  toast(error.message);
+	} finally {
+	  $("disconnectProviderOAuth").disabled = false;
+	}
+}
+
 async function refreshProviderCatalog() {
   state.providers = await request("/api/v1/providers");
   renderProviderOptions();
   renderSessionProviderOptions();
   syncWorkspaceSettings();
   if (state.session) syncSessionUI();
+}
+
+function newMCPSetting() {
+  return {
+    id: "",
+    display_name: "",
+    enabled: true,
+    transport: "stdio",
+    command: "",
+    args: [],
+    work_dir: "",
+    url: "",
+    startup_timeout_seconds: 20,
+    call_timeout_seconds: 1800,
+    trust_annotations: false,
+    status: "disconnected",
+    tools: [],
+  };
+}
+
+async function loadMCPSettings(preferredID = state.selectedMCPSettingsID) {
+  try {
+    state.mcpSettings = await request("/api/v1/admin/mcp-settings");
+    state.mcpSettingsDraft = null;
+    const servers = state.mcpSettings?.servers || [];
+    state.selectedMCPSettingsID = servers.some((item) => item.id === preferredID)
+      ? preferredID
+      : servers[0]?.id || "";
+    renderMCPSettings();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function renderMCPTransportFields(transport) {
+  const stdio = transport === "stdio";
+  $("mcpStdioFields").classList.toggle("hidden", !stdio);
+  $("mcpHTTPFields").classList.toggle("hidden", stdio);
+  $("mcpSettingCommand").required = stdio;
+  $("mcpSettingURL").required = !stdio;
+}
+
+function renderMCPSettings() {
+  const servers = state.mcpSettings?.servers || [];
+  const list = $("mcpSettingsList");
+  list.replaceChildren();
+  for (const server of servers) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `provider-setting-card ${server.enabled ? "" : "provider-disabled"} ${!state.mcpSettingsDraft && server.id === state.selectedMCPSettingsID ? "active" : ""}`;
+    const title = document.createElement("strong");
+    title.textContent = server.display_name || server.id;
+    const badge = document.createElement("span");
+    badge.className = server.enabled ? "provider-default-badge" : "provider-disabled-badge";
+    badge.textContent = server.enabled ? (server.status || "未連線") : "已停用";
+    const detail = document.createElement("small");
+    detail.textContent = `${server.transport || "-"} · ${Number(server.tool_count) || 0} 個工具`;
+    button.append(title, badge, detail);
+    button.addEventListener("click", () => {
+      state.mcpSettingsDraft = null;
+      state.selectedMCPSettingsID = server.id;
+      renderMCPSettings();
+    });
+    list.append(button);
+  }
+
+  const selected = state.mcpSettingsDraft
+    || servers.find((item) => item.id === state.selectedMCPSettingsID);
+  $("mcpSettingsForm").classList.toggle("hidden", !selected);
+  $("noMCPSettings").classList.toggle("hidden", Boolean(selected));
+  if (!selected) return;
+
+  const isNew = Boolean(state.mcpSettingsDraft);
+  $("mcpSettingsEditorTitle").textContent = isNew ? "新增 MCP Server" : `編輯 ${selected.display_name || selected.id}`;
+  $("mcpSettingID").value = selected.id || "";
+  $("mcpSettingID").disabled = !isNew;
+  $("mcpSettingDisplayName").value = selected.display_name || "";
+  $("mcpSettingEnabled").checked = selected.enabled !== false;
+  $("mcpSettingTransport").value = selected.transport || "stdio";
+  $("mcpSettingCommand").value = selected.command || "";
+  $("mcpSettingArgs").value = JSON.stringify(Array.isArray(selected.args) ? selected.args : [], null, 2);
+  $("mcpSettingWorkDir").value = selected.work_dir || "";
+  $("mcpSettingURL").value = selected.url || "";
+  $("mcpSettingAPIKey").value = "";
+  $("mcpSettingClearKey").checked = false;
+  $("mcpSettingClearKeyRow").classList.toggle("hidden", !selected.has_api_key);
+  $("mcpAPIKeyState").textContent = selected.has_api_key
+    ? "已儲存 MCP 金鑰；留空會保留，勾選下方選項可清除。"
+    : "尚未儲存 MCP 金鑰；金鑰不會從後端讀回。";
+  $("mcpSettingEnvironment").value = "";
+  $("mcpSettingHeaders").value = "";
+  $("mcpEnvironmentState").textContent = selected.has_environment
+    ? "已儲存環境變數；留空會保留，輸入 {} 會清除。"
+    : "尚未儲存環境變數；敏感內容不會從後端讀回。";
+  $("mcpHeadersState").textContent = selected.has_headers
+    ? "已儲存 HTTP Headers；留空會保留，輸入 {} 會清除。"
+    : "尚未儲存 HTTP Headers；敏感內容不會從後端讀回。";
+  $("mcpSettingStartupTimeout").value = Number(selected.startup_timeout_seconds) || 20;
+  $("mcpSettingCallTimeout").value = Number(selected.call_timeout_seconds) || 1800;
+  $("mcpSettingTrustAnnotations").checked = Boolean(selected.trust_annotations);
+  $("mcpConnectionState").textContent = selected.enabled === false ? "已停用" : (selected.status || "未連線");
+  $("mcpConnectionError").textContent = selected.error || "";
+  $("mcpSettingsState").textContent = "";
+  $("mcpTestState").textContent = "";
+  $("deleteMCPSetting").classList.toggle("hidden", isNew);
+  const toolList = $("mcpToolList");
+  toolList.replaceChildren();
+  for (const tool of selected.tools || []) {
+    const code = document.createElement("code");
+    code.textContent = tool.name;
+    code.title = tool.display_name || tool.name;
+    toolList.append(code);
+  }
+  if (!(selected.tools || []).length) {
+    const small = document.createElement("small");
+    small.className = "hint";
+    small.textContent = "尚未載入工具清單。";
+    toolList.append(small);
+  }
+  renderMCPTransportFields(selected.transport || "stdio");
+}
+
+function parseMCPJSON(value, label, expected) {
+  const source = String(value || "").trim();
+  if (!source) return undefined;
+  let parsed;
+  try {
+    parsed = JSON.parse(source);
+  } catch {
+    throw new Error(`${label} 必須是有效的 JSON`);
+  }
+  if (expected === "array" && (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string"))) {
+    throw new Error(`${label} 必須是只包含字串的 JSON 陣列`);
+  }
+  if (expected === "object" && (parsed === null || Array.isArray(parsed) || typeof parsed !== "object"
+    || Object.values(parsed).some((item) => typeof item !== "string"))) {
+    throw new Error(`${label} 必須是字串對字串的 JSON 物件`);
+  }
+  return parsed;
+}
+
+function mcpSettingFormValue() {
+  const transport = $("mcpSettingTransport").value === "streamable-http" ? "streamable-http" : "stdio";
+  const server = {
+    id: $("mcpSettingID").value.trim(),
+    display_name: $("mcpSettingDisplayName").value.trim(),
+    enabled: $("mcpSettingEnabled").checked,
+    transport,
+    startup_timeout_seconds: Number($("mcpSettingStartupTimeout").value),
+    call_timeout_seconds: Number($("mcpSettingCallTimeout").value),
+    trust_annotations: $("mcpSettingTrustAnnotations").checked,
+  };
+  if (transport === "stdio") {
+    server.command = $("mcpSettingCommand").value.trim();
+    server.args = parseMCPJSON($("mcpSettingArgs").value, "參數", "array") || [];
+    server.work_dir = $("mcpSettingWorkDir").value.trim();
+    server.environment = parseMCPJSON($("mcpSettingEnvironment").value, "環境變數", "object");
+  } else {
+    server.url = $("mcpSettingURL").value.trim();
+    const apiKey = $("mcpSettingAPIKey").value.trim();
+    if (apiKey) server.api_key = apiKey;
+    if ($("mcpSettingClearKey").checked) server.api_key = "";
+    server.headers = parseMCPJSON($("mcpSettingHeaders").value, "HTTP Headers", "object");
+  }
+  return server;
+}
+
+function mcpSettingsPayload(servers) {
+  return { servers: servers.map((server) => {
+    const value = JSON.parse(JSON.stringify(server));
+    delete value.has_environment;
+    delete value.has_api_key;
+    delete value.has_headers;
+    delete value.status;
+    delete value.error;
+    delete value.tool_count;
+    delete value.tools;
+    delete value.updated_at;
+    return value;
+  }) };
+}
+
+async function persistMCPSetting({ showToast = true } = {}) {
+  if (!state.mcpSettings || !$("mcpSettingsForm").reportValidity()) return null;
+  let server;
+  try {
+    server = mcpSettingFormValue();
+  } catch (error) {
+    toast(error.message);
+    return null;
+  }
+  const isNew = Boolean(state.mcpSettingsDraft);
+  if (isNew && state.mcpSettings.servers.some((item) => item.id === server.id)) {
+    toast(`MCP ID ${server.id} 已存在`);
+    return null;
+  }
+  const servers = isNew
+    ? [...state.mcpSettings.servers, server]
+    : state.mcpSettings.servers.map((item) => item.id === state.selectedMCPSettingsID ? server : item);
+  $("saveMCPSetting").disabled = true;
+  $("testMCPSetting").disabled = true;
+  $("mcpSettingsState").textContent = "儲存中…";
+  try {
+    state.mcpSettings = await request("/api/v1/admin/mcp-settings", {
+      method: "PUT",
+      body: JSON.stringify(mcpSettingsPayload(servers)),
+    });
+    state.mcpSettingsDraft = null;
+    state.selectedMCPSettingsID = server.id;
+    renderMCPSettings();
+    $("mcpSettingsState").textContent = server.enabled ? "已儲存，背景連線中" : "已停用";
+    if (showToast) toast(`MCP Server ${server.id} 設定已儲存`);
+    return server;
+  } catch (error) {
+    $("mcpSettingsState").textContent = "儲存失敗";
+    toast(error.message);
+    return null;
+  } finally {
+    $("saveMCPSetting").disabled = false;
+    $("testMCPSetting").disabled = false;
+  }
+}
+
+async function saveMCPSetting(event) {
+  event.preventDefault();
+  await persistMCPSetting();
+}
+
+async function testMCPSetting() {
+  const server = await persistMCPSetting({ showToast: false });
+  if (!server) return;
+  $("testMCPSetting").disabled = true;
+  $("saveMCPSetting").disabled = true;
+  $("mcpTestState").textContent = "連線中…";
+  try {
+    const result = await request(`/api/v1/admin/mcp-settings/${encodeURIComponent(server.id)}/test`, { method: "POST", reconnects: 0 });
+    $("mcpTestState").textContent = `成功 · ${result.tool_count || 0} 個工具`;
+    toast(`MCP Server ${server.id} 連線成功`);
+    await loadMCPSettings(server.id);
+    await loadTools();
+  } catch (error) {
+    $("mcpTestState").textContent = "連線失敗";
+    toast(error.message);
+    await loadMCPSettings(server.id);
+  } finally {
+    $("testMCPSetting").disabled = false;
+    $("saveMCPSetting").disabled = false;
+  }
+}
+
+async function deleteMCPSetting() {
+  if (!state.mcpSettings || !state.selectedMCPSettingsID) return;
+  const id = state.selectedMCPSettingsID;
+  if (!window.confirm(`確定刪除 MCP Server「${id}」？`)) return;
+  $("deleteMCPSetting").disabled = true;
+  try {
+    state.mcpSettings = await request("/api/v1/admin/mcp-settings", {
+      method: "PUT",
+      body: JSON.stringify(mcpSettingsPayload(state.mcpSettings.servers.filter((item) => item.id !== id))),
+    });
+    state.selectedMCPSettingsID = state.mcpSettings.servers[0]?.id || "";
+    renderMCPSettings();
+    await loadTools();
+    toast(`已刪除 MCP Server ${id}`);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("deleteMCPSetting").disabled = false;
+  }
+}
+
+async function loadReverseProxyStatus({ hydrate = false, silent = false } = {}) {
+  if (state.reverseProxyLoading) return state.reverseProxy;
+  state.reverseProxyLoading = true;
+  try {
+    state.reverseProxy = await request("/api/v1/admin/reverse-proxy", { reconnects: silent ? 0 : 3 });
+    renderReverseProxyStatus({ hydrate });
+    return state.reverseProxy;
+  } catch (error) {
+    if (!silent) toast(error.message);
+    return null;
+  } finally {
+    state.reverseProxyLoading = false;
+    if (state.reverseProxy) renderReverseProxyStatus();
+  }
+}
+
+function renderReverseProxyStatus({ hydrate = false } = {}) {
+  const status = state.reverseProxy || {};
+  const running = Boolean(status.running);
+  const connected = Boolean(status.connected);
+  const available = Boolean(status.available);
+  const apiKeyEntered = Boolean($("reverseProxyAPIKey").value.trim());
+  const policyAccepted = $("reverseProxyAcceptPolicy").checked;
+
+  if (hydrate || !state.reverseProxyHydrated) {
+    $("reverseProxyEndpoint").value = status.endpoint || "https://netpass.mars-cloud.com";
+    $("reverseProxyName").value = status.name || "";
+    $("reverseProxyAPIKey").value = "";
+    $("reverseProxyClearKey").checked = false;
+    state.reverseProxyHydrated = true;
+  }
+  $("reverseProxyTargetPort").value = status.target_port || "—";
+  $("reverseProxyClearKeyRow").classList.toggle("hidden", !status.api_key_set);
+  $("reverseProxyAPIKeyState").textContent = status.api_key_set
+    ? "已儲存 NetPass API Key；留空會保留，勾選下方選項可清除。"
+    : "尚未儲存 NetPass API Key；API Key 不會從後端讀回。";
+
+  const badge = $("reverseProxyConnectionBadge");
+  badge.textContent = connected ? "已連線" : (running ? "連線中" : "未啟動");
+  badge.classList.toggle("warning", running && !connected);
+  $("reverseProxyRuntimeState").textContent = available ? "可用" : "找不到 Runtime";
+  $("reverseProxyConnectedState").textContent = connected ? "已連線" : (running ? "連線中" : "未連線");
+  $("reverseProxyPID").textContent = status.pid || "—";
+  $("reverseProxyClientID").textContent = status.client_id || "—";
+
+  const publicURL = status.public_url || "";
+  $("reverseProxyPublicURL").value = publicURL;
+  $("reverseProxyPublicURLRow").classList.toggle("hidden", !publicURL);
+  $("reverseProxyError").textContent = status.last_error || "";
+  $("reverseProxyError").classList.toggle("hidden", !status.last_error);
+
+  for (const id of ["reverseProxyEndpoint", "reverseProxyAPIKey", "reverseProxyClearKey", "reverseProxyName"]) {
+    $(id).disabled = running;
+  }
+  $("saveReverseProxy").disabled = running || state.reverseProxyLoading;
+  $("startReverseProxy").disabled = running || !available || !(status.api_key_set || apiKeyEntered) || !policyAccepted;
+  $("startReverseProxy").classList.toggle("hidden", running);
+  $("stopReverseProxy").classList.toggle("hidden", !running);
+  $("stopReverseProxy").disabled = state.reverseProxyLoading;
+}
+
+async function persistReverseProxySettings({ showToast = true } = {}) {
+  const form = $("reverseProxySettingsForm");
+  if (!form.reportValidity() || state.reverseProxy?.running) return null;
+  const apiKey = $("reverseProxyAPIKey").value.trim();
+  $("saveReverseProxy").disabled = true;
+  $("startReverseProxy").disabled = true;
+  $("reverseProxySettingsState").textContent = "儲存中…";
+  try {
+    state.reverseProxy = await request("/api/v1/admin/reverse-proxy", {
+      method: "PUT",
+      body: JSON.stringify({
+        endpoint: $("reverseProxyEndpoint").value.trim(),
+        api_key: apiKey,
+        clear_api_key: $("reverseProxyClearKey").checked,
+        name: $("reverseProxyName").value.trim(),
+      }),
+    });
+    $("reverseProxySettingsState").textContent = "已儲存";
+    renderReverseProxyStatus({ hydrate: true });
+    if (showToast) toast("反向代理設定已儲存");
+    return state.reverseProxy;
+  } catch (error) {
+    $("reverseProxySettingsState").textContent = "儲存失敗";
+    toast(error.message);
+    return null;
+  } finally {
+    renderReverseProxyStatus();
+  }
+}
+
+async function saveReverseProxySettings(event) {
+  event.preventDefault();
+  await persistReverseProxySettings();
+}
+
+async function startReverseProxy() {
+  if (!$("reverseProxyAcceptPolicy").checked) {
+    toast("請先閱讀並同意反向代理使用政策");
+    return;
+  }
+  const saved = await persistReverseProxySettings({ showToast: false });
+  if (!saved) return;
+  $("startReverseProxy").disabled = true;
+  $("saveReverseProxy").disabled = true;
+  $("reverseProxySettingsState").textContent = "啟動中…";
+  try {
+    state.reverseProxy = await request("/api/v1/admin/reverse-proxy/start", {
+      method: "POST",
+      body: JSON.stringify({ accept_usage_policy: true }),
+    });
+    $("reverseProxySettingsState").textContent = "反向代理啟動中";
+    renderReverseProxyStatus();
+    toast("NetPass 反向代理已啟動");
+  } catch (error) {
+    $("reverseProxySettingsState").textContent = "啟動失敗";
+    toast(error.message);
+    await loadReverseProxyStatus({ silent: true });
+  }
+}
+
+async function stopReverseProxy() {
+  $("stopReverseProxy").disabled = true;
+  $("reverseProxySettingsState").textContent = "停止中…";
+  try {
+    state.reverseProxy = await request("/api/v1/admin/reverse-proxy/stop", {
+      method: "POST",
+      body: "{}",
+    });
+    $("reverseProxySettingsState").textContent = "已停止";
+    renderReverseProxyStatus();
+    toast("NetPass 反向代理已停止");
+  } catch (error) {
+    $("reverseProxySettingsState").textContent = "停止失敗";
+    toast(error.message);
+  } finally {
+    $("stopReverseProxy").disabled = false;
+  }
+}
+
+function refreshReverseProxyControls() {
+  if (state.reverseProxy) renderReverseProxyStatus();
+}
+
+function refreshReverseProxyInBackground() {
+  const panelOpen = !$("managementPanel").classList.contains("hidden")
+    && !$("reverseProxyPanel").classList.contains("hidden");
+  if (panelOpen || state.reverseProxy?.running) void loadReverseProxyStatus({ silent: true });
 }
 
 async function loadTools() {
@@ -3764,6 +5051,27 @@ $("pickEditProjectFolders").addEventListener("dragleave", () => $("pickEditProje
 $("pickEditProjectFolders").addEventListener("drop", (event) => handleProjectFolderDrop(event, "settings"));
 $("cancelSession").addEventListener("click", () => $("sessionDialog").close());
 $("sessionForm").addEventListener("submit", createSession);
+$("openContextProjectDirectory").addEventListener("click", () => {
+  const project = state.contextProject;
+  const directory = project?.sandbox_roots?.find((root) => String(root || "").trim());
+  closeProjectContextMenu();
+  if (directory) void openResource({ kind: "path", target: directory }, "open");
+});
+$("manageContextProject").addEventListener("click", () => {
+  const project = state.contextProject;
+  closeProjectContextMenu();
+  if (project) manageProject(project);
+});
+$("newContextProjectSession").addEventListener("click", () => {
+  const project = state.contextProject;
+  closeProjectContextMenu();
+  if (project) openSessionDialog(project.id);
+});
+$("deleteContextProject").addEventListener("click", () => {
+  const project = state.contextProject;
+  closeProjectContextMenu();
+  if (project) void deleteProject(project);
+});
 $("inspectContextSession").addEventListener("click", () => {
   const session = state.contextSession;
   closeSessionContextMenu();
@@ -3816,21 +5124,22 @@ $("newProvider").addEventListener("change", (event) => {
 });
 $("composer").addEventListener("submit", sendPrompt);
 $("send").addEventListener("click", activateRunAction);
+$("stopRun").addEventListener("click", () => { void cancelCurrentRun(); });
 $("messages").addEventListener("scroll", updateMessageAutoScroll, { passive: true });
 $("prompt").addEventListener("paste", (event) => {
-  if (!state.session || state.running) return;
+  if (!state.session || (state.running && !selectedSessionIsRunning())) return;
   const files = [...(event.clipboardData?.files || [])];
   if (files.length) addPendingAttachments(files);
 });
 const chatWorkspace = document.querySelector("main.workspace");
 chatWorkspace.addEventListener("dragenter", (event) => {
-  if (!dataTransferHasFiles(event.dataTransfer) || !state.session || state.running) return;
+  if (!dataTransferHasFiles(event.dataTransfer) || !state.session || (state.running && !selectedSessionIsRunning())) return;
   event.preventDefault();
   chatDragDepth += 1;
   chatWorkspace.classList.add("chat-drag-over");
 });
 chatWorkspace.addEventListener("dragover", (event) => {
-  if (!dataTransferHasFiles(event.dataTransfer) || !state.session || state.running) return;
+  if (!dataTransferHasFiles(event.dataTransfer) || !state.session || (state.running && !selectedSessionIsRunning())) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "copy";
   chatWorkspace.classList.add("chat-drag-over");
@@ -3844,7 +5153,7 @@ chatWorkspace.addEventListener("drop", (event) => {
   event.preventDefault();
   chatDragDepth = 0;
   chatWorkspace.classList.remove("chat-drag-over");
-  if (!state.session || state.running) return;
+  if (!state.session || (state.running && !selectedSessionIsRunning())) return;
   addPendingAttachments(event.dataTransfer.files);
   $("prompt").focus();
 });
@@ -3891,6 +5200,14 @@ $("retryRun").addEventListener("click", retryCurrentRun);
 $("approveTool").addEventListener("click", () => decideApproval("approve"));
 $("denyTool").addEventListener("click", () => decideApproval("deny"));
 $("openManagement").addEventListener("click", () => openManagement("overview"));
+$("providerUsageButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleProviderUsagePopover();
+});
+$("contextUsageButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleContextUsagePopover();
+});
 $("closeManagement").addEventListener("click", closeManagement);
 for (const button of document.querySelectorAll(".panel-tab")) button.addEventListener("click", () => activatePanel(button.dataset.panel));
 $("refreshDiagnostics").addEventListener("click", loadDiagnostics);
@@ -3904,6 +5221,85 @@ $("providerSettingsForm").addEventListener("submit", saveProviderSetting);
 $("deleteProviderSetting").addEventListener("click", deleteProviderSetting);
 $("refreshProviderModels").addEventListener("click", () => loadProviderModels(state.selectedProviderSettingsID));
 $("testProviderSetting").addEventListener("click", testProviderSetting);
+$("connectProviderOAuth").addEventListener("click", connectProviderOAuth);
+$("disconnectProviderOAuth").addEventListener("click", disconnectProviderOAuth);
+$("addMCPSetting").addEventListener("click", () => {
+  state.mcpSettingsDraft = newMCPSetting();
+  state.selectedMCPSettingsID = "";
+  renderMCPSettings();
+  $("mcpSettingID").focus();
+});
+$("mcpSettingsForm").addEventListener("submit", saveMCPSetting);
+$("deleteMCPSetting").addEventListener("click", deleteMCPSetting);
+$("testMCPSetting").addEventListener("click", testMCPSetting);
+$("mcpSettingTransport").addEventListener("change", (event) => renderMCPTransportFields(event.target.value));
+$("mcpSettingAPIKey").addEventListener("input", (event) => {
+  if (event.target.value) $("mcpSettingClearKey").checked = false;
+});
+$("mcpSettingClearKey").addEventListener("change", (event) => {
+  if (event.target.checked) $("mcpSettingAPIKey").value = "";
+});
+$("reverseProxySettingsForm").addEventListener("submit", saveReverseProxySettings);
+$("startReverseProxy").addEventListener("click", startReverseProxy);
+$("stopReverseProxy").addEventListener("click", stopReverseProxy);
+$("refreshReverseProxy").addEventListener("click", () => loadReverseProxyStatus());
+$("reverseProxyAPIKey").addEventListener("input", (event) => {
+  if (event.target.value) $("reverseProxyClearKey").checked = false;
+  refreshReverseProxyControls();
+});
+$("reverseProxyClearKey").addEventListener("change", (event) => {
+  if (event.target.checked) $("reverseProxyAPIKey").value = "";
+  refreshReverseProxyControls();
+});
+$("reverseProxyAcceptPolicy").addEventListener("change", refreshReverseProxyControls);
+$("copyReverseProxyURL").addEventListener("click", () => copyText($("reverseProxyPublicURL").value, "已複製公開網址"));
+$("openReverseProxyURL").addEventListener("click", () => {
+  const target = $("reverseProxyPublicURL").value;
+  if (target) void openResource({ kind: "url", target }, "open");
+});
+$("providerSettingType").addEventListener("change", (event) => {
+  const isCodex = event.target.value === "openai-codex-responses";
+  const settings = isCodex ? {
+    has_oauth_token: false,
+    model: "gpt-5.2-codex",
+    max_attempts: 3,
+    timeout_seconds: 1800,
+    connect_timeout_seconds: 20,
+    response_header_timeout_seconds: 120,
+    context_window: 0,
+    max_output_tokens: 0,
+  } : {
+    base_url: "https://api.openai.com/v1",
+    has_api_key: false,
+    model: "gpt-4o-mini",
+    instruction_role: "system",
+    disable_streaming: false,
+    stream_include_usage: true,
+    omit_tool_choice: false,
+    max_attempts: 3,
+    timeout_seconds: 1800,
+    connect_timeout_seconds: 20,
+    response_header_timeout_seconds: 120,
+    context_window: 0,
+    max_output_tokens: 0,
+  };
+  $("providerSettingBaseURL").value = settings.base_url || "";
+  $("providerSettingAPIKey").value = "";
+  $("providerSettingModel").value = settings.model;
+  $("providerSettingModel").dataset.configuredModel = settings.model;
+  $("providerSettingInstructionRole").value = settings.instruction_role || "system";
+  $("providerSettingDisableStreaming").checked = Boolean(settings.disable_streaming);
+  $("providerSettingStreamUsage").checked = settings.stream_include_usage !== false;
+  $("providerSettingOmitToolChoice").checked = Boolean(settings.omit_tool_choice);
+  $("providerSettingMaxAttempts").value = settings.max_attempts;
+  $("providerSettingTimeout").value = settings.timeout_seconds;
+  $("providerSettingConnectTimeout").value = settings.connect_timeout_seconds;
+  $("providerSettingHeaderTimeout").value = settings.response_header_timeout_seconds;
+  $("providerSettingContextWindow").value = settings.context_window;
+  $("providerSettingMaxOutputTokens").value = settings.max_output_tokens;
+  renderProviderTypeFields(event.target.value, settings, Boolean(state.providerSettingsDraft), state.selectedProviderSettingsID);
+  renderProviderModelOptions("");
+});
 $("providerSettingDefault").addEventListener("change", (event) => {
   if (event.target.checked) $("providerSettingEnabled").checked = true;
 });
@@ -3931,8 +5327,11 @@ $("refreshTools").addEventListener("click", loadTools);
 $("refreshAudit").addEventListener("click", () => loadAudit(true));
 $("loadMoreAudit").addEventListener("click", () => loadAudit(false));
 document.addEventListener("pointerdown", (event) => {
+  if (!$("projectContextMenu").contains(event.target)) closeProjectContextMenu();
   if (!$("sessionContextMenu").contains(event.target)) closeSessionContextMenu();
   if (!$("resourceContextMenu").contains(event.target)) closeResourceContextMenu();
+  if (!$("providerUsagePopover").contains(event.target) && !$("providerUsageButton").contains(event.target)) closeProviderUsagePopover();
+  if (!$("contextUsagePopover").contains(event.target) && !$("contextUsageButton").contains(event.target)) closeContextUsagePopover();
 });
 document.addEventListener("click", (event) => {
   const resource = resourceFromElement(event.target);
@@ -3947,27 +5346,40 @@ document.addEventListener("contextmenu", (event) => {
     return;
   }
   closeResourceContextMenu();
+  if (!event.target.closest?.(".project-head")) closeProjectContextMenu();
   if (!event.target.closest?.(".session-row")) closeSessionContextMenu();
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
+  closeProviderUsagePopover();
 });
 document.addEventListener("scroll", () => {
+  closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
 }, true);
 window.addEventListener("resize", () => {
+  closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
 });
 window.addEventListener("blur", () => {
+  closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
+  closeProviderUsagePopover();
+});
+window.addEventListener("nr-intern-language-change", () => {
+  refreshOpenProviderUsage();
+  renderContextUsage();
 });
 
 installDialogDragGuards();
 notifyNativeStartupReady();
 refreshBackend();
 setInterval(updateLiveReasoningDurations, 1000);
+setInterval(refreshOpenProviderUsage, providerUsageUIRefreshIntervalMilliseconds);
+setInterval(refreshReverseProxyInBackground, reverseProxyRefreshIntervalMilliseconds);
