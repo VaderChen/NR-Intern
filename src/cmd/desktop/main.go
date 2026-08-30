@@ -5,6 +5,7 @@ import (
 	"AgenticService/src/desktop/httpui"
 	"AgenticService/src/desktop/launcher"
 	"AgenticService/src/desktop/supervisor"
+	"AgenticService/src/desktop/tray"
 	"AgenticService/src/desktop/window"
 	"context"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -176,6 +178,19 @@ func runDesktop(value options) error {
 		} else {
 			visibleUI = true
 			stop()
+		}
+	}
+	if !visibleUI && runtime.GOOS == "windows" && stopContext.Err() == nil {
+		// Windows fallback UI 使用預設 Browser，但生命週期仍由獨立 Tray 持有；
+		// 第二次啟動會透過既有 UI listener 送 restore，不會再建立第二個程序。
+		if err := tray.Run(stopContext, tray.Options{
+			Title:       "NR-Intern",
+			URL:         uiURL,
+			OpenOnStart: value.openBrowser,
+		}); err == nil {
+			stop()
+		} else {
+			slog.Warn("Windows system tray unavailable", "error", err)
 		}
 	}
 	if !visibleUI && stopContext.Err() == nil {

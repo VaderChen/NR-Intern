@@ -75,3 +75,45 @@ func TestHTTPRejectsUnknownJSONFieldsWithProblemResponse(t *testing.T) {
 		t.Fatalf("problem code = %q", body.Code)
 	}
 }
+
+func TestP1AdminEndpointsExposePersistentCapabilities(t *testing.T) {
+	runtime := testRuntime(t, "")
+
+	status, decoded := call(t, runtime, http.MethodGet, "/api/v1/admin/status", "")
+	if status.Code != http.StatusOK {
+		t.Fatalf("status endpoint = %d, body = %s", status.Code, status.Body.String())
+	}
+	statusData := memoryData(t, decoded)
+	if statusData["api_version"] != "1.0" || statusData["event_schema_version"] != "1.0" {
+		t.Fatalf("compatibility fields = %v", statusData)
+	}
+	capabilities, _ := statusData["capabilities"].([]any)
+	seen := map[string]bool{}
+	for _, value := range capabilities {
+		if name, ok := value.(string); ok {
+			seen[name] = true
+		}
+	}
+	for _, required := range []string{"durable-outbox.v1", "run-recovery.v1", "run-retry.v1", "search.v1", "admin-backup.v1", "admin-permissions.v1", "update-check.v1"} {
+		if !seen[required] {
+			t.Errorf("missing capability %q in %v", required, capabilities)
+		}
+	}
+
+	for _, endpoint := range []string{
+		"/api/v1/admin/permissions",
+		"/api/v1/admin/update",
+		"/api/v1/notifications",
+		"/api/v1/search?q=workspace",
+	} {
+		response, _ := call(t, runtime, http.MethodGet, endpoint, "")
+		if response.Code != http.StatusOK {
+			t.Errorf("GET %s = %d, body = %s", endpoint, response.Code, response.Body.String())
+		}
+	}
+
+	backup, _ := call(t, runtime, http.MethodGet, "/api/v1/admin/backup", "")
+	if backup.Code != http.StatusOK || !strings.Contains(backup.Header().Get("Content-Type"), "application/zip") {
+		t.Errorf("backup response = %d %q", backup.Code, backup.Header().Get("Content-Type"))
+	}
+}

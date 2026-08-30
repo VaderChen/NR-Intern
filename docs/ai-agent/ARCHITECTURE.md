@@ -46,7 +46,7 @@ src/
 │   └── native/
 │       ├── internal/toolutil/  # 參數、workspace 路徑與輸出限制
 │       ├── files/              # directory 與 file read/search/compare/write/edit
-│       ├── documents/          # PDF、DOCX、XLSX、PPTX 結構檢視與分段文字抽取
+│       ├── documents/          # PDF、DOCX、XLSX、PPTX 讀寫、範本、驗證、字型與視覺渲染
 │       ├── plans/              # plan_get/create/step_update 計畫控制工具
 │       ├── shell/              # shell_exec 與 OS platform adapter
 │       ├── ssh/                # Go SSH client
@@ -150,7 +150,8 @@ Session 對原 Run 的邏輯預約，因此其他已排隊 Run 不會插入尚�
 ### 工具分組執行
 
 同一回合的 tool call 會切成群組：連續的 read-only 工具（`file_read`、`file_search`、
-`file_compare`、`directory_list`、`document_inspect`、`document_read`、`memory_search`）在同一群組內並行執行，其餘工具各自成組依序執行。
+`file_compare`、`directory_list`、`document_inspect`、`document_read`、`document_compare`、`document_validate`、
+`document_fonts`、`memory_search`）在同一群組內並行執行，其餘工具各自成組依序執行。
 
 只有「連續」的 read-only 呼叫可以並行：`[read, write, read]` 之中兩個 read 隔著一個 write，
 併發執行會讓第二個 read 讀到不確定的狀態。工具定義裡沒有的名稱一律視為非 read-only。
@@ -165,12 +166,72 @@ Session 對原 Run 的邏輯預約，因此其他已排隊 Run 不會插入尚�
 
 Run 建立與 HTTP request 生命週期分離：`POST` 先回傳 durable queued Run，背景 worker 使用後端持有的 context 繼續執行。所有 event 先 append 到 `runs/events/<run-id>.jsonl`，再通知目前的 SSE 訂閱者；訂閱通知只負責喚醒，Client 一律依最後 sequence 從 durable log 取資料，因此通知合併或短暫離線不會形成事件缺口。
 
-SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後最多重連三次，每次從最後完整事件補流；三次仍失敗才結束前端連線，後端 Run 本身不受影響。後端重啟時，原本 queued/running/waiting_approval Run 會標記為可重試的 `server_restarted` failure，啟動期也會補齊缺少的 terminal event。
+SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後最多重連三次，每次從最後完整事件補流；三次仍失敗才結束前端連線，後端 Run 本身不受影響。後端重啟時，原本 queued/running/paused/waiting_approval Run 會標記為可重試的 `server_restarted` failure，啟動期也會補齊缺少的 terminal event。
 
-Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。這些訊息先放在該 UI instance
-記憶體內的待送佇列，等目前 SSE 收到 terminal event 後依序建立下一個 Run；它不是後端的 durable
-queue，重新整理或關閉 UI 前應先確認待送項目已送出。後端仍以 Session single-writer gate 作最後
-保護，因此其他 Client 同時送入同一 Session 時也不會交錯寫入 transcript。
+Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。這些訊息會先寫入該 Browser profile
+的 IndexedDB Durable Outbox，內容包含 Session、輸入、附件 File、固定 Idempotency-Key 與目前
+送出狀態；等目前 SSE 收到 terminal event 後依序建立下一個 Run。只有收到 Run terminal event
+才移除 outbox item，網路錯誤、UI 關閉或重新整理都會保留可重試資料；`sending` 狀態在 UI
+重開時會恢復為 `pending`。附件上傳成功後也保存 Attachment ID，避免重送時重複上傳。後端仍
+以 Session single-writer gate 最後保護，因此其他 Client 同時送入同一 Session 時也不會交錯寫入
+transcript。
+
+UI 啟動時先讀取目前 Workspace 的 queued／running／paused／waiting approval Run，依 Session
+重新掛接 durable SSE；若後端已將中斷 Run 標記為 retryable failure，也會顯示可重試狀態。這讓
+隱藏視窗、背景執行、瀏覽器重整與桌面程式重開都不會遺失工作生命週期。
+
+## P0／P1 系統能力
+
+P0 與 P1 管理能力共用同一個後端狀態來源，不在 Browser 端自行推導或保存權限結果。
+
+### 異常恢復、通知與 Run 控制
+
+Filestore 啟動時會檢查所有 queued、running、paused 與 waiting approval Run。這些狀態代表上一個
+後端程序未正常完成，因此會被標記為 `failed`、錯誤碼 `server_restarted` 並保留
+`retryable=true`；Application 會補齊缺少的 terminal event；啟用通知中心時才會產生一次可重試摘要。
+原始 Run 與事件不被覆寫，使用既有 retry API 建立新的可追蹤 Run。
+
+通知以 `NotificationRepository` 持久化，最多保留 1000 筆，支援未讀、單筆／全部已讀與清除
+已讀。通知中心由 `notifications_enabled` 控制，預設關閉；關閉時不建立新的 Run、等待工具核准
+或版本更新通知，前端也不顯示通知按鈕。開啟後 Run 完成、失敗、取消、等待工具核准及後端重啟
+中斷都會建立通知；`DedupeKey` 防止重播或重啟時重複建立同一則通知，既有資料不因關閉而刪除。
+
+Run 控制提供 `pause`、`resume` 與 `cancel-all`。暫停只設定 durable 狀態，Harness 在
+目前 Provider request、工具執行與事件寫入完成後，於下一個安全回合邊界等待；不強制中止已送出
+的 Provider HTTP request。Run 狀態與控制事件共用序列化鎖，避免 `run.paused`／`run.resumed`
+與 terminal event 使用重複 sequence。等待人工核准的 Run 不接受一般 pause，必須核准、拒絕或取消。
+
+### 診斷、搜尋、備份與權限中心
+
+`DiagnosticsExport` 只輸出脫敏的管理摘要，移除 API token、DataDir 絕對路徑與憑證欄位；
+不把對話全文放入診斷包。安全備份則保存 sessions、projects、workspaces、runs、events、
+plans、attachments、memories、schedules、notifications 與非秘密的 service settings，明確
+排除 Provider、OAuth、MCP 與 NetPass 憑證檔。還原前先保存 `backups/pre-restore-*.zip`，
+只接受白名單資料目錄、拒絕絕對路徑、`..`、符號連結及超過 512 MiB 的解壓內容，完成後回傳
+`restart_required=true`。
+
+全域搜尋由後端掃描 Workspace、Project、Session、Message、Plan 與 Schedule，限制查詢 200
+字元、最多 100 筆，只回傳 bounded snippet，不把完整訊息或檔案內容交給前端。唯讀權限中心
+回傳後端 permission policy、工具的 standard/elevated 分類、可用性與待核准 Run 數量；不提供
+修改 permission policy 或繞過 Approval 的 API。
+
+版本更新檢查是固定目標的唯讀整合：只查詢 `VaderChen/NR-Intern` 官方 GitHub latest Release，
+不允許 Client 提供任意 URL。Runtime 啟動後檢查一次並每 6 小時重查，管理 API 可要求立即檢查。
+版本比較支援一般 semver 與本專案的 `1.YY.MMDDbHHmm`／`1.YY.MMDD build HHmm` 格式；啟用
+通知中心時，新版本會透過現有 NotificationRepository 以 Release tag 去重，檢查失敗只更新狀態，
+不影響 Agent 工作。
+
+`GET /api/v1/admin/status` 同時回傳 `api_version`、`event_schema_version` 與後端
+`capabilities`。Browser Console 在載入 Workspace 前檢查 API major version 與必要 capability；
+缺少新能力時顯示可理解的不相容提示，不讓使用者在操作中才遇到單一端點 404。Run 建立時會
+對 Session、輸入、附件 IDs、Provider 與 Model 產生持久化 Idempotency fingerprint；同一
+Session 的同一 `Idempotency-Key` 只有在 fingerprint 相同時才回傳原 Run，內容不同則回傳
+`409 Conflict`。
+
+桌面生命週期方面，macOS 使用原生 status item；Windows 使用 Win32 Notify Icon，啟動就建立
+Tray，左鍵開啟 UI、右鍵選單提供開啟與結束。Windows 沒有可用原生視窗時，Tray 仍持有桌面
+程序與 Browser fallback 的生命週期；再次啟動會對既有 UI listener 發送 restore，不建立第二個
+桌面程序。
 
 ## Workspace、Project 與多前端
 
@@ -327,7 +388,10 @@ CJK 字元約 1 token、ASCII 約 0.25 token。以英文為前提的 characters/
 摘要、訊息、tool call 參數，以及每次請求都會重送的工具 schema。低估的後果是請求被拒絕，
 高估只會提早 compaction，因此預設權重刻意偏保守。
 
-大型 tool result 只會在送入模型的 context view 中保留頭尾並縮減；原始工具輸出不會被改寫。每次 Run、Turn 與 Tool execution 另有 operation records，供當機診斷與後續復原使用。
+大型 tool result 只會在送入模型的 context view 中保留頭尾並縮減；原始工具輸出不會被改寫。若
+固定提示本身已佔滿極小的 context window，ContextManager 會優先縮短摘要，再以頭尾保留策略
+產生單一預算版 prompt，避免把正常 compaction 誤報為安全中止。每次 Run、Turn 與 Tool execution
+另有 operation records，供當機診斷與後續復原使用。
 
 ## 紀錄與可觀測性
 
@@ -387,9 +451,17 @@ Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成�
 - `file_edit`：以 old/new text 與預期替換數作 optimistic precondition，保留 mode 後原子寫回。
 - `document_inspect`：檢視 PDF、DOCX、XLSX、PPTX 的格式、中繼資料、頁數、區段、工作表或投影片；不將二進位內容直接送給模型。
 - `document_read`：PDF／PPTX 依頁、DOCX 依區段與段落、XLSX 依工作表與列分段抽取文字；保留 Excel 儲存格座標與公式。掃描型 PDF 不內建 OCR。
+- `document_compare`：以相同範圍抽取兩份支援文件的可見文字並產生 bounded unified diff，同時回傳原始檔 SHA-256；內容相同不等同版面相同。
+- `document_validate`：唯讀驗證 Open XML 容器、XML、Content Types、內部關聯、必要部件與格式特有結構；掃描 XLSX 公式錯誤，辨識巨集、外部關聯與嵌入物件，並回報視覺渲染後端狀態。
+- `document_fonts`：唯讀探索應用程式、使用者與系統 TrueType 字型，使用 SFNT cmap 驗證指定文字的字形覆蓋率；輸出不揭露絕對路徑。
+- `document_create`：以結構化輸入建立 DOCX、XLSX、PPTX 或 PDF。也可指定同格式 `template_path`，在不重建版面的情況下以 replacements、cell_updates 或 annotations 填入既有範本。Unicode PDF 優先使用指定字型，未指定時自動選擇完整覆蓋的系統 TTF。
+- `document_edit`：來源與輸出路徑分離，保留原檔。DOCX/PPTX 可跨相鄰文字 run 精確替換，XLSX 可更新指定工作表儲存格或文字，PDF 則保留原頁並疊加文字、線段或方框。
+- `document_convert`：elevated 工具；由固定探索的 LibreOffice 將 Office／OpenDocument 文件轉成 PDF，或將舊式 DOC／XLS／PPT 與 ODT／ODS／ODP／RTF 遷移到同家族 Open XML。來源與輸出不可為同一路徑。
+- `pdf_pages`：elevated 工具；以純 Go PDF 匯入器完成合併、擷取、重排與分批拆分，保留來源檔與各頁尺寸，單次最多 500 頁。
+- `document_render`：elevated 工具；PDF 由 Poppler 輸出逐頁 PNG，Office 文件先用獨立 LibreOffice profile 轉成 PDF。後端只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受模型指定任意 executable。
 - `shell_exec`：必要高權限工具；Unix 使用 process group，Windows 使用 Job Object，取消或逾時會終止子程序樹；子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
 - `ssh_exec`：使用 Go SSH client；連線憑證只存在後端 profile，模型只取得 profile 名稱。初始連線預設最多三次並使用 keepalive；工作中斷線不自動重跑遠端命令，以免重複副作用。
-- `http_fetch`：唯一由 Agent 直接指定任意網址的內建工具。以 Go `net/http` 讀取 http／https 資源，回傳文字內容；HTML 會先轉成純文字再送進上下文。回應大小、逾時與轉址次數都有上限，私有網段預設拒絕，並且可由管理介面即時關閉。
+- `http_fetch`：唯一由 Agent 直接指定任意網址的內建工具。以 Go `net/http` 讀取 http／https 資源，回傳文字內容；HTML 會先轉成純文字再送進上下文。回應大小、逾時與轉址次數都有上限，localhost 與私有網段預設允許，並且可由管理介面即時關閉。
 - `memory_search`：查詢目前 scope 的有效長期記憶。
 - `memory_remember`：保存耐久資訊並支援去重與取代舊記憶。
 - `memory_forget`：依明確要求軟性遺忘，保留稽核狀態。
@@ -404,9 +476,15 @@ Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具�
 `permissions.elevated_profiles`。profile 由後端 `permissions` 策略指派，預設不接受 API request 指定；
 未宣告任何 elevated profile 時 fail closed。詳見 `docs/ai-agent/SECURITY.md`。
 
-文件工具是 read-only，仍必須通過 Project／Session Sandbox。單一文件預設上限 128MB，Open XML 單一解壓項目上限 64MB，最終輸出沿用 `max_tool_output_bytes`。大型文件應先呼叫 `document_inspect`，再縮小頁面、段落、工作表列或投影片範圍；不支援舊式二進位 DOC／XLS，這類文件需先由 Host 工具轉換。PDF 文字抽取使用純 Go reader；沒有文字層時回報需要 OCR，不臆測掃描影像內容。
+`document_inspect`、`document_read`、`document_compare`、`document_validate`、`document_fonts` 是 read-only；`document_create`、`document_edit`、`document_convert`、`pdf_pages`、`document_render` 是 elevated 寫入工具，須通過 allowlist、permission profile 與單次 Approval。所有模型提供的文件、範本、字型與輸出路徑都必須通過 Project／Session Sandbox。單一文件預設上限 128MB，Open XML 單一解壓項目上限 64MB，文字讀取／驗證／比較輸出沿用 `max_tool_output_bytes`，建立／編輯／PDF 頁面整理的結構化參數沿用 `max_file_input_bytes`。PDF 頁面操作單次最多 500 頁，渲染單次最多 200 頁、最高 300 DPI、總輸出上限 512MB。文件寫入先在記憶體或隔離暫存目錄完成格式驗證，再以同目錄暫存檔原子替換；編輯與轉換工具禁止來源與輸出使用同一路徑。
 
-`directory_create`、`file_write`、`file_edit` 也屬於寫入型高權限工具，使用相同閘門。`ResolvePath` 除了檢查目標，也會解析最深的既有父路徑；即使新檔尚不存在，仍不能藉父層 symlink 寫出 workspace。Unix 與 Windows 的檔案替換分別使用原生 rename／MoveFileEx 語意。
+工具參數、格式差異與範例見 `docs/ai-agent/DOCUMENT_TOOLS.md`。
+
+大型文件應先呼叫 `document_inspect`，再縮小頁面、段落、工作表列或投影片範圍；舊式二進位 DOC／XLS／PPT 不由原生 reader 直接讀取，可先透過 `document_convert` 遷移。Open XML 編輯與範本填入只重寫被修改的 XML part，其餘 ZIP part 原樣帶入新檔。PDF 文字抽取使用純 Go reader；沒有文字層時回報需要 OCR，不臆測掃描影像內容。PDF 建立／文字標註若含非 ASCII 字元，會先驗證指定 Sandbox `.ttf`，未指定時從固定的應用程式／系統字型目錄探索完整覆蓋的 TTF；找不到就拒絕輸出缺字文件。既有 PDF 的「編輯」採頁面匯入後疊加標註；頁面合併、擷取、重排與拆分則由 `pdf_pages` 明確處理，不宣稱能原地重排既有 PDF 文字。
+
+結構驗證與視覺驗證是兩個獨立階段。`document_validate` 的 `valid=true` 只代表沒有結構 error，回傳 `visual_check=not_run`；成功呼叫 `document_render` 並檢查所有 PNG 後，呼叫端才可宣稱排版已驗證。LibreOffice／Poppler 不存在時，建立、讀取、編輯與結構驗證仍可使用，但視覺交付閘門不可標記為通過。
+
+`directory_create`、`file_write`、`file_edit`、`document_create`、`document_edit`、`document_convert`、`pdf_pages`、`document_render` 都屬於寫入型高權限工具，使用相同閘門。`ResolvePath` 除了檢查目標，也會解析最深的既有父路徑；即使新檔尚不存在，仍不能藉父層 symlink 寫出 workspace。Unix 與 Windows 的檔案替換分別使用原生 rename／MoveFileEx 語意。
 
 ## MCP Client 與外部工具
 

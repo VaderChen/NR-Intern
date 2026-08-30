@@ -7,12 +7,15 @@ import (
 	"AgenticService/src/internal/valueutil"
 	"AgenticService/src/ports"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,17 +27,19 @@ type activeRun struct {
 }
 
 type Service struct {
-	registry    *Registry
-	runs        ports.RunRepository
-	events      ports.RunEventRepository
-	projects    ports.ProjectRepository
-	workspaces  ports.WorkspaceRepository
-	providers   ports.ProviderCatalog
-	approvals   ports.ApprovalCoordinator
-	memories    ports.MemoryRepository
-	plans       ports.PlanRepository
-	attachments ports.AttachmentRepository
-	schedules   ports.ScheduleRepository
+	registry             *Registry
+	runs                 ports.RunRepository
+	events               ports.RunEventRepository
+	projects             ports.ProjectRepository
+	workspaces           ports.WorkspaceRepository
+	providers            ports.ProviderCatalog
+	approvals            ports.ApprovalCoordinator
+	memories             ports.MemoryRepository
+	plans                ports.PlanRepository
+	attachments          ports.AttachmentRepository
+	schedules            ports.ScheduleRepository
+	notifications        ports.NotificationRepository
+	notificationsEnabled atomic.Bool
 	// permissions 是後端唯一的 permission profile 依據。
 	// 呼叫端要求的 profile 必須先經過這裡解析，才不會讓 API request 自行決定提權。
 	permissions domain.PermissionPolicy
@@ -49,8 +54,12 @@ type Service struct {
 	sessionGates   map[string]chan struct{}
 	pausedSessions map[string]string
 	sessionSignals map[string]chan struct{}
+	pausedRuns     map[string]bool
+	runSignals     map[string]chan struct{}
 	watchers       map[string]map[uint64]chan struct{}
 	nextWatcher    uint64
+	eventMu        sync.Mutex
+	eventSequences map[string]int64
 	closed         bool
 	wg             sync.WaitGroup
 }
@@ -72,9 +81,12 @@ type Dependencies struct {
 	Attachments ports.AttachmentRepository
 	// Schedules 可以是 nil：沒有排程儲存時，排程 API 會回報 conflict，
 	// 也不會啟動背景排程執行器。
-	Schedules   ports.ScheduleRepository
-	Permissions domain.PermissionPolicy
-	Logger      *slog.Logger
+	Schedules ports.ScheduleRepository
+	// Notifications 可以是 nil，讓精簡測試與嵌入式使用者不必啟用通知儲存。
+	Notifications        ports.NotificationRepository
+	NotificationsEnabled bool
+	Permissions          domain.PermissionPolicy
+	Logger               *slog.Logger
 }
 
 func NewService(dependencies Dependencies) (*Service, error) {
@@ -96,6 +108,7 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		plans:          dependencies.Plans,
 		attachments:    dependencies.Attachments,
 		schedules:      dependencies.Schedules,
+		notifications:  dependencies.Notifications,
 		permissions:    dependencies.Permissions.Normalize(),
 		logger:         logging.Or(dependencies.Logger),
 		now:            time.Now,
@@ -105,8 +118,12 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		sessionGates:   map[string]chan struct{}{},
 		pausedSessions: map[string]string{},
 		sessionSignals: map[string]chan struct{}{},
+		pausedRuns:     map[string]bool{},
+		runSignals:     map[string]chan struct{}{},
 		watchers:       map[string]map[uint64]chan struct{}{},
+		eventSequences: map[string]int64{},
 	}
+	service.notificationsEnabled.Store(dependencies.NotificationsEnabled)
 	if err := service.reconcileTerminalEvents(context.Background()); err != nil {
 		stop()
 		return nil, err
@@ -668,9 +685,16 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	if closed {
 		return domain.Run{}, fmt.Errorf("%w: service is shutting down", domain.ErrConflict)
 	}
+	fingerprint, err := runInputFingerprint(input)
+	if err != nil {
+		return domain.Run{}, err
+	}
 	if input.IdempotencyKey != "" {
 		existing, findErr := s.runs.FindByIdempotencyKey(ctx, input.SessionID, input.IdempotencyKey)
 		if findErr == nil {
+			if !sameIdempotentRun(existing, input, fingerprint) {
+				return domain.Run{}, fmt.Errorf("%w: Idempotency-Key %q was already used with different run input", domain.ErrConflict, input.IdempotencyKey)
+			}
 			return existing, nil
 		}
 		if !errors.Is(findErr, domain.ErrNotFound) {
@@ -680,17 +704,18 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 
 	now := s.now().UTC()
 	run := domain.Run{
-		ID:             domain.NewID("run"),
-		AgentID:        session.AgentID,
-		SessionID:      session.ID,
-		Status:         domain.RunStatusQueued,
-		Input:          input.UserInput,
-		AttachmentIDs:  append([]string(nil), input.AttachmentIDs...),
-		ProviderID:     input.ProviderID,
-		Model:          input.Model,
-		IdempotencyKey: input.IdempotencyKey,
-		Metadata:       valueutil.CloneMap(input.Metadata),
-		CreatedAt:      now,
+		ID:                     domain.NewID("run"),
+		AgentID:                session.AgentID,
+		SessionID:              session.ID,
+		Status:                 domain.RunStatusQueued,
+		Input:                  input.UserInput,
+		AttachmentIDs:          append([]string(nil), input.AttachmentIDs...),
+		ProviderID:             input.ProviderID,
+		Model:                  input.Model,
+		IdempotencyKey:         input.IdempotencyKey,
+		IdempotencyFingerprint: fingerprint,
+		Metadata:               valueutil.CloneMap(input.Metadata),
+		CreatedAt:              now,
 	}
 	if err := s.runs.Save(ctx, run); err != nil {
 		return domain.Run{}, err
@@ -704,6 +729,49 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	s.logger.Info("run queued", "run_id", run.ID, "session_id", session.ID, "agent_id", session.AgentID, "provider_id", run.ProviderID, "model", run.Model)
 	go s.executeRun(runCtx, engine, session, input, run)
 	return run, nil
+}
+
+// runInputFingerprint 只納入會決定實際工作的穩定欄位。後端產生的 instructions、
+// sandbox manifest 與其他環境 metadata 不參與雜湊，避免相同 Client request 因為
+// 後端重新載入設定而失去冪等性。
+func runInputFingerprint(input domain.RunInput) (string, error) {
+	payload := struct {
+		SessionID     string   `json:"session_id"`
+		Input         string   `json:"input"`
+		AttachmentIDs []string `json:"attachment_ids,omitempty"`
+		ProviderID    string   `json:"provider_id,omitempty"`
+		Model         string   `json:"model,omitempty"`
+	}{
+		SessionID:     input.SessionID,
+		Input:         input.UserInput,
+		AttachmentIDs: append([]string(nil), input.AttachmentIDs...),
+		ProviderID:    input.ProviderID,
+		Model:         input.Model,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("encode idempotent run input: %w", err)
+	}
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", digest[:]), nil
+}
+
+func sameIdempotentRun(run domain.Run, input domain.RunInput, fingerprint string) bool {
+	if run.IdempotencyFingerprint != "" {
+		return run.IdempotencyFingerprint == fingerprint
+	}
+	if run.SessionID != input.SessionID || run.Input != input.UserInput || run.ProviderID != input.ProviderID || run.Model != input.Model {
+		return false
+	}
+	if len(run.AttachmentIDs) != len(input.AttachmentIDs) {
+		return false
+	}
+	for index := range run.AttachmentIDs {
+		if run.AttachmentIDs[index] != input.AttachmentIDs[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // ExecuteRun 提供同步等待介面；底層仍是非同步 Run。ctx 取消只停止等待，
@@ -959,6 +1027,10 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 		}
 	}()
 
+	if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
+		s.finishCanceled(run, err, &sequence)
+		return
+	}
 	release, err := s.acquireSession(ctx, session.ID, run.ID)
 	if err != nil {
 		s.finishCanceled(run, err, &sequence)
@@ -971,6 +1043,10 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 		s.clearSessionPause(session.ID, run.ID)
 	}()
 	if err := ctx.Err(); err != nil {
+		s.finishCanceled(run, err, &sequence)
+		return
+	}
+	if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
 		s.finishCanceled(run, err, &sequence)
 		return
 	}
@@ -988,6 +1064,9 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 	}
 
 	result, runErr := engine.Run(ctx, input, func(event domain.EngineEvent) error {
+		if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
+			return err
+		}
 		switch event.Type {
 		case "run.approval_required":
 			request, ok := approvalRequestFromPayload(event.Payload)
@@ -1002,6 +1081,7 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 			if err := s.appendEvent(run, &sequence, event.Type, event.Payload); err != nil {
 				return err
 			}
+			s.notifyApproval(run, request)
 			// 先建立邏輯預約再歸還 gate，已排隊的其他 Run 才不會插入尚未完成的
 			// assistant/tool 協定區段。
 			s.pauseSession(session.ID, run.ID)
@@ -1024,7 +1104,10 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 			}
 			return s.appendEvent(run, &sequence, event.Type, event.Payload)
 		default:
-			return s.appendEvent(run, &sequence, event.Type, event.Payload)
+			if err := s.appendEvent(run, &sequence, event.Type, event.Payload); err != nil {
+				return err
+			}
+			return s.waitIfRunPaused(ctx, run.ID)
 		}
 	})
 	if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, domain.ErrCanceled) {
@@ -1034,6 +1117,10 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 	if runErr != nil {
 		code, retryable := classifyRunFailure(runErr)
 		s.finishFailed(run, code, runErr, retryable, &sequence)
+		return
+	}
+	if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
+		s.finishCanceled(run, err, &sequence)
 		return
 	}
 
@@ -1050,14 +1137,32 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 		run.Metadata["budget_exceeded"] = *result.BudgetExceeded
 	}
 	run.CompletedAt = &completedAt
-	s.logger.Info("run completed", "run_id", run.ID, "session_id", run.SessionID, "duration_ms", completedAt.Sub(startedAt).Milliseconds(), "event_count", sequence)
-	if err := s.runs.Save(context.Background(), run); err != nil {
-		s.finishFailed(run, "run_state_write_failed", err, true, &sequence)
+	// PauseRun 與 terminal transition 共用這把鎖，避免完成寫入後又被舊的
+	// running 快照覆蓋成 paused。若 pause 先取得鎖，則在安全邊界等待恢復。
+	var saveErr error
+	for {
+		s.mu.Lock()
+		if !s.pausedRuns[run.ID] {
+			s.logger.Info("run completed", "run_id", run.ID, "session_id", run.SessionID, "duration_ms", completedAt.Sub(startedAt).Milliseconds(), "event_count", sequence)
+			saveErr = s.runs.Save(context.Background(), run)
+			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
+		if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
+			s.finishCanceled(run, err, &sequence)
+			return
+		}
+	}
+	if saveErr != nil {
+		s.finishFailed(run, "run_state_write_failed", saveErr, true, &sequence)
 		return
 	}
 	if err := s.appendEvent(run, &sequence, "run.completed", map[string]any{"status": run.Status, "result": result}); err != nil {
 		s.finishFailed(run, "event_write_failed", err, true, &sequence)
+		return
 	}
+	s.notifyRunFinished(run)
 }
 
 func classifyRunFailure(cause error) (code string, retryable bool) {
@@ -1072,6 +1177,27 @@ func classifyRunFailure(cause error) (code string, retryable bool) {
 }
 
 func (s *Service) appendEvent(run domain.Run, sequence *int64, eventType string, payload map[string]any) error {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	return s.appendEventLocked(run, sequence, eventType, payload)
+}
+
+// appendControlEvent 供 HTTP 控制操作使用；它會和 Harness 的事件寫入共用同一把鎖，
+// 避免 pause/resume 與模型事件同時寫入時產生重複 sequence。
+func (s *Service) appendControlEvent(run domain.Run, eventType string, payload map[string]any) error {
+	s.eventMu.Lock()
+	defer s.eventMu.Unlock()
+	sequence := s.eventSequences[run.ID]
+	if sequence == 0 {
+		sequence = s.latestRunSequence(context.Background(), run.ID)
+	}
+	return s.appendEventLocked(run, &sequence, eventType, payload)
+}
+
+func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType string, payload map[string]any) error {
+	if latest := s.eventSequences[run.ID]; latest > *sequence {
+		*sequence = latest
+	}
 	next := *sequence + 1
 	event := domain.Event{
 		SchemaVersion: domain.EventSchemaVersion,
@@ -1088,6 +1214,7 @@ func (s *Service) appendEvent(run domain.Run, sequence *int64, eventType string,
 		return err
 	}
 	*sequence = next
+	s.eventSequences[run.ID] = next
 	s.notifyRun(run.ID)
 	return nil
 }
@@ -1102,8 +1229,11 @@ func (s *Service) finishCanceled(run domain.Run, cause error, sequence *int64) {
 		run.Error.Message = cause.Error()
 	}
 	run.CompletedAt = &completedAt
+	s.mu.Lock()
 	_ = s.runs.Save(context.Background(), run)
+	s.mu.Unlock()
 	_ = s.appendEvent(run, sequence, "run.canceled", map[string]any{"status": run.Status, "error": run.Error})
+	s.notifyRunFinished(run)
 }
 
 func (s *Service) finishFailed(run domain.Run, code string, cause error, retryable bool, sequence *int64) {
@@ -1113,8 +1243,11 @@ func (s *Service) finishFailed(run domain.Run, code string, cause error, retryab
 	run.PendingApproval = nil
 	run.Error = &domain.RunError{Code: code, Message: cause.Error(), Retryable: retryable}
 	run.CompletedAt = &completedAt
+	s.mu.Lock()
 	_ = s.runs.Save(context.Background(), run)
+	s.mu.Unlock()
 	_ = s.appendEvent(run, sequence, "run.failed", map[string]any{"status": run.Status, "error": run.Error})
+	s.notifyRunFinished(run)
 }
 
 func (s *Service) resolveSession(ctx context.Context, sessionID string) (ports.AgentEngine, domain.Session, error) {
@@ -1209,7 +1342,42 @@ func (s *Service) clearActive(runID string) {
 		item.cancel()
 		delete(s.active, runID)
 	}
+	s.clearRunPauseLocked(runID)
 	s.mu.Unlock()
+}
+
+func (s *Service) clearRunPause(runID string) {
+	s.mu.Lock()
+	s.clearRunPauseLocked(runID)
+	s.mu.Unlock()
+}
+
+func (s *Service) clearRunPauseLocked(runID string) {
+	delete(s.pausedRuns, runID)
+	if signal := s.runSignals[runID]; signal != nil {
+		close(signal)
+	}
+	delete(s.runSignals, runID)
+}
+
+func (s *Service) waitIfRunPaused(ctx context.Context, runID string) error {
+	for {
+		s.mu.Lock()
+		paused := s.pausedRuns[runID]
+		signal := s.runSignals[runID]
+		s.mu.Unlock()
+		if !paused {
+			return nil
+		}
+		if signal == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-signal:
+		}
+	}
 }
 
 func (s *Service) hasActiveSession(sessionID string) bool {
@@ -1267,6 +1435,9 @@ func (s *Service) reconcileTerminalEvents(ctx context.Context) error {
 		s.logger.Warn("reconciling missing terminal event after restart", "run_id", run.ID, "status", run.Status)
 		if err := s.appendEvent(run, &sequence, "run."+string(run.Status), payload); err != nil {
 			return fmt.Errorf("reconcile run %q terminal event: %w", run.ID, err)
+		}
+		if run.Error != nil && run.Error.Code == "server_restarted" {
+			s.notifyRunFinished(run)
 		}
 	}
 	return nil

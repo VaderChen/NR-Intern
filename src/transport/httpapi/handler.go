@@ -26,10 +26,17 @@ type Handler struct {
 	allowedOrigins          []string
 	maxBodyBytes            int64
 	maxAttachmentBytes      int64
+	maxRestoreBytes         int64
 	attachments             ports.AttachmentRepository
 	status                  func() domain.ServiceStatus
 	toolCatalog             func(context.Context, string) ([]domain.ToolCatalogEntry, error)
 	diagnostics             func(context.Context) (any, error)
+	diagnosticsExport       func(context.Context) ([]byte, error)
+	backup                  func(context.Context) ([]byte, error)
+	restore                 func(context.Context, []byte) (domain.RestoreResult, error)
+	permissions             func(context.Context) (domain.PermissionCenter, error)
+	updateStatus            func(context.Context) (domain.UpdateStatus, error)
+	checkForUpdates         func(context.Context) (domain.UpdateStatus, error)
 	serviceSettings         func(context.Context) (domain.ServiceSettings, error)
 	updateServiceSettings   func(context.Context, domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error)
 	providerSettings        func(context.Context) (domain.ProviderSettings, error)
@@ -62,16 +69,24 @@ func New(service *application.Service, config Config) (*Handler, error) {
 	if maxAttachmentBytes <= 0 {
 		maxAttachmentBytes = 8 * 1024 * 1024
 	}
+	maxRestoreBytes := int64(256 * 1024 * 1024)
 	handler := &Handler{
 		service:                 service,
 		apiToken:                strings.TrimSpace(config.APIToken),
 		allowedOrigins:          append([]string(nil), config.AllowedOrigins...),
 		maxBodyBytes:            maxBodyBytes,
 		maxAttachmentBytes:      maxAttachmentBytes,
+		maxRestoreBytes:         maxRestoreBytes,
 		attachments:             config.Attachments,
 		status:                  config.Status,
 		toolCatalog:             config.ToolCatalog,
 		diagnostics:             config.Diagnostics,
+		diagnosticsExport:       config.DiagnosticsExport,
+		backup:                  config.Backup,
+		restore:                 config.Restore,
+		permissions:             config.Permissions,
+		updateStatus:            config.UpdateStatus,
+		checkForUpdates:         config.CheckForUpdates,
 		serviceSettings:         config.ServiceSettings,
 		updateServiceSettings:   config.UpdateServiceSettings,
 		providerSettings:        config.ProviderSettings,
@@ -105,6 +120,17 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/openapi.yaml", h.openAPI)
 	h.mux.HandleFunc("GET /api/v1/admin/status", h.serviceStatus)
 	h.mux.HandleFunc("GET /api/v1/admin/diagnostics", h.serviceDiagnostics)
+	h.mux.HandleFunc("GET /api/v1/admin/diagnostics/export", h.exportDiagnostics)
+	h.mux.HandleFunc("GET /api/v1/admin/backup", h.downloadBackup)
+	h.mux.HandleFunc("POST /api/v1/admin/restore", h.restoreBackup)
+	h.mux.HandleFunc("GET /api/v1/admin/permissions", h.getPermissions)
+	h.mux.HandleFunc("GET /api/v1/admin/update", h.getUpdateStatus)
+	h.mux.HandleFunc("POST /api/v1/admin/update/check", h.checkUpdates)
+	h.mux.HandleFunc("GET /api/v1/notifications", h.listNotifications)
+	h.mux.HandleFunc("POST /api/v1/notifications/{notification_id}/read", h.markNotificationRead)
+	h.mux.HandleFunc("POST /api/v1/notifications/read-all", h.markAllNotificationsRead)
+	h.mux.HandleFunc("DELETE /api/v1/notifications/read", h.clearReadNotifications)
+	h.mux.HandleFunc("GET /api/v1/search", h.globalSearch)
 	h.mux.HandleFunc("GET /api/v1/admin/service-settings", h.getServiceSettings)
 	h.mux.HandleFunc("PUT /api/v1/admin/service-settings", h.putServiceSettings)
 	h.mux.HandleFunc("GET /api/v1/admin/provider-settings", h.getProviderSettings)
@@ -172,6 +198,9 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/runs/{run_id}", h.getRun)
 	h.mux.HandleFunc("GET /api/v1/runs/{run_id}/events", h.streamExistingRun)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/cancel", h.cancelRun)
+	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/pause", h.pauseRun)
+	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/resume", h.resumeRun)
+	h.mux.HandleFunc("POST /api/v1/runs/cancel-all", h.cancelAllRuns)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/decision", h.decideRun)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/retry", h.retryRun)
 }
@@ -199,6 +228,191 @@ func (h *Handler) serviceDiagnostics(writer http.ResponseWriter, request *http.R
 		return
 	}
 	value, err := h.diagnostics(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) exportDiagnostics(writer http.ResponseWriter, request *http.Request) {
+	if h.diagnosticsExport == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: diagnostics export is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.diagnosticsExport(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.Header().Set("Content-Disposition", `attachment; filename="nr-intern-diagnostics.json"`)
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(value)
+}
+
+func (h *Handler) downloadBackup(writer http.ResponseWriter, request *http.Request) {
+	if h.backup == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: backup is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.backup(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/zip")
+	writer.Header().Set("Content-Disposition", `attachment; filename="nr-intern-backup.zip"`)
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(value)
+}
+
+func (h *Handler) restoreBackup(writer http.ResponseWriter, request *http.Request) {
+	if h.restore == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: restore is unavailable", errUnavailable))
+		return
+	}
+	request.Body = http.MaxBytesReader(writer, request.Body, h.maxRestoreBytes)
+	var data []byte
+	contentType := strings.ToLower(request.Header.Get("Content-Type"))
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		reader, err := request.MultipartReader()
+		if err != nil {
+			writeProblem(writer, request, fmt.Errorf("%w: multipart form-data is required: %v", domain.ErrInvalidInput, err))
+			return
+		}
+		for {
+			part, nextErr := reader.NextPart()
+			if errors.Is(nextErr, io.EOF) {
+				break
+			}
+			if nextErr != nil {
+				writeProblem(writer, request, fmt.Errorf("%w: read restore upload: %v", domain.ErrInvalidInput, nextErr))
+				return
+			}
+			if part.FileName() == "" && part.FormName() != "file" {
+				_ = part.Close()
+				continue
+			}
+			data, err = io.ReadAll(part)
+			_ = part.Close()
+			if err != nil {
+				writeProblem(writer, request, fmt.Errorf("%w: read restore upload: %v", domain.ErrInvalidInput, err))
+				return
+			}
+			break
+		}
+	} else {
+		var err error
+		data, err = io.ReadAll(request.Body)
+		if err != nil {
+			writeProblem(writer, request, fmt.Errorf("%w: read restore upload: %v", domain.ErrInvalidInput, err))
+			return
+		}
+	}
+	if len(data) == 0 {
+		writeProblem(writer, request, fmt.Errorf("%w: backup file is required", domain.ErrInvalidInput))
+		return
+	}
+	value, err := h.restore(request.Context(), data)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) getPermissions(writer http.ResponseWriter, request *http.Request) {
+	if h.permissions == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: permission center is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.permissions(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) getUpdateStatus(writer http.ResponseWriter, request *http.Request) {
+	if h.updateStatus == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: update checker is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.updateStatus(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) checkUpdates(writer http.ResponseWriter, request *http.Request) {
+	if h.checkForUpdates == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: update checker is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.checkForUpdates(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) listNotifications(writer http.ResponseWriter, request *http.Request) {
+	limit, err := queryInt64(request, "limit", 100, 1)
+	if err != nil || limit > 1000 {
+		if err == nil {
+			err = fmt.Errorf("%w: limit cannot exceed 1000", domain.ErrInvalidInput)
+		}
+		writeProblem(writer, request, err)
+		return
+	}
+	unreadOnly := strings.EqualFold(strings.TrimSpace(request.URL.Query().Get("unread_only")), "true")
+	value, err := h.service.ListNotifications(request.Context(), int(limit), unreadOnly)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+func (h *Handler) markNotificationRead(writer http.ResponseWriter, request *http.Request) {
+	if err := h.service.MarkNotificationRead(request.Context(), request.PathValue("notification_id")); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) markAllNotificationsRead(writer http.ResponseWriter, request *http.Request) {
+	if err := h.service.MarkAllNotificationsRead(request.Context()); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) clearReadNotifications(writer http.ResponseWriter, request *http.Request) {
+	if err := h.service.ClearReadNotifications(request.Context()); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (h *Handler) globalSearch(writer http.ResponseWriter, request *http.Request) {
+	limit, err := queryInt64(request, "limit", 50, 1)
+	if err != nil || limit > 100 {
+		if err == nil {
+			err = fmt.Errorf("%w: limit cannot exceed 100", domain.ErrInvalidInput)
+		}
+		writeProblem(writer, request, err)
+		return
+	}
+	value, err := h.service.GlobalSearch(request.Context(), request.URL.Query().Get("q"), int(limit))
 	if err != nil {
 		writeProblem(writer, request, err)
 		return
@@ -461,7 +675,12 @@ func (h *Handler) listTools(writer http.ResponseWriter, request *http.Request) {
 
 func (h *Handler) currentStatus() domain.ServiceStatus {
 	if h.status == nil {
-		return domain.ServiceStatus{Name: "ai-agent", Ready: true}
+		return domain.ServiceStatus{
+			Name:               "ai-agent",
+			APIVersion:         domain.APIVersion,
+			EventSchemaVersion: domain.EventSchemaVersion,
+			Ready:              true,
+		}
 	}
 	return h.status()
 }
@@ -845,7 +1064,7 @@ func (h *Handler) listRuns(writer http.ResponseWriter, request *http.Request) {
 
 func knownRunStatus(status domain.RunStatus) bool {
 	switch status {
-	case domain.RunStatusQueued, domain.RunStatusRunning, domain.RunStatusWaitingApproval,
+	case domain.RunStatusQueued, domain.RunStatusRunning, domain.RunStatusPaused, domain.RunStatusWaitingApproval,
 		domain.RunStatusCompleted, domain.RunStatusFailed, domain.RunStatusCanceled:
 		return true
 	default:
@@ -886,6 +1105,33 @@ func (h *Handler) getRun(writer http.ResponseWriter, request *http.Request) {
 
 func (h *Handler) cancelRun(writer http.ResponseWriter, request *http.Request) {
 	value, err := h.service.CancelRun(request.Context(), request.PathValue("run_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusAccepted, value)
+}
+
+func (h *Handler) pauseRun(writer http.ResponseWriter, request *http.Request) {
+	value, err := h.service.PauseRun(request.Context(), request.PathValue("run_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusAccepted, value)
+}
+
+func (h *Handler) resumeRun(writer http.ResponseWriter, request *http.Request) {
+	value, err := h.service.ResumeRun(request.Context(), request.PathValue("run_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusAccepted, value)
+}
+
+func (h *Handler) cancelAllRuns(writer http.ResponseWriter, request *http.Request) {
+	value, err := h.service.CancelAllRuns(request.Context())
 	if err != nil {
 		writeProblem(writer, request, err)
 		return

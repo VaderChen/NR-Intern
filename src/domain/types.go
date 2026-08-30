@@ -2,7 +2,12 @@ package domain
 
 import "time"
 
-const EventSchemaVersion = "1.0"
+const (
+	// APIVersion 是 HTTP API 契約版本。只要破壞既有欄位或狀態語意，就必須升版，
+	// 讓桌面 UI 能在啟動時明確提示，而不是等到某個端點回 404 才讓使用者猜原因。
+	APIVersion         = "1.0"
+	EventSchemaVersion = "1.0"
+)
 
 type AgentDescriptor struct {
 	ID           string   `json:"id"`
@@ -191,6 +196,7 @@ type RunStatus string
 const (
 	RunStatusQueued          RunStatus = "queued"
 	RunStatusRunning         RunStatus = "running"
+	RunStatusPaused          RunStatus = "paused"
 	RunStatusWaitingApproval RunStatus = "waiting_approval"
 	RunStatusCompleted       RunStatus = "completed"
 	RunStatusFailed          RunStatus = "failed"
@@ -205,6 +211,54 @@ type RunBudget struct {
 	MaxWallClock time.Duration `json:"-"`
 	MaxTokens    int           `json:"max_tokens,omitempty"`
 	MaxToolCalls int           `json:"max_tool_calls,omitempty"`
+}
+
+// Notification 是顯示在通知中心的輕量事件摘要。它不保存完整對話內容，
+// 只保留讓使用者知道下一步該做什麼所需的資訊。
+type Notification struct {
+	ID        string         `json:"id"`
+	Type      string         `json:"type"`
+	Level     string         `json:"level"`
+	Title     string         `json:"title"`
+	Message   string         `json:"message"`
+	Read      bool           `json:"read"`
+	DedupeKey string         `json:"-"`
+	RunID     string         `json:"run_id,omitempty"`
+	SessionID string         `json:"session_id,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
+	CreatedAt time.Time      `json:"created_at"`
+}
+
+// SearchResult 是全域搜尋回傳的短摘要，不直接回傳整份訊息或檔案內容。
+type SearchResult struct {
+	Kind        string    `json:"kind"`
+	ID          string    `json:"id"`
+	Title       string    `json:"title"`
+	Snippet     string    `json:"snippet"`
+	WorkspaceID string    `json:"workspace_id,omitempty"`
+	ProjectID   string    `json:"project_id,omitempty"`
+	SessionID   string    `json:"session_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type PermissionCenter struct {
+	Policy              PermissionPolicy     `json:"policy"`
+	Tools               []ToolPermissionInfo `json:"tools"`
+	WaitingApprovalRuns int                  `json:"waiting_approval_runs"`
+}
+
+type ToolPermissionInfo struct {
+	Name               string `json:"name"`
+	Permission         string `json:"permission"`
+	RequiresPermission bool   `json:"requires_permission"`
+	ReadOnly           bool   `json:"read_only"`
+	Available          bool   `json:"available"`
+}
+
+type RestoreResult struct {
+	RestartRequired bool     `json:"restart_required"`
+	Restored        []string `json:"restored"`
+	Excluded        []string `json:"excluded"`
 }
 
 const (
@@ -281,22 +335,25 @@ type RunError struct {
 }
 
 type Run struct {
-	ID              string               `json:"id"`
-	AgentID         string               `json:"agent_id"`
-	SessionID       string               `json:"session_id"`
-	Status          RunStatus            `json:"status"`
-	Input           string               `json:"input"`
-	AttachmentIDs   []string             `json:"attachment_ids,omitempty"`
-	ProviderID      string               `json:"provider_id,omitempty"`
-	Model           string               `json:"model,omitempty"`
-	IdempotencyKey  string               `json:"idempotency_key,omitempty"`
-	Result          *RunResult           `json:"result,omitempty"`
-	Error           *RunError            `json:"error,omitempty"`
-	PendingApproval *ToolApprovalRequest `json:"pending_approval,omitempty"`
-	Metadata        map[string]any       `json:"metadata,omitempty"`
-	CreatedAt       time.Time            `json:"created_at"`
-	StartedAt       *time.Time           `json:"started_at,omitempty"`
-	CompletedAt     *time.Time           `json:"completed_at,omitempty"`
+	ID             string    `json:"id"`
+	AgentID        string    `json:"agent_id"`
+	SessionID      string    `json:"session_id"`
+	Status         RunStatus `json:"status"`
+	Input          string    `json:"input"`
+	AttachmentIDs  []string  `json:"attachment_ids,omitempty"`
+	ProviderID     string    `json:"provider_id,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	// IdempotencyFingerprint 用來拒絕同一 Idempotency-Key 搭配不同內容的重送，
+	// 避免網路重試把另一個工作誤認成原本的 Run。
+	IdempotencyFingerprint string               `json:"idempotency_fingerprint,omitempty"`
+	Result                 *RunResult           `json:"result,omitempty"`
+	Error                  *RunError            `json:"error,omitempty"`
+	PendingApproval        *ToolApprovalRequest `json:"pending_approval,omitempty"`
+	Metadata               map[string]any       `json:"metadata,omitempty"`
+	CreatedAt              time.Time            `json:"created_at"`
+	StartedAt              *time.Time           `json:"started_at,omitempty"`
+	CompletedAt            *time.Time           `json:"completed_at,omitempty"`
 }
 
 type EngineEvent struct {
@@ -317,9 +374,12 @@ type Event struct {
 }
 
 type ServiceStatus struct {
-	Name       string    `json:"name"`
-	Version    string    `json:"version"`
-	InstanceID string    `json:"instance_id"`
-	StartedAt  time.Time `json:"started_at"`
-	Ready      bool      `json:"ready"`
+	Name               string    `json:"name"`
+	Version            string    `json:"version"`
+	APIVersion         string    `json:"api_version"`
+	EventSchemaVersion string    `json:"event_schema_version"`
+	Capabilities       []string  `json:"capabilities,omitempty"`
+	InstanceID         string    `json:"instance_id"`
+	StartedAt          time.Time `json:"started_at"`
+	Ready              bool      `json:"ready"`
 }

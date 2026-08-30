@@ -305,6 +305,11 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		)
 		completionDirective = ""
 		contextBudgetPrompt := joinPromptSections(systemPrompt, hostPrompt, toolPrompt, phasePrompt, contextPrompt)
+		modelSystemPrompt := systemPrompt
+		modelHostPrompt := hostPrompt
+		modelToolPrompt := toolPrompt
+		modelPhasePrompt := phasePrompt
+		modelContextPrompt := contextPrompt
 		if r.Context != nil {
 			compactionStarted := false
 			window, contextErr := r.Context.BuildObserved(ctx, effectiveSession, contextBudgetPrompt, activeDefinitions, func(status ContextCompactionStatus) error {
@@ -336,8 +341,16 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				return domain.RunResult{}, contextErr
 			}
 			messages = window.Messages
-			contextPrompt = joinPromptSections(contextPrompt, sessionSummaryPrompt(window.Summary))
-			contextBudgetPrompt = joinPromptSections(systemPrompt, hostPrompt, toolPrompt, phasePrompt, contextPrompt)
+			modelContextPrompt = joinPromptSections(contextPrompt, sessionSummaryPrompt(window.Summary))
+			if strings.TrimSpace(window.PromptOverride) != "" {
+				// ContextManager 已將所有固定提示壓成一份符合預算的完整 prompt；
+				// 清空分段欄位，避免 OpenAI-compatible adapter 重複送出同一份內容。
+				modelSystemPrompt = window.PromptOverride
+				modelHostPrompt = ""
+				modelToolPrompt = ""
+				modelPhasePrompt = ""
+				modelContextPrompt = ""
+			}
 			if window.Compacted {
 				logger.Info("session context compacted",
 					"turn", turn,
@@ -388,11 +401,11 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			ProviderID:    providerID,
 			Model:         modelID,
 			ThinkingMode:  input.ThinkingMode,
-			SystemPrompt:  systemPrompt,
-			HostPrompt:    hostPrompt,
-			ToolPrompt:    toolPrompt,
-			PhasePrompt:   phasePrompt,
-			ContextPrompt: contextPrompt,
+			SystemPrompt:  modelSystemPrompt,
+			HostPrompt:    modelHostPrompt,
+			ToolPrompt:    modelToolPrompt,
+			PhasePrompt:   modelPhasePrompt,
+			ContextPrompt: modelContextPrompt,
 			History:       modelHistory,
 			UserPrompt:    userPrompt,
 			Tools:         modelTools,
@@ -1336,7 +1349,7 @@ func toolSelectionPhasePrompt(builtinFallback bool) string {
 		return `## 工具供應階段
 
 目前已進入內建工具備援階段。原因是 Session 沒有 shell_exec，或本次 Run 先前的系統 Shell 已實際執行失敗。
-本輪可使用 ToolPrompt 列出的完整工具目錄；請優先改用適合的檔案、文件、搜尋、比較、編輯、SSH 或其他內建工具處理失敗步驟。分析 PDF、DOCX、XLSX 或 PPTX 時先用 document_inspect 取得結構，再用 document_read 依頁、段落、工作表列或投影片分段讀取，不可用 file_read 直接讀取二進位文件。若仍需 Shell，必須根據先前錯誤改變命令、參數或策略，不得原樣重複失敗呼叫。`
+本輪可使用 ToolPrompt 列出的完整工具目錄；請優先改用適合的檔案、文件、搜尋、比較、編輯、SSH 或其他內建工具處理失敗步驟。分析 PDF、DOCX、XLSX 或 PPTX 時先用 document_inspect 取得結構，再用 document_read 依頁、段落、工作表列或投影片分段讀取，不可用 file_read 直接讀取二進位文件。建立辦公文件使用 document_create；局部編輯既有文件使用 document_edit 並另存新檔；內容差異使用 document_compare；格式遷移使用 document_convert；PDF 頁面合併、擷取、重排或拆分使用 pdf_pages。交付前用 document_validate 驗證結構，再以 document_render 產生逐頁 PNG 做視覺檢查。Unicode PDF 可先用 document_fonts 檢查字形覆蓋。若仍需 Shell，必須根據先前錯誤改變命令、參數或策略，不得原樣重複失敗呼叫。`
 	}
 	return `## 工具供應階段
 
@@ -1363,7 +1376,7 @@ func explorationPhasePrompt(builtinFallback bool) string {
 4. 分段讀取少量代表性檔案；輸出被截斷時縮小範圍或從下一段續讀。
 5. 已取得足以支持結論的證據就停止工具呼叫並整理答案；除非使用者明確要求完整稽核，否則說明取樣範圍與未涵蓋區域。
 
-若目標是 PDF、DOCX、XLSX 或 PPTX 辦公文件，系統 Shell 階段先呼叫 Host 可用的文件程式；Shell 實際失敗並進入內建備援後，必須先用 document_inspect 取得頁數、區段、工作表或投影片，再用 document_read 分段抽取內容。掃描型 PDF 若沒有文字層，必須如實說明需要 OCR，不得假裝已讀取影像文字。
+若目標是 PDF、DOCX、XLSX 或 PPTX 辦公文件，系統 Shell 階段先呼叫 Host 可用的文件程式；Shell 實際失敗並進入內建備援後，讀取既有文件必須先用 document_inspect 取得頁數、區段、工作表或投影片，再用 document_read 分段抽取內容；建立文件使用 document_create，局部編輯使用 document_edit 並另存新檔；內容差異使用 document_compare，格式遷移使用 document_convert，PDF 頁面整理使用 pdf_pages；完成後先用 document_validate 做結構驗證，有可用後端時再以 document_render 做逐頁視覺檢查。掃描型 PDF 若沒有文字層，必須如實說明需要 OCR，不得假裝已讀取影像文字。
 
 若使用者要求修改，先定位目標與相依關係，再執行最小必要變更；不要把「繼續探索」本身當成任務完成條件。
 

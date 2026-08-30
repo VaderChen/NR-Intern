@@ -920,6 +920,9 @@ func TestRunCompactsContextAndContinuesWithoutSafetyPause(t *testing.T) {
 	if hasEngineEvent(events, "run.budget_exceeded") {
 		t.Fatal("context compaction must not be reported as a safety pause")
 	}
+	if len(model.requests) < 2 || model.requests[1].UserPrompt != "請繼續目前工作" {
+		t.Fatalf("latest user prompt was lost during prompt fitting: %+v", model.requests)
+	}
 }
 
 func TestRunBudgetMaxTokensStopsBeforeExecutingNewSideEffects(t *testing.T) {

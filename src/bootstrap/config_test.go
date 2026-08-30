@@ -20,6 +20,9 @@ func TestDefaultConfigAllowsSandboxedWriteTools(t *testing.T) {
 	if config.MaxTokens != 0 || config.MaxToolCalls != 0 {
 		t.Fatalf("long-task count limits must default to unlimited, got tokens=%d tool_calls=%d", config.MaxTokens, config.MaxToolCalls)
 	}
+	if !config.HTTPFetch.AllowPrivateNetworks {
+		t.Fatal("http_fetch must allow localhost and private networks by default")
+	}
 }
 
 func TestValidateAdjustableRunLimitsAllowsUnlimitedCounts(t *testing.T) {

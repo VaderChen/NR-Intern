@@ -11,17 +11,18 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - Standing instructions on workspaces and projects: write the working rules once and every conversation and schedule carries them.
 - Multiple ordered work plans with drag-and-drop ordering, step states, and tool-backed evidence.
 - A standalone schedule section: each schedule carries its own recurrence and sandbox, and starts a new conversation on time.
-- Durable runs, replayable SSE, streamed responses, and reconnection support.
-- You can keep typing while a conversation is running; later messages stay in the current UI's send queue and are submitted in order after the active run ends.
+- Durable runs, replayable SSE, streamed responses, reconnection support, and automatic recovery of active or retryable runs after the UI restarts.
+- You can keep typing while a conversation is running; later messages are stored in the browser's IndexedDB Durable Outbox and submitted in order after the active run ends. Network retries reuse the same Idempotency-Key.
 - Automatic context compaction, cross-session memory, and configurable memory scopes.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
-- `http_fetch` reads external resources: HTML becomes plain text, private addresses are refused by default, and the whole tool can be switched off from system settings.
+- `http_fetch` reads external resources: HTML becomes plain text, localhost and private addresses are allowed by default, and the whole tool can be switched off from system settings.
 - A built-in MCP client connects to local stdio or remote Streamable HTTP servers and places their tools under the same permission and approval flow.
 - An optional NetPass reverse proxy can expose the backend API without publishing the desktop control UI.
 - Provider enablement, model discovery, tool permissions, and audit records.
 - Light and dark appearance with Auto, Traditional Chinese, English, Japanese, and Korean interfaces.
 - Desktop support for Windows x64, Windows ARM64, and macOS ARM64.
 - On macOS, a status item is installed at startup. The UI can be hidden while work continues, then restored from the menu or by launching the app again.
+- On Windows, a Tray Icon is installed at startup. Left-click restores the UI and the context menu can open NR-Intern or exit it, including when the UI uses the browser fallback.
 - A device-local memo pad is available from the sidebar for notes that should not be sent to the agent.
 - Screen capture is available beside the conversation input. On macOS it opens the system region capture and an editor for rectangles, lines, and text; copying or closing the editor updates the clipboard with the edited image. Windows opens the system snipping interface.
 
@@ -34,6 +35,8 @@ The interface language controls only the UI and an uncustomized default name. Th
 3. Create a workspace, project, and session, then assign work from the conversation view.
 
 Runtime configuration, generated data, and credentials must remain outside version control. See the documents below for the architecture, API, and security design.
+
+The frontend checks `/api/v1/admin/status` at startup for the API major version, event schema, and required capabilities. If the same Idempotency-Key is replayed with different input, the backend returns Conflict instead of creating a second run.
 
 ## Documentation
 

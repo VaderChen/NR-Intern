@@ -15,6 +15,12 @@ type Config struct {
 	Status                  func() domain.ServiceStatus
 	ToolCatalog             func(context.Context, string) ([]domain.ToolCatalogEntry, error)
 	Diagnostics             func(context.Context) (any, error)
+	DiagnosticsExport       func(context.Context) ([]byte, error)
+	Backup                  func(context.Context) ([]byte, error)
+	Restore                 func(context.Context, []byte) (domain.RestoreResult, error)
+	Permissions             func(context.Context) (domain.PermissionCenter, error)
+	UpdateStatus            func(context.Context) (domain.UpdateStatus, error)
+	CheckForUpdates         func(context.Context) (domain.UpdateStatus, error)
 	ServiceSettings         func(context.Context) (domain.ServiceSettings, error)
 	UpdateServiceSettings   func(context.Context, domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error)
 	ProviderSettings        func(context.Context) (domain.ProviderSettings, error)

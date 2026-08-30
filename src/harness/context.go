@@ -56,6 +56,10 @@ type ContextWindow struct {
 	// Budget 是本次實際套用的 token 預算，來自模型宣告的 context window 或設定的後備值。
 	Budget    int
 	Compacted bool
+	// PromptOverride 是固定提示本身已超過小型 context window 時的預算版完整提示。
+	// 一般情況留空，Runner 仍以分段欄位送出提示；只有需要縮短固定提示時才改用
+	// 這個欄位，避免同一段提示在 System/Host/Tool/Phase 欄位重複傳送。
+	PromptOverride string
 }
 
 type ContextManager struct {
@@ -136,7 +140,7 @@ func (m *ContextManager) BuildObserved(
 	if budget <= 0 {
 		return ContextWindow{}, fmt.Errorf("%w: model context window leaves no input budget after output reservation", domain.ErrInvalidInput)
 	}
-	estimated := estimateContextTokens(counter, baseSystemPrompt, summary, messages, definitions)
+	estimated := estimateContextTokens(counter, withSummary(baseSystemPrompt, summary), messages, definitions)
 	reportedInputTokens := latestReportedInputTokens(messages, compactionSequence)
 	triggerTokens := estimated
 	if reportedInputTokens > triggerTokens {
@@ -173,21 +177,22 @@ func (m *ContextManager) BuildObserved(
 			return ContextWindow{}, compactErr
 		}
 	}
-	if estimated > budget {
-		return ContextWindow{}, fmt.Errorf("%w: context remains above model budget after compaction (%d > %d tokens)", domain.ErrConflict, estimated, budget)
-	}
 	contextMessages := make([]domain.Message, 0, len(messages))
 	for _, item := range messages {
 		contextMessages = append(contextMessages, item.Message)
 	}
 	contextMessages = shapeToolResults(contextMessages, config.MaxToolResultCharacters)
+	effectiveSystemPrompt, effectiveSummary, effectiveMessages, promptOverride, finalEstimated := fitContextToBudget(
+		counter, baseSystemPrompt, summary, contextMessages, definitions, budget,
+	)
 	return ContextWindow{
-		SystemPrompt:    withSummary(baseSystemPrompt, summary),
-		Messages:        contextMessages,
-		Summary:         summary,
-		EstimatedTokens: estimateContextTokens(counter, baseSystemPrompt, summary, messagesFromDomain(contextMessages), definitions),
+		SystemPrompt:    effectiveSystemPrompt,
+		Messages:        effectiveMessages,
+		Summary:         effectiveSummary,
+		EstimatedTokens: finalEstimated,
 		Budget:          budget,
 		Compacted:       compacted,
+		PromptOverride:  promptOverride,
 	}, nil
 }
 
@@ -214,7 +219,21 @@ func (m *ContextManager) compactMessages(
 		return "", nil, 0, false, err
 	}
 	throughSequence = older[len(older)-1].Sequence
-	afterTokens := estimateContextTokens(counter, baseSystemPrompt, newSummary, retained, definitions)
+	afterTokens := estimateContextTokens(counter, withSummary(baseSystemPrompt, newSummary), retained, definitions)
+	// 保留訊息本身可能就足以讓第一次摘要後仍超過模型預算。此時依時間順序
+	// 將最舊的保留訊息併入本機摘要，直到只剩最新工作狀態；這和摘要輸入的
+	// recency decay 一致，也避免固定 RetainMessages 讓 90% compaction 形同未執行。
+	for afterTokens > budget && len(retained) > 1 {
+		message := retained[0]
+		newSummary = deterministicContextSummary(newSummary, []domain.Message{message.Message}, config.MaxSummaryCharacters)
+		throughSequence = message.Sequence
+		retained = retained[1:]
+		afterTokens = estimateContextTokens(counter, withSummary(baseSystemPrompt, newSummary), retained, definitions)
+	}
+	if afterTokens > budget && strings.TrimSpace(newSummary) != "" {
+		newSummary = fitSummaryToBudget(counter, baseSystemPrompt, newSummary, retained, definitions, budget)
+		afterTokens = estimateContextTokens(counter, withSummary(baseSystemPrompt, newSummary), retained, definitions)
+	}
 	if _, err := m.Sessions.AppendEntry(ctx, session.ID, domain.SessionEntry{
 		ID:        domain.NewID("entry"),
 		SessionID: session.ID,
@@ -235,6 +254,184 @@ func (m *ContextManager) compactMessages(
 		return "", nil, 0, false, err
 	}
 	return newSummary, retained, afterTokens, true, nil
+}
+
+func fitSummaryToBudget(counter ports.TokenCounter, systemPrompt, summary string, messages []sequencedMessage, definitions []domain.ToolDefinition, budget int) string {
+	runes := []rune(summary)
+	low, high := 0, len(runes)
+	best := ""
+	for low <= high {
+		middle := low + (high-low)/2
+		candidate := ""
+		if middle > 0 {
+			candidate = truncateMiddle(summary, middle)
+		}
+		if estimateContextTokens(counter, withSummary(systemPrompt, candidate), messages, definitions) <= budget {
+			best = candidate
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	return best
+}
+
+// fitContextToBudget 將最後送出的 prompt 與 transcript 對齊到同一個預算。
+// 正常模型的 context window 足夠大時不做任何改動；只有固定提示已佔滿小型
+// window 時，才先縮短摘要，再以 head/tail 保留策略縮短固定提示。這比讓一次
+// context compaction 被誤報成 Run 失敗更可恢復，也保留系統提示的開頭與收尾。
+func fitContextToBudget(
+	counter ports.TokenCounter,
+	baseSystemPrompt string,
+	summary string,
+	messages []domain.Message,
+	definitions []domain.ToolDefinition,
+	budget int,
+) (string, string, []domain.Message, string, int) {
+	effectiveMessages := cloneMessages(messages)
+	messageItems := messagesFromDomain(effectiveMessages)
+	effectiveBase := baseSystemPrompt
+	effectiveSummary := summary
+	effective := withSummary(effectiveBase, effectiveSummary)
+	estimated := estimateContextTokens(counter, effective, messageItems, definitions)
+	if estimated <= budget {
+		return effective, effectiveSummary, effectiveMessages, "", estimated
+	}
+
+	// 摘要是可重新產生的歷史資料，優先縮短它；目前訊息與固定指示先保留。
+	effectiveSummary = fitSummaryToBudget(counter, effectiveBase, effectiveSummary, messageItems, definitions, budget)
+	effective = withSummary(effectiveBase, effectiveSummary)
+	estimated = estimateContextTokens(counter, effective, messageItems, definitions)
+	if estimated <= budget {
+		return effective, effectiveSummary, effectiveMessages, "", estimated
+	}
+
+	// 固定提示若太大，先縮短固定提示；這樣能保留最新 user／assistant 內容，
+	// 不會為了容納提示而把使用者剛送出的要求裁成空字串。
+	effectiveBase = fitPromptText(counter, effectiveBase, effectiveSummary, messageItems, definitions, budget)
+	effective = withSummary(effectiveBase, effectiveSummary)
+	estimated = estimateContextTokens(counter, effective, messageItems, definitions)
+	if estimated <= budget {
+		return effective, effectiveSummary, effectiveMessages, effective, estimated
+	}
+
+	// 若保留完整最新訊息仍超標，才移除最舊訊息；只剩最新訊息仍超標時
+	// 才縮短其內容。這個順序讓歷史細節與提示較早讓位給目前工作要求。
+	effectiveMessages = fitMessagesToBudget(counter, effective, effectiveMessages, definitions, budget)
+	messageItems = messagesFromDomain(effectiveMessages)
+	effectiveBase = fitPromptText(counter, effectiveBase, effectiveSummary, messageItems, definitions, budget)
+	effective = withSummary(effectiveBase, effectiveSummary)
+	estimated = estimateContextTokens(counter, effective, messageItems, definitions)
+	if estimated > budget {
+		// wrapper 與摘要可能仍佔用少量額度，最後再對完整提示做保守裁切。
+		effective = fitCompletePrompt(counter, effective, effectiveMessages, definitions, budget)
+		estimated = estimateContextTokens(counter, effective, messageItems, definitions)
+	}
+	return effective, effectiveSummary, effectiveMessages, effective, estimated
+}
+
+func cloneMessages(messages []domain.Message) []domain.Message {
+	result := make([]domain.Message, len(messages))
+	for index, message := range messages {
+		result[index] = cloneMessage(message)
+	}
+	return result
+}
+
+func fitMessagesToBudget(counter ports.TokenCounter, prompt string, messages []domain.Message, definitions []domain.ToolDefinition, budget int) []domain.Message {
+	result := cloneMessages(messages)
+	for len(result) > 1 && estimateContextTokens(counter, prompt, messagesFromDomain(result), definitions) > budget {
+		result = repairMessages(result[1:])
+	}
+	if len(result) == 0 || estimateContextTokens(counter, prompt, messagesFromDomain(result), definitions) <= budget {
+		return result
+	}
+
+	// 最新 user／assistant 內容仍保留，只縮短文字內容；tool call arguments 屬於
+	// 協定資料，不能任意刪除，若它本身超過窗口則交由上游模型回報不可行。
+	last := len(result) - 1
+	original := result[last].Content
+	runes := []rune(original)
+	low, high := 0, len(runes)
+	best := ""
+	for low <= high {
+		middle := low + (high-low)/2
+		candidate := ""
+		if middle > 0 {
+			candidate = truncateMiddle(original, middle)
+		}
+		candidateMessages := cloneMessages(result)
+		candidateMessages[last].Content = candidate
+		if estimateContextTokens(counter, prompt, messagesFromDomain(candidateMessages), definitions) <= budget {
+			best = candidate
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	result[last].Content = best
+	return result
+}
+
+func fitPromptText(
+	counter ports.TokenCounter,
+	baseSystemPrompt string,
+	summary string,
+	messages []sequencedMessage,
+	definitions []domain.ToolDefinition,
+	maxTokens int,
+) string {
+	runes := []rune(baseSystemPrompt)
+	low, high := 0, len(runes)
+	best := ""
+	for low <= high {
+		middle := low + (high-low)/2
+		candidate := ""
+		if middle > 0 {
+			candidate = truncateMiddle(baseSystemPrompt, middle)
+		}
+		if estimateContextTokens(counter, withSummary(candidate, summary), messages, definitions) <= maxTokens {
+			best = candidate
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	return best
+}
+
+func fitCompletePrompt(counter ports.TokenCounter, prompt string, messages []domain.Message, definitions []domain.ToolDefinition, budget int) string {
+	messageTokens := counter.EstimateMessages(messages)
+	toolTokens := counter.EstimateTools(definitions)
+	available := budget - messageTokens - toolTokens
+	if available <= 0 {
+		return ""
+	}
+	runes := []rune(prompt)
+	low, high := 0, len(runes)
+	best := ""
+	for low <= high {
+		middle := low + (high-low)/2
+		candidate := ""
+		if middle > 0 {
+			candidate = truncateMiddle(prompt, middle)
+		}
+		if counter.EstimateText(candidate) <= available {
+			best = candidate
+			low = middle + 1
+		} else {
+			high = middle - 1
+		}
+	}
+	return best
+}
+
+func sequencedToMessages(messages []sequencedMessage) []domain.Message {
+	result := make([]domain.Message, len(messages))
+	for index, message := range messages {
+		result[index] = message.Message
+	}
+	return result
 }
 
 func (m *ContextManager) summarize(ctx context.Context, session domain.Session, previousSummary string, older []sequencedMessage, config ContextConfig) (string, error) {
@@ -538,13 +735,13 @@ func limitSummaryInput(messages []domain.Message, maxCharacters int) []domain.Me
 }
 
 // estimateContextTokens 涵蓋實際會送出的全部內容，包含每次請求都會重送的工具 schema。
-func estimateContextTokens(counter ports.TokenCounter, systemPrompt, summary string, messages []sequencedMessage, definitions []domain.ToolDefinition) int {
+// systemPrompt 已包含必要的摘要包裝，避免把 summary 重複計算。
+func estimateContextTokens(counter ports.TokenCounter, systemPrompt string, messages []sequencedMessage, definitions []domain.ToolDefinition) int {
 	values := make([]domain.Message, len(messages))
 	for index, item := range messages {
 		values[index] = item.Message
 	}
 	return counter.EstimateText(systemPrompt) +
-		counter.EstimateText(summary) +
 		counter.EstimateTools(definitions) +
 		counter.EstimateMessages(values)
 }

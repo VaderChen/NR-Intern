@@ -298,13 +298,19 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 }
 
 var hiddenApprovalArgumentNames = map[string]bool{
-	"content":     true,
-	"new_content": true,
-	"new_text":    true,
-	"old_content": true,
-	"old_text":    true,
-	"patch":       true,
-	"replacement": true,
+	"annotations":  true,
+	"blocks":       true,
+	"cell_updates": true,
+	"content":      true,
+	"new_content":  true,
+	"new_text":     true,
+	"old_content":  true,
+	"old_text":     true,
+	"patch":        true,
+	"replacement":  true,
+	"replacements": true,
+	"sheets":       true,
+	"slides":       true,
 }
 
 // visibleApprovalArguments 只保留判斷副作用範圍所需的參數。檔案本文仍留在

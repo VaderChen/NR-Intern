@@ -26,15 +26,16 @@ const (
 )
 
 type Config struct {
-	ServiceName        string                  `json:"service_name"`
-	UILanguage         string                  `json:"ui_language,omitempty"`
-	ListenAddress      string                  `json:"listen_address"`
-	DataDir            string                  `json:"data_dir"`
-	APIToken           string                  `json:"api_token,omitempty"`
-	AllowedOrigins     []string                `json:"allowed_origins,omitempty"`
-	AllowedTools       []string                `json:"allowed_tools,omitempty"`
-	AllowElevatedTools bool                    `json:"allow_elevated_tools"`
-	Permissions        domain.PermissionPolicy `json:"permissions"`
+	ServiceName          string                  `json:"service_name"`
+	UILanguage           string                  `json:"ui_language,omitempty"`
+	NotificationsEnabled bool                    `json:"notifications_enabled,omitempty"`
+	ListenAddress        string                  `json:"listen_address"`
+	DataDir              string                  `json:"data_dir"`
+	APIToken             string                  `json:"api_token,omitempty"`
+	AllowedOrigins       []string                `json:"allowed_origins,omitempty"`
+	AllowedTools         []string                `json:"allowed_tools,omitempty"`
+	AllowElevatedTools   bool                    `json:"allow_elevated_tools"`
+	Permissions          domain.PermissionPolicy `json:"permissions"`
 	// ToolCallMode 預設採 instruction：由 Harness 強制 LLM 輸出結構化工具指令，
 	// 不依賴各 Provider 是否正確轉換 OpenAI tool_calls。
 	ToolCallMode string `json:"tool_call_mode"`
@@ -91,9 +92,10 @@ func DefaultConfig() Config {
 	return Config{
 		ServiceName:            DefaultServiceName,
 		UILanguage:             DefaultUILanguage,
+		NotificationsEnabled:   false,
 		ListenAddress:          "127.0.0.1:8787",
 		DataDir:                filepath.Join("data", "ai-agent"),
-		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "http_fetch", "shell_exec", "ssh_exec", "memory_search", "memory_remember", "memory_forget"},
+		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "document_compare", "document_validate", "document_fonts", "document_create", "document_edit", "document_convert", "pdf_pages", "document_render", "http_fetch", "shell_exec", "ssh_exec", "memory_search", "memory_remember", "memory_forget"},
 		AllowElevatedTools:     true,
 		MaxTurns:               harness.DefaultMaxTurns,
 		MaxAutonomousToolTurns: harness.DefaultMaxAutonomousToolTurns,
@@ -147,7 +149,7 @@ func DefaultConfig() Config {
 		SSHProfiles: map[string]nativessh.Profile{},
 		HTTPFetch: HTTPFetchConfig{
 			Enabled:              true,
-			AllowPrivateNetworks: false,
+			AllowPrivateNetworks: true,
 			MaxResponseBytes:     1024 * 1024,
 			TimeoutSeconds:       30,
 			MaxRedirects:         5,

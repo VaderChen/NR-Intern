@@ -32,7 +32,8 @@ paths:
               schema: { type: string }
   /api/v1/admin/status:
     get:
-      summary: 取得服務狀態
+      summary: 取得服務狀態與 API 相容資訊
+      description: 回傳 API major version、事件 schema version 與前端可檢查的後端 capabilities。
       responses:
         "200":
           description: 服務狀態
@@ -43,6 +44,115 @@ paths:
     get:
       summary: 取得脫敏後台診斷
       description: 不包含 HTTP token、LLM API key、SSH 密碼、passphrase 或私鑰內容。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/diagnostics/export:
+    get:
+      summary: 匯出脫敏診斷包
+      description: 匯出 JSON 診斷摘要，不包含 API key、OAuth token、MCP/NetPass 憑證、對話全文或 DataDir 絕對路徑。
+      responses:
+        "200":
+          description: JSON diagnostics download
+          content:
+            application/json: { schema: { type: string } }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/backup:
+    get:
+      summary: 下載安全備份
+      description: 備份使用者資料與對話記錄；Provider、OAuth、MCP 與 NetPass 憑證檔案一律排除。
+      responses:
+        "200":
+          description: ZIP backup
+          content:
+            application/zip: { schema: { type: string, format: binary } }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/restore:
+    post:
+      summary: 還原安全備份
+      description: 只接受固定資料目錄內的安全 ZIP 路徑；還原前會保存 pre-restore 備份，完成後必須重啟後端。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+          application/zip: { schema: { type: string, format: binary } }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/permissions:
+    get:
+      summary: 取得唯讀權限中心
+      description: 回傳後端 permission policy、工具權限與待人工核准 Run 數量；不提供自我提權操作。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/update:
+    get:
+      summary: 取得最近一次更新檢查結果
+      description: 回傳目前版本、最近一次 GitHub Release 與更新可用性；尚未檢查時只回傳目前版本。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/update/check:
+    post:
+      summary: 立即檢查 GitHub Release 更新
+      description: 只檢查固定的 VaderChen/NR-Intern 官方 Release，不接受呼叫端提供 URL；網路錯誤會在資料中回傳 check_error。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/notifications:
+    get:
+      summary: 取得通知中心
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - name: unread_only
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/notifications/{notification_id}/read:
+    post:
+      summary: 將一則通知標為已讀
+      parameters:
+        - name: notification_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/notifications/read-all:
+    post:
+      summary: 將所有通知標為已讀
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/notifications/read:
+    delete:
+      summary: 清除已讀通知
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/search:
+    get:
+      summary: 全域搜尋
+      description: 搜尋 Workspace、Project、Session、Message、Plan 與 Schedule，回傳最多 100 筆短摘要。
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
       responses:
         "200": { $ref: "#/components/responses/JSONData" }
         default: { $ref: "#/components/responses/Problem" }
@@ -910,6 +1020,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/RunEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/pause:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    post:
+      summary: 暫停 Run
+      description: 將 Run 停在下一個安全回合邊界；目前進行中的 Provider 請求會先完成。
+      responses:
+        "202": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/resume:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    post:
+      summary: 恢復已暫停 Run
+      responses:
+        "202": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/runs/{run_id}/decision:
     parameters:
       - $ref: "#/components/parameters/RunID"
@@ -942,6 +1069,13 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/cancel-all:
+    post:
+      summary: 取消所有活動中的 Run
+      description: 取消 queued、running、paused 與 waiting_approval 狀態的 Run。
+      responses:
+        "202": { $ref: "#/components/responses/JSONData" }
         default: { $ref: "#/components/responses/Problem" }
 components:
   securitySchemes:
@@ -1299,10 +1433,11 @@ components:
           description: Provider 是否能可靠使用協定原生的工具呼叫欄位。
     ServiceSettings:
       type: object
-      required: [service_name, ui_language, max_wall_clock_seconds, max_tokens, max_tool_calls]
+      required: [service_name, ui_language, notifications_enabled, max_wall_clock_seconds, max_tokens, max_tool_calls]
       properties:
         service_name: { type: string, minLength: 1, maxLength: 80 }
         ui_language: { type: string, enum: [auto, zh-TW, en, ja, ko] }
+        notifications_enabled: { type: boolean, description: 預設 false；關閉時不建立或顯示通知中心摘要。 }
         max_wall_clock_seconds:
           type: integer
           minimum: 1
@@ -1324,13 +1459,14 @@ components:
       description: http_fetch 是唯一可由模型自行指定任意 URL 的原生工具，因此可由管理介面即時開關。
       properties:
         enabled: { type: boolean, description: 關閉時工具不會出現在模型的工具清單，執行請求也會被拒絕。 }
-        allow_private_networks: { type: boolean, description: 預設 false；關閉時拒絕連線到 loopback、私有網段、link-local 與 CGNAT 位址。 }
+        allow_private_networks: { type: boolean, description: 預設 true；開啟時允許連線到 localhost、loopback、私有網段、link-local 與 CGNAT 位址，關閉時拒絕上述位址。 }
     UpdateServiceSettingsInput:
       type: object
       required: [service_name]
       properties:
         service_name: { type: string, minLength: 1, maxLength: 80 }
         ui_language: { type: string, enum: [auto, zh-TW, en, ja, ko] }
+        notifications_enabled: { type: boolean, description: 是否啟用通知中心；省略時保留目前設定。 }
         max_wall_clock_seconds: { type: integer, minimum: 1, maximum: 86400 }
         max_tokens: { type: integer, minimum: 0 }
         max_tool_calls: { type: integer, minimum: 0, maximum: 10000 }
@@ -1575,7 +1711,7 @@ components:
         id: { type: string }
         agent_id: { type: string }
         session_id: { type: string }
-        status: { type: string, enum: [queued, running, waiting_approval, completed, failed, canceled] }
+        status: { type: string, enum: [queued, running, paused, waiting_approval, completed, failed, canceled] }
         input: { type: string }
         attachment_ids:
           type: array
@@ -1583,6 +1719,7 @@ components:
         provider_id: { type: string }
         model: { type: string }
         idempotency_key: { type: string }
+        idempotency_fingerprint: { type: string, description: 伺服器用來判斷重送內容是否相同的指紋。 }
         result: { $ref: "#/components/schemas/RunResult" }
         error: { type: object, additionalProperties: true }
         pending_approval: { $ref: "#/components/schemas/ToolApprovalRequest" }
@@ -1590,6 +1727,74 @@ components:
         created_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time }
         completed_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      required: [id, type, level, title, message, read, created_at]
+      properties:
+        id: { type: string }
+        type: { type: string }
+        level: { type: string, enum: [info, success, warning, error] }
+        title: { type: string }
+        message: { type: string }
+        read: { type: boolean }
+        run_id: { type: string }
+        session_id: { type: string }
+        metadata: { type: object, additionalProperties: true }
+        created_at: { type: string, format: date-time }
+    UpdateStatus:
+      type: object
+      required: [current_version, available, checked_at]
+      properties:
+        current_version: { type: string }
+        latest_version: { type: string }
+        available: { type: boolean }
+        release_name: { type: string }
+        release_url: { type: string, format: uri }
+        published_at: { type: string, format: date-time }
+        checked_at: { type: string, format: date-time }
+        check_error: { type: string }
+    SearchResult:
+      type: object
+      required: [kind, id, title, snippet, created_at]
+      properties:
+        kind: { type: string, enum: [workspace, project, session, message, plan, schedule] }
+        id: { type: string }
+        title: { type: string }
+        snippet: { type: string }
+        workspace_id: { type: string }
+        project_id: { type: string }
+        session_id: { type: string }
+        created_at: { type: string, format: date-time }
+    ToolPermissionInfo:
+      type: object
+      required: [name, permission, requires_permission, read_only, available]
+      properties:
+        name: { type: string }
+        permission: { type: string, enum: [standard, elevated] }
+        requires_permission: { type: boolean }
+        read_only: { type: boolean }
+        available: { type: boolean }
+    PermissionCenter:
+      type: object
+      required: [policy, tools, waiting_approval_runs]
+      properties:
+        policy: { $ref: "#/components/schemas/PermissionPolicy" }
+        tools: { type: array, items: { $ref: "#/components/schemas/ToolPermissionInfo" } }
+        waiting_approval_runs: { type: integer, minimum: 0 }
+    PermissionPolicy:
+      type: object
+      required: [default_profile, allow_client_choice]
+      properties:
+        default_profile: { type: string }
+        elevated_profiles: { type: array, items: { type: string } }
+        allow_client_choice: { type: boolean }
+    RestoreResult:
+      type: object
+      required: [restart_required, restored, excluded]
+      properties:
+        restart_required: { type: boolean }
+        restored: { type: array, items: { type: string } }
+        excluded: { type: array, items: { type: string } }
     Attachment:
       type: object
       required: [id, session_id, name, path, size, created_at]
@@ -1723,10 +1928,13 @@ components:
         unavailable_reason: { type: string }
     ServiceStatus:
       type: object
-      required: [name, version, instance_id, started_at, ready]
+      required: [name, version, api_version, event_schema_version, instance_id, started_at, ready]
       properties:
         name: { type: string }
         version: { type: string }
+        api_version: { type: string, description: HTTP API 契約版本；Client 應先比較 major version。 }
+        event_schema_version: { type: string, description: Durable event schema 版本。 }
+        capabilities: { type: array, uniqueItems: true, items: { type: string } }
         instance_id: { type: string }
         started_at: { type: string, format: date-time }
         ready: { type: boolean }

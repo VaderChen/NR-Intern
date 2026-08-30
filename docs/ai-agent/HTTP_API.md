@@ -13,9 +13,20 @@ Authorization: Bearer <token>
 | GET | `/healthz` | Process health |
 | GET | `/readyz` | Application readiness |
 | GET | `/api/v1/openapi.yaml` | 完整 OpenAPI 3.1 契約 |
-| GET | `/api/v1/admin/status` | 版本、instance 與啟動時間 |
+| GET | `/api/v1/admin/status` | 版本、API／事件 schema、capabilities、instance 與啟動時間 |
 | GET | `/api/v1/admin/diagnostics` | 脫敏後端設定、Provider、Session、Run 與工具統計 |
-| GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、Run 上限與 `http_fetch` 開關 |
+| GET | `/api/v1/admin/diagnostics/export` | 下載不含憑證與 DataDir 絕對路徑的診斷 JSON |
+| GET | `/api/v1/admin/backup` | 下載排除 Provider／OAuth／MCP／NetPass 憑證的安全 ZIP 備份 |
+| POST | `/api/v1/admin/restore` | 上傳安全備份還原；還原前保留 pre-restore 快照，完成後需重啟後端 |
+| GET | `/api/v1/admin/permissions` | 唯讀權限策略、工具權限與待核准 Run 摘要 |
+| GET | `/api/v1/admin/update` | 最近一次版本更新檢查結果 |
+| POST | `/api/v1/admin/update/check` | 立即檢查官方 GitHub Release；啟用通知中心時發現新版本才寫入通知 |
+| GET | `/api/v1/notifications` | 通知中心清單，可依未讀篩選 |
+| POST | `/api/v1/notifications/{notification_id}/read` | 將單筆通知標為已讀 |
+| POST | `/api/v1/notifications/read-all` | 將全部通知標為已讀 |
+| DELETE | `/api/v1/notifications/read` | 清除已讀通知 |
+| GET | `/api/v1/search` | 搜尋 Workspace、Project、Session、Message、Plan 與 Schedule 的短摘要 |
+| GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、通知中心、Run 上限與 `http_fetch` 開關 |
 | GET／PUT | `/api/v1/admin/provider-settings` | 讀取或完整取代脫敏 Provider 設定 |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/models` | 重新取得模型目錄；沒有目錄時回傳空陣列 |
 | POST | `/api/v1/admin/provider-settings/{provider_id}/test` | 送出最小模型請求並測試工具呼叫 |
@@ -78,6 +89,9 @@ Authorization: Bearer <token>
 | GET | `/api/v1/runs/{run_id}` | Run 狀態與結果 |
 | GET | `/api/v1/runs/{run_id}/events` | 重播並持續訂閱 Run SSE 事件 |
 | POST | `/api/v1/runs/{run_id}/cancel` | 取消執行中的 Run |
+| POST | `/api/v1/runs/{run_id}/pause` | 在安全回合邊界暫停 queued／running Run |
+| POST | `/api/v1/runs/{run_id}/resume` | 恢復 paused Run |
+| POST | `/api/v1/runs/cancel-all` | 對所有 queued／running／paused／waiting approval Run 送出取消要求 |
 | POST | `/api/v1/runs/{run_id}/decision` | 核准或拒絕等待中的高風險工具 |
 | POST | `/api/v1/runs/{run_id}/retry` | 以原始輸入建立新的可追溯 Run |
 
@@ -340,6 +354,16 @@ curl -X PUT http://127.0.0.1:8787/api/v1/admin/service-settings \
 `http_fetch is turned off in the backend service settings`。回應大小、逾時、轉址次數與
 `allowed_hosts`／`blocked_hosts` 只能由設定檔的 `http_fetch` 區塊調整。診斷資料只包含 SSH profile 名稱、API token 是否已設定，以及 Provider 的脫敏設定；不回傳 HTTP token、LLM API key、SSH 密碼、passphrase 或私鑰內容。
 
+`allow_private_networks` 預設為 `true`，因此 `http_fetch` 預設可連線到 localhost 與私有網段；若不需要存取本機、內網或雲端 metadata 服務，請將它設為 `false`。
+
+通知中心由 `notifications_enabled` 控制，預設為 `false`。關閉時不建立新的 Run、工具授權或版本更新通知，前端也不顯示通知按鈕；既有通知資料會保留，重新開啟後仍可查看。省略此欄位時保留目前設定：
+
+```bash
+curl -X PUT http://127.0.0.1:8787/api/v1/admin/service-settings \
+  -H 'Content-Type: application/json' \
+  -d '{"service_name":"永不休息的實習生","notifications_enabled":false}'
+```
+
 完整機器可讀契約位於 [`src/transport/httpapi/openapi.yaml`](../../src/transport/httpapi/openapi.yaml)，執行中的後端也會由 `/api/v1/openapi.yaml` 提供相同內容。
 
 ## Harness 稽核 Entries
@@ -385,7 +409,61 @@ curl -N http://127.0.0.1:8787/api/v1/runs/RUN_ID/events \
 
 也可用 `?after_sequence=42`；若兩者同時提供，以 `Last-Event-ID` 為準。後端先補送 sequence 42 之後的 durable events，再等待新事件。同一串流最後會收到 `run.completed`、`run.failed` 或 `run.canceled`，terminal Run 補送完畢後會關閉連線。
 
-Browser Console 的策略是：斷線後最多重連 3 次，依序等待 400、800、1600 毫秒；每次都攜帶最後 sequence 補回缺漏，第三次仍失敗才顯示連線中斷。自訂 HTTP Client 應採相同行為，並固定重用原本的 `Idempotency-Key`，避免在尚未取得 Run ID 時重複建立工作。
+Browser Console 的策略是：斷線後最多重連 3 次，依序等待 400、800、1600 毫秒；每次都攜帶最後 sequence 補回缺漏，第三次仍失敗才顯示連線中斷。自訂 HTTP Client 應採相同行為，並固定重用原本的 `Idempotency-Key`，避免在尚未取得 Run ID 時重複建立工作。相同 Session 的同一 Key 若搭配不同輸入、附件、Provider 或 Model，後端會回傳 `409 Conflict`。
+
+前端送出訊息前會先寫入 IndexedDB Durable Outbox。附件上傳成功後保存 Attachment ID，只有 Run
+收到 terminal event 才移除項目；`pending`、`sending` 與 `failed` 項目在 UI 重開或網路恢復後可
+繼續送出。這是 Browser 端的持久化送出佇列，不取代後端已建立 Run 的 durable 狀態。
+
+## 後端相容性與 UI 恢復
+
+`GET /api/v1/admin/status` 的回應包含：
+
+```json
+{
+  "api_version": "1.0",
+  "event_schema_version": "1.0",
+  "capabilities": ["durable-outbox.v1", "run-recovery.v1", "run-retry.v1"]
+}
+```
+
+Browser Console 會在載入 Workspace 前檢查 API major version 與必要 capabilities。缺少相容資訊、
+major version 不同或缺少必要功能時，UI 會顯示版本不相容提示；Client 不應把單一新端點的 404
+當成唯一相容性判斷。
+
+UI 重開時會查詢目前 Workspace 的 queued、running、paused、waiting approval Run，重新連接其
+SSE；若後端重啟已將 Run 標記為 `server_restarted` 且 `retryable=true`，UI 會保留重試入口。
+
+## P0／P1 管理與復原
+
+後端重啟會把 queued、running、paused 與 waiting approval 的未完成 Run 標記為 `failed`、錯誤碼 `server_restarted` 並保留可重試狀態；原 Run
+不會被覆寫。`pause` 只在目前 Provider request 或工具回合結束後生效，等待人工核准的 Run
+不能一般暫停；`cancel-all` 則對所有尚未 terminal 的 Run 送出取消要求。
+
+通知中心只回傳工作狀態摘要，最多保留 1000 筆，支援 `unread_only=true`、單筆／全部已讀與
+清除已讀。全域搜尋的 `q` 最多 200 字元、回傳最多 100 筆，每筆只有短 snippet，不回傳完整
+對話內容。
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/v1/runs/RUN_ID/pause
+curl -X POST http://127.0.0.1:8787/api/v1/runs/RUN_ID/resume
+curl -X POST http://127.0.0.1:8787/api/v1/runs/cancel-all
+curl 'http://127.0.0.1:8787/api/v1/search?q=部署&limit=20'
+curl 'http://127.0.0.1:8787/api/v1/notifications?unread_only=true'
+curl http://127.0.0.1:8787/api/v1/admin/diagnostics/export -o nr-intern-diagnostics.json
+curl http://127.0.0.1:8787/api/v1/admin/backup -o nr-intern-backup.zip
+curl -X POST http://127.0.0.1:8787/api/v1/admin/restore \
+  -F 'file=@nr-intern-backup.zip'
+```
+
+安全備份包含使用者對話、附件、記憶與其他工作資料，但不包含 Provider、OAuth、MCP 或 NetPass
+憑證。還原前後端會保留 pre-restore 備份；還原成功後必須重啟，且權限中心本身只有讀取能力，
+不提供從 API 或 UI 修改後端 permission policy 的入口。
+
+版本更新檢查只連固定的 `https://api.github.com/repos/VaderChen/NR-Intern/releases/latest`，
+不接受 Client 傳入檢查網址。後端啟動後會背景檢查一次，之後每 6 小時檢查；管理頁也可手動
+觸發。若 Release 版本高於目前版本，且已啟用通知中心，才會建立一則去重通知，通知內可開啟
+官方 Release 頁面；同一版本不會重複通知。
 
 ## 錯誤格式
 

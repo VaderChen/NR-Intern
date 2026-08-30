@@ -73,6 +73,10 @@
               <path d="M14.5 3.75v3.5H18M9 11h6M9 14.5h6M9 18h4"></path>
             </svg>
           </button>
+          <button id="notificationButton" class="sidebar-icon-button notification-icon-button hidden" type="button" title="通知中心" aria-label="通知中心" aria-expanded="false" aria-controls="notificationPopover" disabled>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 17h12l-1.4-2.2V10a4.6 4.6 0 0 0-9.2 0v4.8Z"></path><path d="M10 19a2.2 2.2 0 0 0 4 0"></path></svg>
+            <span id="notificationBadge" class="notification-badge hidden">0</span>
+          </button>
           <button id="providerUsageButton" class="sidebar-icon-button usage-icon-button" type="button" title="查看用量" aria-label="查看用量" aria-expanded="false" aria-controls="providerUsagePopover" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="12" cy="12" r="8"></circle>
@@ -107,6 +111,10 @@
             </div>
           </div>
         </section>
+        <section id="notificationPopover" class="notification-popover hidden" role="dialog" aria-label="通知中心">
+          <div class="notification-popover-head"><strong>通知中心</strong><div><button id="markAllNotificationsRead" class="small ghost" type="button">全部已讀</button><button id="clearReadNotifications" class="small ghost" type="button">清除已讀</button></div></div>
+          <div id="notificationList" class="notification-list"></div>
+        </section>
       </div>
     </aside>
 
@@ -117,15 +125,10 @@
           <small id="agentLabel">General Harness Agent</small>
         </div>
         <div class="topbar-meta">
-          <div id="sessionRuntimeControls" class="session-runtime-controls hidden" aria-label="對話 Provider 與模型">
-            <label title="此對話使用的 Provider">
-              <span>Provider</span>
-              <select id="sessionProviderSelect" aria-label="對話 Provider"></select>
-            </label>
-            <label title="此對話使用的模型">
-              <span>模型</span>
-              <select id="sessionModelSelect" aria-label="對話模型"></select>
-            </label>
+          <div class="global-search-control">
+            <input id="globalSearchInput" type="search" placeholder="搜尋 Workspace、Project、對話…" aria-label="全域搜尋" autocomplete="off">
+            <button id="globalSearchButton" class="icon-button" type="button" title="搜尋" aria-label="搜尋">⌕</button>
+            <div id="globalSearchPopover" class="global-search-popover hidden" role="dialog" aria-label="搜尋結果"><div id="globalSearchResults"></div></div>
           </div>
           <label class="display-mode-control" title="顯示模式">
             <span>外觀</span>
@@ -135,7 +138,23 @@
               <option value="dark">深色</option>
             </select>
           </label>
-          <span id="sessionPermission" class="chip hidden"></span>
+          <div id="modelControl" class="model-control hidden">
+            <button id="modelControlButton" class="model-capsule" type="button" title="選擇 Provider 與模型" aria-label="選擇模型" aria-haspopup="dialog" aria-expanded="false" aria-controls="sessionRuntimeControls">
+              <span class="model-capsule-label">模型</span>
+              <strong id="modelCapsuleValue">—</strong>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"></path></svg>
+            </button>
+            <section id="sessionRuntimeControls" class="model-popover hidden" role="dialog" aria-label="模型選項">
+              <label title="此對話使用的 Provider">
+                <span>Provider</span>
+                <select id="sessionProviderSelect" aria-label="對話 Provider"></select>
+              </label>
+              <label title="此對話使用的模型">
+                <span>模型</span>
+                <select id="sessionModelSelect" aria-label="對話模型"></select>
+              </label>
+            </section>
+          </div>
         </div>
       </header>
 
@@ -227,10 +246,14 @@
       </div>
       <div class="panel-tabs" role="tablist" aria-label="系統管理功能" aria-orientation="vertical">
         <button id="overviewManagementTab" class="panel-tab active" data-panel="overview" role="tab" aria-selected="true" aria-controls="overviewPanel">一般設定</button>
+        <button id="workspaceManagementTab" class="panel-tab" data-panel="workspace" role="tab" aria-selected="false" aria-controls="workspacePanel">Workspace 設定</button>
         <button id="providersManagementTab" class="panel-tab" data-panel="providers" role="tab" aria-selected="false" aria-controls="providersPanel">Provider 設定</button>
+        <button id="systemToolsManagementTab" class="panel-tab" data-panel="systemTools" role="tab" aria-selected="false" aria-controls="systemToolsPanel">系統工具</button>
         <button id="mcpManagementTab" class="panel-tab" data-panel="mcp" role="tab" aria-selected="false" aria-controls="mcpPanel">使用 MCP</button>
         <button id="reverseProxyManagementTab" class="panel-tab" data-panel="reverseProxy" role="tab" aria-selected="false" aria-controls="reverseProxyPanel">反向代理</button>
         <button id="toolsManagementTab" class="panel-tab" data-panel="tools" role="tab" aria-selected="false" aria-controls="toolsPanel">工具列表</button>
+        <button id="permissionsManagementTab" class="panel-tab" data-panel="permissions" role="tab" aria-selected="false" aria-controls="permissionsPanel">權限中心</button>
+        <button id="aboutManagementTab" class="panel-tab" data-panel="about" role="tab" aria-selected="false" aria-controls="aboutPanel">關於</button>
         <button id="auditManagementTab" class="panel-tab hidden" data-panel="audit" role="tab" aria-selected="false" aria-controls="auditPanel">稽核</button>
       </div>
 
@@ -252,42 +275,19 @@
           <label>單次工作工具呼叫上限<input id="settingMaxToolCalls" type="number" min="0" max="10000" step="1" inputmode="numeric" required></label>
           <p class="hint">Token 與工具呼叫填 0 表示不限制；時間上限為 1～1440 分鐘。新數值會套用到之後開始的工作，不影響正在執行中的工作。</p>
           <fieldset class="settings-fieldset">
+            <legend>通知</legend>
+            <label class="check-label"><input id="settingNotificationsEnabled" type="checkbox">啟用通知中心</label>
+            <p class="hint">預設關閉。開啟後才會顯示通知圖示，並保存 Run、工具授權與版本更新摘要。</p>
+          </fieldset>
+          <fieldset class="settings-fieldset">
             <legend>對外網路</legend>
             <label class="check-label"><input id="settingHTTPFetchEnabled" type="checkbox">允許 Agent 讀取外部網路（http_fetch）</label>
-            <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox">允許連線到 localhost 與私有網段</label>
-            <p class="hint">關閉後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。私有網段預設拒絕，避免 Agent 讀取內網服務或雲端 metadata 位址；要讓 Agent 呼叫本機服務時才開啟。</p>
+            <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox" checked>允許連線到 localhost 與私有網段</label>
+            <p class="hint">關閉第一項後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。第二項預設允許連線到 localhost、內網與雲端 metadata 位址；若不需要存取私有服務，建議關閉。</p>
           </fieldset>
           <div class="management-form-actions">
             <button id="saveServiceSettings" class="primary" type="submit">儲存服務設定</button>
           </div>
-        </form>
-        <section class="management-section backend-card">
-          <div class="section-head"><h2>後端程序</h2><span class="status-line"><span id="managementStatusDot" class="dot"></span><strong id="managementBackendState">檢查中</strong></span></div>
-          <small id="backendURL"></small>
-          <small id="backendDetail"></small>
-          <div class="control-row">
-            <button id="startBackend" class="small">啟動</button>
-            <button id="restartBackend" class="small">重啟</button>
-            <button id="stopBackend" class="small danger">停止</button>
-          </div>
-        </section>
-        <section class="management-section">
-          <div class="section-head"><h2>後端診斷</h2><button id="refreshDiagnostics" class="small ghost">重新整理</button></div>
-          <div id="diagnosticCards" class="metric-grid"></div>
-          <dl id="providerSummary" class="summary-list"></dl>
-          <details><summary>脫敏設定</summary><pre id="diagnosticConfig" class="json-view"></pre></details>
-        </section>
-
-        <form id="workspaceSettings" class="management-section hidden">
-          <div class="section-head"><h2>Workspace 設定</h2><span id="workspaceSettingsState" class="save-state"></span></div>
-          <label>名稱<input id="settingWorkspaceName" autocomplete="off"></label>
-          <label>說明<textarea id="settingWorkspaceDescription" rows="2"></textarea></label>
-          <label>預設 Provider<select id="settingWorkspaceProvider"></select></label>
-          <label>預設模型<input id="settingWorkspaceModel" placeholder="使用 Provider 預設模型" autocomplete="off"></label>
-          <label>職務說明<textarea id="settingWorkspaceInstructions" rows="4" placeholder="這個 Workspace 的常駐工作規則；底下所有對話都會自動套用"></textarea></label>
-          <p class="hint">職務說明只寫一次，之後每次對話與每個排程都會自動帶入，不必重述工作規則；Project 也可以再寫自己的說明，範圍較小者優先。上限 8000 字，內容每一輪都會佔用 Context 預算。</p>
-          <p class="hint">不同前端分頁可同時選擇不同 Workspace；此處更新只影響之後未指定 override 的 Run。</p>
-          <button id="saveWorkspaceSettings" class="primary" type="submit">儲存 Workspace 設定</button>
         </form>
 
         <form id="sessionSettings" class="management-section hidden">
@@ -307,7 +307,68 @@
           <p class="hint">Workspace root 不可由 HTTP 管理介面變更。信任權限仍須後端允許 elevated tools。</p>
           <button id="saveSessionSettings" class="primary" type="submit">儲存 Session 設定</button>
         </form>
-        <section id="noSessionManagement" class="management-section quiet">選擇 Session 後可管理模型、權限與記憶 scope。</section>
+        <section id="noSessionManagement" class="management-section quiet hidden">選擇 Session 後可管理模型、權限與記憶 scope。</section>
+      </div>
+
+      <div id="workspacePanel" class="panel-content hidden" role="tabpanel" aria-labelledby="workspaceManagementTab">
+        <div class="workspace-settings-toolbar">
+          <div>
+            <strong>Workspace 設定</strong>
+            <p class="hint">選擇 Workspace 後，直接編輯其預設模型與常駐工作規則。</p>
+          </div>
+          <div class="workspace-management-picker">
+            <label class="workspace-management-select">Workspace
+              <select id="workspaceManagementSelect" aria-label="選擇 Workspace" disabled></select>
+            </label>
+            <button id="newManagementWorkspace" class="icon-button" type="button" title="新增 Workspace" aria-label="新增 Workspace" disabled>＋</button>
+          </div>
+        </div>
+        <form id="workspaceSettings" class="management-section hidden">
+          <div class="section-head"><h2>基本設定</h2><span id="workspaceSettingsState" class="save-state"></span></div>
+          <label>名稱<input id="settingWorkspaceName" autocomplete="off"></label>
+          <label>說明<textarea id="settingWorkspaceDescription" rows="2"></textarea></label>
+          <label>預設 Provider<select id="settingWorkspaceProvider"></select></label>
+          <label>預設模型<input id="settingWorkspaceModel" placeholder="使用 Provider 預設模型" autocomplete="off"></label>
+          <label>職務說明<textarea id="settingWorkspaceInstructions" rows="4" placeholder="這個 Workspace 的常駐工作規則；底下所有對話都會自動套用"></textarea></label>
+          <p class="hint">職務說明只寫一次，之後每次對話與每個排程都會自動帶入，不必重述工作規則；Project 也可以再寫自己的說明，範圍較小者優先。上限 8000 字，內容每一輪都會佔用 Context 預算。</p>
+          <p class="hint">不同前端分頁可同時選擇不同 Workspace；此處更新只影響之後未指定 override 的 Run。</p>
+          <button id="saveWorkspaceSettings" class="primary" type="submit">儲存 Workspace 設定</button>
+        </form>
+        <section id="noWorkspaceSettings" class="management-section quiet hidden">目前沒有可設定的 Workspace。</section>
+      </div>
+
+      <div id="systemToolsPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="systemToolsManagementTab">
+        <section class="management-section backend-card">
+          <div class="section-head"><h2>後端程序</h2><span class="status-line"><span id="managementStatusDot" class="dot"></span><strong id="managementBackendState">檢查中</strong></span></div>
+          <small id="backendURL"></small>
+          <small id="backendDetail"></small>
+          <div class="control-row">
+            <button id="startBackend" class="small">啟動</button>
+            <button id="restartBackend" class="small">重啟</button>
+            <button id="stopBackend" class="small danger">停止</button>
+          </div>
+          <div class="control-row run-control-row">
+            <button id="pauseRun" class="small ghost" type="button" disabled>暫停目前 Run</button>
+            <button id="resumeRun" class="small ghost" type="button" disabled>恢復目前 Run</button>
+            <button id="cancelAllRuns" class="small danger ghost" type="button">取消全部 Run</button>
+          </div>
+        </section>
+        <section class="management-section">
+          <div class="section-head"><h2>後端診斷</h2><button id="refreshDiagnostics" class="small ghost">重新整理</button></div>
+          <div id="diagnosticCards" class="metric-grid"></div>
+          <dl id="providerSummary" class="summary-list"></dl>
+          <details><summary>脫敏設定</summary><pre id="diagnosticConfig" class="json-view"></pre></details>
+        </section>
+        <section class="management-section">
+          <div class="section-head"><h2>系統工具</h2><span id="adminDataState" class="save-state"></span></div>
+          <p class="hint">診斷包與備份不包含 Provider、MCP、OAuth 或 NetPass 金鑰。還原使用者資料後需要重新啟動後端。</p>
+          <div class="management-form-actions admin-data-actions">
+            <button id="exportDiagnostics" class="ghost" type="button">下載診斷包</button>
+            <button id="downloadBackup" class="ghost" type="button">下載安全備份</button>
+            <button id="restoreBackup" class="danger ghost" type="button">還原備份</button>
+            <input id="restoreBackupFile" class="hidden" type="file" accept=".zip,application/zip">
+          </div>
+        </section>
       </div>
 
       <div id="providersPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="providersManagementTab">
@@ -540,6 +601,28 @@
           <div class="section-head"><h2>工具目錄</h2><button id="refreshTools" class="small ghost">重新整理</button></div>
           <p class="hint">包含內建與 MCP 工具；可用性由後端設定、MCP 連線與 Session 權限共同判斷。</p>
           <div id="toolList" class="tool-list"></div>
+        </section>
+      </div>
+
+      <div id="permissionsPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="permissionsManagementTab">
+        <section class="management-section">
+          <div class="section-head"><h2>權限中心</h2><button id="refreshPermissions" class="small ghost" type="button">重新整理</button></div>
+          <p class="hint">此頁只讀取後端權限策略；Session 提權仍須符合後端設定，或經人工核准流程完成。</p>
+          <dl id="permissionSummary" class="summary-list"></dl>
+          <div id="permissionToolList" class="tool-list"></div>
+        </section>
+      </div>
+
+      <div id="aboutPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="aboutManagementTab">
+        <section class="management-section about-card">
+          <div class="section-head">
+            <div><h2>關於 NR-Intern</h2><p class="hint">版本與執行環境資訊。</p></div>
+          </div>
+          <dl id="aboutVersionSummary" class="summary-list about-version-summary"></dl>
+        </section>
+        <section class="management-section update-section">
+          <div class="section-head"><h2>版本更新</h2><p id="updateStatus" class="hint">尚未檢查更新。</p><button id="checkForUpdates" class="small ghost" type="button">檢查更新</button></div>
+          <button id="openLatestRelease" class="ghost hidden" type="button">開啟最新 Release</button>
         </section>
       </div>
 

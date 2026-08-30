@@ -32,6 +32,9 @@ const state = {
   sessionDragProjectID: "",
   sessionOrderSaving: false,
   backendHealthy: false,
+  backendCompatible: false,
+  backendStatus: null,
+  backendCompatibilityError: "",
   backendLifecycleState: "stopped",
   refreshingBackend: false,
   running: false,
@@ -41,6 +44,7 @@ const state = {
   screenCapturing: false,
   screenCaptureHideWindow: localStorage.getItem("nrIntern.screenCapture.hideWindow") !== "0",
   currentRunId: "",
+  currentRunStatus: "",
   retryableRunId: "",
   retryableSessionId: "",
   pendingApproval: null,
@@ -61,7 +65,10 @@ const state = {
   pendingAttachments: [],
   attachmentSessionId: "",
   promptQueue: [],
+  outboxLoaded: false,
+  outboxAvailable: true,
   queueDraining: false,
+  trackedRunId: "",
   runStartedAt: new Map(),
   sessionSelectionVersion: 0,
   sessionRuntimeSaving: false,
@@ -75,6 +82,9 @@ const state = {
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("collapsedProjects") || "[]")),
   projectSectionCollapsed: localStorage.getItem("projectSectionCollapsed") === "1",
   schedules: [],
+  notifications: [],
+  updateStatus: null,
+  globalSearchResults: [],
   scheduleSectionCollapsed: localStorage.getItem("scheduleSectionCollapsed") === "1",
   scheduleSandboxRoots: [],
   editingSchedule: null,
@@ -99,6 +109,13 @@ const knownDefaultServiceNames = new Set([
   "똑똑한 인턴",
 ]);
 const transientStatuses = new Set([502, 503, 504]);
+const supportedBackendAPIMajor = 1;
+const requiredBackendCapabilities = Object.freeze([
+  "durable-outbox.v1",
+  "run-events.v1",
+  "run-recovery.v1",
+  "run-retry.v1",
+]);
 // 側邊欄的排程列是動態產生的，i18n 的 MutationObserver 只認得靜態文字，
 // 因此這裡自行查表；語言切換時會重新繪製整份清單。
 const translate = (source) => window.NRInternI18n?.t(source) ?? source;
@@ -142,6 +159,7 @@ let messageScrollFrame = 0;
 let backendRefreshTimer = 0;
 let providerOAuthPollTimer = 0;
 let backendFastPollUntil = Date.now() + 5000;
+let outboxDatabasePromise = null;
 const dialogPointerGesture = {
   dialog: null,
   inputKind: "",
@@ -207,17 +225,19 @@ function normalizedServiceSettings(value = {}) {
   const serviceNameIsDefault = value.service_name_is_default
     ?? current.service_name_is_default
     ?? knownDefaultServiceNames.has(serviceName);
-  const httpFetch = value.http_fetch ?? current.http_fetch ?? {};
+  const currentHTTPFetch = current.http_fetch ?? {};
+  const httpFetch = value.http_fetch ?? {};
   return {
     service_name: serviceName,
     service_name_is_default: Boolean(serviceNameIsDefault),
     ui_language: normalizedUILanguage(value.ui_language ?? current.ui_language ?? "auto"),
+    notifications_enabled: Boolean(value.notifications_enabled ?? current.notifications_enabled ?? false),
     max_wall_clock_seconds: Number.isInteger(wallClockSeconds) && wallClockSeconds > 0 ? wallClockSeconds : 7200,
     max_tokens: Number.isInteger(maxTokens) && maxTokens >= 0 ? maxTokens : 0,
     max_tool_calls: Number.isInteger(maxToolCalls) && maxToolCalls >= 0 ? maxToolCalls : 0,
     http_fetch: {
-      enabled: Boolean(httpFetch.enabled),
-      allow_private_networks: Boolean(httpFetch.allow_private_networks),
+      enabled: Boolean(httpFetch.enabled ?? currentHTTPFetch.enabled),
+      allow_private_networks: Boolean(httpFetch.allow_private_networks ?? currentHTTPFetch.allow_private_networks ?? true),
     },
   };
 }
@@ -227,6 +247,8 @@ function applyServiceSettings(value) {
   state.serviceSettings = settings;
   applyUILanguage(settings.ui_language);
   applyServiceName(settings.service_name_is_default ? localizedDefaultServiceName() : settings.service_name);
+  if ($("settingNotificationsEnabled")) $("settingNotificationsEnabled").checked = settings.notifications_enabled;
+  syncNotificationUIAvailability();
   if ($("settingMaxWallClockMinutes")) $("settingMaxWallClockMinutes").value = String(Math.ceil(settings.max_wall_clock_seconds / 60));
   if ($("settingMaxTokens")) $("settingMaxTokens").value = String(settings.max_tokens);
   if ($("settingMaxToolCalls")) $("settingMaxToolCalls").value = String(settings.max_tool_calls);
@@ -235,6 +257,24 @@ function applyServiceSettings(value) {
     $("settingHTTPFetchPrivateNetworks").checked = settings.http_fetch.allow_private_networks;
     syncHTTPFetchSettingFields();
   }
+}
+
+function notificationCenterEnabled() {
+  return Boolean(state.serviceSettings?.notifications_enabled);
+}
+
+function syncNotificationUIAvailability() {
+  const enabled = notificationCenterEnabled();
+  const button = $("notificationButton");
+  if (!button) return;
+  button.classList.toggle("hidden", !enabled);
+  button.disabled = !enabled || !state.backendHealthy;
+  button.closest(".sidebar-action-row")?.classList.toggle("notifications-disabled", !enabled);
+  renderAboutVersionInfo();
+  if (enabled) return;
+  state.notifications = [];
+  closeNotificationPopover();
+  renderNotifications();
 }
 
 // 關閉對外網路時，私有網段的選項沒有意義，直接停用避免誤會成兩個獨立開關。
@@ -693,6 +733,37 @@ async function closeImageEditor() {
   if (await copyEditedImage()) $("imageEditorDialog").close();
 }
 
+function backendCompatibility(status) {
+  const apiVersion = String(status?.api_version || "").trim();
+  const apiMajor = Number.parseInt(apiVersion.split(".")[0], 10);
+  if (!apiVersion || !Number.isInteger(apiMajor)) {
+    return { compatible: false, message: "後端版本過舊，缺少 API 相容資訊；請重新啟動 NR-Intern。" };
+  }
+  if (apiMajor !== supportedBackendAPIMajor) {
+    return { compatible: false, message: `前端需要 API ${supportedBackendAPIMajor}.x，但後端為 ${apiVersion}；請更新或重新啟動整套程式。` };
+  }
+  const capabilities = new Set(Array.isArray(status.capabilities) ? status.capabilities : []);
+  const missing = requiredBackendCapabilities.filter((capability) => !capabilities.has(capability));
+  if (missing.length > 0) {
+    return { compatible: false, message: `後端缺少必要功能（${missing.join("、")}）；請重新啟動或更新 NR-Intern。` };
+  }
+  return { compatible: true, message: "" };
+}
+
+async function readBackendCompatibility() {
+  try {
+    const status = await request("/api/v1/admin/status", { reconnects: 0 });
+    const result = backendCompatibility(status);
+    return { ...result, status };
+  } catch (_) {
+    return {
+      compatible: false,
+      status: null,
+      message: "目前後端不支援版本／功能相容檢查；請完整關閉後重新啟動 NR-Intern。",
+    };
+  }
+}
+
 function toast(message) {
   $("toast").textContent = message;
   $("toast").classList.remove("hidden");
@@ -717,32 +788,45 @@ async function refreshBackend() {
   try {
     const status = await desktop("status");
     const wasHealthy = state.backendHealthy;
-    state.backendHealthy = status.healthy;
+    let compatibility = { compatible: false, status: null, message: "" };
+    if (status.healthy) compatibility = await readBackendCompatibility();
+    state.backendCompatible = Boolean(status.healthy && compatibility.compatible);
+    state.backendStatus = compatibility.status;
+    renderAboutVersionInfo();
+    state.backendCompatibilityError = compatibility.message || "";
+    state.backendHealthy = state.backendCompatible;
     state.backendLifecycleState = status.state || "stopped";
-    const label = status.healthy
+    const label = status.healthy && !state.backendCompatible
+      ? "後端版本不相容"
+      : status.healthy
       ? (status.owned ? "後端執行中" : "已連接外部後端")
       : ["starting", "running"].includes(status.state) ? "啟動中" : "後端未啟動";
     $("backendState").textContent = label;
     $("managementBackendState").textContent = label;
     $("backendURL").textContent = status.backend_url;
-    $("backendDetail").textContent = status.last_error
+    $("backendDetail").textContent = state.backendCompatibilityError
+      || (status.last_error
       ? `錯誤：${status.last_error}`
-      : status.pid ? `PID ${status.pid}` : status.owned ? "由桌面程式管理" : "";
+      : status.pid ? `PID ${status.pid}` : status.owned ? "由桌面程式管理" : "");
     for (const id of ["statusDot", "managementStatusDot"]) {
-      $(id).className = `dot ${status.healthy ? "ok" : "bad"}`;
+      $(id).className = `dot ${state.backendHealthy ? "ok" : "bad"}`;
     }
     $("stopBackend").disabled = !status.owned;
     $("restartBackend").disabled = !status.owned;
     $("startBackend").disabled = status.healthy || ["starting", "running"].includes(status.state);
-    $("newWorkspace").disabled = !status.healthy || state.running;
-    $("workspaceSelect").disabled = !status.healthy || state.running;
-    $("newProject").disabled = !status.healthy || !state.workspace || state.running;
-    $("newSchedule").disabled = !status.healthy || !state.workspace;
-    $("openManagement").disabled = !status.healthy;
-    $("providerUsageButton").disabled = !status.healthy;
-    if (!status.healthy) closeProviderUsagePopover();
-    if (status.healthy && (!wasHealthy || !state.agent)) await loadApplicationState();
-    if (!status.healthy && wasHealthy) resetWorkspace();
+    $("newWorkspace").disabled = !state.backendHealthy || state.running;
+    $("newManagementWorkspace").disabled = !state.backendHealthy || state.running;
+    $("workspaceSelect").disabled = !state.backendHealthy || state.running;
+    $("workspaceManagementSelect").disabled = !state.backendHealthy || state.running;
+    $("newProject").disabled = !state.backendHealthy || !state.workspace || state.running;
+    $("newSchedule").disabled = !state.backendHealthy || !state.workspace;
+    $("openManagement").disabled = !state.backendHealthy;
+    $("providerUsageButton").disabled = !state.backendHealthy;
+    syncNotificationUIAvailability();
+    if (!state.backendHealthy) closeProviderUsagePopover();
+    if (!state.backendHealthy) closeNotificationPopover();
+    if (state.backendHealthy && (!wasHealthy || !state.agent)) await loadApplicationState();
+    if (!state.backendHealthy && wasHealthy) resetWorkspace();
   } catch (error) {
     toast(error.message);
   } finally {
@@ -761,7 +845,8 @@ function scheduleBackendRefresh() {
 
 function resetWorkspace() {
   clearPendingAttachments();
-  clearPromptQueue();
+  // 後端離線時仍保留 durable outbox；恢復連線後再繼續送出。
+  if ($("promptQueue")) renderPromptQueue();
   state.agent = null;
   state.providers = [];
   state.providerSettings = null;
@@ -788,6 +873,7 @@ function resetWorkspace() {
   state.sessionOrderSaving = false;
   state.sessionRuntimeSaving = false;
   state.runningSessionId = "";
+  state.currentRunStatus = "";
   state.runActivityText = "";
   state.retryableRunId = "";
   state.retryableSessionId = "";
@@ -804,10 +890,11 @@ function resetWorkspace() {
   $("prompt").disabled = true;
   syncRunActionButton();
   $("workspaceSelect").replaceChildren();
+  $("workspaceManagementSelect").replaceChildren();
   syncSessionRuntimeControls({ loadModels: false });
   syncPlanButton();
   renderContextUsage();
-  $("workspaceSettings").classList.add("hidden");
+  syncWorkspaceSettings();
   $("messages").replaceChildren();
   $("messages").classList.add("hidden");
   $("emptyState").classList.remove("hidden");
@@ -836,6 +923,7 @@ async function loadApplicationState() {
   state.providers = providers;
   state.workspaces = workspaces;
   state.permissions = diagnostics.config?.permissions || null;
+  void loadUpdateStatus();
   $("agentLabel").textContent = state.agent?.name || "尚無 Agent";
   renderProviderOptions();
   renderPermissionOptions();
@@ -843,15 +931,20 @@ async function loadApplicationState() {
   const storedID = sessionStorage.getItem("activeWorkspaceID");
   state.workspace = state.workspaces.find((item) => item.id === storedID) || state.workspaces[0] || null;
   if (state.workspace) {
-    $("workspaceSelect").value = state.workspace.id;
+    syncWorkspaceSelectorValues(state.workspace.id);
     sessionStorage.setItem("activeWorkspaceID", state.workspace.id);
     syncWorkspaceSettings();
     void initializeWorkspaceModels(state.workspace.id);
   }
   if (!state.agent || !state.workspace) return;
   await Promise.all([loadProjects(), loadSessions(), loadSchedules()]);
+  await restoreWorkspaceRun();
+  if (notificationCenterEnabled()) void loadNotifications();
+  void drainPromptQueue();
   $("newProject").disabled = state.running;
+  $("newManagementWorkspace").disabled = state.running;
   $("workspaceSelect").disabled = state.running;
+  $("workspaceManagementSelect").disabled = state.running;
 }
 
 function renderPermissionOptions() {
@@ -1039,8 +1132,8 @@ function sessionNode(session, pinnedContext) {
   const meta = document.createElement("small");
   const providerID = session.provider_id || state.workspace?.default_provider_id || "";
   meta.textContent = displayedModelForProvider(providerID, session.model)
-    || session.permission_profile
-    || "default";
+    || providerDisplayName(providerID)
+    || "未選擇模型";
   button.append(title, meta);
   button.addEventListener("click", () => selectSession(session));
   button.addEventListener("keydown", (event) => {
@@ -1921,6 +2014,33 @@ function sessionRuntimeModels(providerID) {
   return providerModelCatalog(providerID) || [];
 }
 
+function closeModelPopover() {
+  $("sessionRuntimeControls")?.classList.add("hidden");
+  $("modelControlButton")?.setAttribute("aria-expanded", "false");
+}
+
+function toggleModelPopover() {
+  const popover = $("sessionRuntimeControls");
+  if (!popover || !state.session) return;
+  const open = popover.classList.toggle("hidden");
+  $("modelControlButton")?.setAttribute("aria-expanded", String(!open));
+}
+
+function syncModelCapsule(providerID, model, catalog) {
+  const button = $("modelControlButton");
+  const value = $("modelCapsuleValue");
+  if (!button || !value) return;
+  const providerName = providerDisplayName(providerID) || providerID;
+  const displayModel = catalog === null
+    ? (state.providerModelErrors[providerID] ? "無法載入" : "載入中…")
+    : model || "未設定";
+  value.textContent = displayModel;
+  button.title = providerName ? `${providerName} · ${displayModel}` : `模型：${displayModel}`;
+  button.setAttribute("aria-label", providerName
+    ? `模型：${displayModel}（${providerName}）`
+    : `模型：${displayModel}`);
+}
+
 function syncSessionRuntimeControlState() {
   const disabled = !state.session || selectedSessionIsRunning() || state.sessionRuntimeSaving;
   const providerID = state.session?.provider_id || state.workspace?.default_provider_id || "";
@@ -1931,11 +2051,14 @@ function syncSessionRuntimeControlState() {
 
 function syncSessionRuntimeControls({ loadModels = true } = {}) {
   const controls = $("sessionRuntimeControls");
+  const modelControl = $("modelControl");
   const session = state.session;
-  controls.classList.toggle("hidden", !session);
+  modelControl.classList.toggle("hidden", !session);
   if (!session) {
+    closeModelPopover();
     $("sessionProviderSelect").replaceChildren();
     $("sessionModelSelect").replaceChildren();
+    $("modelCapsuleValue").textContent = "—";
     syncSessionRuntimeControlState();
     return;
   }
@@ -1961,6 +2084,7 @@ function syncSessionRuntimeControls({ loadModels = true } = {}) {
   }
   const validModel = models.includes(model);
   modelSelect.value = validModel ? model : models[0] || "";
+  syncModelCapsule(providerID, modelSelect.value, catalog);
   syncSessionRuntimeControlState();
 
   if (loadModels && providerID && catalog === null && !state.providerModelErrors[providerID]) {
@@ -2037,22 +2161,39 @@ async function changeSessionModel(event) {
 }
 
 function renderWorkspaceOptions() {
-  const select = $("workspaceSelect");
-  select.replaceChildren();
-  for (const workspace of state.workspaces) {
-    select.add(new Option(workspace.name, workspace.id));
+  for (const select of [$("workspaceSelect"), $("workspaceManagementSelect")]) {
+    const selected = state.workspace?.id || select.value;
+    select.replaceChildren();
+    for (const workspace of state.workspaces) {
+      select.add(new Option(workspace.name, workspace.id));
+    }
+    if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+  }
+}
+
+function syncWorkspaceSelectorValues(workspaceID = state.workspace?.id || "") {
+  for (const select of [$("workspaceSelect"), $("workspaceManagementSelect")]) {
+    if ([...select.options].some((option) => option.value === workspaceID)) select.value = workspaceID;
   }
 }
 
 async function switchWorkspace(workspaceID) {
   if (state.running) {
-    $("workspaceSelect").value = state.workspace?.id || "";
+    syncWorkspaceSelectorValues();
     toast("Run 執行中，完成或取消後才能切換 Workspace");
     return;
   }
   const workspace = state.workspaces.find((item) => item.id === workspaceID);
-  if (!workspace || workspace.id === state.workspace?.id) return;
+  if (!workspace) {
+    syncWorkspaceSelectorValues();
+    return;
+  }
+  if (workspace.id === state.workspace?.id) {
+    syncWorkspaceSelectorValues(workspace.id);
+    return;
+  }
   state.workspace = workspace;
+  syncWorkspaceSelectorValues(workspace.id);
   sessionStorage.setItem("activeWorkspaceID", workspace.id);
   state.projects = [];
   state.sessions = [];
@@ -2091,21 +2232,22 @@ function clearSessionUI() {
   syncSessionRuntimeControls({ loadModels: false });
   syncPlanButton();
   renderContextUsage();
-  $("sessionPermission").classList.add("hidden");
   $("prompt").disabled = true;
   syncRunActionButton();
   $("messages").replaceChildren();
   $("messages").classList.add("hidden");
   $("emptyState").classList.remove("hidden");
   $("sessionSettings").classList.add("hidden");
-  $("noSessionManagement").classList.remove("hidden");
+  $("noSessionManagement").classList.add("hidden");
   refreshOpenProviderUsage();
 }
 
 function syncWorkspaceSettings() {
   const workspace = state.workspace;
   $("workspaceSettings").classList.toggle("hidden", !workspace);
+  $("noWorkspaceSettings").classList.toggle("hidden", Boolean(workspace));
   if (!workspace) return;
+  syncWorkspaceSelectorValues(workspace.id);
   renderProviderOptions();
   renderSessionProviderOptions();
   $("settingWorkspaceName").value = workspace.name || "";
@@ -2138,11 +2280,92 @@ async function selectSession(session) {
     renderNavigation();
     await Promise.all([loadMessages(), loadPlans(selected.id)]);
     if (selectionVersion !== state.sessionSelectionVersion) return;
+    await loadSessionRunState(selected.id);
+    if (selectionVersion !== state.sessionSelectionVersion) return;
     syncSelectedRunUI();
   } catch (error) {
     if (selectionVersion !== state.sessionSelectionVersion) return;
     toast(error.message);
   }
+}
+
+async function restoreWorkspaceRun() {
+  if (state.running || !state.workspace) return;
+  try {
+    const values = await request("/api/v1/runs?status=queued,running,paused,waiting_approval", { reconnects: 1 });
+    const sessions = new Map(state.sessions.map((session) => [session.id, session]));
+    const run = (Array.isArray(values) ? values : [])
+      .filter((value) => sessions.has(value.session_id))
+      .sort((left, right) => new Date(right.created_at) - new Date(left.created_at))[0];
+    if (run) await selectSession(sessions.get(run.session_id));
+  } catch (_) {
+    // 相容檢查已保護正式後端；這裡的失敗不能阻斷使用者瀏覽既有對話。
+  }
+}
+
+async function loadSessionRunState(sessionID) {
+  if (!sessionID || (state.running && state.runningSessionId !== sessionID)) return;
+  try {
+    const values = await request(`/api/v1/runs?session_id=${encodeURIComponent(sessionID)}`);
+    const runs = Array.isArray(values) ? values : [];
+    const active = runs.find((value) => ["queued", "running", "paused", "waiting_approval"].includes(value.status));
+    if (active && !state.running) {
+      attachExistingRun(active);
+      return;
+    }
+    if (state.running) return;
+    const retryable = runs.find((value) => ["failed", "canceled"].includes(value.status) && value.error?.retryable);
+    state.retryableRunId = retryable?.id || "";
+    state.retryableSessionId = retryable ? sessionID : "";
+    syncSelectedRunUI();
+  } catch (_) {
+    // 對話內容仍可讀取；Run 狀態下次切換或輪詢時再補查。
+  }
+}
+
+function attachExistingRun(run) {
+  if (!run?.id || state.running) return;
+  const sessionID = run.session_id;
+  state.running = true;
+  state.runningSessionId = sessionID;
+  state.currentRunId = run.id;
+  state.currentRunStatus = run.status || "running";
+  state.trackedRunId = run.id;
+  state.canceling = false;
+  state.runActivityText = run.status === "paused" ? "Run 已暫停" : "";
+  state.runDraft = {
+    sessionId: sessionID,
+    operationId: run.id,
+    messageId: "",
+    content: "",
+    reasoning: "",
+    internal: false,
+    processing: true,
+  };
+  if (run.pending_approval) showApproval(run.pending_approval, sessionID);
+  renderNavigation();
+  syncSelectedRunUI();
+  void runWithReconnect({ runId: run.id, sessionId: sessionID, lastSequence: 0 })
+    .catch((error) => {
+      if (state.trackedRunId === run.id) setRunActivity(`背景 Run 連線中斷：${error.message}`, sessionID);
+    })
+    .finally(async () => {
+      if (state.trackedRunId !== run.id) return;
+      state.trackedRunId = "";
+      state.running = false;
+      state.runningSessionId = "";
+      state.currentRunId = "";
+      state.currentRunStatus = "";
+      state.runActivityText = "";
+      state.runDraft = null;
+      state.liveMessage = null;
+      if ($("approvalDialog").open) $("approvalDialog").close();
+      syncSelectedRunUI();
+      renderNavigation();
+      if (state.session?.id === sessionID) await loadMessages().catch(() => {});
+      await loadSessions().catch(() => {});
+      if (state.promptQueue.some((item) => item.status === "pending")) void drainPromptQueue();
+    });
 }
 
 function syncSessionUI() {
@@ -2152,8 +2375,6 @@ function syncSessionUI() {
   const providerID = session.provider_id || state.workspace?.default_provider_id || "";
   const model = displayedModelForProvider(providerID, session.model);
   $("agentLabel").textContent = `${providerDisplayName(providerID) || providerID}${model ? ` · ${model}` : ""}`;
-  $("sessionPermission").textContent = session.permission_profile || "default";
-  $("sessionPermission").classList.remove("hidden");
   syncSessionRuntimeControls();
   syncPlanButton();
   const contextIdentity = activeContextIdentity(session);
@@ -2164,7 +2385,7 @@ function syncSessionUI() {
   renderContextCompactionState();
   void loadContextCapabilities(session.id);
   syncSelectedRunUI();
-  $("sessionSettings").classList.remove("hidden");
+  $("sessionSettings").classList.add("hidden");
   $("noSessionManagement").classList.add("hidden");
   $("settingTitle").value = session.title || "";
   renderProjectOptions();
@@ -3023,6 +3244,7 @@ function showActivity(text) {
   $("activityText").textContent = text;
   $("activity").classList.toggle("hidden", !text);
   const retryVisible = Boolean(state.retryableRunId)
+    && Boolean(text)
     && !state.running
     && (!state.retryableSessionId || state.retryableSessionId === state.session?.id);
   $("retryRun").classList.toggle("hidden", !retryVisible);
@@ -3139,7 +3361,8 @@ function syncSelectedRunUI() {
   }
   if ($("approvalDialog").open && state.pendingApprovalSessionId !== state.session?.id) $("approvalDialog").close();
   if (state.retryableRunId && (!state.retryableSessionId || state.retryableSessionId === state.session?.id)) {
-    showActivity("Run 已中斷，可用原始輸入建立重試");
+    // 可重試狀態保留供內部恢復流程使用，但不在對話區顯示重複的提示列。
+    showActivity("");
     return;
   }
   showActivity("");
@@ -3160,6 +3383,10 @@ function syncRunActionButton() {
   const stopButton = $("stopRun");
   stopButton.classList.toggle("hidden", !selectedRunning);
   stopButton.disabled = !selectedRunning || !state.currentRunId || state.canceling;
+  const pauseButton = $("pauseRun");
+  const resumeButton = $("resumeRun");
+  if (pauseButton) pauseButton.disabled = !selectedRunning || !state.currentRunId || state.canceling || !["queued", "running"].includes(state.currentRunStatus);
+  if (resumeButton) resumeButton.disabled = !selectedRunning || !state.currentRunId || state.canceling || state.currentRunStatus !== "paused";
   syncPlanButton();
   syncNativeConversationActivity();
 }
@@ -3330,6 +3557,106 @@ async function uploadPendingAttachments(sessionID, pending) {
   return (await response.json()).data || [];
 }
 
+function openPromptOutbox() {
+  if (!window.indexedDB) return Promise.reject(new Error("此瀏覽器不支援待送訊息持久化"));
+  if (outboxDatabasePromise) return outboxDatabasePromise;
+  outboxDatabasePromise = new Promise((resolve, reject) => {
+    const request = window.indexedDB.open("nr-intern-outbox", 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains("prompts")) request.result.createObjectStore("prompts", { keyPath: "id" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("無法開啟待送訊息儲存"));
+  });
+  return outboxDatabasePromise;
+}
+
+function outboxTransaction(mode, operation) {
+  return openPromptOutbox().then((database) => new Promise((resolve, reject) => {
+    const transaction = database.transaction("prompts", mode);
+    const store = transaction.objectStore("prompts");
+    let request;
+    try {
+      request = operation(store);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    let result;
+    if (request) {
+      request.onsuccess = () => { result = request.result; };
+      request.onerror = () => reject(request.error || new Error("待送訊息儲存失敗"));
+    }
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () => reject(transaction.error || new Error("待送訊息儲存失敗"));
+    transaction.onabort = () => reject(transaction.error || new Error("待送訊息儲存已中止"));
+  }));
+}
+
+function serializablePromptItem(item) {
+  return {
+    id: item.id,
+    sessionId: item.sessionId,
+    input: item.input,
+    idempotencyKey: item.idempotencyKey,
+    attachmentIds: Array.isArray(item.attachmentIds) ? [...item.attachmentIds] : [],
+    attachments: (item.attachments || []).map((attachment) => ({
+      key: attachment.key,
+      name: attachment.name,
+      file: attachment.file,
+    })),
+    status: item.status || "pending",
+    runId: item.runId || "",
+    lastSequence: Number(item.lastSequence || 0),
+    error: item.error || "",
+    createdAt: item.createdAt || new Date().toISOString(),
+  };
+}
+
+async function savePromptOutboxItem(item) {
+  if (!state.outboxAvailable) return;
+  try {
+    await outboxTransaction("readwrite", (store) => store.put(serializablePromptItem(item)));
+  } catch (error) {
+    state.outboxAvailable = false;
+    throw new Error(`待送訊息無法保存：${error.message}`);
+  }
+}
+
+async function deletePromptOutboxItem(id) {
+  if (!state.outboxAvailable) return;
+  try {
+    await outboxTransaction("readwrite", (store) => store.delete(id));
+  } catch (error) {
+    state.outboxAvailable = false;
+    throw new Error(`待送訊息無法移除：${error.message}`);
+  }
+}
+
+async function loadPromptOutbox() {
+  try {
+    const items = await outboxTransaction("readonly", (store) => store.getAll());
+    state.promptQueue = (Array.isArray(items) ? items : [])
+      .map((item) => ({
+        ...item,
+        status: item.status === "sending" ? "pending" : (item.status || "pending"),
+        attachments: Array.isArray(item.attachments) ? item.attachments : [],
+        attachmentIds: Array.isArray(item.attachmentIds) ? item.attachmentIds : [],
+      }))
+      .sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+    for (const item of state.promptQueue) {
+      if (item.status === "pending") await savePromptOutboxItem(item);
+    }
+  } catch (error) {
+    state.outboxAvailable = false;
+    toast(`待送訊息無法恢復：${error.message}`);
+  } finally {
+    state.outboxLoaded = true;
+    renderPromptQueue();
+    if (state.backendHealthy) void drainPromptQueue();
+  }
+}
+
 function dataTransferHasFiles(dataTransfer) {
   return [...(dataTransfer?.types || [])].includes("Files") || (dataTransfer?.files?.length || 0) > 0;
 }
@@ -3339,13 +3666,16 @@ function renderPromptQueue() {
   if (!tray) return;
   tray.replaceChildren();
   const sessionID = state.session?.id || "";
-  const queued = state.promptQueue.filter((item) => item.sessionId === sessionID);
+  // 執行中的輸入已經顯示在對話區；只保留真正等待送出或需要重試的項目，
+  // 避免同一段文字同時出現在使用者訊息與輸入框佇列中。
+  const queued = state.promptQueue.filter((item) => item.sessionId === sessionID && item.status !== "sending");
   for (const [index, item] of queued.entries()) {
     const row = document.createElement("div");
     row.className = "queued-prompt";
     const status = document.createElement("span");
     status.className = "queued-prompt-status";
-    status.textContent = `排隊 ${index + 1}`;
+    status.textContent = item.status === "failed" ? "需要重試" : item.status === "sending" ? "傳送中" : `排隊 ${index + 1}`;
+    status.classList.toggle("error", item.status === "failed");
     const content = document.createElement("span");
     content.className = "queued-prompt-content";
     const attachmentCount = item.attachments.length;
@@ -3357,22 +3687,56 @@ function renderPromptQueue() {
     remove.textContent = "×";
     remove.title = "移除待送訊息";
     remove.setAttribute("aria-label", `移除排隊中的第 ${index + 1} 則訊息`);
-    remove.addEventListener("click", () => removeQueuedPrompt(item.id));
-    row.append(status, content, remove);
+    remove.disabled = item.status === "sending";
+    remove.addEventListener("click", () => { void removeQueuedPrompt(item.id); });
+    if (item.status === "failed") {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "retry-queued-prompt";
+      retry.textContent = "↻";
+      retry.title = "重試待送訊息";
+      retry.setAttribute("aria-label", "重試待送訊息");
+      retry.addEventListener("click", () => { void retryQueuedPrompt(item.id); });
+      row.append(status, content, retry, remove);
+    } else {
+      row.append(status, content, remove);
+    }
     tray.append(row);
   }
   tray.classList.toggle("hidden", queued.length === 0);
   syncNativeConversationActivity();
 }
 
-function removeQueuedPrompt(queueID) {
-  state.promptQueue = state.promptQueue.filter((item) => item.id !== queueID);
+async function removeQueuedPrompt(queueID) {
+  const item = state.promptQueue.find((value) => value.id === queueID);
+  if (!item || item.status === "sending") return;
+  state.promptQueue = state.promptQueue.filter((value) => value.id !== queueID);
+  try {
+    await deletePromptOutboxItem(queueID);
+  } catch (error) {
+    state.promptQueue.push(item);
+    state.promptQueue.sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+    toast(error.message);
+  }
   renderPromptQueue();
 }
 
-function clearPromptQueue() {
+function clearPromptQueue({ persist = false } = {}) {
   state.promptQueue = [];
   if ($("promptQueue")) renderPromptQueue();
+  if (persist && state.outboxAvailable) {
+    void outboxTransaction("readwrite", (store) => store.clear()).catch((error) => toast(`清除待送訊息失敗：${error.message}`));
+  }
+}
+
+async function retryQueuedPrompt(queueID) {
+  const item = state.promptQueue.find((value) => value.id === queueID);
+  if (!item || item.status !== "failed") return;
+  item.status = "pending";
+  item.error = "";
+  await savePromptOutboxItem(item).catch((error) => toast(error.message));
+  renderPromptQueue();
+  void drainPromptQueue();
 }
 
 async function sendPrompt(event) {
@@ -3386,12 +3750,26 @@ async function sendPrompt(event) {
   }
   if (!input) input = "請檢視附件。";
   const queued = state.running || state.promptQueue.length > 0;
-  state.promptQueue.push({
+  const item = {
     id: crypto.randomUUID(),
     sessionId: state.session.id,
     input,
     attachments: pending,
-  });
+    attachmentIds: [],
+    idempotencyKey: crypto.randomUUID(),
+    status: "pending",
+    runId: "",
+    lastSequence: 0,
+    error: "",
+    createdAt: new Date().toISOString(),
+  };
+  try {
+    await savePromptOutboxItem(item);
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  state.promptQueue.push(item);
   $("prompt").value = "";
   if (pending.length) clearPendingAttachments();
   renderPromptQueue();
@@ -3401,16 +3779,20 @@ async function sendPrompt(event) {
 }
 
 async function drainPromptQueue() {
-  if (state.queueDraining || state.running) return;
+  if (!state.outboxLoaded || state.queueDraining || state.running || !state.backendHealthy) return;
   state.queueDraining = true;
   let finishedSessionID = "";
   try {
     while (true) {
-      while (state.promptQueue.length > 0) {
-        const item = state.promptQueue.shift();
+      while (state.promptQueue.length > 0 && !state.running) {
+        const item = state.promptQueue.find((value) => value.status === "pending");
+        if (!item) break;
         finishedSessionID = item.sessionId;
+        const completed = await executePrompt(item);
+        if (!completed) break;
+        state.promptQueue = state.promptQueue.filter((value) => value.id !== item.id);
+        await deletePromptOutboxItem(item.id).catch((error) => toast(error.message));
         renderPromptQueue();
-        await executePrompt(item);
       }
       if (finishedSessionID) {
         const refreshSessionID = finishedSessionID;
@@ -3433,11 +3815,23 @@ async function executePrompt(item) {
   const sessionID = item.sessionId;
   const input = item.input;
   const pending = item.attachments;
+  item.status = "sending";
+  item.error = "";
+  try {
+    await savePromptOutboxItem(item);
+  } catch (error) {
+    item.status = "failed";
+    item.error = error.message;
+    renderPromptQueue();
+    toast(error.message);
+    return false;
+  }
   state.running = true;
   state.runningSessionId = sessionID;
 	state.runActivityText = "";
   state.canceling = false;
   state.currentRunId = "";
+  state.currentRunStatus = "";
   state.retryableRunId = "";
   state.retryableSessionId = "";
   state.pendingApproval = null;
@@ -3453,12 +3847,20 @@ async function executePrompt(item) {
   };
   $("newProject").disabled = true;
   $("newWorkspace").disabled = true;
+  $("newManagementWorkspace").disabled = true;
   $("workspaceSelect").disabled = true;
   $("emptyState").classList.add("hidden");
   $("messages").classList.remove("hidden");
   renderNavigation();
   try {
-    const attachments = await uploadPendingAttachments(sessionID, pending);
+    const attachments = item.attachmentIds.length > 0
+      ? item.attachmentIds.map((id) => ({ id }))
+      : await uploadPendingAttachments(sessionID, pending);
+    if (item.attachmentIds.length === 0) {
+      item.attachmentIds = attachments.map((attachment) => attachment.id);
+      item.attachments = [];
+      await savePromptOutboxItem(item);
+    }
     if (state.session?.id === sessionID) {
       appendMessage({ role: "user", content: input, metadata: { attachments }, id: `local-${Date.now()}` });
       // 使用者問題必須先進入 DOM，接著才建立本輪 assistant placeholder；
@@ -3472,11 +3874,27 @@ async function executePrompt(item) {
     await runWithReconnect({
       sessionId: sessionID,
       input,
-      attachmentIds: attachments.map((attachment) => attachment.id),
-      idempotencyKey: crypto.randomUUID(),
+      attachmentIds: item.attachmentIds,
+      idempotencyKey: item.idempotencyKey,
+      runId: item.runId,
+      lastSequence: item.lastSequence,
+      onRunIdentified: async (runID, lastSequence) => {
+        item.runId = runID;
+        item.lastSequence = lastSequence;
+        await savePromptOutboxItem(item);
+      },
+      onSequence: async (sequence) => {
+        item.lastSequence = sequence;
+        await savePromptOutboxItem(item);
+      },
     });
+    return true;
   } catch (error) {
+    item.status = "failed";
+    item.error = error.message;
+    await savePromptOutboxItem(item).catch(() => {});
     toast(error.message);
+    return false;
   } finally {
     if (state.currentRunId) state.runStartedAt.delete(state.currentRunId);
     setContextCompactionState(sessionID, false);
@@ -3485,6 +3903,7 @@ async function executePrompt(item) {
     state.runActivityText = "";
     state.canceling = false;
     state.currentRunId = "";
+    state.currentRunStatus = "";
     setAgentProcessing(state.liveMessage, false);
     state.liveMessage = null;
     state.runDraft = null;
@@ -3495,6 +3914,7 @@ async function executePrompt(item) {
     $("newProject").disabled = !state.backendHealthy || !state.workspace;
     $("newSchedule").disabled = !state.backendHealthy || !state.workspace;
     $("newWorkspace").disabled = !state.backendHealthy;
+    $("newManagementWorkspace").disabled = !state.backendHealthy;
     $("workspaceSelect").disabled = !state.backendHealthy;
     renderNavigation();
   }
@@ -3502,7 +3922,7 @@ async function executePrompt(item) {
 
 async function runWithReconnect(task) {
   const sessionID = task.sessionId || state.runningSessionId;
-  const progress = { runId: task.runId || "", lastSequence: 0, terminal: false };
+  const progress = { runId: task.runId || "", lastSequence: Number(task.lastSequence || 0), terminal: false };
   let reconnects = 0;
   while (!progress.terminal) {
     try {
@@ -3510,9 +3930,12 @@ async function runWithReconnect(task) {
       progress.runId = response.headers.get("X-Run-ID") || progress.runId;
       if (!progress.runId) throw new Error("後端未回傳 Run ID，無法安全重連");
       state.currentRunId = progress.runId;
+      if (typeof task.onRunIdentified === "function") await task.onRunIdentified(progress.runId, progress.lastSequence);
+      if (!state.currentRunStatus) state.currentRunStatus = "running";
       syncRunActionButton();
 			setRunActivity("", sessionID);
       await consumeEvents(response.body, progress, sessionID);
+      if (typeof task.onSequence === "function") await task.onSequence(progress.lastSequence);
       if (progress.terminal) return;
       const run = await request(`/api/v1/runs/${encodeURIComponent(progress.runId)}`);
       if (["completed", "failed", "canceled"].includes(run.status)) {
@@ -3619,11 +4042,21 @@ function handleEvent(event, sessionID) {
 	if (visible && event.type === "plan.completion_check") loadPlans(sessionID).catch(() => {});
 	const operationID = String(event.run_id || state.currentRunId || "");
 	if (event.type === "run.started" && operationID && !state.runStartedAt.has(operationID)) {
+		state.currentRunStatus = "running";
 	  const startedAt = Date.parse(event.created_at);
 	  state.runStartedAt.set(operationID, Number.isFinite(startedAt) ? startedAt : Date.now());
 	  const draft = ensureRunDraft(sessionID, operationID);
 	  draft.processing = true;
 	  if (visible) renderSelectedRunDraft();
+	}
+	if (event.type === "run.paused") {
+		state.currentRunStatus = "paused";
+		setRunActivity("Run 已暫停", sessionID);
+		syncRunActionButton();
+	} else if (event.type === "run.resumed") {
+		state.currentRunStatus = "running";
+		setRunActivity("", sessionID);
+		syncRunActionButton();
 	}
 	if (event.type === "message.start" && payload.message?.role === "assistant") {
     const message = normalizeAssistantThinking(payload.message);
@@ -3807,6 +4240,7 @@ async function retryCurrentRun() {
     state.runActivityText = "";
     state.canceling = false;
     state.currentRunId = "";
+    state.currentRunStatus = "";
     setAgentProcessing(state.liveMessage, false);
     state.liveMessage = null;
     state.runDraft = null;
@@ -3876,6 +4310,22 @@ async function cancelCurrentRun() {
     syncRunActionButton();
     toast(error.message);
   }
+}
+
+async function pauseCurrentRun() {
+  if (!state.currentRunId || state.currentRunStatus === "paused") return;
+  try {
+    await request("/api/v1/runs/" + encodeURIComponent(state.currentRunId) + "/pause", { method: "POST", body: "{}" });
+    state.currentRunStatus = "paused"; setRunActivity("Run 已暫停", state.runningSessionId); syncRunActionButton();
+  } catch (error) { toast(error.message); }
+}
+
+async function resumeCurrentRun() {
+  if (!state.currentRunId || state.currentRunStatus !== "paused") return;
+  try {
+    await request("/api/v1/runs/" + encodeURIComponent(state.currentRunId) + "/resume", { method: "POST", body: "{}" });
+    state.currentRunStatus = "running"; setRunActivity("", state.runningSessionId); syncRunActionButton();
+  } catch (error) { toast(error.message); }
 }
 
 function findMessage(id) {
@@ -4478,7 +4928,7 @@ async function createWorkspace(event) {
     state.workspaces = await request("/api/v1/workspaces");
     renderWorkspaceOptions();
     await switchWorkspace(workspace.id);
-    $("workspaceSelect").value = workspace.id;
+    syncWorkspaceSelectorValues(workspace.id);
   } catch (error) {
     toast(error.message);
   }
@@ -4505,7 +4955,7 @@ async function saveWorkspaceSettings(event) {
     state.workspace = updated;
     state.workspaces = state.workspaces.map((item) => item.id === updated.id ? updated : item);
     renderWorkspaceOptions();
-    $("workspaceSelect").value = updated.id;
+    syncWorkspaceSelectorValues(updated.id);
     syncWorkspaceSettings();
     $("workspaceSettingsState").textContent = "已儲存";
   } catch (error) {
@@ -4541,6 +4991,7 @@ async function saveServiceSettings(event) {
       body: JSON.stringify({
         service_name: serviceName,
         ui_language: uiLanguage,
+        notifications_enabled: $("settingNotificationsEnabled").checked,
         max_wall_clock_seconds: wallClockMinutes * 60,
         max_tokens: maxTokens,
         max_tool_calls: maxToolCalls,
@@ -4680,12 +5131,21 @@ async function activatePanel(name) {
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
   }
-  for (const value of ["overview", "providers", "mcp", "reverseProxy", "tools", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
-  if (name === "overview") await loadDiagnostics();
+  for (const value of ["overview", "workspace", "systemTools", "providers", "mcp", "reverseProxy", "tools", "permissions", "about", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
+  if (name === "workspace") {
+    renderWorkspaceOptions();
+    syncWorkspaceSettings();
+  }
+  if (name === "systemTools") await loadDiagnostics();
   if (name === "providers") await loadProviderSettings();
   if (name === "mcp") await loadMCPSettings();
   if (name === "reverseProxy") await loadReverseProxyStatus({ hydrate: !state.reverseProxyHydrated });
   if (name === "tools") await loadTools();
+  if (name === "permissions") await loadPermissionCenter();
+  if (name === "about") {
+    renderAboutVersionInfo();
+    renderUpdateStatus();
+  }
   if (name === "audit") await loadAudit(true);
 }
 
@@ -4741,6 +5201,229 @@ function appendSummary(container, term, description) {
   dt.textContent = term;
   dd.textContent = description;
   container.append(dt, dd);
+}
+
+async function loadNotifications() {
+  if (!notificationCenterEnabled()) {
+    state.notifications = [];
+    renderNotifications();
+    return;
+  }
+  try {
+    state.notifications = await request("/api/v1/notifications?limit=80");
+    renderNotifications();
+  } catch (_) {
+    // 通知中心不可用不應阻斷主要對話介面。
+  }
+}
+
+function closeNotificationPopover() {
+  $("notificationPopover")?.classList.add("hidden");
+  $("notificationButton")?.setAttribute("aria-expanded", "false");
+}
+
+function toggleNotificationPopover() {
+  const popover = $("notificationPopover");
+  if (!popover || !notificationCenterEnabled()) return;
+  const open = popover.classList.toggle("hidden");
+  $("notificationButton").setAttribute("aria-expanded", String(!open));
+  if (!open) void loadNotifications();
+}
+
+function renderNotifications() {
+  const values = notificationCenterEnabled() && Array.isArray(state.notifications) ? state.notifications : [];
+  const unread = values.filter((item) => !item.read).length;
+  const badge = $("notificationBadge");
+  badge.textContent = unread > 99 ? "99+" : String(unread);
+  badge.classList.toggle("hidden", unread === 0);
+  const list = $("notificationList");
+  if (!list) return;
+  list.replaceChildren();
+  if (!values.length) {
+    const empty = document.createElement("p");
+    empty.className = "quiet";
+    empty.textContent = "目前沒有通知。";
+    list.append(empty);
+    return;
+  }
+  for (const item of values) {
+    const article = document.createElement("article");
+    article.className = "notification-item" + (item.read ? " is-read" : "");
+    const head = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = item.title || "通知";
+    const time = document.createElement("time");
+    time.textContent = item.created_at ? new Date(item.created_at).toLocaleString() : "";
+    head.append(title, time);
+    const message = document.createElement("p");
+    message.textContent = item.message || "";
+    article.append(head, message);
+    if (!item.read) {
+      const mark = document.createElement("button");
+      mark.className = "small ghost";
+      mark.type = "button";
+      mark.textContent = "標為已讀";
+      mark.addEventListener("click", async () => {
+        try { await request("/api/v1/notifications/" + encodeURIComponent(item.id) + "/read", { method: "POST", body: "{}" }); await loadNotifications(); } catch (error) { toast(error.message); }
+      });
+      article.append(mark);
+    }
+		if (item.type === "system.update_available" && item.metadata?.release_url) {
+			const release = document.createElement("button");
+			release.className = "small ghost";
+			release.type = "button";
+			release.textContent = "查看 Release";
+			release.addEventListener("click", () => void openResource({ kind: "url", target: item.metadata.release_url }, "open"));
+			article.append(release);
+		}
+    list.append(article);
+  }
+}
+
+async function loadGlobalSearch() {
+  const query = $("globalSearchInput").value.trim();
+  if (!query) { $("globalSearchPopover").classList.add("hidden"); return; }
+  try {
+    state.globalSearchResults = await request("/api/v1/search?q=" + encodeURIComponent(query) + "&limit=30");
+    renderGlobalSearchResults();
+  } catch (error) { toast(error.message); }
+}
+
+function renderGlobalSearchResults() {
+  const popover = $("globalSearchPopover");
+  const list = $("globalSearchResults");
+  list.replaceChildren();
+  popover.classList.remove("hidden");
+  const values = Array.isArray(state.globalSearchResults) ? state.globalSearchResults : [];
+  if (!values.length) { const empty = document.createElement("p"); empty.className = "quiet"; empty.textContent = "找不到符合的內容。"; list.append(empty); return; }
+  for (const item of values) {
+    const button = document.createElement("button");
+    button.className = "global-search-result";
+    button.type = "button";
+    const title = document.createElement("strong"); title.textContent = item.title || item.kind;
+    const kind = document.createElement("small"); kind.textContent = item.kind;
+    const snippet = document.createElement("span"); snippet.textContent = item.snippet || "";
+    button.append(title, kind, snippet);
+    button.addEventListener("click", () => {
+      popover.classList.add("hidden");
+      if (item.session_id) void selectSession({ id: item.session_id });
+    });
+    list.append(button);
+  }
+}
+
+async function downloadAdminFile(path, filename) {
+  try {
+    const response = await fetch("/backend" + path);
+    if (!response.ok) throw new Error(response.statusText);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a"); link.href = url; link.download = filename; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) { toast(error.message); }
+}
+
+async function loadUpdateStatus() {
+	try {
+		state.updateStatus = await request("/api/v1/admin/update");
+		renderUpdateStatus();
+	} catch (_) {
+		// 更新檢查不可用時不應影響對話與其他管理功能。
+	}
+}
+
+function renderUpdateStatus() {
+	const status = state.updateStatus;
+	const label = $("updateStatus");
+	const releaseButton = $("openLatestRelease");
+	if (!label || !releaseButton) return;
+	renderAboutVersionInfo();
+	if (!status?.checked_at) {
+		label.textContent = "尚未檢查更新。";
+		releaseButton.classList.add("hidden");
+		return;
+	}
+	if (status.check_error) {
+		label.textContent = status.check_error + "，稍後可再試。";
+		releaseButton.classList.add("hidden");
+		return;
+	}
+	if (status.available) {
+		label.textContent = `有新版本 ${status.latest_version}（目前 ${status.current_version}）。`;
+		releaseButton.classList.toggle("hidden", !status.release_url);
+		return;
+	}
+	label.textContent = `目前已是最新版本（${status.current_version || "—"}）。`;
+	releaseButton.classList.add("hidden");
+}
+
+function renderAboutVersionInfo() {
+  const summary = $("aboutVersionSummary");
+  if (!summary) return;
+  const update = state.updateStatus || {};
+  const backend = state.backendStatus || {};
+  summary.replaceChildren();
+  appendSummary(summary, "目前版本", update.current_version || backend.version || state.agent?.version || "—");
+  appendSummary(summary, "後端 API", backend.api_version || "—");
+  appendSummary(summary, "事件格式", backend.event_schema_version || "—");
+  appendSummary(summary, "通知中心", notificationCenterEnabled() ? "已啟用" : "已關閉");
+}
+
+async function checkForUpdates() {
+	const button = $("checkForUpdates");
+	if (button) {
+		button.disabled = true;
+		button.textContent = "檢查中…";
+	}
+	try {
+		state.updateStatus = await request("/api/v1/admin/update/check", { method: "POST", body: "{}" });
+		renderUpdateStatus();
+		await loadNotifications();
+		toast(state.updateStatus?.available ? `發現新版本 ${state.updateStatus.latest_version}` : "目前已是最新版本");
+	} catch (error) {
+		toast(error.message);
+	} finally {
+		if (button) {
+			button.disabled = false;
+			button.textContent = "檢查更新";
+		}
+	}
+}
+
+async function restoreAdminBackup(file) {
+  if (!file || !(await confirmAction("確定還原備份嗎？目前資料會先保留一份備份，還原後必須重新啟動後端。"))) return;
+  const form = new FormData(); form.append("file", file);
+  try {
+    $("adminDataState").textContent = "還原中…";
+    const response = await fetch("/backend/api/v1/admin/restore", { method: "POST", body: form });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || response.statusText);
+    $("adminDataState").textContent = "還原完成，請重新啟動後端";
+    toast("備份已還原；請重新啟動後端套用資料");
+  } catch (error) { $("adminDataState").textContent = "還原失敗"; toast(error.message); }
+}
+
+async function loadPermissionCenter() {
+  try {
+    const value = await request("/api/v1/admin/permissions");
+    appendPermissionSummary(value);
+    const list = $("permissionToolList"); list.replaceChildren();
+    for (const item of value.tools || []) {
+      const article = document.createElement("article"); article.className = "tool-item" + (item.available ? "" : " unavailable");
+      const head = document.createElement("div"); const name = document.createElement("strong"); name.textContent = item.name;
+      const badge = document.createElement("span"); badge.className = "tool-status"; badge.textContent = item.permission === "elevated" ? "信任權限" : "標準權限"; head.append(name, badge);
+      const detail = document.createElement("p"); detail.textContent = (item.read_only ? "唯讀" : "可修改") + (item.available ? " · 目前可用" : " · 目前不可用"); article.append(head, detail); list.append(article);
+    }
+  } catch (error) { toast(error.message); }
+}
+
+function appendPermissionSummary(value) {
+  const summary = $("permissionSummary"); summary.replaceChildren();
+  const policy = value.policy || {};
+  appendSummary(summary, "預設 Profile", policy.default_profile || "default");
+  appendSummary(summary, "允許 Client 選擇", policy.allow_client_choice ? "是" : "否");
+  appendSummary(summary, "Elevated Profiles", (policy.elevated_profiles || []).join(", ") || "無");
+  appendSummary(summary, "待人工核准 Run", value.waiting_approval_runs || 0);
 }
 
 async function loadProviderSettings(preferredID = state.selectedProviderSettingsID) {
@@ -5788,10 +6471,19 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function initializeApplication() {
+  await loadPromptOutbox();
+  await refreshBackend();
+}
+
 $("startBackend").addEventListener("click", () => controlBackend("start"));
 $("restartBackend").addEventListener("click", () => controlBackend("restart"));
 $("stopBackend").addEventListener("click", () => controlBackend("stop"));
 $("displayMode").addEventListener("change", (event) => applyDisplayMode(event.target.value));
+$("modelControlButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleModelPopover();
+});
 $("openPlan").addEventListener("click", openPlanDialog);
 $("closePlan").addEventListener("click", () => $("planDialog").close());
 $("activePlanTab").addEventListener("click", () => selectPlanTab("active"));
@@ -5812,7 +6504,8 @@ $("addPlanStep").addEventListener("click", () => addPlanStepEditorRow());
 $("cancelPlanEdit").addEventListener("click", cancelPlanEdit);
 $("planForm").addEventListener("submit", savePlan);
 $("workspaceSelect").addEventListener("change", (event) => switchWorkspace(event.target.value));
-$("newWorkspace").addEventListener("click", async () => {
+$("workspaceManagementSelect").addEventListener("change", (event) => switchWorkspace(event.target.value));
+async function openNewWorkspaceDialog() {
   renderProviderOptions();
   const provider = selectableProviders()[0];
   if (provider) {
@@ -5821,7 +6514,9 @@ $("newWorkspace").addEventListener("click", async () => {
     $("newWorkspaceModel").value = displayedModelForProvider(provider.id);
   }
   $("workspaceDialog").showModal();
-});
+}
+$("newWorkspace").addEventListener("click", openNewWorkspaceDialog);
+$("newManagementWorkspace").addEventListener("click", openNewWorkspaceDialog);
 $("cancelWorkspace").addEventListener("click", () => $("workspaceDialog").close());
 $("workspaceForm").addEventListener("submit", createWorkspace);
 $("workspaceSettings").addEventListener("submit", saveWorkspaceSettings);
@@ -6097,6 +6792,18 @@ $("providerUsageButton").addEventListener("click", (event) => {
   event.stopPropagation();
   toggleProviderUsagePopover();
 });
+$("notificationButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleNotificationPopover();
+});
+$("markAllNotificationsRead").addEventListener("click", async () => {
+  try { await request("/api/v1/notifications/read-all", { method: "POST", body: "{}" }); await loadNotifications(); } catch (error) { toast(error.message); }
+});
+$("clearReadNotifications").addEventListener("click", async () => {
+  try { await request("/api/v1/notifications/read", { method: "DELETE" }); await loadNotifications(); } catch (error) { toast(error.message); }
+});
+$("globalSearchButton").addEventListener("click", () => void loadGlobalSearch());
+$("globalSearchInput").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void loadGlobalSearch(); } });
 $("contextUsageButton").addEventListener("click", (event) => {
   event.stopPropagation();
   toggleContextUsagePopover();
@@ -6104,6 +6811,21 @@ $("contextUsageButton").addEventListener("click", (event) => {
 $("closeManagement").addEventListener("click", closeManagement);
 for (const button of document.querySelectorAll(".panel-tab")) button.addEventListener("click", () => activatePanel(button.dataset.panel));
 $("refreshDiagnostics").addEventListener("click", loadDiagnostics);
+$("exportDiagnostics").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/diagnostics/export", "nr-intern-diagnostics.json"));
+$("downloadBackup").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/backup", "nr-intern-backup.zip"));
+$("checkForUpdates").addEventListener("click", () => void checkForUpdates());
+$("openLatestRelease").addEventListener("click", () => {
+	if (state.updateStatus?.release_url) void openResource({ kind: "url", target: state.updateStatus.release_url }, "open");
+});
+$("restoreBackup").addEventListener("click", () => $("restoreBackupFile").click());
+$("restoreBackupFile").addEventListener("change", (event) => { void restoreAdminBackup(event.target.files?.[0]); event.target.value = ""; });
+$("pauseRun").addEventListener("click", () => void pauseCurrentRun());
+$("resumeRun").addEventListener("click", () => void resumeCurrentRun());
+$("cancelAllRuns").addEventListener("click", async () => {
+  if (!(await confirmAction("確定取消所有排隊中與執行中的 Run 嗎？"))) return;
+  try { const value = await request("/api/v1/runs/cancel-all", { method: "POST", body: "{}" }); toast("已送出取消 " + (value.accepted || 0) + " 個 Run 的要求"); } catch (error) { toast(error.message); }
+});
+$("refreshPermissions").addEventListener("click", loadPermissionCenter);
 $("addProviderSetting").addEventListener("click", () => {
   state.providerSettingsDraft = newProviderSetting();
   state.selectedProviderSettingsID = "";
@@ -6224,6 +6946,9 @@ document.addEventListener("pointerdown", (event) => {
   if (!$("sessionContextMenu").contains(event.target)) closeSessionContextMenu();
   if (!$("resourceContextMenu").contains(event.target)) closeResourceContextMenu();
   if (!$("providerUsagePopover").contains(event.target) && !$("providerUsageButton").contains(event.target)) closeProviderUsagePopover();
+  if (!$("notificationPopover").contains(event.target) && !$("notificationButton").contains(event.target)) closeNotificationPopover();
+  if (!$("sessionRuntimeControls").contains(event.target) && !$("modelControlButton").contains(event.target)) closeModelPopover();
+  if (!$("globalSearchPopover").contains(event.target) && !$("globalSearchInput").contains(event.target) && !$("globalSearchButton").contains(event.target)) $("globalSearchPopover").classList.add("hidden");
   if (!$("contextUsagePopover").contains(event.target) && !$("contextUsageButton").contains(event.target)) closeContextUsagePopover();
   if (!$("screenCaptureMenu").contains(event.target) && !$("screenCaptureOptions").contains(event.target)) closeScreenCaptureMenu();
   if (!$("imageEditorColorPalette").contains(event.target) && !$("imageEditorColorButton").contains(event.target)) closeImageEditorColorPalette();
@@ -6250,6 +6975,9 @@ document.addEventListener("keydown", (event) => {
   closeSessionContextMenu();
   closeResourceContextMenu();
   closeProviderUsagePopover();
+  closeNotificationPopover();
+  closeModelPopover();
+  $("globalSearchPopover").classList.add("hidden");
   closeScreenCaptureMenu();
   closeImageEditorColorPalette();
 });
@@ -6257,17 +6985,21 @@ document.addEventListener("scroll", () => {
   closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
+  closeModelPopover();
 }, true);
 window.addEventListener("resize", () => {
   closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
+  closeModelPopover();
 });
 window.addEventListener("blur", () => {
   closeProjectContextMenu();
   closeSessionContextMenu();
   closeResourceContextMenu();
   closeProviderUsagePopover();
+  closeNotificationPopover();
+  closeModelPopover();
 });
 window.addEventListener("nr-intern-language-change", () => {
   refreshOpenProviderUsage();
@@ -6278,11 +7010,14 @@ window.addEventListener("nr-intern-language-change", () => {
 setInterval(() => {
   if (state.backendHealthy && state.workspace && !$("scheduleDialog").open) void loadSchedules();
 }, scheduleRefreshIntervalMilliseconds);
+setInterval(() => {
+  if (state.backendHealthy && notificationCenterEnabled()) void loadNotifications();
+}, 30_000);
 
 installDialogDragGuards();
 renderSchedules();
 notifyNativeStartupReady();
-refreshBackend();
+void initializeApplication();
 setInterval(updateLiveReasoningDurations, 1000);
 setInterval(refreshOpenProviderUsage, providerUsageUIRefreshIntervalMilliseconds);
 setInterval(refreshReverseProxyInBackground, reverseProxyRefreshIntervalMilliseconds);

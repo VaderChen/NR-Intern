@@ -12,11 +12,12 @@ import (
 const serviceSettingsFilename = "service-settings.json"
 
 type storedServiceSettings struct {
-	ServiceName         string `json:"service_name"`
-	UILanguage          string `json:"ui_language,omitempty"`
-	MaxWallClockSeconds *int   `json:"max_wall_clock_seconds,omitempty"`
-	MaxTokens           *int   `json:"max_tokens,omitempty"`
-	MaxToolCalls        *int   `json:"max_tool_calls,omitempty"`
+	ServiceName          string `json:"service_name"`
+	UILanguage           string `json:"ui_language,omitempty"`
+	NotificationsEnabled *bool  `json:"notifications_enabled,omitempty"`
+	MaxWallClockSeconds  *int   `json:"max_wall_clock_seconds,omitempty"`
+	MaxTokens            *int   `json:"max_tokens,omitempty"`
+	MaxToolCalls         *int   `json:"max_tool_calls,omitempty"`
 	// 指標型別讓「設定檔提供、管理介面沒動過」與「管理介面明確關閉」可以區分。
 	HTTPFetchEnabled              *bool `json:"http_fetch_enabled,omitempty"`
 	HTTPFetchAllowPrivateNetworks *bool `json:"http_fetch_allow_private_networks,omitempty"`
@@ -51,6 +52,9 @@ func loadPersistedServiceSettings(config *Config) error {
 	if stored.UILanguage != "" {
 		config.UILanguage = stored.UILanguage
 	}
+	if stored.NotificationsEnabled != nil {
+		config.NotificationsEnabled = *stored.NotificationsEnabled
+	}
 	if stored.MaxWallClockSeconds != nil {
 		config.MaxWallClockSeconds = *stored.MaxWallClockSeconds
 	}
@@ -74,11 +78,12 @@ func persistServiceSettings(dataDir string, settings domain.ServiceSettings) err
 		return fmt.Errorf("create service settings directory: %w", err)
 	}
 	data, err := json.MarshalIndent(storedServiceSettings{
-		ServiceName:         settings.ServiceName,
-		UILanguage:          settings.UILanguage,
-		MaxWallClockSeconds: intPointer(settings.MaxWallClockSeconds),
-		MaxTokens:           intPointer(settings.MaxTokens),
-		MaxToolCalls:        intPointer(settings.MaxToolCalls),
+		ServiceName:          settings.ServiceName,
+		UILanguage:           settings.UILanguage,
+		NotificationsEnabled: boolPointer(settings.NotificationsEnabled),
+		MaxWallClockSeconds:  intPointer(settings.MaxWallClockSeconds),
+		MaxTokens:            intPointer(settings.MaxTokens),
+		MaxToolCalls:         intPointer(settings.MaxToolCalls),
 
 		HTTPFetchEnabled:              boolPointer(settings.HTTPFetch.Enabled),
 		HTTPFetchAllowPrivateNetworks: boolPointer(settings.HTTPFetch.AllowPrivateNetworks),

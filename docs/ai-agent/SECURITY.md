@@ -23,7 +23,7 @@
 `http_fetch` 的限制如下：
 
 - 工具必須同時通過 allowlist、elevated permission profile、單次人工 Approval，以及 `ServiceSettings.http_fetch.enabled` 開關；管理介面關閉後工具立即從模型的工具清單消失，不需重啟後端。
-- 私有網段預設拒絕：loopback、RFC1918、link-local（含 `169.254.169.254` 這類雲端 metadata 位址）、CGNAT 與 multicast 都不允許。判斷在 Dial 階段執行，因此 DNS 重新綁定與轉址無法繞過；要連本機服務時才由管理介面開啟 `allow_private_networks`。
+- 私有網段預設允許：`allow_private_networks` 預設為 `true`，因此 localhost、loopback、RFC1918、link-local（含 `169.254.169.254` 這類雲端 metadata 位址）、CGNAT 與 multicast 都可連線；設為 `false` 時全部拒絕。判斷在 Dial 階段執行，因此 DNS 重新綁定與轉址無法繞過。若不需要存取私有服務，建議由管理介面關閉此開關。
 - 不使用系統 Proxy 設定，避免實際連線目標與網址主機不一致而讓上述檢查失效。可另外以 `http_fetch.allowed_hosts` 限制成白名單，`blocked_hosts` 一律優先拒絕。
 - 只允許 http／https 與 GET、HEAD、POST；`Host`、`Content-Length`、`Connection` 等由 Transport 管理的 header 不可覆寫，帶換行的 header 值直接丟棄。回應大小、逾時與轉址次數都有上限，非文字內容不會送進上下文。
 - Approval 對話框會顯示 `url`、`method`、`headers` 與 `body`，讓使用者在送出前確認實際會離開本機的內容。
@@ -44,7 +44,7 @@ NetPass 連線前必須保存自己的 API Key 並明確接受使用政策；這
 - Project 必須屬於 Workspace；Session 的 `workspace_id` 與 `project_id` 必須一致。
 - 啟動時會檢查已持久化的 Workspace／Project／Session 關聯與 Provider 引用；資料不一致時 fail fast，不在背景靜默搬移或改寫。
 - Workspace／Project 只允許在沒有子項目時刪除，不做隱含級聯刪除。
-- Session 有 queued/running/waiting_approval Run 時，禁止更新或刪除 Session，避免執行途中改變 Provider、工具權限、workspace path 或移除資料。
+- Session 有 queued/running/paused/waiting_approval Run 時，禁止更新或刪除 Session，避免執行途中改變 Provider、工具權限、workspace path 或移除資料。
 - Session 的工具沙箱根目錄由後端在建立 Session 時寫入，request 帶入的 `metadata.workspace_root` 會被覆寫。
 - 職務說明（Workspace／Project 的 `instructions`）由後端依 Session 所屬層級注入提示；`StartRun` 會先移除呼叫端自帶的 `metadata.instructions`，避免 Client 直接對提示注入內容。單一層級上限 8000 字。
 
@@ -78,6 +78,32 @@ Session 不屬於任何 Project，沙箱只來自該排程；路徑經 `RunInput
 （使用者要指定 Agent 的工作目錄），但也表示 token 的保護範圍等同於這些目錄的存取權。
 需要更窄的邊界時，用作業系統帳號權限限制後端程序本身能觸及的範圍。
 - 同一 Session 的 Run 經 single-writer gate 序列化，不同 Session 可並行。
+
+### Run 異常恢復與控制
+
+- 後端重啟時，原本 queued、running、paused 或 waiting approval 的 Run 會標記為 `failed`，錯誤碼為
+  `server_restarted` 且可重試；不會假裝恢復未完成的 Provider 或工具副作用。原 Run 保留，重試
+  必須建立新的 Run 並以 `metadata.retry_of` 追溯來源。
+- pause 只在安全回合邊界生效，不能用來強制切斷已送出的 Provider request；waiting approval
+  Run 必須先完成核准流程或取消。pause／resume／terminal transition 共用狀態與事件序列化，
+  避免舊快照覆蓋較新的 terminal 狀態。
+- 啟用通知中心時只保存工作狀態摘要，不保存完整 prompt、工具參數或工具輸出；去重鍵避免重播
+  事件造成重複通知。通知資料仍屬使用者資料，應依一般執行資料的生命週期保護；關閉通知中心
+  時不建立新的通知，既有資料保留。
+
+### 診斷與安全備份
+
+- Diagnostics export 會移除 DataDir、API token 與其他憑證欄位，且不輸出對話全文；正常的管理
+  diagnostics endpoint 仍可能包含管理者排障所需的本機設定，因此只應交給受信任的管理者。
+- 安全備份排除 `providers.json`、`provider-oauth-tokens.json`、`mcp-servers.json` 與
+  `netpass.json`，但不是匿名資料包：sessions、transcript、附件、記憶與排程可能含使用者
+  個資，Session metadata 也可能包含本機工作目錄資訊。備份檔應存放在受限位置，不應直接上傳
+  公開服務或版本庫。
+- 還原只允許固定資料目錄白名單，拒絕絕對路徑、`..` segment、符號連結、資料目錄符號連結及
+  超過 512 MiB 的解壓內容；寫入前會檢查目標與暫存檔，還原前另存 pre-restore backup。還原
+  完成後必須重啟後端，讓 filestore 與既有記憶體狀態重新載入。
+- Permission center 是唯讀資訊頁；它不接受修改 profile、elevated allowlist 或 Approval
+  狀態的請求。任何高權限操作仍須同時符合後端 policy 與本次人工核准。
 
 ## Provider 與秘密
 
@@ -114,7 +140,7 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - Session 永久核准只能在有效 pending approval 上以 `approve + permanent` 開啟，不能透過一般 Session PATCH 提權；拒絕、過期 approval 或其他 Session 都不會繼承。
 - Approval 對外參數會移除 `content`、`old_text`、`new_text`、`patch` 等本文欄位，只顯示路徑、操作模式與前置條件等判斷副作用所需資料。
 - 檔案工具會解析最深既有父路徑與 symlink，限制在目前 Session 的沙箱根目錄集合內（見上節「工具沙箱範圍」）。
-- 文件工具同樣受 Sandbox 限制，並限制來源檔案、Open XML 解壓項目與回傳內容大小；只讀取 PDF、DOCX、XLSX、PPTX 的必要結構，不執行文件中的巨集、外部關聯或嵌入物件。
+- 文件工具同樣受 Sandbox 限制，並限制來源檔案、範本、結構化輸入、輸出文件、PDF 操作頁數／總量、渲染頁數／大小與 Open XML 解壓項目大小；不執行 PDF、DOCX、XLSX、PPTX 中的巨集、外部關聯或嵌入物件。`document_create`、`document_edit`、`document_convert`、`pdf_pages`、`document_render` 屬於 elevated tools；編輯與轉換必須另存新檔。模型指定的 TTF 必須位於 Sandbox；自動字型探索只讀固定的應用程式與作業系統字型目錄，回傳結果不揭露絕對路徑。LibreOffice／Poppler 只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受工具參數指定任意 executable，且子程序只繼承 PATH、HOME、暫存目錄、語系與必要的作業系統環境，不繼承 Provider API key 或後端 token。Approval 對外參數會隱藏 blocks、sheets、slides、replacements、cell_updates、annotations、sources 與 pages 的實際本文。
 - `http_fetch` 是唯一可由模型自行指定任意 URL 的內建工具，邊界見上節「網路邊界」；關閉後不會出現在模型的工具清單。
 - MCP 工具一律標記 `RequiresPermission=true`，和高風險內建工具一樣必須通過 elevated profile 與單次 Approval；Server 的 `readOnlyHint` 即使受信任，也只影響只讀並行排程，不會跳過權限或 Approval。
 - MCP stdio 子程序只繼承必要 OS 環境以及管理者明確設定的變數；Streamable HTTP 的 Bearer Token 與 headers 不會顯示於工具定義、Prompt 或管理 API 回應。

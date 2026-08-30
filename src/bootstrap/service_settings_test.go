@@ -66,6 +66,31 @@ func TestUpdateServiceSettingsPreservesOmittedRunLimits(t *testing.T) {
 	}
 }
 
+func TestPersistedPrivateNetworkSettingOverridesDefault(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := persistServiceSettings(dataDir, domain.ServiceSettings{
+		ServiceName: DefaultServiceName,
+		HTTPFetch: domain.HTTPFetchSettings{
+			AllowPrivateNetworks: false,
+		},
+	}); err != nil {
+		t.Fatalf("persistServiceSettings: %v", err)
+	}
+
+	loaded := Config{
+		DataDir: dataDir,
+		HTTPFetch: HTTPFetchConfig{
+			AllowPrivateNetworks: true,
+		},
+	}
+	if err := loadPersistedServiceSettings(&loaded); err != nil {
+		t.Fatalf("loadPersistedServiceSettings: %v", err)
+	}
+	if loaded.HTTPFetch.AllowPrivateNetworks {
+		t.Fatal("explicitly disabled private-network access was replaced by the default")
+	}
+}
+
 func TestUpdateServiceSettingsRejectsUnsupportedUILanguage(t *testing.T) {
 	runtime := &Runtime{Config: Config{
 		DataDir:             t.TempDir(),

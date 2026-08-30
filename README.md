@@ -11,17 +11,21 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 - Workspace 與 Project 的職務說明：常駐工作規則只寫一次，之後每次對話與排程都自動帶入。
 - 多份有序工作計畫、拖曳排序、步驟狀態與工具驗證證據。
 - 獨立的排程區塊：可自訂週期與 Sandbox，到點自動建立新對話並開工。
-- Durable Run、可重播 SSE、串流回答與斷線續接。
-- 對話執行中仍可繼續輸入，後續訊息會排入目前 UI 的待送佇列，上一輪結束後依序送出。
+- Durable Run、可重播 SSE、串流回答與斷線續接；UI 重開後會自動恢復仍在執行或可重試的 Run。
+- P0 異常恢復、可選的持久化通知中心、Run 暫停／恢復／取消全部控制，以及脫敏診斷包。
+- P1 全域搜尋、安全備份／還原與唯讀權限中心；還原前會自動保留可復原快照。
+- 官方 GitHub Release 版本更新檢查；啟用通知中心後新版本會進入通知中心，同一版本不重複通知。
+- 對話執行中仍可繼續輸入，後續訊息會寫入 Browser IndexedDB 的 Durable Outbox，上一輪結束後依序送出；網路中斷時保留固定 Idempotency-Key 供安全重試。
 - Context 自動整理、跨 Session 長期記憶與記憶範圍控制。
 - 原生檔案、文件、Shell、SSH 與計畫工具，搭配 Sandbox 及執行審核。
-- `http_fetch` 對外讀取網路資源：HTML 自動轉純文字，私有網段預設拒絕，並可從管理介面直接關閉。
+- `http_fetch` 對外讀取網路資源：HTML 自動轉純文字，localhost 與私有網段預設允許，並可從管理介面直接關閉。
 - 內建 MCP Client，可連接本機 stdio 或遠端 Streamable HTTP Server，將外部工具納入相同的權限與審核流程。
 - 選用的 NetPass 反向代理可公開後端 API；桌面控制 UI 不會經由通道公開。
 - Provider 啟用控制、模型探索、工具權限與稽核記錄。
 - 淺色／深色外觀，以及 AUTO、繁體中文、英文、日文、韓文介面。
 - Windows x64、Windows ARM64 與 macOS ARM64 桌面環境。
 - macOS 啟動時即建立狀態列圖示；工作進行中可隱藏 UI 繼續背景執行，再由選單或重新啟動程式恢復原視窗。
+- Windows 啟動時即建立 Tray Icon；左鍵可重新開啟 UI，右鍵可開啟 NR-Intern 或結束程式，即使 UI 使用瀏覽器 fallback 也維持相同生命週期。
 - 側邊欄內建只保存在目前裝置的記事本，適合暫存不需要送給 Agent 的文字。
 - 對話輸入區可啟動畫面擷取；macOS 會使用系統區域截圖並開啟方框、直線與文字標註編輯器，完成或關閉時把編輯結果更新到剪貼簿。Windows 則開啟系統剪取介面。
 
@@ -35,9 +39,17 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 實際設定檔、執行資料與憑證不應提交到版本庫。完整架構、API 與安全設計請參考下方文件。
 
+P0／P1 管理功能都以後端持久化狀態為準：後端重啟時會把未完成 Run 標記為可重試的中斷，
+通知中心可在一般設定關閉，預設不建立通知；開啟後保留去重後的工作摘要。暫停只在安全回合邊界生效，不強制切斷正在進行的 Provider
+請求。安全備份只收錄工作資料，不收錄 Provider、OAuth、MCP 或 NetPass 憑證；診斷包另會移除
+DataDir 等本機絕對路徑。權限中心為唯讀頁面，不提供從 UI 自行提權的入口。前端啟動時會先
+透過 `/api/v1/admin/status` 檢查 API major version、事件 schema 與必要 capabilities；同一
+Idempotency-Key 若搭配不同輸入，後端會回傳 Conflict，不會建立另一個 Run。
+
 ## 文件
 
 - [架構設計](docs/ai-agent/ARCHITECTURE.md)
+- [辦公文件工具](docs/ai-agent/DOCUMENT_TOOLS.md)
 - [開發說明](docs/ai-agent/DEVELOPMENT.md)
 - [HTTP API](docs/ai-agent/HTTP_API.md)
 - [安全設計](docs/ai-agent/SECURITY.md)

@@ -62,6 +62,11 @@ type Runtime struct {
 	providerUsageContext   context.Context
 	providerUsageCancel    context.CancelFunc
 	providerUsageRefreshMu sync.Mutex
+	updateCheckContext     context.Context
+	updateCheckCancel      context.CancelFunc
+	updateCheckMu          sync.Mutex
+	updateStatusMu         sync.RWMutex
+	updateStatus           domain.UpdateStatus
 	logger                 *slog.Logger
 }
 
@@ -69,33 +74,49 @@ type RunCounts struct {
 	Total           int `json:"total"`
 	Queued          int `json:"queued"`
 	Running         int `json:"running"`
+	Paused          int `json:"paused"`
 	WaitingApproval int `json:"waiting_approval"`
 	Completed       int `json:"completed"`
 	Failed          int `json:"failed"`
 	Canceled        int `json:"canceled"`
 }
 
+var serviceCapabilities = []string{
+	"attachments.v1",
+	"durable-outbox.v1",
+	"notifications.v1",
+	"run-control.v1",
+	"run-events.v1",
+	"run-recovery.v1",
+	"run-retry.v1",
+	"search.v1",
+	"admin-backup.v1",
+	"admin-permissions.v1",
+	"update-check.v1",
+}
+
 type RedactedConfig struct {
-	ServiceName         string                      `json:"service_name"`
-	UILanguage          string                      `json:"ui_language"`
-	ListenAddress       string                      `json:"listen_address"`
-	DataDir             string                      `json:"data_dir"`
-	APITokenConfigured  bool                        `json:"api_token_configured"`
-	AllowedOrigins      []string                    `json:"allowed_origins,omitempty"`
-	AllowedTools        []string                    `json:"allowed_tools,omitempty"`
-	AllowElevatedTools  bool                        `json:"allow_elevated_tools"`
-	Permissions         domain.PermissionPolicy     `json:"permissions"`
-	MaxTurns            int                         `json:"max_turns"`
-	MaxWallClockSeconds int                         `json:"max_wall_clock_seconds"`
-	MaxTokens           int                         `json:"max_tokens"`
-	MaxToolCalls        int                         `json:"max_tool_calls"`
-	HTTPFetch           domain.HTTPFetchSettings    `json:"http_fetch"`
-	Context             harness.ContextConfig       `json:"context"`
-	Memory              memory.Config               `json:"memory"`
-	DefaultProviderID   string                      `json:"default_provider_id"`
-	Providers           []domain.ProviderDescriptor `json:"providers"`
-	SSHProfiles         []string                    `json:"ssh_profiles,omitempty"`
-	MCPServers          []string                    `json:"mcp_servers,omitempty"`
+	ServiceName          string                      `json:"service_name"`
+	UILanguage           string                      `json:"ui_language"`
+	NotificationsEnabled bool                        `json:"notifications_enabled"`
+	ListenAddress        string                      `json:"listen_address"`
+	DataDir              string                      `json:"data_dir"`
+	APITokenConfigured   bool                        `json:"api_token_configured"`
+	AllowedOrigins       []string                    `json:"allowed_origins,omitempty"`
+	AllowedTools         []string                    `json:"allowed_tools,omitempty"`
+	AllowElevatedTools   bool                        `json:"allow_elevated_tools"`
+	Permissions          domain.PermissionPolicy     `json:"permissions"`
+	MaxTurns             int                         `json:"max_turns"`
+	MaxWallClockSeconds  int                         `json:"max_wall_clock_seconds"`
+	MaxTokens            int                         `json:"max_tokens"`
+	MaxToolCalls         int                         `json:"max_tool_calls"`
+	HTTPFetch            domain.HTTPFetchSettings    `json:"http_fetch"`
+	Context              harness.ContextConfig       `json:"context"`
+	Memory               memory.Config               `json:"memory"`
+	DefaultProviderID    string                      `json:"default_provider_id"`
+	Providers            []domain.ProviderDescriptor `json:"providers"`
+	SSHProfiles          []string                    `json:"ssh_profiles,omitempty"`
+	MCPServers           []string                    `json:"mcp_servers,omitempty"`
 }
 
 type ManagementDiagnostics struct {
@@ -162,6 +183,10 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	notifications, err := filestore.NewNotificationRepository(config.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	providerValues, err := buildProviderValues(config, logger, providerAuth)
 	if err != nil {
 		return nil, err
@@ -207,6 +232,14 @@ func Build(config Config) (*Runtime, error) {
 		nativefiles.NewEditTool(config.MaxFileInputBytes),
 		nativedocuments.NewInspectTool(128*1024*1024, config.MaxToolOutputBytes),
 		nativedocuments.NewReadTool(128*1024*1024, config.MaxToolOutputBytes),
+		nativedocuments.NewCompareTool(128*1024*1024, config.MaxToolOutputBytes),
+		nativedocuments.NewValidateTool(128*1024*1024, config.MaxToolOutputBytes),
+		nativedocuments.NewFontTool(config.MaxToolOutputBytes),
+		nativedocuments.NewCreateTool(config.MaxFileInputBytes, 128*1024*1024),
+		nativedocuments.NewEditTool(config.MaxFileInputBytes, 128*1024*1024),
+		nativedocuments.NewConvertTool(128 * 1024 * 1024),
+		nativedocuments.NewPDFPagesTool(config.MaxFileInputBytes, 128*1024*1024),
+		nativedocuments.NewRenderTool(128*1024*1024, config.MaxToolOutputBytes),
 		nativeshell.New(config.MaxToolOutputBytes, 30*time.Minute),
 	}
 	httpFetch := nativenetwork.New(nativenetwork.Options{
@@ -311,19 +344,21 @@ func Build(config Config) (*Runtime, error) {
 		return nil, err
 	}
 	service, err := application.NewService(application.Dependencies{
-		Registry:    registry,
-		Runs:        runs,
-		Events:      events,
-		Projects:    projects,
-		Workspaces:  workspaces,
-		Providers:   model,
-		Approvals:   approvalCoordinator,
-		Memories:    memoryRepository,
-		Plans:       plans,
-		Attachments: attachments,
-		Schedules:   schedules,
-		Permissions: config.Permissions,
-		Logger:      logger,
+		Registry:             registry,
+		Runs:                 runs,
+		Events:               events,
+		Projects:             projects,
+		Workspaces:           workspaces,
+		Providers:            model,
+		Approvals:            approvalCoordinator,
+		Memories:             memoryRepository,
+		Plans:                plans,
+		Attachments:          attachments,
+		Schedules:            schedules,
+		Notifications:        notifications,
+		NotificationsEnabled: config.NotificationsEnabled,
+		Permissions:          config.Permissions,
+		Logger:               logger,
 	})
 	if err != nil {
 		return nil, err
@@ -354,6 +389,12 @@ func Build(config Config) (*Runtime, error) {
 		Status:                  runtime.Status,
 		ToolCatalog:             runtime.ToolCatalog,
 		Diagnostics:             runtime.Diagnostics,
+		DiagnosticsExport:       runtime.DiagnosticsExport,
+		Backup:                  runtime.Backup,
+		Restore:                 runtime.Restore,
+		Permissions:             runtime.Permissions,
+		UpdateStatus:            runtime.UpdateStatus,
+		CheckForUpdates:         runtime.CheckForUpdates,
 		ServiceSettings:         runtime.ServiceSettings,
 		UpdateServiceSettings:   runtime.UpdateServiceSettings,
 		ProviderSettings:        runtime.ProviderSettings,
@@ -377,6 +418,7 @@ func Build(config Config) (*Runtime, error) {
 	}
 	runtime.HTTPHandler = handler
 	runtime.startProviderUsageRefresher()
+	runtime.startUpdateChecker()
 	mcpManager.Warm(context.Background())
 	return runtime, nil
 }
@@ -425,6 +467,9 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 		}
 		updatedConfig.UILanguage = uiLanguage
 	}
+	if input.NotificationsEnabled != nil {
+		updatedConfig.NotificationsEnabled = *input.NotificationsEnabled
+	}
 	if input.MaxWallClockSeconds != nil {
 		updatedConfig.MaxWallClockSeconds = *input.MaxWallClockSeconds
 	}
@@ -448,6 +493,9 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 		return domain.ServiceSettings{}, err
 	}
 	r.Config = updatedConfig
+	if r.Application != nil {
+		r.Application.SetNotificationsEnabled(settings.NotificationsEnabled)
+	}
 	if r.Agent != nil {
 		r.Agent.SetName(serviceName)
 		r.Agent.SetRunBudget(runBudgetFromConfig(updatedConfig))
@@ -464,12 +512,13 @@ func serviceSettingsFromConfig(config Config) domain.ServiceSettings {
 		uiLanguage = DefaultUILanguage
 	}
 	return domain.ServiceSettings{
-		ServiceName:         config.ServiceName,
-		UILanguage:          uiLanguage,
-		MaxWallClockSeconds: config.MaxWallClockSeconds,
-		MaxTokens:           config.MaxTokens,
-		MaxToolCalls:        config.MaxToolCalls,
-		HTTPFetch:           httpFetchSettingsFromConfig(config),
+		ServiceName:          config.ServiceName,
+		UILanguage:           uiLanguage,
+		NotificationsEnabled: config.NotificationsEnabled,
+		MaxWallClockSeconds:  config.MaxWallClockSeconds,
+		MaxTokens:            config.MaxTokens,
+		MaxToolCalls:         config.MaxToolCalls,
+		HTTPFetch:            httpFetchSettingsFromConfig(config),
 	}
 }
 
@@ -658,6 +707,30 @@ func (r *Runtime) ToolCatalog(ctx context.Context, sessionID string) ([]domain.T
 		return nil, err
 	}
 	return r.Tools.Catalog(&session), nil
+}
+
+// Permissions 回傳唯讀權限中心；權限 profile 仍只能由後端策略與人工核准流程改變。
+func (r *Runtime) Permissions(ctx context.Context) (domain.PermissionCenter, error) {
+	center, err := r.Application.PermissionCenter(ctx)
+	if err != nil {
+		return domain.PermissionCenter{}, err
+	}
+	if r.Tools == nil {
+		return center, nil
+	}
+	for _, entry := range r.Tools.Catalog(nil) {
+		permission := "standard"
+		if entry.Definition.RequiresPermission {
+			permission = "elevated"
+		}
+		center.Tools = append(center.Tools, domain.ToolPermissionInfo{
+			Name: entry.Definition.Name, Permission: permission,
+			RequiresPermission: entry.Definition.RequiresPermission,
+			ReadOnly:           entry.Definition.ReadOnly,
+			Available:          entry.Available,
+		})
+	}
+	return center, nil
 }
 
 // ProviderSettings 回傳可供管理介面編輯的脫敏設定。
@@ -1183,6 +1256,8 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 			counts.Queued++
 		case domain.RunStatusRunning:
 			counts.Running++
+		case domain.RunStatusPaused:
+			counts.Paused++
 		case domain.RunStatusWaitingApproval:
 			counts.WaitingApproval++
 		case domain.RunStatusCompleted:
@@ -1215,26 +1290,27 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 	return ManagementDiagnostics{
 		Status: r.Status(),
 		Config: RedactedConfig{
-			ServiceName:         config.ServiceName,
-			UILanguage:          config.UILanguage,
-			ListenAddress:       config.ListenAddress,
-			DataDir:             config.DataDir,
-			APITokenConfigured:  strings.TrimSpace(config.APIToken) != "",
-			AllowedOrigins:      append([]string(nil), config.AllowedOrigins...),
-			AllowedTools:        append([]string(nil), config.AllowedTools...),
-			AllowElevatedTools:  config.AllowElevatedTools,
-			Permissions:         config.Permissions.Normalize(),
-			MaxTurns:            config.MaxTurns,
-			MaxWallClockSeconds: config.MaxWallClockSeconds,
-			MaxTokens:           config.MaxTokens,
-			MaxToolCalls:        config.MaxToolCalls,
-			HTTPFetch:           httpFetchSettingsFromConfig(config),
-			Context:             config.Context,
-			Memory:              config.Memory,
-			DefaultProviderID:   r.Model.DefaultProviderID(),
-			Providers:           r.Model.ListProviders(),
-			SSHProfiles:         profileNames,
-			MCPServers:          mcpServerNames,
+			ServiceName:          config.ServiceName,
+			UILanguage:           config.UILanguage,
+			NotificationsEnabled: config.NotificationsEnabled,
+			ListenAddress:        config.ListenAddress,
+			DataDir:              config.DataDir,
+			APITokenConfigured:   strings.TrimSpace(config.APIToken) != "",
+			AllowedOrigins:       append([]string(nil), config.AllowedOrigins...),
+			AllowedTools:         append([]string(nil), config.AllowedTools...),
+			AllowElevatedTools:   config.AllowElevatedTools,
+			Permissions:          config.Permissions.Normalize(),
+			MaxTurns:             config.MaxTurns,
+			MaxWallClockSeconds:  config.MaxWallClockSeconds,
+			MaxTokens:            config.MaxTokens,
+			MaxToolCalls:         config.MaxToolCalls,
+			HTTPFetch:            httpFetchSettingsFromConfig(config),
+			Context:              config.Context,
+			Memory:               config.Memory,
+			DefaultProviderID:    r.Model.DefaultProviderID(),
+			Providers:            r.Model.ListProviders(),
+			SSHProfiles:          profileNames,
+			MCPServers:           mcpServerNames,
 		},
 		SessionCount:   sessionCount,
 		ProjectCount:   len(projects),
@@ -1251,6 +1327,9 @@ func (r *Runtime) Close(ctx context.Context) error {
 	var result error
 	if r.providerUsageCancel != nil {
 		r.providerUsageCancel()
+	}
+	if r.updateCheckCancel != nil {
+		r.updateCheckCancel()
 	}
 	if r.ProviderAuth != nil {
 		result = r.ProviderAuth.Close(ctx)
@@ -1278,11 +1357,14 @@ func (r *Runtime) Status() domain.ServiceStatus {
 	serviceName := r.Config.ServiceName
 	r.configMu.RUnlock()
 	return domain.ServiceStatus{
-		Name:       serviceName,
-		Version:    Version,
-		InstanceID: r.InstanceID,
-		StartedAt:  r.StartedAt,
-		Ready:      r.Application != nil && r.HTTPHandler != nil,
+		Name:               serviceName,
+		Version:            Version,
+		APIVersion:         domain.APIVersion,
+		EventSchemaVersion: domain.EventSchemaVersion,
+		Capabilities:       append([]string(nil), serviceCapabilities...),
+		InstanceID:         r.InstanceID,
+		StartedAt:          r.StartedAt,
+		Ready:              r.Application != nil && r.HTTPHandler != nil,
 	}
 }
 

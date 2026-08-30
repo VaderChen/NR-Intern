@@ -37,7 +37,7 @@ function run(arguments) {
   iconView.imageScaling = $.NSImageScaleProportionallyUpOrDown;
   content.addSubview(iconView);
 
-  const title = $.NSTextField.labelWithString($(appName + " 啟動中"));
+  const title = $.NSTextField.labelWithString($(appName));
   title.setFont($.NSFont.systemFontOfSizeWeight(18, $.NSFontWeightSemibold));
   title.setTextColor($.NSColor.labelColor);
   title.sizeToFit;

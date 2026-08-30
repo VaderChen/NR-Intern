@@ -102,7 +102,7 @@ func (t *Tool) Definition() domain.ToolDefinition {
 		Label:              "讀取網路資源",
 		Version:            "1.0.0",
 		Category:           "network",
-		Description:        "以 HTTP 讀取外部資源並回傳文字內容。HTML 會轉成純文字，回應大小與轉址次數都有上限；私有網段預設拒絕連線。",
+		Description:        "以 HTTP 讀取外部資源並回傳文字內容。HTML 會轉成純文字，回應大小與轉址次數都有上限；預設允許連線到 localhost 與私有網段，可由服務設定關閉。",
 		Platforms:          []string{"darwin", "linux", "windows"},
 		Capabilities:       []string{"http", "html-to-text", "bounded-response", "redirect-limit", "private-network-guard"},
 		RequiresPermission: true,

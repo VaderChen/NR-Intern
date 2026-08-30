@@ -140,7 +140,7 @@ func (r *RunRepository) persistLocked() error {
 func (r *RunRepository) markInterruptedRuns() bool {
 	changed := false
 	for id, run := range r.runs {
-		if run.Status != domain.RunStatusQueued && run.Status != domain.RunStatusRunning && run.Status != domain.RunStatusWaitingApproval {
+		if run.Status != domain.RunStatusQueued && run.Status != domain.RunStatusRunning && run.Status != domain.RunStatusPaused && run.Status != domain.RunStatusWaitingApproval {
 			continue
 		}
 		now := time.Now().UTC()

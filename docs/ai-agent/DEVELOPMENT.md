@@ -83,7 +83,7 @@ Provider ID 必須已存在於 `providers`。留空時摘要沿用 Session 的 P
 {
   "http_fetch": {
     "enabled": true,
-    "allow_private_networks": false,
+    "allow_private_networks": true,
     "max_response_bytes": 1048576,
     "timeout_seconds": 30,
     "max_redirects": 5,
@@ -94,7 +94,8 @@ Provider ID 必須已存在於 `providers`。留空時摘要沿用 Session 的 P
 ```
 
 `enabled` 與 `allow_private_networks` 可由管理介面即時調整；其餘邊界只讀取 JSON 設定。
-`allowed_hosts` 非空時採白名單，`blocked_hosts` 永遠優先。私有網段預設拒絕。
+`allowed_hosts` 非空時採白名單，`blocked_hosts` 永遠優先。`allow_private_networks` 預設為 `true`，允許
+localhost、loopback、私有網段、link-local、CGNAT 與 multicast；不需要存取私有服務時可關閉。
 
 ## 獨立後端
 

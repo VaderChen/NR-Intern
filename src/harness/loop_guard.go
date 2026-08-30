@@ -172,7 +172,7 @@ func mutationStrategyKey(definition domain.ToolDefinition, call domain.ToolCall)
 	controls := make(map[string]any, len(call.Arguments))
 	for key, value := range call.Arguments {
 		switch strings.ToLower(strings.TrimSpace(key)) {
-		case "content", "new_content", "new_text", "replacement", "patch", "data", "body", "payload":
+		case "annotations", "blocks", "body", "cell_updates", "content", "data", "new_content", "new_text", "patch", "payload", "replacement", "replacements", "sheets", "slides":
 			continue
 		default:
 			controls[key] = value
@@ -202,7 +202,7 @@ func mutationResource(definition domain.ToolDefinition, arguments map[string]any
 	if !hasCapability(definition.Capabilities, "atomic-replace") {
 		return ""
 	}
-	for _, key := range []string{"path", "target_path", "destination", "remote_path"} {
+	for _, key := range []string{"output_path", "path", "target_path", "destination", "remote_path"} {
 		if value, ok := arguments[key].(string); ok {
 			if value = strings.TrimSpace(value); value != "" {
 				return "atomic-resource:" + value
