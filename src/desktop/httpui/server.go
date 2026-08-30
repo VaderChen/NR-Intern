@@ -91,6 +91,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /desktop/api/restart", s.restart)
 	s.mux.HandleFunc("POST /desktop/api/folders/pick", s.pickFolders)
 	s.mux.HandleFunc("POST /desktop/api/folders/dropped", s.droppedFolders)
+	s.mux.HandleFunc("POST /desktop/api/screen-capture", s.captureScreen)
+	s.mux.HandleFunc("POST /desktop/api/clipboard/image", s.copyImageToClipboard)
 	s.mux.HandleFunc("POST /desktop/api/resources/open", s.openResource)
 	s.mux.Handle("/backend/", s.proxy)
 	s.mux.HandleFunc("/", s.serveStatic)

@@ -38,6 +38,8 @@ const state = {
   runningSessionId: "",
   runActivityText: "",
   canceling: false,
+  screenCapturing: false,
+  screenCaptureHideWindow: localStorage.getItem("nrIntern.screenCapture.hideWindow") !== "0",
   currentRunId: "",
   retryableRunId: "",
   retryableSessionId: "",
@@ -117,6 +119,18 @@ const backendRefreshIntervalMilliseconds = 4000;
 const backendStartupRefreshIntervalMilliseconds = 200;
 const providerUsageUIRefreshIntervalMilliseconds = 30_000;
 const reverseProxyRefreshIntervalMilliseconds = 3_000;
+const memoStorageKey = "nrIntern.memo.v1";
+const memoSaveDelayMilliseconds = 250;
+let memoSaveTimer = 0;
+const imageEditorState = {
+  image: null,
+  operations: [],
+  draft: null,
+  tool: "rectangle",
+  pointerId: null,
+  start: null,
+  copying: false,
+};
 const promptComposition = {
   active: false,
   enterObserved: false,
@@ -370,6 +384,313 @@ async function desktop(path, options = {}) {
   const body = response.status === 204 ? null : await response.json();
   if (!response.ok) throw new Error(body?.error || response.statusText);
   return body?.data;
+}
+
+async function captureScreenToClipboard() {
+  if (state.screenCapturing) return;
+  state.screenCapturing = true;
+  const button = $("captureScreen");
+  const optionsButton = $("screenCaptureOptions");
+  let nativeWindowHidden = false;
+  button.disabled = true;
+  optionsButton.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  try {
+    if (state.screenCaptureHideWindow && typeof window.nrInternSetWindowHidden === "function") {
+      await Promise.resolve(window.nrInternSetWindowHidden(true));
+      nativeWindowHidden = true;
+      await delay(160);
+    }
+    const result = await desktop("screen-capture", { method: "POST", body: "{}" });
+    if (!result) return;
+    if (nativeWindowHidden) {
+      await Promise.resolve(window.nrInternSetWindowHidden(false));
+      nativeWindowHidden = false;
+      await delay(80);
+    }
+    toast(translate(result.status === "launched"
+      ? "已開啟畫面擷取；完成後圖片會複製到剪貼簿"
+      : "畫面已擷取並複製到剪貼簿"));
+    if (result.image_base64) await openImageEditor(result.image_base64);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    if (nativeWindowHidden && typeof window.nrInternSetWindowHidden === "function") {
+      await Promise.resolve(window.nrInternSetWindowHidden(false)).catch(() => {});
+    }
+    state.screenCapturing = false;
+    button.disabled = false;
+    optionsButton.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+function closeScreenCaptureMenu() {
+  $("screenCaptureMenu").classList.add("hidden");
+  $("screenCaptureOptions").setAttribute("aria-expanded", "false");
+}
+
+function toggleScreenCaptureMenu() {
+  const menu = $("screenCaptureMenu");
+  const willOpen = menu.classList.contains("hidden");
+  menu.classList.toggle("hidden", !willOpen);
+  $("screenCaptureOptions").setAttribute("aria-expanded", String(willOpen));
+}
+
+function imageEditorCoordinates(event) {
+  const canvas = $("imageEditorCanvas");
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return { x: 0, y: 0 };
+  return {
+    x: Math.max(0, Math.min(canvas.width, (event.clientX - rect.left) * canvas.width / rect.width)),
+    y: Math.max(0, Math.min(canvas.height, (event.clientY - rect.top) * canvas.height / rect.height)),
+  };
+}
+
+function imageEditorScale() {
+  const canvas = $("imageEditorCanvas");
+  const rect = canvas.getBoundingClientRect();
+  return rect.width ? canvas.width / rect.width : 1;
+}
+
+function fitImageEditorCanvas() {
+  const dialog = $("imageEditorDialog");
+  const canvas = $("imageEditorCanvas");
+  if (!dialog.open || !imageEditorState.image || !canvas.width || !canvas.height) return;
+  const stage = $("imageEditorStage").getBoundingClientRect();
+  const scale = Math.min(1, Math.max(0.05, (stage.width - 4) / canvas.width), Math.max(0.05, (stage.height - 4) / canvas.height));
+  canvas.style.width = `${Math.max(1, Math.floor(canvas.width * scale))}px`;
+  canvas.style.height = `${Math.max(1, Math.floor(canvas.height * scale))}px`;
+}
+
+function drawImageEditorOperation(context, operation, draft = false) {
+  context.save();
+  context.strokeStyle = operation.color;
+  context.fillStyle = operation.color;
+  context.lineWidth = operation.lineWidth;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  if (draft) context.setLineDash([operation.lineWidth * 2.5, operation.lineWidth * 1.5]);
+  if (operation.type === "rectangle") {
+    const x = Math.min(operation.x1, operation.x2);
+    const y = Math.min(operation.y1, operation.y2);
+    context.strokeRect(x, y, Math.abs(operation.x2 - operation.x1), Math.abs(operation.y2 - operation.y1));
+  } else if (operation.type === "line") {
+    context.beginPath();
+    context.moveTo(operation.x1, operation.y1);
+    context.lineTo(operation.x2, operation.y2);
+    context.stroke();
+  } else if (operation.type === "text") {
+    context.font = `700 ${operation.fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`;
+    context.textBaseline = "top";
+    context.setLineDash([]);
+    context.strokeStyle = "rgba(255, 255, 255, .92)";
+    context.lineWidth = Math.max(2, operation.fontSize * .12);
+    context.strokeText(operation.text, operation.x, operation.y);
+    context.fillStyle = operation.color;
+    context.fillText(operation.text, operation.x, operation.y);
+  }
+  context.restore();
+}
+
+function renderImageEditor() {
+  const canvas = $("imageEditorCanvas");
+  const context = canvas.getContext("2d");
+  if (!context || !imageEditorState.image) return;
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(imageEditorState.image, 0, 0, canvas.width, canvas.height);
+  for (const operation of imageEditorState.operations) drawImageEditorOperation(context, operation);
+  if (imageEditorState.draft) drawImageEditorOperation(context, imageEditorState.draft, true);
+  const hasOperations = imageEditorState.operations.length > 0;
+  $("undoImageEdit").disabled = !hasOperations;
+  $("resetImageEdit").disabled = !hasOperations;
+}
+
+function setImageEditorTool(tool) {
+  imageEditorState.tool = tool;
+  for (const button of document.querySelectorAll("[data-image-tool]")) {
+    const selected = button.dataset.imageTool === tool;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  const textMode = tool === "text";
+  $("imageEditorTextControl").classList.toggle("hidden", !textMode);
+  $("imageEditorFontControl").classList.toggle("hidden", !textMode);
+  if (textMode) $("imageEditorText").focus();
+}
+
+function normalizeImageEditorColor(value) {
+  const match = String(value || "").trim().match(/^#?([0-9a-f]{6})$/i);
+  return match ? `#${match[1].toLowerCase()}` : "";
+}
+
+function closeImageEditorColorPalette() {
+  $("imageEditorColorPalette").classList.add("hidden");
+  $("imageEditorColorButton").setAttribute("aria-expanded", "false");
+}
+
+function setImageEditorColor(value, { close = false, syncHex = true } = {}) {
+  const color = normalizeImageEditorColor(value);
+  if (!color) return false;
+  $("imageEditorColor").value = color;
+  $("imageEditorColorSwatch").style.backgroundColor = color;
+  if (syncHex) $("imageEditorColorHex").value = color.toUpperCase();
+  for (const button of document.querySelectorAll("[data-image-color]")) {
+    const selected = button.dataset.imageColor.toLowerCase() === color;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+  }
+  if (close) closeImageEditorColorPalette();
+  return true;
+}
+
+function toggleImageEditorColorPalette() {
+  const palette = $("imageEditorColorPalette");
+  const willOpen = palette.classList.contains("hidden");
+  palette.classList.toggle("hidden", !willOpen);
+  $("imageEditorColorButton").setAttribute("aria-expanded", String(willOpen));
+  if (willOpen) $("imageEditorColorHex").focus();
+}
+
+function loadImageEditorSource(imageBase64) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error(translate("無法建立編輯圖像")));
+    image.src = `data:image/png;base64,${imageBase64}`;
+  });
+}
+
+async function openImageEditor(imageBase64) {
+  const image = await loadImageEditorSource(imageBase64);
+  imageEditorState.image = image;
+  imageEditorState.operations = [];
+  imageEditorState.draft = null;
+  imageEditorState.pointerId = null;
+  imageEditorState.start = null;
+  const canvas = $("imageEditorCanvas");
+  canvas.width = image.naturalWidth;
+  canvas.height = image.naturalHeight;
+  $("imageEditorStatus").textContent = `${image.naturalWidth} × ${image.naturalHeight}`;
+  $("imageEditorText").value = "";
+  setImageEditorColor($("imageEditorColor").value);
+  closeImageEditorColorPalette();
+  setImageEditorTool("rectangle");
+  const dialog = $("imageEditorDialog");
+  if (!dialog.open) dialog.showModal();
+  requestAnimationFrame(() => {
+    fitImageEditorCanvas();
+    renderImageEditor();
+    canvas.focus();
+  });
+}
+
+function startImageEditorDrawing(event) {
+  if (event.button !== 0 || !imageEditorState.image) return;
+  const point = imageEditorCoordinates(event);
+  const scale = imageEditorScale();
+  if (imageEditorState.tool === "text") {
+    const text = $("imageEditorText").value.trim();
+    if (!text) {
+      toast(translate("請先輸入要放到圖上的文字"));
+      $("imageEditorText").focus();
+      return;
+    }
+    imageEditorState.operations.push({
+      type: "text",
+      text,
+      x: point.x,
+      y: point.y,
+      color: $("imageEditorColor").value,
+      fontSize: Number($("imageEditorFontSize").value) * scale,
+    });
+    renderImageEditor();
+    return;
+  }
+  imageEditorState.pointerId = event.pointerId;
+  imageEditorState.start = point;
+  imageEditorState.draft = {
+    type: imageEditorState.tool,
+    x1: point.x,
+    y1: point.y,
+    x2: point.x,
+    y2: point.y,
+    color: $("imageEditorColor").value,
+    lineWidth: Number($("imageEditorLineWidth").value) * scale,
+  };
+  $("imageEditorCanvas").setPointerCapture(event.pointerId);
+  event.preventDefault();
+}
+
+function moveImageEditorDrawing(event) {
+  if (imageEditorState.pointerId !== event.pointerId || !imageEditorState.draft) return;
+  const point = imageEditorCoordinates(event);
+  imageEditorState.draft.x2 = point.x;
+  imageEditorState.draft.y2 = point.y;
+  renderImageEditor();
+}
+
+function finishImageEditorDrawing(event, commit = true) {
+  if (imageEditorState.pointerId !== event.pointerId || !imageEditorState.draft) return;
+  const canvas = $("imageEditorCanvas");
+  if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+  const operation = imageEditorState.draft;
+  const distance = Math.hypot(operation.x2 - operation.x1, operation.y2 - operation.y1);
+  if (commit && distance >= Math.max(2, operation.lineWidth)) imageEditorState.operations.push(operation);
+  imageEditorState.pointerId = null;
+  imageEditorState.start = null;
+  imageEditorState.draft = null;
+  renderImageEditor();
+}
+
+function undoImageEdit() {
+  imageEditorState.operations.pop();
+  renderImageEditor();
+}
+
+function resetImageEdit() {
+  imageEditorState.operations = [];
+  imageEditorState.draft = null;
+  renderImageEditor();
+}
+
+function imageEditorPNGBlob() {
+  renderImageEditor();
+  return new Promise((resolve, reject) => {
+    $("imageEditorCanvas").toBlob((blob) => {
+      if (blob) resolve(blob);
+      else reject(new Error(translate("無法建立編輯圖像")));
+    }, "image/png");
+  });
+}
+
+async function copyEditedImage() {
+  if (imageEditorState.copying || !imageEditorState.image) return false;
+  imageEditorState.copying = true;
+  const button = $("copyEditedImage");
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  $("imageEditorStatus").textContent = translate("正在複製圖像…");
+  try {
+    const blob = await imageEditorPNGBlob();
+    await desktop("clipboard/image", { method: "POST", headers: { "Content-Type": "image/png" }, body: blob });
+    $("imageEditorStatus").textContent = translate("已更新系統剪貼簿");
+    toast(translate("已更新系統剪貼簿"));
+    return true;
+  } catch (error) {
+    $("imageEditorStatus").textContent = error.message;
+    toast(error.message);
+    return false;
+  } finally {
+    imageEditorState.copying = false;
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
+}
+
+async function closeImageEditor() {
+  closeImageEditorColorPalette();
+  if (await copyEditedImage()) $("imageEditorDialog").close();
 }
 
 function toast(message) {
@@ -1076,7 +1397,7 @@ function renderSchedules() {
   if (state.schedules.length === 0) {
     const empty = document.createElement("small");
     empty.className = "schedule-empty";
-    empty.textContent = translate("尚無排程；建立後 Agent 會自己到點開工。");
+    empty.textContent = translate("尚無排程");
     list.append(empty);
     return;
   }
@@ -1444,6 +1765,69 @@ function toggleProviderUsagePopover() {
   popover.classList.remove("hidden");
   $("providerUsageButton").setAttribute("aria-expanded", "true");
   void loadActiveProviderUsage();
+}
+
+function readMemo() {
+  try {
+    return localStorage.getItem(memoStorageKey) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function updateMemoActions() {
+  $("clearMemo").disabled = !$("memoText").value;
+}
+
+function saveMemo() {
+  clearTimeout(memoSaveTimer);
+  memoSaveTimer = 0;
+  const status = $("memoSaveState");
+  try {
+    localStorage.setItem(memoStorageKey, $("memoText").value);
+    status.textContent = translate("已儲存");
+    status.classList.remove("error");
+  } catch (_) {
+    status.textContent = translate("無法儲存記事，請縮短內容後重試。");
+    status.classList.add("error");
+  }
+  updateMemoActions();
+}
+
+function scheduleMemoSave() {
+  clearTimeout(memoSaveTimer);
+  $("memoSaveState").textContent = translate("儲存中…");
+  $("memoSaveState").classList.remove("error");
+  updateMemoActions();
+  memoSaveTimer = setTimeout(saveMemo, memoSaveDelayMilliseconds);
+}
+
+function openMemo() {
+  closeProviderUsagePopover();
+  const editor = $("memoText");
+  editor.value = readMemo();
+  $("memoSaveState").textContent = translate("自動儲存在本機");
+  $("memoSaveState").classList.remove("error");
+  updateMemoActions();
+  $("memoDialog").showModal();
+  requestAnimationFrame(() => {
+    editor.focus();
+    editor.setSelectionRange(editor.value.length, editor.value.length);
+  });
+}
+
+function closeMemo() {
+  if (memoSaveTimer) saveMemo();
+  $("memoDialog").close();
+}
+
+async function clearMemo() {
+  if (!$("memoText").value) return;
+  if (!(await confirmAction(translate("確定清除所有記事內容嗎？")))) return;
+  $("memoText").value = "";
+  saveMemo();
+  toast(translate("記事已清除"));
+  $("memoText").focus();
 }
 
 function renderProviderOptions() {
@@ -5565,6 +5949,61 @@ $("newProvider").addEventListener("change", (event) => {
   $("newModel").value = defaultModelForProvider(providerID);
 });
 $("composer").addEventListener("submit", sendPrompt);
+$("hideWindowDuringCapture").checked = state.screenCaptureHideWindow;
+$("captureScreen").addEventListener("click", () => { closeScreenCaptureMenu(); void captureScreenToClipboard(); });
+$("screenCaptureOptions").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleScreenCaptureMenu();
+});
+$("screenCaptureMenu").addEventListener("pointerdown", (event) => event.stopPropagation());
+$("hideWindowDuringCapture").addEventListener("change", (event) => {
+  state.screenCaptureHideWindow = event.target.checked;
+  localStorage.setItem("nrIntern.screenCapture.hideWindow", event.target.checked ? "1" : "0");
+});
+for (const button of document.querySelectorAll("[data-image-tool]")) {
+  button.addEventListener("click", () => setImageEditorTool(button.dataset.imageTool));
+}
+$("imageEditorColorButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleImageEditorColorPalette();
+});
+$("imageEditorColorPalette").addEventListener("pointerdown", (event) => event.stopPropagation());
+for (const button of document.querySelectorAll("[data-image-color]")) {
+  button.style.setProperty("--image-editor-color", button.dataset.imageColor);
+  button.addEventListener("click", () => setImageEditorColor(button.dataset.imageColor, { close: true }));
+}
+$("imageEditorColorHex").addEventListener("input", (event) => {
+  setImageEditorColor(event.target.value, { syncHex: false });
+});
+$("imageEditorColorHex").addEventListener("blur", (event) => {
+  if (!setImageEditorColor(event.target.value)) event.target.value = $("imageEditorColor").value.toUpperCase();
+});
+$("imageEditorColorHex").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  if (setImageEditorColor(event.target.value, { close: true })) $("imageEditorColorButton").focus();
+});
+$("closeImageEditor").addEventListener("click", () => { void closeImageEditor(); });
+$("undoImageEdit").addEventListener("click", undoImageEdit);
+$("resetImageEdit").addEventListener("click", resetImageEdit);
+$("copyEditedImage").addEventListener("click", () => { void copyEditedImage(); });
+$("imageEditorCanvas").addEventListener("pointerdown", startImageEditorDrawing);
+$("imageEditorCanvas").addEventListener("pointermove", moveImageEditorDrawing);
+$("imageEditorCanvas").addEventListener("pointerup", (event) => finishImageEditorDrawing(event, true));
+$("imageEditorCanvas").addEventListener("pointercancel", (event) => finishImageEditorDrawing(event, false));
+$("imageEditorDialog").addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
+  event.preventDefault();
+  undoImageEdit();
+});
+$("imageEditorDialog").addEventListener("close", () => {
+  closeImageEditorColorPalette();
+  imageEditorState.image = null;
+  imageEditorState.operations = [];
+  imageEditorState.draft = null;
+  imageEditorState.pointerId = null;
+});
+window.addEventListener("resize", fitImageEditorCanvas);
 $("send").addEventListener("click", activateRunAction);
 $("stopRun").addEventListener("click", () => { void cancelCurrentRun(); });
 $("messages").addEventListener("scroll", updateMessageAutoScroll, { passive: true });
@@ -5642,6 +6081,18 @@ $("retryRun").addEventListener("click", retryCurrentRun);
 $("approveTool").addEventListener("click", () => decideApproval("approve"));
 $("denyTool").addEventListener("click", () => decideApproval("deny"));
 $("openManagement").addEventListener("click", () => openManagement("overview"));
+$("memoButton").addEventListener("click", openMemo);
+$("closeMemo").addEventListener("click", closeMemo);
+$("clearMemo").addEventListener("click", () => void clearMemo());
+$("memoText").addEventListener("input", scheduleMemoSave);
+$("memoText").addEventListener("keydown", (event) => {
+  if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "s") return;
+  event.preventDefault();
+  saveMemo();
+});
+$("memoDialog").addEventListener("close", () => {
+  if (memoSaveTimer) saveMemo();
+});
 $("providerUsageButton").addEventListener("click", (event) => {
   event.stopPropagation();
   toggleProviderUsagePopover();
@@ -5774,6 +6225,8 @@ document.addEventListener("pointerdown", (event) => {
   if (!$("resourceContextMenu").contains(event.target)) closeResourceContextMenu();
   if (!$("providerUsagePopover").contains(event.target) && !$("providerUsageButton").contains(event.target)) closeProviderUsagePopover();
   if (!$("contextUsagePopover").contains(event.target) && !$("contextUsageButton").contains(event.target)) closeContextUsagePopover();
+  if (!$("screenCaptureMenu").contains(event.target) && !$("screenCaptureOptions").contains(event.target)) closeScreenCaptureMenu();
+  if (!$("imageEditorColorPalette").contains(event.target) && !$("imageEditorColorButton").contains(event.target)) closeImageEditorColorPalette();
 });
 document.addEventListener("click", (event) => {
   const resource = resourceFromElement(event.target);
@@ -5797,6 +6250,8 @@ document.addEventListener("keydown", (event) => {
   closeSessionContextMenu();
   closeResourceContextMenu();
   closeProviderUsagePopover();
+  closeScreenCaptureMenu();
+  closeImageEditorColorPalette();
 });
 document.addEventListener("scroll", () => {
   closeProjectContextMenu();

@@ -57,6 +57,7 @@ src/
 ├── desktop/
 │   ├── supervisor/             # 後端程序生命週期與紀錄
 │   ├── httpui/                 # 本機 UI server 與後端 reverse proxy
+│   ├── screencapture/          # 系統擷取介面與圖像剪貼簿 adapter
 │   └── launcher/               # 跨平台開啟 Browser
 └── web/console/                # 內嵌 HTML/CSS/JavaScript
 ```
@@ -477,3 +478,10 @@ macOS 原生視窗啟動時就安裝狀態列項目，提供顯示主視窗、�
 關閉會詢問是否隱藏 UI 並讓後端 Run 繼續；狀態列項目與 Dock reopen 都能恢復同一個視窗。若使用者
 再次啟動程式而本機 desktop port 已被既有 NR-Intern 使用，新程序會先驗證 identity endpoint，再
 要求既有程序顯示 UI，不會啟動第二套後端。這項原生狀態列生命週期目前只在 macOS 實作。
+
+畫面擷取是 desktop-local 能力，不屬於對外後端 API。macOS adapter 只啟動 Apple 的
+`Screenshot.app`，由系統完成互動式區域選取並寫入剪貼簿；desktop bridge 監看剪貼簿中的 PNG，
+再交給 WebView 內的 Canvas 標註編輯器。這條路徑不讓 NR-Intern 直接讀取整個顯示器，也不公開
+桌面擷取端點到 NetPass 反向代理。Windows adapter 則啟動系統剪取 URI；兩個平台最後都以系統
+剪貼簿作為圖像交接邊界。編輯器的方框、直線與文字操作只存在前端記憶體，使用者按複製或關閉
+後才輸出合成 PNG。

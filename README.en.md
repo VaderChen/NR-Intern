@@ -22,6 +22,8 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - Light and dark appearance with Auto, Traditional Chinese, English, Japanese, and Korean interfaces.
 - Desktop support for Windows x64, Windows ARM64, and macOS ARM64.
 - On macOS, a status item is installed at startup. The UI can be hidden while work continues, then restored from the menu or by launching the app again.
+- A device-local memo pad is available from the sidebar for notes that should not be sent to the agent.
+- Screen capture is available beside the conversation input. On macOS it opens the system region capture and an editor for rectangles, lines, and text; copying or closing the editor updates the clipboard with the edited image. Windows opens the system snipping interface.
 
 The interface language controls only the UI and an uncustomized default name. The agent infers the user's preferred language from the current message, recent conversation, and explicit preferences.
 

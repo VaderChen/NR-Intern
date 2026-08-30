@@ -129,6 +129,13 @@ macOS 版啟動時就建立狀態列項目。對話進行中關閉主視窗可�
 Console 的待送訊息佇列只存在目前 Browser／WebView 記憶體，上一個 Run 結束後依序送出；重新整理
 頁面或結束 UI 不保證保留尚未送出的項目。已送出的 Run 則是 durable，UI 斷線不會取消。
 
+側邊欄記事本使用 Browser／WebView 的 `localStorage`，內容只留在目前裝置，不會傳入後端、Session
+或 Agent Prompt。畫面擷取由 desktop-local bridge 處理：macOS 啟動系統 `Screenshot.app` 的區域
+截圖模式，先把原圖送到系統剪貼簿，再將 PNG 回傳內建標註編輯器；按複製或關閉編輯器都會以
+標註後的 PNG 覆寫剪貼簿。若啟用「擷取畫面時隱藏視窗」，WebView 會透過原生 binding 暫時隱藏
+NR-Intern，擷取完成或取消後再恢復。Windows 目前啟動系統剪取介面，完成結果由 Windows 寫入
+剪貼簿，不會自動把 PNG 回傳編輯器。
+
 ## MCP Client
 
 主系統可從管理頁或 `mcp_servers` 設定連接 MCP Server：

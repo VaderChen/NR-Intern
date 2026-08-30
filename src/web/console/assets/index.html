@@ -67,7 +67,13 @@
       <div class="sidebar-actions">
         <div class="sidebar-action-row">
           <button id="openManagement" class="ghost full" disabled>系統管理</button>
-          <button id="providerUsageButton" class="usage-icon-button" type="button" title="查看用量" aria-label="查看用量" aria-expanded="false" aria-controls="providerUsagePopover" disabled>
+          <button id="memoButton" class="sidebar-icon-button memo-icon-button" type="button" title="開啟記事本" aria-label="開啟記事本" aria-haspopup="dialog" aria-controls="memoDialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 3.75h8.5L18 7.25v13H6Z"></path>
+              <path d="M14.5 3.75v3.5H18M9 11h6M9 14.5h6M9 18h4"></path>
+            </svg>
+          </button>
+          <button id="providerUsageButton" class="sidebar-icon-button usage-icon-button" type="button" title="查看用量" aria-label="查看用量" aria-expanded="false" aria-controls="providerUsagePopover" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="12" cy="12" r="8"></circle>
               <path d="M12 4a8 8 0 0 1 8 8"></path>
@@ -181,16 +187,35 @@
         <div id="attachmentTray" class="attachment-tray hidden" aria-label="待送出附件"></div>
         <div class="composer-input-row">
           <textarea id="prompt" rows="2" placeholder="輸入想做的事 或 請 Agent 幫你制定一個計畫" disabled></textarea>
-          <button id="send" class="send" type="button" aria-label="送出訊息" title="送出訊息" disabled>
-            <svg id="sendIcon" class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 19V5m0 0-6 6m6-6 6 6" />
-            </svg>
-          </button>
-          <button id="stopRun" class="send stop-run hidden" type="button" aria-label="停止 Run" title="停止 Run">
-            <svg class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="7" y="7" width="10" height="10" rx="1.5" />
-            </svg>
-          </button>
+          <div class="composer-action-stack">
+            <div id="screenCaptureControl" class="screen-capture-control">
+              <button id="captureScreen" class="composer-capture-button" type="button" aria-label="擷取畫面" title="擷取畫面">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M6 2v14a2 2 0 0 0 2 2h14M18 22V8a2 2 0 0 0-2-2H2"></path>
+                </svg>
+              </button>
+              <button id="screenCaptureOptions" class="screen-capture-options" type="button" aria-label="畫面擷取設定" title="畫面擷取設定" aria-haspopup="dialog" aria-expanded="false">
+                <svg viewBox="0 0 10 10" aria-hidden="true"><path d="m2 3 3 3 3-3"></path></svg>
+              </button>
+              <div id="screenCaptureMenu" class="screen-capture-menu hidden" role="dialog" aria-label="畫面擷取設定">
+                <label class="screen-capture-toggle">
+                  <input id="hideWindowDuringCapture" type="checkbox">
+                  <span class="toggle-switch" aria-hidden="true"></span>
+                  <span>截取畫面時隱藏視窗</span>
+                </label>
+              </div>
+            </div>
+            <button id="send" class="send" type="button" aria-label="送出訊息" title="送出訊息" disabled>
+              <svg id="sendIcon" class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 19V5m0 0-6 6m6-6 6 6" />
+              </svg>
+            </button>
+            <button id="stopRun" class="send stop-run hidden" type="button" aria-label="停止 Run" title="停止 Run">
+              <svg class="run-action-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="7" y="7" width="10" height="10" rx="1.5" />
+              </svg>
+            </button>
+          </div>
         </div>
       </form>
     </main>
@@ -232,7 +257,9 @@
             <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox">允許連線到 localhost 與私有網段</label>
             <p class="hint">關閉後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。私有網段預設拒絕，避免 Agent 讀取內網服務或雲端 metadata 位址；要讓 Agent 呼叫本機服務時才開啟。</p>
           </fieldset>
-          <button id="saveServiceSettings" class="primary" type="submit">儲存服務設定</button>
+          <div class="management-form-actions">
+            <button id="saveServiceSettings" class="primary" type="submit">儲存服務設定</button>
+          </div>
         </form>
         <section class="management-section backend-card">
           <div class="section-head"><h2>後端程序</h2><span class="status-line"><span id="managementStatusDot" class="dot"></span><strong id="managementBackendState">檢查中</strong></span></div>
@@ -824,6 +851,112 @@
         <button class="danger" type="submit" value="confirm">確認</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="imageEditorDialog" class="image-editor-dialog" aria-labelledby="imageEditorTitle">
+    <div class="dialog-title-row image-editor-title-row">
+      <div>
+        <h2 id="imageEditorTitle">編輯擷取畫面</h2>
+        <small>在圖像上加入方框、直線或文字；完成後按複製更新系統剪貼簿。</small>
+      </div>
+      <button id="closeImageEditor" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+    </div>
+    <div class="image-editor-toolbar" role="toolbar" aria-label="圖像編輯工具">
+      <div class="image-editor-tool-group" role="group" aria-label="繪圖工具">
+        <button class="image-editor-tool is-selected" type="button" data-image-tool="rectangle" aria-pressed="true" title="方框" aria-label="方框">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="14" rx="1"></rect></svg>
+        </button>
+        <button class="image-editor-tool" type="button" data-image-tool="line" aria-pressed="false" title="直線" aria-label="直線">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 19 19 5"></path></svg>
+        </button>
+        <button class="image-editor-tool" type="button" data-image-tool="text" aria-pressed="false" title="文字" aria-label="文字">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 5h14M12 5v14M8 19h8"></path></svg>
+        </button>
+      </div>
+      <div class="image-editor-color-picker">
+        <span class="image-editor-control-label">顏色</span>
+        <button id="imageEditorColorButton" class="image-editor-color-button" type="button" title="選擇顏色" aria-label="選擇顏色" aria-haspopup="dialog" aria-expanded="false">
+          <span id="imageEditorColorSwatch" class="image-editor-color-swatch" aria-hidden="true"></span>
+        </button>
+        <input id="imageEditorColor" type="hidden" value="#ff3b30">
+        <div id="imageEditorColorPalette" class="image-editor-color-palette hidden" role="dialog" aria-label="選擇顏色">
+          <div class="image-editor-color-grid" role="group" aria-label="選擇顏色">
+            <button type="button" data-image-color="#ff3b30" aria-label="#FF3B30"></button>
+            <button type="button" data-image-color="#ff9500" aria-label="#FF9500"></button>
+            <button type="button" data-image-color="#ffcc00" aria-label="#FFCC00"></button>
+            <button type="button" data-image-color="#34c759" aria-label="#34C759"></button>
+            <button type="button" data-image-color="#00c7be" aria-label="#00C7BE"></button>
+            <button type="button" data-image-color="#32ade6" aria-label="#32ADE6"></button>
+            <button type="button" data-image-color="#007aff" aria-label="#007AFF"></button>
+            <button type="button" data-image-color="#5856d6" aria-label="#5856D6"></button>
+            <button type="button" data-image-color="#af52de" aria-label="#AF52DE"></button>
+            <button type="button" data-image-color="#ff2d55" aria-label="#FF2D55"></button>
+            <button type="button" data-image-color="#a2845e" aria-label="#A2845E"></button>
+            <button type="button" data-image-color="#8e8e93" aria-label="#8E8E93"></button>
+            <button type="button" data-image-color="#ffffff" aria-label="#FFFFFF"></button>
+            <button type="button" data-image-color="#1c1c1e" aria-label="#1C1C1E"></button>
+          </div>
+          <div class="image-editor-hex-control">
+            <span>HEX</span>
+            <input id="imageEditorColorHex" type="text" value="#FF3B30" maxlength="7" spellcheck="false" aria-label="HEX 色碼">
+          </div>
+        </div>
+      </div>
+      <label class="image-editor-select-control">
+        <span>線條</span>
+        <select id="imageEditorLineWidth" aria-label="線條粗細">
+          <option value="2">2 px</option>
+          <option value="4" selected>4 px</option>
+          <option value="6">6 px</option>
+          <option value="10">10 px</option>
+        </select>
+      </label>
+      <label id="imageEditorTextControl" class="image-editor-text-control hidden">
+        <span>文字內容</span>
+        <input id="imageEditorText" type="text" maxlength="160" placeholder="輸入文字後在圖上點一下">
+      </label>
+      <label id="imageEditorFontControl" class="image-editor-select-control hidden">
+        <span>字級</span>
+        <select id="imageEditorFontSize" aria-label="文字大小">
+          <option value="20">20 px</option>
+          <option value="28" selected>28 px</option>
+          <option value="36">36 px</option>
+          <option value="48">48 px</option>
+        </select>
+      </label>
+      <span class="image-editor-toolbar-spacer"></span>
+      <button id="undoImageEdit" class="image-editor-command" type="button" title="復原" aria-label="復原" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7 4 12l5 5M5 12h8a6 6 0 0 1 6 6"></path></svg>
+      </button>
+      <button id="resetImageEdit" class="image-editor-command" type="button" title="清除所有標註" aria-label="清除所有標註" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13"></path></svg>
+      </button>
+      <button id="copyEditedImage" class="image-editor-copy primary" type="button" title="複製圖像" aria-label="複製圖像">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+      </button>
+    </div>
+    <div id="imageEditorStage" class="image-editor-stage">
+      <canvas id="imageEditorCanvas" tabindex="0" aria-label="擷取畫面編輯區"></canvas>
+    </div>
+    <div class="image-editor-footer">
+      <span id="imageEditorStatus" class="save-state" role="status"></span>
+      <span>⌘Z 復原</span>
+    </div>
+  </dialog>
+
+  <dialog id="memoDialog" class="memo-dialog">
+    <div class="dialog-title-row">
+      <div>
+        <h2>記事本</h2>
+        <small>隨手記錄；內容只保存在這台裝置，不會送到後端。</small>
+      </div>
+      <button id="closeMemo" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+    </div>
+    <textarea id="memoText" class="memo-editor" placeholder="開始輸入記事…" aria-label="記事本"></textarea>
+    <div class="memo-footer">
+      <span id="memoSaveState" class="save-state" role="status">自動儲存在本機</span>
+      <button id="clearMemo" class="danger ghost" type="button">清除記事</button>
+    </div>
   </dialog>
 
   <div id="toast" class="toast hidden" role="status"></div>

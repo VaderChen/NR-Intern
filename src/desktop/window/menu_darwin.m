@@ -280,6 +280,16 @@ void nr_restore_application_window(void) {
   }
 }
 
+void nr_hide_application_window(void) {
+  if (nr_window_lifecycle_delegate != nil) {
+    [(NRWindowLifecycleDelegate *)nr_window_lifecycle_delegate hideWindow:nil];
+    return;
+  }
+  if (nr_main_window != nil) {
+    [nr_main_window orderOut:nil];
+  }
+}
+
 void nr_uninstall_window_lifecycle(void) {
   if (nr_main_window != nil && nr_main_window.delegate == nr_window_lifecycle_delegate) {
     nr_main_window.delegate = nr_original_window_delegate;

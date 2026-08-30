@@ -16,6 +16,7 @@ STARTUP_SPLASH_SCRIPT="$PROJECT_ROOT/scripts/macos-startup-splash.js"
 STARTUP_SPLASH_ICON="$PROJECT_ROOT/assets/app-icon.png"
 STARTUP_SIGNAL=""
 STARTUP_SIGNAL_HANDED_OFF=0
+STARTUP_VERSION=""
 
 cleanup_startup_signal() {
 	if [[ "$STARTUP_SIGNAL_HANDED_OFF" != "1" && -n "$STARTUP_SIGNAL" && -e "$STARTUP_SIGNAL" ]]; then
@@ -56,6 +57,30 @@ resolve_startup_app_name() {
 	print -r -- "$service_name"
 }
 
+resolve_startup_version() {
+	if [[ -n "${NR_INTERN_VERSION:-}" ]]; then
+		print -r -- "$NR_INTERN_VERSION"
+		return
+	fi
+	TZ=Asia/Taipei date '+1.%y.%m%d build %H%M'
+}
+
+prepare_macos_codesign_identity() {
+	local identity
+	if [[ "$(uname -s)" != "Darwin" || -n "${NR_INTERN_CODESIGN_IDENTITY+x}" ]]; then
+		return 0
+	fi
+	if [[ ! -x /usr/bin/security ]]; then
+		return 0
+	fi
+	identity="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null |
+		/usr/bin/sed -n 's/^[^"]*"\(Developer ID Application:[^"]*\)".*$/\1/p' |
+		/usr/bin/head -n 1)"
+	if [[ -n "$identity" ]]; then
+		export NR_INTERN_CODESIGN_IDENTITY="$identity"
+	fi
+}
+
 start_startup_splash() {
 	local startup_app_name
 	if [[ "$(uname -s)" != "Darwin" || ! -f "$STARTUP_SPLASH_SCRIPT" || ! -f "$STARTUP_SPLASH_ICON" ]]; then
@@ -63,7 +88,7 @@ start_startup_splash() {
 	fi
 	startup_app_name="$(resolve_startup_app_name)"
 	STARTUP_SIGNAL="$(mktemp "${TMPDIR:-/tmp}/nr-intern-startup.XXXXXX")"
-	/usr/bin/osascript -l JavaScript "$STARTUP_SPLASH_SCRIPT" "$STARTUP_SIGNAL" "$STARTUP_SPLASH_ICON" "$startup_app_name" \
+	/usr/bin/osascript -l JavaScript "$STARTUP_SPLASH_SCRIPT" "$STARTUP_SIGNAL" "$STARTUP_SPLASH_ICON" "$startup_app_name" "$STARTUP_VERSION" \
 		</dev/null >>"$RUN_LOG" 2>&1 &
 	STARTUP_SPLASH_PID=$!
 	disown "$STARTUP_SPLASH_PID" 2>/dev/null || true
@@ -106,6 +131,10 @@ if [[ ! -x "$BUILD_SCRIPT" ]]; then
 	exit 1
 fi
 
+# Finder 啟動的背景子程序必須沿用相同 Developer ID；否則每次重建的
+# ad-hoc CDHash 都不同，macOS 會把螢幕錄製授權視為另一個 App。
+prepare_macos_codesign_identity
+
 # Finder 以 Terminal 執行 .command；先把完整建置與 UI 啟動流程轉到背景，
 # 再關閉承載本腳本的 Terminal，避免建置期間一直顯示 Shell 視窗。
 if [[ "${NR_INTERN_KEEP_TERMINAL:-0}" != "1" && "${NR_INTERN_DETACHED_LAUNCH:-0}" != "1" && "${TERM_PROGRAM:-}" == "Apple_Terminal" ]]; then
@@ -122,6 +151,8 @@ if [[ "${NR_INTERN_KEEP_TERMINAL:-0}" != "1" && "${NR_INTERN_DETACHED_LAUNCH:-0}
 fi
 
 mkdir -p "$LOG_DIR"
+STARTUP_VERSION="$(resolve_startup_version)"
+export NR_INTERN_VERSION="$STARTUP_VERSION"
 start_startup_splash
 
 "$BUILD_SCRIPT"

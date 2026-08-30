@@ -7,6 +7,7 @@ function run(arguments) {
   const signalPath = $(String(arguments[0]));
   const iconPath = $(String(arguments[1]));
   const appName = String(arguments[2] || "").trim() || "永不休息的實習生";
+  const version = String(arguments[3] || "").trim() || "0.1.0";
   const fileManager = $.NSFileManager.defaultManager;
   const application = $.NSApplication.sharedApplication;
   application.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
@@ -41,11 +42,20 @@ function run(arguments) {
   title.setTextColor($.NSColor.labelColor);
   title.sizeToFit;
   const titleWidth = Math.min(300, Math.ceil(Number(title.frame.size.width)));
-  title.setFrame($.NSMakeRect((360 - titleWidth) / 2, 70, titleWidth, 28));
+  title.setFrame($.NSMakeRect((360 - titleWidth) / 2, 76, titleWidth, 28));
   title.setLineBreakMode($.NSLineBreakByTruncatingMiddle);
   content.addSubview(title);
 
-  const progress = $.NSProgressIndicator.alloc.initWithFrame($.NSMakeRect(171, 24, 18, 18));
+  const versionLabel = $.NSTextField.labelWithString($("版本 " + version));
+  versionLabel.setFont($.NSFont.systemFontOfSizeWeight(12, $.NSFontWeightRegular));
+  versionLabel.setTextColor($.NSColor.secondaryLabelColor);
+  versionLabel.sizeToFit;
+  const versionWidth = Math.min(300, Math.ceil(Number(versionLabel.frame.size.width)));
+  versionLabel.setFrame($.NSMakeRect((360 - versionWidth) / 2, 52, versionWidth, 18));
+  versionLabel.setLineBreakMode($.NSLineBreakByTruncatingMiddle);
+  content.addSubview(versionLabel);
+
+  const progress = $.NSProgressIndicator.alloc.initWithFrame($.NSMakeRect(171, 22, 18, 18));
   progress.style = $.NSProgressIndicatorStyleSpinning;
   progress.controlSize = $.NSControlSizeSmall;
   progress.indeterminate = true;

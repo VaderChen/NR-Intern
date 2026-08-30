@@ -50,6 +50,18 @@ func run(ctx context.Context, options Options) error {
 	}); err != nil {
 		return fmt.Errorf("bind conversation activity callback: %w", err)
 	}
+	if err := view.Bind("nrInternSetWindowHidden", func(hidden bool) string {
+		view.Dispatch(func() {
+			if hidden {
+				hideApplicationWindow()
+				return
+			}
+			restoreApplicationWindow()
+		})
+		return ""
+	}); err != nil {
+		return fmt.Errorf("bind window visibility callback: %w", err)
+	}
 	readyTimer := time.AfterFunc(nativeStartupReadyTimeout, notifyReady)
 	defer readyTimer.Stop()
 
