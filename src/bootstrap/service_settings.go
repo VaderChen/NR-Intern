@@ -17,6 +17,9 @@ type storedServiceSettings struct {
 	MaxWallClockSeconds *int   `json:"max_wall_clock_seconds,omitempty"`
 	MaxTokens           *int   `json:"max_tokens,omitempty"`
 	MaxToolCalls        *int   `json:"max_tool_calls,omitempty"`
+	// 指標型別讓「設定檔提供、管理介面沒動過」與「管理介面明確關閉」可以區分。
+	HTTPFetchEnabled              *bool `json:"http_fetch_enabled,omitempty"`
+	HTTPFetchAllowPrivateNetworks *bool `json:"http_fetch_allow_private_networks,omitempty"`
 }
 
 func loadPersistedServiceSettings(config *Config) error {
@@ -57,6 +60,12 @@ func loadPersistedServiceSettings(config *Config) error {
 	if stored.MaxToolCalls != nil {
 		config.MaxToolCalls = *stored.MaxToolCalls
 	}
+	if stored.HTTPFetchEnabled != nil {
+		config.HTTPFetch.Enabled = *stored.HTTPFetchEnabled
+	}
+	if stored.HTTPFetchAllowPrivateNetworks != nil {
+		config.HTTPFetch.AllowPrivateNetworks = *stored.HTTPFetchAllowPrivateNetworks
+	}
 	return nil
 }
 
@@ -70,6 +79,9 @@ func persistServiceSettings(dataDir string, settings domain.ServiceSettings) err
 		MaxWallClockSeconds: intPointer(settings.MaxWallClockSeconds),
 		MaxTokens:           intPointer(settings.MaxTokens),
 		MaxToolCalls:        intPointer(settings.MaxToolCalls),
+
+		HTTPFetchEnabled:              boolPointer(settings.HTTPFetch.Enabled),
+		HTTPFetchAllowPrivateNetworks: boolPointer(settings.HTTPFetch.AllowPrivateNetworks),
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode service settings: %w", err)

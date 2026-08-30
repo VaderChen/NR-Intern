@@ -6,15 +6,22 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 ## 主要能力
 
-- 可擴充的 OpenAI-compatible Provider Router，支援遠端或本機模型服務。
+- 可擴充的 Provider Router，支援 OpenAI-compatible Chat Completions，以及使用 ChatGPT／Codex OAuth 的 OpenAI Codex Responses。
 - `Workspace → Project → Session` 管理結構，以及每個對話獨立的 Provider 與模型選擇。
+- Workspace 與 Project 的職務說明：常駐工作規則只寫一次，之後每次對話與排程都自動帶入。
 - 多份有序工作計畫、拖曳排序、步驟狀態與工具驗證證據。
+- 獨立的排程區塊：可自訂週期與 Sandbox，到點自動建立新對話並開工。
 - Durable Run、可重播 SSE、串流回答與斷線續接。
+- 對話執行中仍可繼續輸入，後續訊息會排入目前 UI 的待送佇列，上一輪結束後依序送出。
 - Context 自動整理、跨 Session 長期記憶與記憶範圍控制。
 - 原生檔案、文件、Shell、SSH 與計畫工具，搭配 Sandbox 及執行審核。
+- `http_fetch` 對外讀取網路資源：HTML 自動轉純文字，私有網段預設拒絕，並可從管理介面直接關閉。
+- 內建 MCP Client，可連接本機 stdio 或遠端 Streamable HTTP Server，將外部工具納入相同的權限與審核流程。
+- 選用的 NetPass 反向代理可公開後端 API；桌面控制 UI 不會經由通道公開。
 - Provider 啟用控制、模型探索、工具權限與稽核記錄。
 - 淺色／深色外觀，以及 AUTO、繁體中文、英文、日文、韓文介面。
 - Windows x64、Windows ARM64 與 macOS ARM64 桌面環境。
+- macOS 啟動時即建立狀態列圖示；工作進行中可隱藏 UI 繼續背景執行，再由選單或重新啟動程式恢復原視窗。
 
 介面語言只控制 UI 與尚未自訂的預設名稱；Agent 會依目前訊息、近期對話與明確偏好判斷使用者的慣用語言。
 
@@ -38,7 +45,7 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 ## 資料安全
 
-- Repository 只包含範例設定；Provider 金鑰、SSH 憑證、日誌、執行資料及發行產物均由 `.gitignore` 排除。
+- Repository 只包含範例設定；Provider／OAuth／MCP／NetPass 金鑰、SSH 憑證、日誌、執行資料及發行產物均由 `.gitignore` 排除。
 - 文件與範例僅使用相對路徑、localhost 或示例網域，不包含開發者電腦的絕對目錄。
 - 請勿提交 API Key、Token、私鑰、憑證、簽章身分或真實服務位址。
 

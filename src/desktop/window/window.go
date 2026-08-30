@@ -14,6 +14,7 @@ type Options struct {
 	Height  int
 	Debug   bool
 	OnReady func()
+	Restore <-chan struct{}
 }
 
 // Run 會阻塞直到使用者關閉視窗或 context 被取消。

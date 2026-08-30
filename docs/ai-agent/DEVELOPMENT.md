@@ -18,16 +18,21 @@
 | `AI_AGENT_ALLOWED_TOOLS` | 逗號分隔工具 allowlist |
 | `AI_AGENT_ALLOW_ELEVATED_TOOLS` | 是否允許 elevated session 使用寫檔、Shell／SSH；單機範例預設開啟，但每次高風險操作仍須人工核准 |
 | `AI_AGENT_MAX_TURNS` | Harness 最大回合數 |
+| `AI_AGENT_MAX_AUTONOMOUS_TOOL_TURNS` | 自主工作工具回合的額外上限；`0` 表示不另設固定上限，仍受 `max_turns` 與其他 Run budget 約束 |
 | `AI_AGENT_MAX_WALL_CLOCK_SECONDS` | 單次 Run 最長執行秒數；到期會取消正在等待的模型或工具 |
 | `AI_AGENT_MAX_TOKENS` | 單次 Run 累計 Provider token 上限 |
 | `AI_AGENT_MAX_TOOL_CALLS` | 單次 Run 最多可實際執行的工具呼叫數 |
-| `AI_AGENT_CONTEXT_MAX_TOKENS` | 觸發上下文壓縮的估算 token 上限 |
+| `AI_AGENT_CONTEXT_MAX_TOKENS` | 模型未回報 context window 時使用的輸入預算後備值；預設 256K |
 | `AI_AGENT_MAX_FILE_INPUT_BYTES` | `file_write`／`file_edit` 可處理的內容上限 |
 | `AI_AGENT_MEMORY_ENABLED` | 啟用長期記憶儲存與工具 |
 | `AI_AGENT_MEMORY_AUTO_RECALL` | 每次 operation 自動召回相關記憶 |
 | `AI_AGENT_MEMORY_ALLOW_WRITES` | 開放記憶寫入與軟性遺忘工具 |
 
-JSON 設定使用具名 Provider registry。`type` 是 adapter 工廠辨識欄位；目前支援 `openai-compatible`，日後新增類型時不修改 Workspace 或 Harness：
+載入優先序為：內建預設 → JSON 設定 → 管理介面持久化設定 → 環境變數。環境變數在持久化設定
+載入後會再套用一次，因此永遠具有最高優先權；管理介面不會覆寫部署環境明確注入的值。
+
+JSON 設定使用具名 Provider registry。`type` 是 adapter 工廠辨識欄位；目前支援
+`openai-compatible` 與 `openai-codex-responses`，新增類型時不修改 Workspace 或 Harness：
 
 ```json
 {
@@ -36,9 +41,9 @@ JSON 設定使用具名 Provider registry。`type` 是 adapter 工廠辨識欄�
     "openai-compatible": {
       "type": "openai-compatible",
       "openai_compatible": {
-        "base_url": "https://api.openai.com/v1",
+        "base_url": "https://llm.example.com/v1",
         "api_key": "",
-        "model": "gpt-4o-mini",
+        "model": "example-model",
         "max_attempts": 3
       }
     }
@@ -46,10 +51,50 @@ JSON 設定使用具名 Provider registry。`type` 是 adapter 工廠辨識欄�
 }
 ```
 
+Codex Responses Provider 不設定自訂 endpoint 或 API Key；先保存 Provider，再從管理頁完成
+ChatGPT／Codex OAuth：
+
+```json
+{
+  "providers": {
+    "codex": {
+      "type": "openai-codex-responses",
+      "enabled": true,
+      "openai_codex_responses": {
+        "model": "YOUR_CODEX_MODEL"
+      }
+    }
+  }
+}
+```
+
+OAuth Token、管理頁保存的 Provider 集合、MCP Server 集合、服務設定與 NetPass Key 都位於
+`data_dir` 下的權限限制檔案，不應複製回範例設定或提交版本庫。管理 API 只回傳是否已設定，
+不提供秘密明文。
+
 `AI_AGENT_LLM_*` 與 `OPENAI_*` 只覆寫 `AI_AGENT_DEFAULT_PROVIDER_ID` 指定的 OpenAI-compatible Provider；其他具名 Provider 使用 JSON 設定。
 
 Context 摘要可在 JSON 的 `context.summary_provider_id`／`summary_model` 指定較便宜的路由；
 Provider ID 必須已存在於 `providers`。留空時摘要沿用 Session 的 Provider 與 Model。
+
+`http_fetch` 使用獨立設定區塊：
+
+```json
+{
+  "http_fetch": {
+    "enabled": true,
+    "allow_private_networks": false,
+    "max_response_bytes": 1048576,
+    "timeout_seconds": 30,
+    "max_redirects": 5,
+    "allowed_hosts": [],
+    "blocked_hosts": []
+  }
+}
+```
+
+`enabled` 與 `allow_private_networks` 可由管理介面即時調整；其餘邊界只讀取 JSON 設定。
+`allowed_hosts` 非空時採白名單，`blocked_hosts` 永遠優先。私有網段預設拒絕。
 
 ## 獨立後端
 
@@ -75,6 +120,26 @@ go run ./src/cmd/desktop \
   -backend-url http://127.0.0.1:9000 \
   -backend-token YOUR_TOKEN
 ```
+
+macOS 版啟動時就建立狀態列項目。對話進行中關閉主視窗可選擇只隱藏 UI，Run 會繼續由後端執行；
+狀態列選單可顯示、隱藏或真正結束程式。若再次啟動時 desktop port 已由 NR-Intern 使用，新程序會
+要求既有程序恢復主視窗後結束，不會建立第二個 UI／backend。Windows 目前沒有這組原生狀態列
+生命週期。
+
+Console 的待送訊息佇列只存在目前 Browser／WebView 記憶體，上一個 Run 結束後依序送出；重新整理
+頁面或結束 UI 不保證保留尚未送出的項目。已送出的 Run 則是 durable，UI 斷線不會取消。
+
+## MCP Client
+
+主系統可從管理頁或 `mcp_servers` 設定連接 MCP Server：
+
+- `stdio`：指定 command、args、work directory 與必要 environment。子程序不會繼承完整後端環境。
+- `streamable-http`：指定 http／https URL，可另帶 Bearer Token 與 headers。
+
+儲存後 `mcpclient.Manager` 在背景連線並刷新 `tools/list`。每個 MCP 工具都經由既有 permission
+profile、人工 Approval、工具事件與輸出限制，不應直接註冊成繞過 `tools.Registry` 的捷徑。
+新增 transport 或內容類型時，維持「秘密不回讀、外部內容不受信任、取消可傳遞、輸出有上限」四個
+邊界。
 
 ## 新增原生工具
 

@@ -17,6 +17,8 @@ import (
 
 var _ ports.ProjectRepository = (*ProjectRepository)(nil)
 
+const maxInstructionCharacters = 8000
+
 type ProjectRepository struct {
 	mu       sync.RWMutex
 	filePath string
@@ -60,6 +62,10 @@ func (r *ProjectRepository) Create(ctx context.Context, input domain.CreateProje
 	if err != nil {
 		return domain.Project{}, err
 	}
+	instructions, err := normalizeInstructions(input.Instructions)
+	if err != nil {
+		return domain.Project{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.nameExistsLocked(workspaceID, name, "") {
@@ -77,6 +83,7 @@ func (r *ProjectRepository) Create(ctx context.Context, input domain.CreateProje
 		WorkspaceID:  workspaceID,
 		Name:         name,
 		Description:  strings.TrimSpace(input.Description),
+		Instructions: instructions,
 		SandboxRoots: sandboxRoots,
 		Position:     position,
 		CreatedAt:    now,
@@ -127,7 +134,7 @@ func (r *ProjectRepository) Update(ctx context.Context, projectID string, input 
 	if err := ctx.Err(); err != nil {
 		return domain.Project{}, err
 	}
-	if input.Name == nil && input.Description == nil && input.SandboxRoots == nil && input.Position == nil {
+	if input.Name == nil && input.Description == nil && input.Instructions == nil && input.SandboxRoots == nil && input.Position == nil {
 		return domain.Project{}, fmt.Errorf("%w: at least one project field is required", domain.ErrInvalidInput)
 	}
 	projectID = strings.TrimSpace(projectID)
@@ -149,6 +156,13 @@ func (r *ProjectRepository) Update(ctx context.Context, projectID string, input 
 	}
 	if input.Description != nil {
 		value.Description = strings.TrimSpace(*input.Description)
+	}
+	if input.Instructions != nil {
+		instructions, err := normalizeInstructions(*input.Instructions)
+		if err != nil {
+			return domain.Project{}, err
+		}
+		value.Instructions = instructions
 	}
 	if input.SandboxRoots != nil {
 		sandboxRoots, err := normalizeProjectSandboxRoots(*input.SandboxRoots)
@@ -254,6 +268,16 @@ func cloneProjects(values map[string]domain.Project) map[string]domain.Project {
 func cloneProject(value domain.Project) domain.Project {
 	value.SandboxRoots = append([]string(nil), value.SandboxRoots...)
 	return value
+}
+
+// normalizeInstructions 是 Workspace 與 Project 職務說明的共用檢查。
+// 上限存在的理由是這段文字每一輪都會進入提示，不設限會安靜地吃掉 context 預算。
+func normalizeInstructions(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if len([]rune(value)) > maxInstructionCharacters {
+		return "", fmt.Errorf("%w: instructions cannot exceed %d characters", domain.ErrInvalidInput, maxInstructionCharacters)
+	}
+	return value, nil
 }
 
 func normalizeProjectSandboxRoots(values []string) ([]string, error) {

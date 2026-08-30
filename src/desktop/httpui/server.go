@@ -23,12 +23,14 @@ type Config struct {
 	Supervisor   *supervisor.Supervisor
 	BackendToken string
 	ControlToken string
+	RestoreUI    func()
 }
 
 type Server struct {
 	supervisor   *supervisor.Supervisor
 	backendToken string
 	controlToken string
+	restoreUI    func()
 	static       http.Handler
 	proxy        http.Handler
 	mux          *http.ServeMux
@@ -53,6 +55,7 @@ func New(config Config) (*Server, error) {
 		supervisor:   config.Supervisor,
 		backendToken: strings.TrimSpace(config.BackendToken),
 		controlToken: config.ControlToken,
+		restoreUI:    config.RestoreUI,
 		static:       http.FileServer(http.FS(assets)),
 		mux:          http.NewServeMux(),
 	}
@@ -79,6 +82,8 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("GET /.well-known/nr-intern-desktop", s.desktopIdentity)
+	s.mux.HandleFunc("POST /desktop/restore", s.restoreDesktop)
 	s.mux.HandleFunc("GET /desktop/api/status", s.status)
 	s.mux.HandleFunc("GET /desktop/api/logs", s.logs)
 	s.mux.HandleFunc("POST /desktop/api/start", s.start)
@@ -89,6 +94,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /desktop/api/resources/open", s.openResource)
 	s.mux.Handle("/backend/", s.proxy)
 	s.mux.HandleFunc("/", s.serveStatic)
+}
+
+func (s *Server) desktopIdentity(writer http.ResponseWriter, _ *http.Request) {
+	writer.Header().Set("X-NR-Intern-Desktop", "1")
+	writeData(writer, map[string]any{"service": "nr-intern-desktop", "version": 1})
+}
+
+func (s *Server) restoreDesktop(writer http.ResponseWriter, _ *http.Request) {
+	if s.restoreUI == nil {
+		writeJSON(writer, http.StatusServiceUnavailable, map[string]any{"error": "native UI restore is unavailable"})
+		return
+	}
+	s.restoreUI()
+	writeJSON(writer, http.StatusAccepted, map[string]any{"status": "restoring"})
 }
 
 func (s *Server) status(writer http.ResponseWriter, request *http.Request) {

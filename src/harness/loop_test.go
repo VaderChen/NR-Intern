@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"AgenticService/src/adapters/filestore"
 	"AgenticService/src/approval"
 	"AgenticService/src/domain"
 	"AgenticService/src/ports"
@@ -456,8 +457,21 @@ func TestRunExecutesToolsAndFeedsResultsBack(t *testing.T) {
 	}
 }
 
-func TestRunForcesFinalizationAfterAutonomousToolTurnLimit(t *testing.T) {
+func TestRunForcesFinalizationAfterAutonomousToolTurnLimitWithoutPlanLoop(t *testing.T) {
 	sessions := newMemorySessions(testSession())
+	plans, err := filestore.NewPlanRepository(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewPlanRepository: %v", err)
+	}
+	plan, err := domain.NewPlan(testSession().ID, domain.CreatePlanInput{
+		Title: "長任務", Steps: []domain.CreatePlanStepInput{{Title: "分析目錄", Verification: "摘要完成"}},
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("NewPlan: %v", err)
+	}
+	if _, err := plans.Create(context.Background(), plan); err != nil {
+		t.Fatalf("Create plan: %v", err)
+	}
 	model := &scriptedModel{responses: []domain.ModelResponse{
 		{ToolCalls: []domain.ToolCall{{ID: "call_1", Name: "directory_list", Arguments: map[string]any{"path": "."}}}},
 		{ToolCalls: []domain.ToolCall{{ID: "call_2", Name: "file_search", Arguments: map[string]any{"path": ".", "query": "README"}}}},
@@ -473,6 +487,7 @@ func TestRunForcesFinalizationAfterAutonomousToolTurnLimit(t *testing.T) {
 		},
 	}
 	runner := newTestRunner(sessions, model, tools)
+	runner.Plans = plans
 	runner.MaxAutonomousToolTurns = 2
 
 	result, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "分析目前目錄"}, nil)
@@ -481,6 +496,9 @@ func TestRunForcesFinalizationAfterAutonomousToolTurnLimit(t *testing.T) {
 	}
 	if result.Message.Content != "已根據目前取得的目錄與搜尋結果完成摘要。" {
 		t.Fatalf("answer = %q", result.Message.Content)
+	}
+	if result.Message.Metadata["termination"] != "plan_no_progress" {
+		t.Fatalf("final metadata = %+v, want visible plan no-progress termination", result.Message.Metadata)
 	}
 	if len(model.requests) != 3 {
 		t.Fatalf("model requests = %d, want 3", len(model.requests))
@@ -491,6 +509,43 @@ func TestRunForcesFinalizationAfterAutonomousToolTurnLimit(t *testing.T) {
 	}
 	if !strings.Contains(forced.PhasePrompt, "強制收斂階段") || !strings.Contains(forced.ToolPrompt, "Session 工具能力目錄") || strings.Contains(forced.ToolPrompt, "本輪沒有可用") {
 		t.Fatalf("forced finalization prompts missing: phase=%q tools=%q", forced.PhasePrompt, forced.ToolPrompt)
+	}
+}
+
+func TestRunDoesNotApplyFixedAutonomousToolLimitByDefault(t *testing.T) {
+	sessions := newMemorySessions(testSession())
+	const toolTurns = 17
+	responses := make([]domain.ModelResponse, 0, toolTurns+1)
+	for index := 0; index < toolTurns; index++ {
+		responses = append(responses, domain.ModelResponse{ToolCalls: []domain.ToolCall{{
+			ID:   fmt.Sprintf("call_%d", index),
+			Name: "directory_list",
+			Arguments: map[string]any{
+				"path": fmt.Sprintf("dir-%d", index),
+			},
+		}}})
+	}
+	responses = append(responses, domain.ModelResponse{Content: "長任務已完成。"})
+	model := &scriptedModel{responses: responses}
+	tools := &fakeTools{
+		definitions: []domain.ToolDefinition{{Name: "directory_list", ReadOnly: true}},
+		execute: func(_ context.Context, _ domain.Session, call domain.ToolCall) (domain.ToolExecution, error) {
+			return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: "ok"}, nil
+		},
+	}
+	runner := newTestRunner(sessions, model, tools)
+	runner.Budget.MaxTurns = toolTurns + 2
+	runner.MaxAutonomousToolTurns = 0
+
+	result, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "執行長任務"}, nil)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Message.Content != "長任務已完成。" || len(model.requests) != toolTurns+1 {
+		t.Fatalf("result=%+v requests=%d, want all %d tool turns followed by final answer", result.Message, len(model.requests), toolTurns)
+	}
+	if len(model.requests[toolTurns].Tools) == 0 {
+		t.Fatal("default unlimited mode unexpectedly forced finalization")
 	}
 }
 

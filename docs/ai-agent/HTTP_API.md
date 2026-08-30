@@ -15,8 +15,22 @@ Authorization: Bearer <token>
 | GET | `/api/v1/openapi.yaml` | 完整 OpenAPI 3.1 契約 |
 | GET | `/api/v1/admin/status` | 版本、instance 與啟動時間 |
 | GET | `/api/v1/admin/diagnostics` | 脫敏後端設定、Provider、Session、Run 與工具統計 |
-| GET | `/api/v1/tools` | 原生工具定義、allowlist 與目前可用性 |
+| GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、Run 上限與 `http_fetch` 開關 |
+| GET／PUT | `/api/v1/admin/provider-settings` | 讀取或完整取代脫敏 Provider 設定 |
+| GET | `/api/v1/admin/provider-settings/{provider_id}/models` | 重新取得模型目錄；沒有目錄時回傳空陣列 |
+| POST | `/api/v1/admin/provider-settings/{provider_id}/test` | 送出最小模型請求並測試工具呼叫 |
+| POST | `/api/v1/admin/provider-settings/{provider_id}/oauth/start` | 啟動 ChatGPT／Codex OAuth PKCE 驗證 |
+| GET | `/api/v1/admin/provider-settings/{provider_id}/oauth/status` | 讀取脫敏 OAuth 狀態 |
+| DELETE | `/api/v1/admin/provider-settings/{provider_id}/oauth` | 中斷 OAuth 並刪除該 Provider Token |
+| GET／PUT | `/api/v1/admin/mcp-settings` | 讀取或完整取代 MCP Server 設定 |
+| POST | `/api/v1/admin/mcp-settings/{mcp_id}/test` | 重新連線 MCP Server 並刷新工具清單 |
+| GET／PUT | `/api/v1/admin/reverse-proxy` | 讀取或更新 NetPass 反向代理設定 |
+| POST | `/api/v1/admin/reverse-proxy/start` | 接受使用政策後啟動 NetPassClient |
+| POST | `/api/v1/admin/reverse-proxy/stop` | 停止 NetPassClient |
+| GET | `/api/v1/tools` | 內建與 MCP 工具定義、allowlist 與目前可用性 |
 | GET | `/api/v1/providers` | 已註冊 Provider adapter 清單 |
+| GET | `/api/v1/providers/{provider_id}/capabilities` | 讀取 Provider／Model 的 Context 與輸出限制 |
+| GET | `/api/v1/providers/{provider_id}/usage` | 讀取最近一次 5 小時／7 天用量視窗；無資料時標記 unavailable |
 | GET | `/api/v1/memories` | 搜尋長期記憶（`scope`、`q`、`kinds`、`tags`、`limit`） |
 | POST | `/api/v1/memories` | 由使用者寫入長期記憶 |
 | GET | `/api/v1/memories/{memory_id}` | 讀取單筆長期記憶 |
@@ -32,10 +46,17 @@ Authorization: Bearer <token>
 | GET | `/api/v1/projects/{project_id}` | 讀取 Project |
 | PATCH | `/api/v1/projects/{project_id}` | 更新 Project 名稱、描述或排序位置 |
 | DELETE | `/api/v1/projects/{project_id}` | 刪除空 Project |
+| GET | `/api/v1/schedules` | 排程清單（`workspace_id` 過濾） |
+| POST | `/api/v1/schedules` | 建立排程 |
+| GET | `/api/v1/schedules/{schedule_id}` | 讀取排程 |
+| PATCH | `/api/v1/schedules/{schedule_id}` | 更新排程；變更週期或啟用狀態會重算 `next_run_at` |
+| DELETE | `/api/v1/schedules/{schedule_id}` | 刪除排程；已建立的 Session 保留 |
+| POST | `/api/v1/schedules/{schedule_id}/run` | 立刻執行一次，不改變 `next_run_at` |
 | GET | `/api/v1/agents` | Agent 清單 |
 | GET | `/api/v1/agents/{agent_id}` | Agent 描述 |
 | GET | `/api/v1/agents/{agent_id}/sessions` | Session 清單 |
 | POST | `/api/v1/agents/{agent_id}/sessions` | 建立 Session |
+| PUT | `/api/v1/agents/{agent_id}/sessions/order` | 調整同一 Project 內未釘選 Session 的完整順序 |
 | GET | `/api/v1/sessions/{session_id}` | 讀取 Session |
 | PATCH | `/api/v1/sessions/{session_id}` | 更新標題、Provider、模型、權限或記憶 scope |
 | DELETE | `/api/v1/sessions/{session_id}` | 刪除 Session 與 workspace |
@@ -48,6 +69,7 @@ Authorization: Bearer <token>
 | DELETE | `/api/v1/sessions/{session_id}/plans/{plan_id}` | 刪除指定計畫 |
 | PUT | `/api/v1/sessions/{session_id}/plans/order` | 以完整 `plan_ids` 列表調整執行順序 |
 | GET | `/api/v1/sessions/{session_id}/messages` | Transcript messages |
+| POST | `/api/v1/sessions/{session_id}/attachments` | 上傳這次對話要使用的附件 |
 | GET | `/api/v1/sessions/{session_id}/entries` | 分頁讀取完整 Harness 稽核 entries |
 | GET | `/api/v1/sessions/{session_id}/runs` | Session 的 Runs |
 | POST | `/api/v1/sessions/{session_id}/runs` | 建立非同步 Run，立即回傳 `202` |
@@ -87,6 +109,73 @@ curl -X POST http://127.0.0.1:8787/api/v1/runs/RUN_ID/retry \
   -H 'Idempotency-Key: retry-client-key'
 ```
 
+## 管理設定與外部整合
+
+管理端點與一般 API 使用相同的 Bearer 驗證。讀取設定時所有秘密都經過脫敏：API Key、OAuth
+Token、MCP environment／headers 與 NetPass Key 只回傳是否已設定，永遠不回傳明文。
+
+### Provider 與 ChatGPT／Codex OAuth
+
+`PUT /api/v1/admin/provider-settings` 以完整集合套用設定，支援 `openai-compatible` 與
+`openai-codex-responses`。OpenAI-compatible 的 `api_key` 省略時保留、空字串清除；Codex
+Responses Token 不放在這份 payload，而由 OAuth 端點管理。仍被系統預設、Workspace 或 Session
+引用的 Provider 不可直接移除或停用。
+
+OAuth 流程如下：
+
+1. `POST .../{provider_id}/oauth/start` 啟動 authorization-code + PKCE，並暫時建立只監聽
+   loopback 的 callback server。
+2. 回應提供公開的 `authorization_url` 與 `callback_uri`，桌面端會嘗試開啟 Browser；登入與帳號
+   選擇都在 Browser 完成。
+3. `GET .../{provider_id}/oauth/status` 輪詢 `pending`、`connected` 或 `failed`；狀態不含 access
+   token 或 refresh token。
+4. `DELETE .../{provider_id}/oauth` 中斷連線並刪除該 Provider 的本機 Token。
+
+OpenAI Codex Responses 不提供模型目錄時，models endpoint 回傳空陣列，Console 顯示 `-`，仍可
+手動設定模型名稱。`GET /api/v1/providers/{provider_id}/usage` 的 5 小時／7 天視窗若沒有上游資料，
+`available=false`，呼叫端不得推測為 100%。
+
+### MCP Client
+
+MCP 設定以完整 `servers` 集合更新。每個 Server 支援本機 `stdio` 或遠端
+`streamable-http`；遠端連線可設定 Bearer Token 與自訂 headers，本機程序可設定 args、工作目錄
+與明確的 environment。秘密欄位省略時保留既有值，API Key 傳空字串、environment／headers 傳
+空物件時清除。
+
+```json
+{
+  "servers": [
+    {
+      "id": "example",
+      "display_name": "Example MCP",
+      "enabled": true,
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "startup_timeout_seconds": 20,
+      "call_timeout_seconds": 1800,
+      "trust_annotations": false
+    }
+  ]
+}
+```
+
+儲存後連線在背景暖機；`POST .../{mcp_id}/test` 會強制重連並刷新工具清單。所有 MCP 工具都進入
+Session permission 與人工 Approval 流程。`trust_annotations=true` 只允許 Server 的
+`readOnlyHint` 影響並行排程，不代表跳過權限或 Approval。
+
+### NetPass 反向代理
+
+反向代理只把 backend API port 交給 NetPassClient，不公開 desktop UI。API Key 留白時保留，
+`clear_api_key=true` 才清除；執行中必須先停止才能改設定。啟動 request 必須明確帶入：
+
+```json
+{"accept_usage_policy": true}
+```
+
+NetPass Key 只用來連接通道，不等同後端 API 認證。啟動通道前必須另外設定強度足夠的
+`api_token`；目前 NetPass 啟動流程不會代為驗證這個條件。公開網址與 Key 應視為敏感資料，
+不應寫入文件、日誌或版本庫。
+
 ## Workspace、Project 與 Session
 
 正式層級為 `Workspace → Project → Session`。先建立可容納多個 Provider 的 Workspace；現階段前端為單選，因此會寫入單元素 `provider_ids`，但資料與 API 不需在未來擴充時搬移：
@@ -97,18 +186,15 @@ curl -X POST http://127.0.0.1:8787/api/v1/workspaces \
   -d '{"name":"產品開發","provider_ids":["openai-compatible"],"default_provider_id":"openai-compatible","model":"gpt-5.4"}'
 ```
 
-`default_provider_id` 必須存在於 `provider_ids`，這個集合只管理 Workspace 自己的預設來源。Session／Run 的 Provider override 可選擇任一全域已啟用 Provider；未指定時才沿用 Workspace 預設。仍被 Workspace 或 Session 引用的 Provider 不可停用或刪除。目前 Provider 工廠只實作 `openai-compatible`，Router、Workspace 與 Harness 介面則允許日後註冊其他協定類型。
+`default_provider_id` 必須存在於 `provider_ids`，這個集合只管理 Workspace 自己的預設來源。Session／Run 的 Provider override 可選擇任一全域已啟用 Provider；未指定時才沿用 Workspace 預設。仍被 Workspace 或 Session 引用的 Provider 不可停用或刪除。目前 Provider 工廠支援 `openai-compatible` 與 `openai-codex-responses`；Router、Workspace 與 Harness 仍以協定無關介面運作。
 
-建立 Project 時可透過 `sandbox_roots` 指定多個既有的絕對目錄。Session 屬於該 Project 時，原生檔案工具與 Shell 的工作目錄只能落在其中一個根目錄內；空陣列則使用 Session 私有工作目錄：
+建立 Project 時可透過 `sandbox_roots` 指定多個本機既有的絕對目錄。Session 屬於該 Project 時，原生檔案工具與 Shell 的工作目錄只能落在其中一個根目錄內；空陣列則使用 Session 私有工作目錄。公開文件不放入任何主機的絕對目錄，API Client 應在部署時提供實際路徑：
 
 ```json
 {
   "name": "NR-Intern",
   "workspace_id": "workspace_xxx",
-  "sandbox_roots": [
-    "projects/nr-intern",
-    "documents/specifications"
-  ]
+  "sandbox_roots": []
 }
 ```
 
@@ -138,6 +224,21 @@ curl -X POST http://127.0.0.1:8787/api/v1/agents/general-agent/sessions \
 Workspace 與 Project 都是獨立持久化實體，Project 名稱只要求在所屬 Workspace 內唯一。Session 以 `workspace_id`、`project_id` 建立正式關聯；空 `project_id` 代表該 Workspace 內未分類。釘選使用 Session 的 `pinned` 與 `pinned_at`，不依賴瀏覽器 local storage。刪除仍含有子項目的 Workspace／Project 會回傳 `409 Conflict`，不會隱含刪除或搬移。
 
 每個 Browser 分頁以自己的 `sessionStorage` 保存目前 Workspace，不修改後端全域狀態，因此可多開前端並同時操作不同 Workspace。後端只序列化同一 Session 的 Run，不同 Session 可並行。
+
+## 職務說明
+
+Workspace 與 Project 都有 `instructions` 欄位，用來保存只寫一次、每次對話都套用的工作規則：
+
+```bash
+curl -X PATCH http://127.0.0.1:8787/api/v1/workspaces/WORKSPACE_ID \
+  -H 'Content-Type: application/json' \
+  -d '{"instructions":"回覆一律使用繁體中文；提交前必須跑過測試。"}'
+```
+
+每次 Run 由後端依 Session 所屬層級組成 `## 職務說明` 提示段落，順序為 Workspace → Project，
+範圍較小者優先；與使用者本輪明確要求衝突時以本輪要求為準。呼叫端自帶的
+`metadata.instructions` 會在 `StartRun` 被移除，不能藉此注入提示。單一層級上限 8000 字，
+空字串代表移除該層級的說明。排程建立的對話不屬於任何 Project，因此只會套用 Workspace 的說明。
 
 ## 管理 Session
 
@@ -171,13 +272,50 @@ curl -X POST http://127.0.0.1:8787/api/v1/sessions/SESSION_ID/plans \
 ```
 
 列表中第一份未完成計畫為 `active`，後續計畫為 `queued`；active 完成後會自動啟用下一份。
-Console 可收合各計畫，並以拖曳後送出完整 `plan_ids` 調整順序。已經開始執行的 active
+Console 可收合各計畫，並以拖曳後送出完整 `plan_ids` 調整順序；「清除已完成」只會刪除
+`completed` 與 `canceled`，不影響 `active` 或 `queued`。已經開始執行的 active
 計畫不能移到其他未完成計畫之後。Run 執行期間不能由 HTTP 新增、重建、刪除或排序計畫，
 以免 UI 與 Agent 同時改寫。Agent 使用 `plan_get`、`plan_create`、`plan_step_update` 控制
 同一個有序佇列；Domain 只接受
 `pending → in_progress → verifying → completed` 的依序流程，且 completed 必須附上
 實際驗證證據。Session 匯出會一併包含全部計畫。舊版單數 `/plan` 端點仍保留相容行為，
 優先操作目前 active 計畫，沒有 active 時才使用列表第一份。
+
+## 排程
+
+排程是 Workspace 層級的獨立實體，不隸屬於任何 Project 或 Session：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/v1/schedules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "workspace_id":"WORKSPACE_ID",
+    "name":"每日巡檢",
+    "prompt":"檢查昨天的執行結果並整理成摘要",
+    "recurrence":{"frequency":"daily","time_of_day":"09:00"},
+    "sandbox_roots":[]
+  }'
+```
+
+`recurrence.frequency` 只接受 `interval`（`interval_minutes` 1–10080）、`daily`（`time_of_day`）與
+`weekly`（`time_of_day` 加至少一個 `weekdays`，0 是星期日）；每日與每週採後端所在時區的牆上時間。
+`sandbox_roots` 與 Project 套用同一組驗證；API Client 若指定，必須使用部署主機上實際存在的
+絕對目錄。留空時只使用該次執行建立的 Session 私有工作目錄。
+
+到點時後端會建立一個全新的 Session 再送出 `prompt`，因此每次執行都是乾淨的上下文；Session
+metadata 帶有 `schedule_id`。後端沒有執行的時間點不補跑，重新啟動時超過 15 分鐘寬限的
+`next_run_at` 會直接對齊到下一次。
+
+```bash
+curl "http://127.0.0.1:8787/api/v1/schedules?workspace_id=WORKSPACE_ID"
+curl -X PATCH http://127.0.0.1:8787/api/v1/schedules/SCHEDULE_ID \
+  -H 'Content-Type: application/json' -d '{"enabled":false}'
+curl -X POST http://127.0.0.1:8787/api/v1/schedules/SCHEDULE_ID/run
+curl -X DELETE http://127.0.0.1:8787/api/v1/schedules/SCHEDULE_ID
+```
+
+變更 `recurrence` 或 `enabled` 時 `next_run_at` 會立即重算，停用的排程不帶 `next_run_at`。
+`/run` 立刻執行一次並回傳 Run，排程原本的 `next_run_at` 不變。刪除排程不會刪除已經建立的 Session。
 
 ## 工具目錄與後端診斷
 
@@ -188,7 +326,19 @@ curl 'http://127.0.0.1:8787/api/v1/tools?session_id=SESSION_ID'
 curl http://127.0.0.1:8787/api/v1/admin/diagnostics
 ```
 
-每個工具都回傳 `allowed`、`available` 與可能的 `unavailable_reason`。診斷資料只包含 SSH profile 名稱、API token 是否已設定，以及 Provider 的脫敏設定；不回傳 HTTP token、LLM API key、SSH 密碼、passphrase 或私鑰內容。
+每個工具都回傳 `allowed`、`available` 與可能的 `unavailable_reason`。`http_fetch` 是唯一可由模型自行指定任意 URL 的內建工具，
+除了 allowlist 與 permission profile，另外受管理介面的開關控制：
+
+```bash
+curl -X PUT http://127.0.0.1:8787/api/v1/admin/service-settings \
+  -H 'Content-Type: application/json' \
+  -d '{"service_name":"永不休息的實習生","http_fetch_enabled":false}'
+```
+
+`http_fetch_enabled` 與 `http_fetch_allow_private_networks` 省略時保留目前設定，變更立即生效，
+不需要重啟後端；關閉後工具不會出現在模型的工具清單，工具目錄會回報
+`http_fetch is turned off in the backend service settings`。回應大小、逾時、轉址次數與
+`allowed_hosts`／`blocked_hosts` 只能由設定檔的 `http_fetch` 區塊調整。診斷資料只包含 SSH profile 名稱、API token 是否已設定，以及 Provider 的脫敏設定；不回傳 HTTP token、LLM API key、SSH 密碼、passphrase 或私鑰內容。
 
 完整機器可讀契約位於 [`src/transport/httpapi/openapi.yaml`](../../src/transport/httpapi/openapi.yaml)，執行中的後端也會由 `/api/v1/openapi.yaml` 提供相同內容。
 

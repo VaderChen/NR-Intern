@@ -60,6 +60,10 @@ func (r *WorkspaceRepository) Create(ctx context.Context, input domain.CreateWor
 	if name == "" || len(providerIDs) == 0 || !containsString(providerIDs, defaultProviderID) {
 		return domain.Workspace{}, fmt.Errorf("%w: workspace name, provider ids and a default provider in that set are required", domain.ErrInvalidInput)
 	}
+	instructions, err := normalizeInstructions(input.Instructions)
+	if err != nil {
+		return domain.Workspace{}, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.nameExistsLocked(name, "") {
@@ -76,6 +80,7 @@ func (r *WorkspaceRepository) Create(ctx context.Context, input domain.CreateWor
 		ID:                domain.NewID("workspace"),
 		Name:              name,
 		Description:       strings.TrimSpace(input.Description),
+		Instructions:      instructions,
 		ProviderIDs:       providerIDs,
 		DefaultProviderID: defaultProviderID,
 		Model:             strings.TrimSpace(input.Model),
@@ -128,7 +133,7 @@ func (r *WorkspaceRepository) Update(ctx context.Context, workspaceID string, in
 	if err := ctx.Err(); err != nil {
 		return domain.Workspace{}, err
 	}
-	if input.Name == nil && input.Description == nil && input.ProviderIDs == nil && input.DefaultProviderID == nil && input.Model == nil && input.Position == nil {
+	if input.Name == nil && input.Description == nil && input.Instructions == nil && input.ProviderIDs == nil && input.DefaultProviderID == nil && input.Model == nil && input.Position == nil {
 		return domain.Workspace{}, fmt.Errorf("%w: at least one workspace field is required", domain.ErrInvalidInput)
 	}
 	workspaceID = strings.TrimSpace(workspaceID)
@@ -150,6 +155,13 @@ func (r *WorkspaceRepository) Update(ctx context.Context, workspaceID string, in
 	}
 	if input.Description != nil {
 		value.Description = strings.TrimSpace(*input.Description)
+	}
+	if input.Instructions != nil {
+		instructions, err := normalizeInstructions(*input.Instructions)
+		if err != nil {
+			return domain.Workspace{}, err
+		}
+		value.Instructions = instructions
 	}
 	if input.ProviderIDs != nil {
 		value.ProviderIDs = normalizeWorkspaceProviderIDs(*input.ProviderIDs)

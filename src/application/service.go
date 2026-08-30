@@ -34,6 +34,7 @@ type Service struct {
 	memories    ports.MemoryRepository
 	plans       ports.PlanRepository
 	attachments ports.AttachmentRepository
+	schedules   ports.ScheduleRepository
 	// permissions 是後端唯一的 permission profile 依據。
 	// 呼叫端要求的 profile 必須先經過這裡解析，才不會讓 API request 自行決定提權。
 	permissions domain.PermissionPolicy
@@ -69,6 +70,9 @@ type Dependencies struct {
 	Plans ports.PlanRepository
 	// Attachments 可以是 nil；只有建立含附件的 Run 時才要求此能力。
 	Attachments ports.AttachmentRepository
+	// Schedules 可以是 nil：沒有排程儲存時，排程 API 會回報 conflict，
+	// 也不會啟動背景排程執行器。
+	Schedules   ports.ScheduleRepository
 	Permissions domain.PermissionPolicy
 	Logger      *slog.Logger
 }
@@ -91,6 +95,7 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		memories:       dependencies.Memories,
 		plans:          dependencies.Plans,
 		attachments:    dependencies.Attachments,
+		schedules:      dependencies.Schedules,
 		permissions:    dependencies.Permissions.Normalize(),
 		logger:         logging.Or(dependencies.Logger),
 		now:            time.Now,
@@ -106,6 +111,7 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		stop()
 		return nil, err
 	}
+	service.startScheduleRunner()
 	return service, nil
 }
 
@@ -309,6 +315,33 @@ func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectI
 		return domain.Project{}, err
 	}
 	return s.projects.Create(ctx, input)
+}
+
+// sessionInstructions 依 Workspace → Project 的順序收集職務說明。
+//
+// 這是「寫一次、每次對話都適用」的常駐指示：使用者不必在每個新對話重述工作規則，
+// 排程建立的對話也會自動沿用所屬 Workspace 的說明。
+func (s *Service) sessionInstructions(ctx context.Context, session domain.Session) ([]any, error) {
+	entries := []any{}
+	if workspaceID := strings.TrimSpace(session.WorkspaceID); workspaceID != "" {
+		workspace, err := s.workspaces.Get(ctx, workspaceID)
+		if err != nil {
+			return nil, err
+		}
+		if text := strings.TrimSpace(workspace.Instructions); text != "" {
+			entries = append(entries, map[string]any{"scope": "workspace", "name": workspace.Name, "text": text})
+		}
+	}
+	if projectID := strings.TrimSpace(session.ProjectID); projectID != "" {
+		project, err := s.projects.Get(ctx, projectID)
+		if err != nil {
+			return nil, err
+		}
+		if text := strings.TrimSpace(project.Instructions); text != "" {
+			entries = append(entries, map[string]any{"scope": "project", "name": project.Name, "text": text})
+		}
+	}
+	return entries, nil
 }
 
 func (s *Service) ListProjects(ctx context.Context) ([]domain.Project, error) {
@@ -565,13 +598,19 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	// 直接夾帶同名 metadata 不能注入任意主機路徑。
 	delete(input.Metadata, "attachments")
 	sandboxRoots := []string{}
+	// 後端內部流程（排程執行器）帶進來的沙箱優先，讓相對路徑以它為基準。
+	for _, root := range input.SandboxRoots {
+		if root = strings.TrimSpace(root); root != "" {
+			sandboxRoots = appendUniqueString(sandboxRoots, root)
+		}
+	}
 	if session.ProjectID != "" {
 		project, projectErr := s.projects.Get(ctx, session.ProjectID)
 		if projectErr != nil {
 			return domain.Run{}, projectErr
 		}
-		if len(project.SandboxRoots) > 0 {
-			sandboxRoots = append(sandboxRoots, project.SandboxRoots...)
+		for _, root := range project.SandboxRoots {
+			sandboxRoots = appendUniqueString(sandboxRoots, root)
 		}
 	}
 	// Session 私有工作目錄由後端建立，用來容納對話附件與未綁定 Project 的工作。
@@ -581,6 +620,16 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	}
 	if len(sandboxRoots) > 0 {
 		input.Metadata["sandbox_roots"] = sandboxRoots
+	}
+	// instructions 同樣是後端依 Workspace／Project 產生的保留欄位；
+	// 呼叫端不能藉 metadata 自行往提示注入內容。
+	delete(input.Metadata, "instructions")
+	instructions, err := s.sessionInstructions(ctx, session)
+	if err != nil {
+		return domain.Run{}, err
+	}
+	if len(instructions) > 0 {
+		input.Metadata["instructions"] = instructions
 	}
 	if len(input.AttachmentIDs) > 0 {
 		if s.attachments == nil {

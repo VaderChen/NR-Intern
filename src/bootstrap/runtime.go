@@ -19,6 +19,7 @@ import (
 	nativedocuments "AgenticService/src/tools/native/documents"
 	nativefiles "AgenticService/src/tools/native/files"
 	nativememories "AgenticService/src/tools/native/memories"
+	nativenetwork "AgenticService/src/tools/native/network"
 	nativeplans "AgenticService/src/tools/native/plans"
 	nativeshell "AgenticService/src/tools/native/shell"
 	nativessh "AgenticService/src/tools/native/ssh"
@@ -54,6 +55,8 @@ type Runtime struct {
 	Plans        ports.PlanRepository
 	Agent        *harnessagent.Agent
 	ProviderAuth *providerauth.Manager
+	// HTTPFetch 保留參考，讓管理介面的開關不必重啟後端就能生效。
+	HTTPFetch *nativenetwork.Tool
 
 	configMu               sync.RWMutex
 	providerUsageContext   context.Context
@@ -86,6 +89,7 @@ type RedactedConfig struct {
 	MaxWallClockSeconds int                         `json:"max_wall_clock_seconds"`
 	MaxTokens           int                         `json:"max_tokens"`
 	MaxToolCalls        int                         `json:"max_tool_calls"`
+	HTTPFetch           domain.HTTPFetchSettings    `json:"http_fetch"`
 	Context             harness.ContextConfig       `json:"context"`
 	Memory              memory.Config               `json:"memory"`
 	DefaultProviderID   string                      `json:"default_provider_id"`
@@ -154,6 +158,10 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	schedules, err := filestore.NewScheduleRepository(config.DataDir)
+	if err != nil {
+		return nil, err
+	}
 	providerValues, err := buildProviderValues(config, logger, providerAuth)
 	if err != nil {
 		return nil, err
@@ -201,6 +209,14 @@ func Build(config Config) (*Runtime, error) {
 		nativedocuments.NewReadTool(128*1024*1024, config.MaxToolOutputBytes),
 		nativeshell.New(config.MaxToolOutputBytes, 30*time.Minute),
 	}
+	httpFetch := nativenetwork.New(nativenetwork.Options{
+		MaxResponseBytes: config.HTTPFetch.MaxResponseBytes,
+		TimeoutSeconds:   config.HTTPFetch.TimeoutSeconds,
+		MaxRedirects:     config.HTTPFetch.MaxRedirects,
+		AllowedHosts:     config.HTTPFetch.AllowedHosts,
+		BlockedHosts:     config.HTTPFetch.BlockedHosts,
+	}, httpFetchSettingsFromConfig(config))
+	nativeToolValues = append(nativeToolValues, httpFetch)
 	var memoryRepository ports.MemoryRepository
 	var memoryManager *memory.Manager
 	if config.Memory.Enabled {
@@ -305,6 +321,7 @@ func Build(config Config) (*Runtime, error) {
 		Memories:    memoryRepository,
 		Plans:       plans,
 		Attachments: attachments,
+		Schedules:   schedules,
 		Permissions: config.Permissions,
 		Logger:      logger,
 	})
@@ -326,6 +343,7 @@ func Build(config Config) (*Runtime, error) {
 		Plans:        plans,
 		Agent:        agent,
 		ProviderAuth: providerAuth,
+		HTTPFetch:    httpFetch,
 		logger:       logger,
 	}
 	handler, err := httpapi.New(service, httpapi.Config{
@@ -416,6 +434,12 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if input.MaxToolCalls != nil {
 		updatedConfig.MaxToolCalls = *input.MaxToolCalls
 	}
+	if input.HTTPFetchEnabled != nil {
+		updatedConfig.HTTPFetch.Enabled = *input.HTTPFetchEnabled
+	}
+	if input.HTTPFetchAllowPrivateNetworks != nil {
+		updatedConfig.HTTPFetch.AllowPrivateNetworks = *input.HTTPFetchAllowPrivateNetworks
+	}
 	if err := validateAdjustableRunLimits(updatedConfig.MaxWallClockSeconds, updatedConfig.MaxTokens, updatedConfig.MaxToolCalls); err != nil {
 		return domain.ServiceSettings{}, fmt.Errorf("%w: %v", domain.ErrInvalidInput, err)
 	}
@@ -427,6 +451,9 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if r.Agent != nil {
 		r.Agent.SetName(serviceName)
 		r.Agent.SetRunBudget(runBudgetFromConfig(updatedConfig))
+	}
+	if r.HTTPFetch != nil {
+		r.HTTPFetch.ApplySettings(settings.HTTPFetch)
 	}
 	return settings, nil
 }
@@ -442,6 +469,14 @@ func serviceSettingsFromConfig(config Config) domain.ServiceSettings {
 		MaxWallClockSeconds: config.MaxWallClockSeconds,
 		MaxTokens:           config.MaxTokens,
 		MaxToolCalls:        config.MaxToolCalls,
+		HTTPFetch:           httpFetchSettingsFromConfig(config),
+	}
+}
+
+func httpFetchSettingsFromConfig(config Config) domain.HTTPFetchSettings {
+	return domain.HTTPFetchSettings{
+		Enabled:              config.HTTPFetch.Enabled,
+		AllowPrivateNetworks: config.HTTPFetch.AllowPrivateNetworks,
 	}
 }
 
@@ -1193,6 +1228,7 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 			MaxWallClockSeconds: config.MaxWallClockSeconds,
 			MaxTokens:           config.MaxTokens,
 			MaxToolCalls:        config.MaxToolCalls,
+			HTTPFetch:           httpFetchSettingsFromConfig(config),
 			Context:             config.Context,
 			Memory:              config.Memory,
 			DefaultProviderID:   r.Model.DefaultProviderID(),

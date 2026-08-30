@@ -71,6 +71,11 @@ const state = {
   contextCapabilityCache: {},
   contextCompactionSessionId: "",
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("collapsedProjects") || "[]")),
+  schedules: [],
+  scheduleSectionCollapsed: localStorage.getItem("scheduleSectionCollapsed") === "1",
+  scheduleSandboxRoots: [],
+  editingSchedule: null,
+  scheduleSaving: false,
 };
 
 let nativeConversationActivity = null;
@@ -91,6 +96,11 @@ const knownDefaultServiceNames = new Set([
   "똑똑한 인턴",
 ]);
 const transientStatuses = new Set([502, 503, 504]);
+// 側邊欄的排程列是動態產生的，i18n 的 MutationObserver 只認得靜態文字，
+// 因此這裡自行查表；語言切換時會重新繪製整份清單。
+const translate = (source) => window.NRInternI18n?.t(source) ?? source;
+const scheduleWeekdayNames = ["週日", "週一", "週二", "週三", "週四", "週五", "週六"];
+const scheduleRefreshIntervalMilliseconds = 30_000;
 const displayModes = new Set(["auto", "light", "dark"]);
 const uiLanguagePreferences = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
 const systemColorScheme = window.matchMedia("(prefers-color-scheme: dark)");
@@ -182,6 +192,7 @@ function normalizedServiceSettings(value = {}) {
   const serviceNameIsDefault = value.service_name_is_default
     ?? current.service_name_is_default
     ?? knownDefaultServiceNames.has(serviceName);
+  const httpFetch = value.http_fetch ?? current.http_fetch ?? {};
   return {
     service_name: serviceName,
     service_name_is_default: Boolean(serviceNameIsDefault),
@@ -189,6 +200,10 @@ function normalizedServiceSettings(value = {}) {
     max_wall_clock_seconds: Number.isInteger(wallClockSeconds) && wallClockSeconds > 0 ? wallClockSeconds : 7200,
     max_tokens: Number.isInteger(maxTokens) && maxTokens >= 0 ? maxTokens : 0,
     max_tool_calls: Number.isInteger(maxToolCalls) && maxToolCalls >= 0 ? maxToolCalls : 0,
+    http_fetch: {
+      enabled: Boolean(httpFetch.enabled),
+      allow_private_networks: Boolean(httpFetch.allow_private_networks),
+    },
   };
 }
 
@@ -200,6 +215,17 @@ function applyServiceSettings(value) {
   if ($("settingMaxWallClockMinutes")) $("settingMaxWallClockMinutes").value = String(Math.ceil(settings.max_wall_clock_seconds / 60));
   if ($("settingMaxTokens")) $("settingMaxTokens").value = String(settings.max_tokens);
   if ($("settingMaxToolCalls")) $("settingMaxToolCalls").value = String(settings.max_tool_calls);
+  if ($("settingHTTPFetchEnabled")) {
+    $("settingHTTPFetchEnabled").checked = settings.http_fetch.enabled;
+    $("settingHTTPFetchPrivateNetworks").checked = settings.http_fetch.allow_private_networks;
+    syncHTTPFetchSettingFields();
+  }
+}
+
+// 關閉對外網路時，私有網段的選項沒有意義，直接停用避免誤會成兩個獨立開關。
+function syncHTTPFetchSettingFields() {
+  const enabled = $("settingHTTPFetchEnabled").checked;
+  $("settingHTTPFetchPrivateNetworks").disabled = !enabled;
 }
 
 function installDialogDragGuards() {
@@ -352,6 +378,17 @@ function toast(message) {
   toast.timer = setTimeout(() => $("toast").classList.add("hidden"), 4200);
 }
 
+function confirmAction(message) {
+  const dialog = $("confirmationDialog");
+  if (dialog.open) return Promise.resolve(false);
+  $("confirmationMessage").textContent = message;
+  dialog.returnValue = "cancel";
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
+    dialog.showModal();
+  });
+}
+
 async function refreshBackend() {
   if (state.refreshingBackend) return;
   state.refreshingBackend = true;
@@ -378,6 +415,7 @@ async function refreshBackend() {
     $("newWorkspace").disabled = !status.healthy || state.running;
     $("workspaceSelect").disabled = !status.healthy || state.running;
     $("newProject").disabled = !status.healthy || !state.workspace || state.running;
+    $("newSchedule").disabled = !status.healthy || !state.workspace;
     $("openManagement").disabled = !status.healthy;
     $("providerUsageButton").disabled = !status.healthy;
     if (!status.healthy) closeProviderUsagePopover();
@@ -414,6 +452,7 @@ function resetWorkspace() {
   state.workspace = null;
   state.projects = [];
   state.sessions = [];
+  state.schedules = [];
   state.session = null;
   state.plans = [];
   state.planTab = "active";
@@ -488,7 +527,7 @@ async function loadApplicationState() {
     void initializeWorkspaceModels(state.workspace.id);
   }
   if (!state.agent || !state.workspace) return;
-  await Promise.all([loadProjects(), loadSessions()]);
+  await Promise.all([loadProjects(), loadSessions(), loadSchedules()]);
   $("newProject").disabled = state.running;
   $("workspaceSelect").disabled = state.running;
 }
@@ -518,6 +557,29 @@ async function loadProjects() {
   state.projects = await request(`/api/v1/projects?workspace_id=${encodeURIComponent(state.workspace.id)}`);
   renderProjectOptions();
   renderNavigation();
+}
+
+// 排程是 Workspace 層級的獨立實體，不隨 Project 或 Session 一起載入。
+async function loadSchedules() {
+  if (!state.workspace) {
+    state.schedules = [];
+    renderSchedules();
+    return;
+  }
+  const previousRuns = new Map(state.schedules.map((schedule) => [schedule.id, schedule.last_run_id || ""]));
+  try {
+    state.schedules = await request(`/api/v1/schedules?workspace_id=${encodeURIComponent(state.workspace.id)}`);
+  } catch (_) {
+    // 後端未提供排程儲存時只顯示空清單，不打斷其他側邊欄內容。
+    state.schedules = [];
+  }
+  renderSchedules();
+  // 背景觸發的排程會建立新的對話；偵測到新的 Run 才重新抓 Session，避免定期輪詢整份清單。
+  const triggered = state.schedules.some((schedule) => {
+    const runID = schedule.last_run_id || "";
+    return runID && previousRuns.has(schedule.id) && previousRuns.get(schedule.id) !== runID;
+  });
+  if (triggered) await loadSessions();
 }
 
 async function loadSessions() {
@@ -556,6 +618,7 @@ function renderNavigation() {
     empty.textContent = "尚無專案，先建立一個專案。";
     projectList.append(empty);
   }
+  renderSchedules();
 }
 
 function orderedProjectSessions(sessions) {
@@ -979,6 +1042,148 @@ function toggleProject(projectID) {
   else state.collapsedProjects.add(projectID);
   localStorage.setItem("collapsedProjects", JSON.stringify([...state.collapsedProjects]));
   renderNavigation();
+}
+
+function toggleScheduleSection() {
+  state.scheduleSectionCollapsed = !state.scheduleSectionCollapsed;
+  localStorage.setItem("scheduleSectionCollapsed", state.scheduleSectionCollapsed ? "1" : "0");
+  renderSchedules();
+}
+
+function renderSchedules() {
+  const collapsed = state.scheduleSectionCollapsed;
+  const toggle = $("scheduleToggle");
+  toggle.setAttribute("aria-expanded", String(!collapsed));
+  toggle.querySelector(".caret")?.classList.toggle("collapsed", collapsed);
+  const list = $("scheduleList");
+  list.classList.toggle("hidden", collapsed);
+  list.replaceChildren();
+  if (collapsed) return;
+  if (state.schedules.length === 0) {
+    const empty = document.createElement("small");
+    empty.className = "schedule-empty";
+    empty.textContent = translate("尚無排程；建立後 Agent 會自己到點開工。");
+    list.append(empty);
+    return;
+  }
+  list.append(...state.schedules.map(scheduleNode));
+}
+
+function scheduleNode(schedule) {
+  const row = document.createElement("div");
+  row.className = `schedule-row ${schedule.enabled ? "" : "is-disabled"}`;
+  row.dataset.scheduleId = schedule.id;
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "schedule-open";
+  const copy = document.createElement("span");
+  copy.className = "schedule-copy";
+  const name = document.createElement("span");
+  name.textContent = schedule.name || translate("未命名排程");
+  name.title = schedule.prompt || "";
+  name.setAttribute("data-i18n-ignore", "");
+  const meta = document.createElement("small");
+  meta.textContent = scheduleMetaText(schedule);
+  if (schedule.last_status === "failed") meta.classList.add("is-failed");
+  copy.append(name, meta);
+  open.append(scheduleClockIcon(), copy);
+  open.addEventListener("click", () => openScheduleTarget(schedule));
+  const actions = document.createElement("div");
+  actions.className = "schedule-row-actions";
+  const run = iconButton(schedulePlayIcon(), "立即執行一次", () => void runScheduleNow(schedule));
+  run.classList.add("schedule-run-button");
+  run.disabled = state.running || !state.backendHealthy;
+  const manage = iconButton("⋯", "管理排程", () => openScheduleDialog(schedule));
+  manage.classList.add("schedule-manage-button");
+  manage.disabled = !state.backendHealthy;
+  actions.append(run, manage);
+  row.append(open, actions);
+  return row;
+}
+
+// 點排程列優先開啟它最近一次建立的對話；還沒跑過就直接開設定。
+function openScheduleTarget(schedule) {
+  const session = state.sessions.find((item) => item.id === schedule.last_session_id);
+  if (session) {
+    void selectSession(session);
+    return;
+  }
+  openScheduleDialog(schedule);
+}
+
+function scheduleMetaText(schedule) {
+  const summary = scheduleRecurrenceText(schedule.recurrence || {});
+  if (!schedule.enabled) return `${summary} · ${translate("已停用")}`;
+  if (schedule.last_status === "failed") return `${summary} · ${translate("上次啟動失敗")}`;
+  if (!schedule.next_run_at) return summary;
+  return `${summary} · ${translate("下次 %s").replace("%s", formatScheduleMoment(schedule.next_run_at))}`;
+}
+
+function scheduleRecurrenceText(recurrence) {
+  if (recurrence.frequency === "daily") {
+    return translate("每天 %s").replace("%s", recurrence.time_of_day || "");
+  }
+  if (recurrence.frequency === "weekly") {
+    const language = window.NRInternI18n?.language || "zh-TW";
+    const separator = language === "zh-TW" || language === "ja" ? "、" : ", ";
+    const days = (recurrence.weekdays || []).map((value) => translate(scheduleWeekdayNames[value] || "")).join(separator);
+    return `${days} ${recurrence.time_of_day || ""}`.trim();
+  }
+  const minutes = Number(recurrence.interval_minutes) || 0;
+  if (minutes >= 60 && minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return hours === 1 ? translate("每 1 小時") : translate("每 %s 小時").replace("%s", String(hours));
+  }
+  return minutes === 1 ? translate("每 1 分鐘") : translate("每 %s 分鐘").replace("%s", String(minutes));
+}
+
+function formatScheduleMoment(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "-";
+  const language = window.NRInternI18n?.language || "zh-TW";
+  const sameDay = date.toDateString() === new Date().toDateString();
+  // 側邊欄空間有限，一律用 24 小時制，避免「下午01:46」這種較長的表示法。
+  return new Intl.DateTimeFormat(language, sameDay
+    ? { hour: "2-digit", minute: "2-digit", hour12: false }
+    : { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+}
+
+function scheduleClockIcon() {
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  svg.classList.add("schedule-icon");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const circle = document.createElementNS(namespace, "circle");
+  circle.setAttribute("cx", "12");
+  circle.setAttribute("cy", "12");
+  circle.setAttribute("r", "8.2");
+  const hands = document.createElementNS(namespace, "path");
+  hands.setAttribute("d", "M12 7.4v5l3 1.8");
+  for (const node of [circle, hands]) {
+    node.setAttribute("fill", "none");
+    node.setAttribute("stroke", "currentColor");
+    node.setAttribute("stroke-width", "1.7");
+    node.setAttribute("stroke-linecap", "round");
+    node.setAttribute("stroke-linejoin", "round");
+    svg.append(node);
+  }
+  return svg;
+}
+
+function schedulePlayIcon() {
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(namespace, "path");
+  path.setAttribute("d", "M8.5 6.4 17 12l-8.5 5.6Z");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.7");
+  path.setAttribute("stroke-linejoin", "round");
+  svg.append(path);
+  return svg;
 }
 
 function renderProjectOptions() {
@@ -1453,6 +1658,7 @@ async function switchWorkspace(workspaceID) {
   sessionStorage.setItem("activeWorkspaceID", workspace.id);
   state.projects = [];
   state.sessions = [];
+  state.schedules = [];
   state.session = null;
   clearPendingAttachments();
   clearSessionUI();
@@ -1460,7 +1666,7 @@ async function switchWorkspace(workspaceID) {
   void initializeWorkspaceModels(workspace.id);
   renderNavigation();
   try {
-    await Promise.all([loadProjects(), loadSessions()]);
+    await Promise.all([loadProjects(), loadSessions(), loadSchedules()]);
   } catch (error) {
     toast(error.message);
   }
@@ -1508,6 +1714,7 @@ function syncWorkspaceSettings() {
   $("settingWorkspaceDescription").value = workspace.description || "";
   $("settingWorkspaceProvider").value = workspace.default_provider_id || "";
   $("settingWorkspaceModel").value = workspace.model || "";
+  $("settingWorkspaceInstructions").value = workspace.instructions || "";
   if (!state.session) clearSessionUI();
 }
 
@@ -1651,6 +1858,8 @@ function renderPlanDialog() {
   $("planEmpty").classList.toggle("hidden", visiblePlans.length > 0);
   $("planList").classList.toggle("hidden", visiblePlans.length === 0);
   $("createPlan").classList.toggle("hidden", plans.length === 0);
+  $("clearCompletedPlans").classList.toggle("hidden", !showingCompleted || completedPlans.length === 0);
+  $("clearCompletedPlans").disabled = sessionRunIsActive();
   $("planListHint").textContent = showingCompleted ? "已完成與已取消的計畫" : "拖曳計畫可調整執行順序";
   if (plans.length === 0) {
     $("planEmptyTitle").textContent = "尚未建立計畫";
@@ -1890,7 +2099,7 @@ async function savePlan(event) {
     toast("每個步驟都要填寫名稱與驗證條件。");
     return;
   }
-  if (state.planEditingID && !window.confirm("重建計畫會清除這份計畫目前的步驟進度，確定繼續嗎？")) return;
+  if (state.planEditingID && !(await confirmAction("重建計畫會清除這份計畫目前的步驟進度，確定繼續嗎？"))) return;
   const sessionID = state.session.id;
   const editingPlanID = state.planEditingID;
   $("savePlan").disabled = true;
@@ -1916,7 +2125,7 @@ async function savePlan(event) {
 
 async function deletePlan(planID) {
   if (!state.session || !planID || sessionRunIsActive()) return;
-  if (!window.confirm("確定刪除這份計畫嗎？")) return;
+  if (!(await confirmAction("確定刪除這份計畫嗎？"))) return;
   const sessionID = state.session.id;
   try {
     await request(`/api/v1/sessions/${encodeURIComponent(sessionID)}/plans/${encodeURIComponent(planID)}`, { method: "DELETE" });
@@ -1926,6 +2135,34 @@ async function deletePlan(planID) {
     renderPlanDialog();
   } catch (error) {
     toast(error.message);
+  }
+}
+
+async function clearCompletedPlans() {
+  if (!state.session || sessionRunIsActive()) return;
+  const terminalPlans = state.plans.filter((plan) => terminalPlanStatuses.has(plan.status));
+  if (!terminalPlans.length) return;
+  if (!(await confirmAction(translate("確定清除所有已完成與已取消的計畫嗎？")))) return;
+  const sessionID = state.session.id;
+  const button = $("clearCompletedPlans");
+  button.disabled = true;
+  try {
+    for (const plan of terminalPlans) {
+      await request(`/api/v1/sessions/${encodeURIComponent(sessionID)}/plans/${encodeURIComponent(plan.id)}`, { method: "DELETE" });
+      state.expandedPlanIDs.delete(plan.id);
+    }
+    if (state.session?.id !== sessionID) return;
+    await loadPlans(sessionID);
+    renderPlanDialog();
+    toast(translate("已清除完成的計畫"));
+  } catch (error) {
+    if (state.session?.id === sessionID) {
+      await loadPlans(sessionID).catch(() => {});
+      renderPlanDialog();
+    }
+    toast(error.message);
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -2453,13 +2690,29 @@ function renderSelectedRunDraft() {
   if (draft.operationId) messageNode.dataset.operationId = draft.operationId;
   const content = messageNode.querySelector(".content");
   if (content && richContentSource(content) !== draft.content) scheduleRichContent(content, draft.content);
-  if (draft.reasoning) setMessageReasoning(messageNode, draft.reasoning);
+  if (draft.reasoning) {
+    setMessageReasoning(messageNode, draft.reasoning);
+    revealLatestReasoning(messageNode, draft.operationId);
+  }
   messageNode.classList.toggle("reasoning-only", Boolean(draft.internal));
   setAgentProcessing(messageNode, draft.processing);
   state.liveMessage = messageNode;
   $("emptyState").classList.add("hidden");
   $("messages").classList.remove("hidden");
   return messageNode;
+}
+
+function revealLatestReasoning(messageNode, operationID = "") {
+  const current = messageNode?.querySelector(":scope > .message-reasoning:not(.hidden)");
+  if (!current) return;
+  if (operationID) {
+    for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
+      if (node === messageNode || node.dataset.operationId !== operationID) continue;
+      const block = node.querySelector(":scope > .message-reasoning");
+      if (block) block.open = false;
+    }
+  }
+  current.open = true;
 }
 
 function setRunActivity(text, sessionID = state.runningSessionId) {
@@ -2842,6 +3095,7 @@ async function executePrompt(item) {
     if ($("approvalDialog").open) $("approvalDialog").close();
     syncSelectedRunUI();
     $("newProject").disabled = !state.backendHealthy || !state.workspace;
+    $("newSchedule").disabled = !state.backendHealthy || !state.workspace;
     $("newWorkspace").disabled = !state.backendHealthy;
     $("workspaceSelect").disabled = !state.backendHealthy;
     renderNavigation();
@@ -3100,6 +3354,11 @@ function finalizeLiveReasoningDuration(event, operationID, visible) {
   const completedAt = Date.parse(event.created_at);
   if (visible && Number.isFinite(startedAt) && Number.isFinite(completedAt)) {
     finalizeReasoningGroup(operationID, completedAt - startedAt);
+    for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
+      if (node.dataset.operationId !== operationID) continue;
+      const block = node.querySelector(".message-reasoning");
+      if (block) block.open = false;
+    }
   }
   state.runStartedAt.delete(operationID);
 }
@@ -3502,6 +3761,7 @@ async function createProject(event) {
         name: $("newProjectName").value.trim(),
         workspace_id: state.workspace.id,
         description: $("newProjectDescription").value.trim(),
+        instructions: $("newProjectInstructions").value.trim(),
         sandbox_roots: [...state.newProjectSandboxRoots],
       }),
     });
@@ -3514,6 +3774,145 @@ async function createProject(event) {
   }
 }
 
+function openScheduleDialog(schedule) {
+  state.editingSchedule = schedule || null;
+  const form = $("scheduleForm");
+  form.reset();
+  const recurrence = schedule?.recurrence || {};
+  const frequency = ["interval", "daily", "weekly"].includes(recurrence.frequency) ? recurrence.frequency : "interval";
+  $("scheduleDialogTitle").textContent = schedule ? "排程設定" : "建立排程";
+  $("saveSchedule").textContent = schedule ? "儲存" : "建立";
+  $("scheduleDialogState").textContent = "";
+  $("scheduleName").value = schedule?.name || "";
+  $("schedulePrompt").value = schedule?.prompt || "";
+  $("scheduleFrequency").value = frequency;
+  $("scheduleIntervalMinutes").value = String(recurrence.interval_minutes || 60);
+  $("scheduleTimeOfDay").value = recurrence.time_of_day || "09:00";
+  const weekdays = new Set(recurrence.weekdays || []);
+  for (const input of document.querySelectorAll("#scheduleWeekdayField input[data-weekday]")) {
+    input.checked = weekdays.has(Number(input.dataset.weekday));
+  }
+  $("scheduleEnabled").checked = schedule ? Boolean(schedule.enabled) : true;
+  $("deleteSchedule").classList.toggle("hidden", !schedule);
+  $("runScheduleNow").classList.toggle("hidden", !schedule);
+  $("runScheduleNow").disabled = state.running || !state.backendHealthy;
+  state.scheduleSandboxRoots = [...(schedule?.sandbox_roots || [])];
+  renderProjectSandboxRoots("schedule");
+  syncScheduleFrequencyFields();
+  $("scheduleDialog").showModal();
+  $("scheduleName").focus();
+}
+
+function closeScheduleDialog() {
+  $("scheduleDialog").close();
+  $("scheduleForm").reset();
+  state.editingSchedule = null;
+  state.scheduleSandboxRoots = [];
+}
+
+function syncScheduleFrequencyFields() {
+  const frequency = $("scheduleFrequency").value;
+  $("scheduleIntervalField").classList.toggle("hidden", frequency !== "interval");
+  $("scheduleTimeField").classList.toggle("hidden", frequency === "interval");
+  $("scheduleWeekdayField").classList.toggle("hidden", frequency !== "weekly");
+}
+
+// scheduleRecurrencePayload 只負責把表單整理成後端契約；真正的週期驗證仍在後端。
+function scheduleRecurrencePayload() {
+  const frequency = $("scheduleFrequency").value;
+  if (frequency === "interval") {
+    const minutes = Math.trunc(Number($("scheduleIntervalMinutes").value));
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 10080) {
+      throw new Error(translate("間隔必須介於 1 到 10080 分鐘"));
+    }
+    return { frequency, interval_minutes: minutes };
+  }
+  const timeOfDay = $("scheduleTimeOfDay").value;
+  if (!/^\d{1,2}:\d{2}$/.test(timeOfDay)) throw new Error(translate("請設定執行時間"));
+  if (frequency === "daily") return { frequency, time_of_day: timeOfDay };
+  const weekdays = [...document.querySelectorAll("#scheduleWeekdayField input[data-weekday]")]
+    .filter((input) => input.checked)
+    .map((input) => Number(input.dataset.weekday));
+  if (weekdays.length === 0) throw new Error(translate("請至少選擇一天"));
+  return { frequency, time_of_day: timeOfDay, weekdays };
+}
+
+async function saveSchedule(event) {
+  event.preventDefault();
+  if (!state.workspace || state.scheduleSaving) return;
+  const name = $("scheduleName").value.trim();
+  const prompt = $("schedulePrompt").value.trim();
+  if (!name || !prompt) {
+    toast(translate("排程名稱與交辦內容都要填寫"));
+    return;
+  }
+  let recurrence;
+  try {
+    recurrence = scheduleRecurrencePayload();
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  const payload = {
+    name,
+    prompt,
+    enabled: $("scheduleEnabled").checked,
+    recurrence,
+    sandbox_roots: [...state.scheduleSandboxRoots],
+  };
+  const schedule = state.editingSchedule;
+  state.scheduleSaving = true;
+  $("saveSchedule").disabled = true;
+  try {
+    if (schedule) {
+      await request(`/api/v1/schedules/${encodeURIComponent(schedule.id)}`, { method: "PATCH", body: JSON.stringify(payload) });
+    } else {
+      await request("/api/v1/schedules", {
+        method: "POST",
+        body: JSON.stringify({ ...payload, workspace_id: state.workspace.id }),
+      });
+    }
+    closeScheduleDialog();
+    await loadSchedules();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.scheduleSaving = false;
+    $("saveSchedule").disabled = false;
+  }
+}
+
+async function deleteScheduleFromDialog() {
+  const schedule = state.editingSchedule;
+  if (!schedule || !(await confirmAction(`確定刪除排程「${schedule.name}」？已建立的對話會保留。`))) return;
+  $("deleteSchedule").disabled = true;
+  try {
+    await request(`/api/v1/schedules/${encodeURIComponent(schedule.id)}`, { method: "DELETE" });
+    closeScheduleDialog();
+    await loadSchedules();
+    toast(`已刪除排程「${schedule.name}」`);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    $("deleteSchedule").disabled = false;
+  }
+}
+
+// 立即執行一次：建立新的對話並開始 Run，排程原本的下一次時間不變。
+async function runScheduleNow(schedule) {
+  if (!schedule) return;
+  try {
+    const run = await request(`/api/v1/schedules/${encodeURIComponent(schedule.id)}/run`, { method: "POST", body: "{}" });
+    if ($("scheduleDialog").open) closeScheduleDialog();
+    await Promise.all([loadSessions(), loadSchedules()]);
+    const session = state.sessions.find((item) => item.id === run?.session_id);
+    if (session) await selectSession(session);
+    toast(`已依排程「${schedule.name}」建立新對話`);
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
 function resetProjectForm() {
   $("projectForm").reset();
   state.newProjectSandboxRoots = [];
@@ -3521,6 +3920,14 @@ function resetProjectForm() {
 }
 
 function projectSandboxEditor(mode) {
+  if (mode === "schedule") {
+    return {
+      buttonID: "pickScheduleFolders",
+      emptyID: "scheduleSandboxEmpty",
+      listID: "scheduleSandboxRoots",
+      roots: state.scheduleSandboxRoots,
+    };
+  }
   if (mode === "settings") {
     return {
       buttonID: "pickEditProjectFolders",
@@ -3538,7 +3945,8 @@ function projectSandboxEditor(mode) {
 }
 
 function setProjectSandboxRoots(mode, roots) {
-  if (mode === "settings") state.editProjectSandboxRoots = roots;
+  if (mode === "schedule") state.scheduleSandboxRoots = roots;
+  else if (mode === "settings") state.editProjectSandboxRoots = roots;
   else state.newProjectSandboxRoots = roots;
 }
 
@@ -3693,6 +4101,7 @@ async function saveWorkspaceSettings(event) {
         provider_ids: [$("settingWorkspaceProvider").value],
         default_provider_id: $("settingWorkspaceProvider").value,
         model: $("settingWorkspaceModel").value.trim(),
+        instructions: $("settingWorkspaceInstructions").value,
       }),
     });
     state.workspace = updated;
@@ -3737,6 +4146,8 @@ async function saveServiceSettings(event) {
         max_wall_clock_seconds: wallClockMinutes * 60,
         max_tokens: maxTokens,
         max_tool_calls: maxToolCalls,
+        http_fetch_enabled: $("settingHTTPFetchEnabled").checked,
+        http_fetch_allow_private_networks: $("settingHTTPFetchPrivateNetworks").checked,
       }),
     });
     applyServiceSettings(updated);
@@ -3754,6 +4165,7 @@ function manageProject(project) {
   state.editProjectSandboxRoots = [...(project.sandbox_roots || [])];
   $("editProjectName").value = project.name || "";
   $("editProjectDescription").value = project.description || "";
+  $("editProjectInstructions").value = project.instructions || "";
   $("projectSettingsState").textContent = "";
   renderProjectSandboxRoots("settings");
   $("projectSettingsDialog").showModal();
@@ -3779,6 +4191,7 @@ async function saveProjectSettings(event) {
       body: JSON.stringify({
         name: $("editProjectName").value.trim(),
         description: $("editProjectDescription").value.trim(),
+        instructions: $("editProjectInstructions").value,
         sandbox_roots: [...state.editProjectSandboxRoots],
       }),
     });
@@ -3806,7 +4219,7 @@ async function deleteProjectSettings() {
 }
 
 async function deleteProject(project, { closeSettings = false } = {}) {
-  if (!project || !window.confirm(`確定刪除專案「${project.name}」？含有對話時後端會拒絕。`)) return false;
+  if (!project || !(await confirmAction(`確定刪除專案「${project.name}」？含有對話時後端會拒絕。`))) return false;
   try {
     await request(`/api/v1/projects/${encodeURIComponent(project.id)}`, { method: "DELETE" });
     if (closeSettings && state.editingProject?.id === project.id) closeProjectSettings();
@@ -4342,7 +4755,7 @@ async function deleteProviderSetting() {
     toast("請先將其他 Provider 設為系統預設，再刪除此 Provider");
     return;
   }
-  if (!window.confirm(`確定刪除 Provider「${id}」？`)) return;
+  if (!(await confirmAction(`確定刪除 Provider「${id}」？`))) return;
   const providers = state.providerSettings.providers.filter((item) => item.id !== id);
   $("deleteProviderSetting").disabled = true;
   try {
@@ -4719,7 +5132,7 @@ async function testMCPSetting() {
 async function deleteMCPSetting() {
   if (!state.mcpSettings || !state.selectedMCPSettingsID) return;
   const id = state.selectedMCPSettingsID;
-  if (!window.confirm(`確定刪除 MCP Server「${id}」？`)) return;
+  if (!(await confirmAction(`確定刪除 MCP Server「${id}」？`))) return;
   $("deleteMCPSetting").disabled = true;
   try {
     state.mcpSettings = await request("/api/v1/admin/mcp-settings", {
@@ -4993,6 +5406,7 @@ for (const tab of [$("activePlanTab"), $("completedPlanTab")]) {
   });
 }
 $("createPlan").addEventListener("click", () => editPlan());
+$("clearCompletedPlans").addEventListener("click", clearCompletedPlans);
 $("createPlanFromEmpty").addEventListener("click", () => editPlan());
 $("planList").addEventListener("dragover", handlePlanDragOver);
 $("planList").addEventListener("drop", persistPlanOrder);
@@ -5014,6 +5428,7 @@ $("cancelWorkspace").addEventListener("click", () => $("workspaceDialog").close(
 $("workspaceForm").addEventListener("submit", createWorkspace);
 $("workspaceSettings").addEventListener("submit", saveWorkspaceSettings);
 $("serviceSettings").addEventListener("submit", saveServiceSettings);
+$("settingHTTPFetchEnabled").addEventListener("change", syncHTTPFetchSettingFields);
 $("settingServiceName").addEventListener("input", (event) => {
   if (state.serviceSettings) {
     state.serviceSettings.service_name_is_default = event.target.value.trim() === localizedDefaultServiceName();
@@ -5031,6 +5446,18 @@ $("newProject").addEventListener("click", () => {
   resetProjectForm();
   $("projectDialog").showModal();
 });
+$("scheduleToggle").addEventListener("click", toggleScheduleSection);
+$("newSchedule").addEventListener("click", () => openScheduleDialog(null));
+$("scheduleFrequency").addEventListener("change", syncScheduleFrequencyFields);
+$("scheduleForm").addEventListener("submit", saveSchedule);
+$("cancelSchedule").addEventListener("click", closeScheduleDialog);
+$("deleteSchedule").addEventListener("click", () => void deleteScheduleFromDialog());
+$("runScheduleNow").addEventListener("click", () => void runScheduleNow(state.editingSchedule));
+$("pickScheduleFolders").addEventListener("click", () => pickProjectSandboxRoots("schedule"));
+$("pickScheduleFolders").addEventListener("dragenter", (event) => handleProjectFolderDrag(event, "schedule"));
+$("pickScheduleFolders").addEventListener("dragover", (event) => handleProjectFolderDrag(event, "schedule"));
+$("pickScheduleFolders").addEventListener("dragleave", () => $("pickScheduleFolders").classList.remove("drag-over"));
+$("pickScheduleFolders").addEventListener("drop", (event) => handleProjectFolderDrop(event, "schedule"));
 $("cancelProject").addEventListener("click", () => {
   $("projectDialog").close();
   resetProjectForm();
@@ -5375,9 +5802,15 @@ window.addEventListener("blur", () => {
 window.addEventListener("nr-intern-language-change", () => {
   refreshOpenProviderUsage();
   renderContextUsage();
+  renderSchedules();
 });
 
+setInterval(() => {
+  if (state.backendHealthy && state.workspace && !$("scheduleDialog").open) void loadSchedules();
+}, scheduleRefreshIntervalMilliseconds);
+
 installDialogDragGuards();
+renderSchedules();
 notifyNativeStartupReady();
 refreshBackend();
 setInterval(updateLiveReasoningDurations, 1000);

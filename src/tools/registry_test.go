@@ -147,3 +147,50 @@ func TestCatalogExplainsWhyElevatedToolsAreUnavailable(t *testing.T) {
 		t.Error("catalog should explain why the tool is unavailable")
 	}
 }
+
+type toggleableStub struct {
+	stubTool
+	enabled bool
+}
+
+func (t *toggleableStub) Enabled() bool          { return t.enabled }
+func (t *toggleableStub) DisabledReason() string { return "http_fetch is turned off" }
+
+// 關閉的工具必須從模型可見的工具清單消失，而不是只在執行時失敗：
+// 留在清單上會讓模型反覆嘗試一個確定不會成功的工具。
+func TestDisabledToolIsHiddenAndRefused(t *testing.T) {
+	tool := &toggleableStub{stubTool: stubTool{definition: domain.ToolDefinition{Name: "http_fetch", Description: "fetch"}}}
+	registry, err := NewRegistry(RegistryConfig{AllowElevated: true, Permissions: trustedPolicy()}, tool)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	session := sessionWithProfile("trusted")
+
+	definitions, err := registry.Definitions(context.Background(), session)
+	if err != nil {
+		t.Fatalf("Definitions: %v", err)
+	}
+	if len(definitions) != 0 {
+		t.Fatalf("disabled tool must not be offered, got %d definitions", len(definitions))
+	}
+	result, err := registry.Execute(context.Background(), session, domain.ToolCall{ID: "call_1", Name: "http_fetch"}, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !result.IsError || tool.calls != 0 {
+		t.Fatalf("disabled tool must not run: %+v calls=%d", result, tool.calls)
+	}
+	catalog := registry.Catalog(&session)
+	if len(catalog) != 1 || catalog[0].Available || catalog[0].UnavailableReason != "http_fetch is turned off" {
+		t.Fatalf("catalog entry does not report the disabled reason: %+v", catalog)
+	}
+
+	tool.enabled = true
+	definitions, err = registry.Definitions(context.Background(), session)
+	if err != nil {
+		t.Fatalf("Definitions: %v", err)
+	}
+	if len(definitions) != 1 {
+		t.Fatalf("enabled tool must be offered again, got %d definitions", len(definitions))
+	}
+}

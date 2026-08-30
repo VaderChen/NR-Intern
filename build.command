@@ -23,6 +23,21 @@ cleanup_stage() {
 }
 trap cleanup_stage EXIT INT TERM
 
+dist_output_in_use() {
+	local candidate="$1"
+	local running_command
+	if [[ -x /usr/sbin/lsof ]] && /usr/sbin/lsof -nP +D "$candidate" 2>/dev/null |
+		/usr/bin/awk 'NR > 1 { found = 1 } END { exit !found }'; then
+		return 0
+	fi
+	while IFS= read -r running_command; do
+		if [[ "$running_command" == "$candidate/"* ]]; then
+			return 0
+		fi
+	done < <(/bin/ps -axo command=)
+	return 1
+}
+
 reset_dist_output() {
 	local expected_dist="$PROJECT_ROOT/dist"
 	local output_path
@@ -40,9 +55,13 @@ reset_dist_output() {
 	fi
 	mkdir -p "$DIST_OUTPUT_DIR"
 	for output_path in "$DIST_OUTPUT_DIR"/*(DN); do
+		if dist_output_in_use "$output_path"; then
+			print "保留執行中的發行目錄：$output_path"
+			continue
+		fi
 		/bin/rm -rf -- "$output_path"
 	done
-	print "已清空發行輸出目錄：$DIST_OUTPUT_DIR"
+	print "已清理發行輸出目錄：$DIST_OUTPUT_DIR"
 }
 
 if ! command -v go >/dev/null 2>&1; then

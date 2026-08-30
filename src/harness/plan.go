@@ -66,6 +66,21 @@ func (r *Runner) planCompletionDirective(ctx context.Context, sessionID string) 
 	return strings.TrimSpace(directive), value, nil
 }
 
+// pendingPlanStateKey 只描述會影響目前工作步驟的持久化狀態。若模型收到一次
+// 完成度提醒後，沒有透過工具讓這個狀態前進，Harness 就不再把相同提醒送回模型；
+// 這是無進展偵測，不是長任務的固定時間或工具回合上限。
+func pendingPlanStateKey(value domain.Plan) string {
+	if strings.TrimSpace(value.ID) == "" || strings.TrimSpace(value.CurrentStepID) == "" {
+		return ""
+	}
+	for _, step := range value.Steps {
+		if step.ID == value.CurrentStepID {
+			return strings.Join([]string{value.ID, step.ID, string(step.Status), strings.TrimSpace(step.Evidence)}, "\x00")
+		}
+	}
+	return strings.Join([]string{value.ID, value.CurrentStepID, string(value.Status)}, "\x00")
+}
+
 func currentPlan(values []domain.Plan) *domain.Plan {
 	for index := range values {
 		if values[index].Status == domain.PlanStatusActive {

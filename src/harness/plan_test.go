@@ -4,12 +4,11 @@ import (
 	"AgenticService/src/adapters/filestore"
 	"AgenticService/src/domain"
 	"context"
-	"strings"
 	"testing"
 	"time"
 )
 
-func TestRunNeverAcceptsPrematureFinalAnswerWhilePlanIsActive(t *testing.T) {
+func TestRunStopsRepeatingWhenActivePlanMakesNoProgress(t *testing.T) {
 	sessions := newMemorySessions(testSession())
 	plans, err := filestore.NewPlanRepository(t.TempDir())
 	if err != nil {
@@ -35,11 +34,14 @@ func TestRunNeverAcceptsPrematureFinalAnswerWhilePlanIsActive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if result.BudgetExceeded == nil || result.BudgetExceeded.Resource != domain.RunBudgetResourceTurns {
-		t.Fatalf("budget result = %+v, want turn limit while plan remains active", result.BudgetExceeded)
+	if result.BudgetExceeded != nil {
+		t.Fatalf("budget result = %+v, want normal no-progress stop", result.BudgetExceeded)
 	}
-	if result.Message.Metadata["internal"] == true || result.Message.Content == "" {
+	if result.Message.Metadata["internal"] == true || result.Message.Metadata["termination"] != "plan_no_progress" || result.Message.Content != "真的已完成" {
 		t.Fatalf("final message must be visible: %+v", result.Message)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("model requests = %d, want one completion reminder and one visible stop", len(model.requests))
 	}
 	messages, err := sessions.ListMessages(context.Background(), testSession().ID)
 	if err != nil {
@@ -51,10 +53,7 @@ func TestRunNeverAcceptsPrematureFinalAnswerWhilePlanIsActive(t *testing.T) {
 			internalChecks++
 		}
 	}
-	if internalChecks != runner.Budget.MaxTurns {
-		t.Fatalf("internal plan checks = %d, want %d before safety pause", internalChecks, runner.Budget.MaxTurns)
-	}
-	if !strings.Contains(result.Message.Content, "工作持續次數過長") || !strings.Contains(result.Message.Content, "請告訴我「繼續」") {
-		t.Fatalf("final message = %q, want an explicit continue prompt", result.Message.Content)
+	if internalChecks != 1 {
+		t.Fatalf("internal plan checks = %d, want exactly one for unchanged plan state", internalChecks)
 	}
 }

@@ -59,10 +59,16 @@ func run(ctx context.Context, options Options) error {
 	finished := make(chan struct{})
 	defer close(finished)
 	go func() {
-		select {
-		case <-ctx.Done():
-			view.Terminate()
-		case <-finished:
+		for {
+			select {
+			case <-ctx.Done():
+				view.Terminate()
+				return
+			case <-options.Restore:
+				view.Dispatch(restoreApplicationWindow)
+			case <-finished:
+				return
+			}
 		}
 	}()
 

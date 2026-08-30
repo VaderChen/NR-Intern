@@ -18,6 +18,13 @@ type NativeTool interface {
 	Execute(context.Context, Invocation, ports.ToolUpdateSink) (domain.ToolExecution, error)
 }
 
+// ToggleableTool 讓工具可以在執行期被後端設定關閉。未實作這個介面的工具一律視為
+// 可用；實作後，關閉狀態下工具不會出現在模型的工具清單，執行請求也會直接拒絕。
+type ToggleableTool interface {
+	Enabled() bool
+	DisabledReason() string
+}
+
 type Invocation struct {
 	Session        domain.Session
 	Call           domain.ToolCall
@@ -98,6 +105,9 @@ func (r *Registry) Definitions(_ context.Context, session domain.Session) ([]dom
 		if !r.isAllowed(name) {
 			continue
 		}
+		if _, disabled := toolDisabledReason(value); disabled {
+			continue
+		}
 		definition := value.Definition()
 		if definition.RequiresPermission && !r.elevatedAllowed(session.PermissionProfile) {
 			continue
@@ -120,6 +130,10 @@ func (r *Registry) Execute(ctx context.Context, session domain.Session, call dom
 	if value == nil || !allowed {
 		r.logger.Warn("native tool refused", "tool_name", name, "session_id", session.ID, "reason", "not_registered_or_disallowed")
 		return failedExecution(call, "native tool is unavailable or disabled"), nil
+	}
+	if reason, disabled := toolDisabledReason(value); disabled {
+		r.logger.Warn("disabled tool refused", "tool_name", name, "session_id", session.ID, "reason", reason)
+		return failedExecution(call, reason), nil
 	}
 	definition := value.Definition()
 	if definition.RequiresPermission && !r.elevatedAllowed(session.PermissionProfile) {
@@ -171,7 +185,10 @@ func (r *Registry) Catalog(session *domain.Session) []domain.ToolCatalogEntry {
 			Allowed:    r.isAllowed(name),
 			Available:  r.isAllowed(name),
 		}
-		if !entry.Allowed {
+		if reason, disabled := toolDisabledReason(tool); disabled && entry.Allowed {
+			entry.Available = false
+			entry.UnavailableReason = reason
+		} else if !entry.Allowed {
 			entry.UnavailableReason = "tool is disabled by the backend allowlist"
 		} else if definition.RequiresPermission {
 			switch {
@@ -190,6 +207,18 @@ func (r *Registry) Catalog(session *domain.Session) []domain.ToolCatalogEntry {
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i].Definition.Name < values[j].Definition.Name })
 	return values
+}
+
+func toolDisabledReason(value NativeTool) (string, bool) {
+	toggleable, ok := value.(ToggleableTool)
+	if !ok || toggleable.Enabled() {
+		return "", false
+	}
+	reason := strings.TrimSpace(toggleable.DisabledReason())
+	if reason == "" {
+		reason = "tool is turned off in the backend settings"
+	}
+	return reason, true
 }
 
 func (r *Registry) isAllowed(name string) bool {

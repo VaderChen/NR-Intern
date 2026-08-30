@@ -22,7 +22,7 @@
   "allow_elevated_tools": true,
   "tool_call_mode": "instruction",
   "max_turns": 96,
-  "max_autonomous_tool_turns": 16,
+  "max_autonomous_tool_turns": 0,
   "max_wall_clock_seconds": 7200,
   "max_tokens": 0,
   "max_tool_calls": 0,

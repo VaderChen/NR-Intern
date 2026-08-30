@@ -94,10 +94,12 @@ type ReorderSessionsInput struct {
 }
 
 type Project struct {
-	ID           string    `json:"id"`
-	WorkspaceID  string    `json:"workspace_id"`
-	Name         string    `json:"name"`
-	Description  string    `json:"description,omitempty"`
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Instructions 是 Project 的職務說明，接在所屬 Workspace 的說明之後注入。
+	Instructions string    `json:"instructions,omitempty"`
 	SandboxRoots []string  `json:"sandbox_roots,omitempty"`
 	Position     int       `json:"position"`
 	CreatedAt    time.Time `json:"created_at"`
@@ -108,20 +110,25 @@ type CreateProjectInput struct {
 	Name         string   `json:"name"`
 	WorkspaceID  string   `json:"workspace_id"`
 	Description  string   `json:"description,omitempty"`
+	Instructions string   `json:"instructions,omitempty"`
 	SandboxRoots []string `json:"sandbox_roots,omitempty"`
 }
 
 type UpdateProjectInput struct {
 	Name         *string   `json:"name,omitempty"`
 	Description  *string   `json:"description,omitempty"`
+	Instructions *string   `json:"instructions,omitempty"`
 	SandboxRoots *[]string `json:"sandbox_roots,omitempty"`
 	Position     *int      `json:"position,omitempty"`
 }
 
 type Workspace struct {
-	ID                string    `json:"id"`
-	Name              string    `json:"name"`
-	Description       string    `json:"description,omitempty"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	// Instructions 是 Workspace 的職務說明：每次 Run 都會注入提示，
+	// 讓使用者只寫一次就套用到底下所有對話，不必每次重述工作規則。
+	Instructions      string    `json:"instructions,omitempty"`
 	ProviderIDs       []string  `json:"provider_ids"`
 	DefaultProviderID string    `json:"default_provider_id"`
 	Model             string    `json:"model,omitempty"`
@@ -133,6 +140,7 @@ type Workspace struct {
 type CreateWorkspaceInput struct {
 	Name              string   `json:"name"`
 	Description       string   `json:"description,omitempty"`
+	Instructions      string   `json:"instructions,omitempty"`
 	ProviderIDs       []string `json:"provider_ids"`
 	DefaultProviderID string   `json:"default_provider_id"`
 	Model             string   `json:"model,omitempty"`
@@ -141,6 +149,7 @@ type CreateWorkspaceInput struct {
 type UpdateWorkspaceInput struct {
 	Name              *string   `json:"name,omitempty"`
 	Description       *string   `json:"description,omitempty"`
+	Instructions      *string   `json:"instructions,omitempty"`
 	ProviderIDs       *[]string `json:"provider_ids,omitempty"`
 	DefaultProviderID *string   `json:"default_provider_id,omitempty"`
 	Model             *string   `json:"model,omitempty"`
@@ -164,12 +173,15 @@ type ProviderDescriptor struct {
 }
 
 type RunInput struct {
-	RunID          string         `json:"-"`
-	SessionID      string         `json:"session_id"`
-	UserInput      string         `json:"input"`
-	AttachmentIDs  []string       `json:"attachment_ids,omitempty"`
-	ProviderID     string         `json:"provider_id,omitempty"`
-	Model          string         `json:"model,omitempty"`
+	RunID         string   `json:"-"`
+	SessionID     string   `json:"session_id"`
+	UserInput     string   `json:"input"`
+	AttachmentIDs []string `json:"attachment_ids,omitempty"`
+	ProviderID    string   `json:"provider_id,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	// SandboxRoots 只由後端內部流程填入（目前是排程執行器），JSON 不解析。
+	// 這些路徑在寫入來源實體時就已驗證，HTTP 呼叫端無法藉此擴大沙箱。
+	SandboxRoots   []string       `json:"-"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
 	IdempotencyKey string         `json:"-"`
 }

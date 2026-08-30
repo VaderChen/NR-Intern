@@ -113,13 +113,29 @@ func runDesktop(value options) error {
 	if err != nil {
 		return err
 	}
-	ui, err := httpui.New(httpui.Config{Supervisor: manager, BackendToken: value.backendToken})
+	restoreRequests := make(chan struct{}, 1)
+	requestRestore := func() {
+		select {
+		case restoreRequests <- struct{}{}:
+		default:
+		}
+	}
+	ui, err := httpui.New(httpui.Config{
+		Supervisor:   manager,
+		BackendToken: value.backendToken,
+		RestoreUI:    requestRestore,
+	})
 	if err != nil {
 		return err
 	}
 	listener, err := net.Listen("tcp", value.uiListen)
 	if err != nil {
-		return err
+		if restoreErr := restoreExistingDesktop(value.uiListen); restoreErr == nil {
+			slog.Info("existing desktop UI restored", "address", value.uiListen)
+			notifyStartupReady()
+			return nil
+		}
+		return fmt.Errorf("listen desktop UI: %w", err)
 	}
 	server := &http.Server{Handler: ui, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 1 << 20}
 	uiURL := "http://" + listener.Addr().String()
@@ -150,6 +166,7 @@ func runDesktop(value options) error {
 			Width:   1280,
 			Height:  820,
 			OnReady: notifyStartupReady,
+			Restore: restoreRequests,
 		}); err != nil {
 			if !errors.Is(err, window.ErrUnavailable) {
 				slog.Warn("native desktop window failed", "error", err)
@@ -274,6 +291,36 @@ func loopbackAddress(address string) bool {
 	}
 	host = strings.Trim(host, "[]")
 	return strings.EqualFold(host, "localhost") || net.ParseIP(host).IsLoopback()
+}
+
+func restoreExistingDesktop(address string) error {
+	baseURL := "http://" + address
+	identityURL, err := url.JoinPath(baseURL, "/.well-known/nr-intern-desktop")
+	if err != nil {
+		return err
+	}
+	restoreURL, err := url.JoinPath(baseURL, "/desktop/restore")
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	identityResponse, err := client.Get(identityURL)
+	if err != nil {
+		return err
+	}
+	_ = identityResponse.Body.Close()
+	if identityResponse.StatusCode != http.StatusOK || identityResponse.Header.Get("X-NR-Intern-Desktop") != "1" {
+		return fmt.Errorf("address is not an NR-Intern desktop service")
+	}
+	restoreResponse, err := client.Post(restoreURL, "application/json", http.NoBody)
+	if err != nil {
+		return err
+	}
+	_ = restoreResponse.Body.Close()
+	if restoreResponse.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("desktop restore returned HTTP %d", restoreResponse.StatusCode)
+	}
+	return nil
 }
 
 func fatal(err error) {

@@ -11,7 +11,8 @@
 - 桌面程式可以連接外部後端，或啟動、停止、重啟自己擁有的後端子程序。
 - Agent 採 Harness 工作迴圈；簡單任務不強制規劃，長任務則可建立結構化計畫並逐步驗證。
 - Agent 原生工具使用 Go 實作，不依賴 `grep`、`find`、`diff`、`ssh` 等本機外部指令。
-- Provider Router 在結構上支援多種 adapter；目前只實作 OpenAI Chat Completions 相容協定。
+- Provider Router 以相同介面承載 OpenAI-compatible Chat Completions 與 OpenAI Codex Responses；認證與協定差異留在 adapter／bootstrap 邊界。
+- 主系統可作為 MCP Client，連接本機 stdio 或遠端 Streamable HTTP Server，再把工具納入既有 Harness 權限與稽核流程。
 - 管理層級固定為 `Workspace → Project → Session`，不同前端可同時操作不同 Workspace。
 
 設計參考 `pi` 的 Agent Loop：模型輸出工具呼叫時執行工具，將結果加入訊息，再進入下一回合；沒有工具呼叫時完成回覆。參考來源：[pi agent package](https://github.com/earendil-works/pi/tree/main/packages/agent)。
@@ -33,10 +34,13 @@ src/
 ├── memory/                     # 長期記憶 scope、召回與提示注入
 ├── tokens/                     # 不依賴 Provider tokenizer 的 token 估算
 ├── modelrouter/                # Provider ID → ports.Model adapter 路由
-├── application/                # use case、Agent registry、run/session 協調；不依賴具體 Harness
+├── providerauth/               # ChatGPT／Codex OAuth PKCE、loopback callback 與 Token 保存
+├── mcpclient/                  # stdio／Streamable HTTP MCP Client 與遠端工具轉接
+├── netpass/                    # 選用的 NetPassClient 子程序與反向代理狀態
+├── application/                # use case、Agent registry、run/session 協調與排程執行器；不依賴具體 Harness
 ├── adapters/
 │   ├── openaicompat/           # 目前已實作的 Provider adapter
-│   └── filestore/              # Workspace、Project、Session、Plan、Run 與記憶持久化
+│   └── filestore/              # Workspace、Project、Session、Plan、Run、排程與記憶持久化
 ├── tools/
 │   ├── registry.go             # 原生工具註冊、權限與統一執行入口
 │   └── native/
@@ -46,6 +50,7 @@ src/
 │       ├── plans/              # plan_get/create/step_update 計畫控制工具
 │       ├── shell/              # shell_exec 與 OS platform adapter
 │       ├── ssh/                # Go SSH client
+│       ├── network/            # http_fetch 與外部網路邊界
 │       └── memories/           # memory_search/remember/forget
 ├── transport/httpapi/          # REST、SSE、驗證、CORS、Problem JSON
 ├── bootstrap/                  # 設定與 dependency composition root
@@ -64,7 +69,7 @@ src/
 收到使用者訊息
   → 寫入 append-only session transcript
   → 讀取 Session 計畫；長任務可由模型建立計畫
-  → 呼叫 OpenAI-compatible LLM（含目前可用工具 schema）
+  → 經 Provider Router 呼叫模型（含目前可用工具 schema）
   → 有 tool_calls？
       ├─ 是：分組執行原生工具 → 依原順序寫入 tool result → 下一回合
       └─ 否：寫入 assistant final message → 完成 run
@@ -161,6 +166,11 @@ Run 建立與 HTTP request 生命週期分離：`POST` 先回傳 durable queued 
 
 SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後最多重連三次，每次從最後完整事件補流；三次仍失敗才結束前端連線，後端 Run 本身不受影響。後端重啟時，原本 queued/running/waiting_approval Run 會標記為可重試的 `server_restarted` failure，啟動期也會補齊缺少的 terminal event。
 
+Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。這些訊息先放在該 UI instance
+記憶體內的待送佇列，等目前 SSE 收到 terminal event 後依序建立下一個 Run；它不是後端的 durable
+queue，重新整理或關閉 UI 前應先確認待送項目已送出。後端仍以 Session single-writer gate 作最後
+保護，因此其他 Client 同時送入同一 Session 時也不會交錯寫入 transcript。
+
 ## Workspace、Project 與多前端
 
 Workspace 是最上層持久化邊界，Project 必須屬於一個 Workspace，Session 同時保存 `workspace_id` 與可選的 `project_id`。後端不保存「目前選取 Workspace」這種全域狀態；Browser 每個分頁以自己的 `sessionStorage` 保存選擇，因此多開前端時可以同時操作不同 Workspace。
@@ -178,9 +188,41 @@ override。停用或刪除仍被 Session 明確引用的 Provider 會回傳 conf
 其他 Provider 或恢復 Workspace 預設。Provider Router 依 ID 選擇 adapter；同一 Session 維持
 single-writer，不同 Workspace／Session 可並行。
 
+Workspace 與 Project 都可以保存「職務說明」（`instructions`）：使用者只寫一次的常駐工作規則，
+每次 Run 由後端依 Session 所屬層級組成 `## 職務說明` 段落，接在 Host 環境提示之後注入。
+順序固定為 Workspace → Project，範圍較小者優先；提示同時寫明與使用者本輪明確要求衝突時，
+以本輪要求為準，避免常駐指示反過來蓋掉當下的指示。內容與 `sandbox_roots` 一樣是後端產生的
+保留欄位：`StartRun` 會先移除呼叫端自帶的 `metadata.instructions`，任何 API client 都不能藉此
+往提示注入內容。單一層級上限 8000 字，因為這段文字每一輪都會佔用 Context 預算。
+
+排程（Schedule）與 Project 並列在 Workspace 之下，但刻意不與 Project 或 Session 建立關聯：
+使用者要的是「每天九點做這件事」，不是「維護一個長對話」。每個排程自己保存交辦內容、週期與
+`sandbox_roots`；到點時由排程執行器建立一個全新的 Session 再送出交辦內容，因此每次執行都是
+乾淨的上下文。詳見 [排程](#排程)。
+
 Project 與 Workspace 刪除都不做級聯操作：只要還有子 Project 或 Session 就回傳 conflict，避免 UI 管理動作隱含遺失對話。
 
 Project 可保存多個 `sandbox_roots`。建立與更新時由後端解析實體路徑、確認目錄存在、去重並拒絕檔案系統根目錄；Run 開始時才依 Session 所屬 Project 產生不可由 Client 覆寫的 Sandbox metadata。檔案與 Shell 工具對絕對路徑逐一檢查是否位於任一根目錄，相對路徑固定以第一個根目錄為基準，且既有 symlink 解析後仍須留在允許範圍。未設定 Project Sandbox 時，維持 Session 私有 `workspace/`。
+
+## 排程
+
+排程是 Workspace 層級的獨立實體，儲存在 `data/ai-agent/schedules/schedules.json`。週期只提供
+固定間隔、每日與每週三種結構化設定，不使用 cron 字串：桌面使用者要的是可以在 UI 上完整
+回顯與驗證的週期，而不是一段容易寫錯的表達式。每日與每週採後端所在時區的牆上時間，跨日
+使用日期加法而非固定加 24 小時，夏令時間切換時仍停在使用者設定的時刻。
+
+`application.Service` 內只有一個排程迴圈，隨 Service 的 root context 一起結束，每 20 秒檢查
+一次到期排程。到點後的處理順序固定：先算出下一次時間，再建立 Session 與 Run；即使這次啟動
+失敗，時間軸仍會往前走，不會每 20 秒重試同一個到期時間點。失敗原因寫回排程的
+`last_status` 與 `last_error`，Console 會顯示在該列。
+
+錯過的時間點不補跑。後端重新啟動時，`next_run_at` 落後超過 15 分鐘寬限的排程會直接對齊到
+下一次；關機一週再開機時，使用者要的是下一次執行，不是一次湧出的補償 Run。落在寬限內的
+排程仍會照常執行，短暫重啟不會漏掉。
+
+排程建立的 Session 不屬於任何 Project，metadata 帶有 `schedule_id` 與 `schedule_name`；沙箱則
+由排程自己的 `sandbox_roots` 決定，經 `RunInput.SandboxRoots` 這個不解析 JSON 的後端專用欄位
+傳入，Client 無法自行帶入。刪除排程不會刪除已經建立的 Session。
 
 ## Session 與資料
 
@@ -218,20 +260,26 @@ data/ai-agent/plans/
 
 組裝 context 時只讀取上一次 compaction 之後的 entry：`ListEntriesAfter` 以 streaming decoder
 取得每行的 `sequence` 與 `type`，只對真正需要的行做完整解碼。更早的內容已經在摘要裡，
-每個 turn 重新解碼它們（尤其是數十 KB 的工具輸出）沒有用途，而那正是長 session 變慢的主因。此處小寫 `workspace/` 是 Session 專屬目錄，不是管理層的 Workspace 實體。它是**預設**沙箱；Session 所屬 Project 設定了 `sandbox_roots` 時，工具範圍改由那些目錄決定。任一情況下既有 symlink 都會檢查實際目標是否逃逸。
+每個 turn 重新解碼它們（尤其是數十 KB 的工具輸出）沒有用途，而那正是長 session 變慢的主因。
+不論使用 Session 預設沙箱或 Project 的 `sandbox_roots`，既有 symlink 都會檢查實際目標是否逃逸。
 
 JSONL 逐行讀取不使用 `bufio.Scanner` 的固定 token 上限。Provider 解碼後的 tool arguments
 重新 JSON 跳脫時可能膨脹數倍；單筆合法 entry 不應讓整個 Session 在重啟後永久無法讀取或追加。
 
-Harness 在 context 預算 80% 的 soft limit 於 turn 完整落盤後排程背景 compaction，
-讓下一輪通常不必同步等待摘要模型；如果仍直接碰到 hard limit，`Build` 會同步壓縮作為最後保護。
-完整訊息仍保留在 `entries.jsonl`，模型 context 則改用「較早紀錄摘要＋近期完整訊息」。
-摘要會留下 `compaction` entry、`through_sequence` 與觸發比例，後續 compaction 在既有摘要上增量合併。
+Harness 以「模型可用輸入預算」的 90% 為 soft limit。每輪組裝 context 時會比較本機估算值與
+上一次 Provider 回報的 input usage，採較大者判斷；到達門檻後先送出
+`context.compaction.started`，在同一 Run 事件序列中同步壓縮，再送出 `context.compacted`。
+壓縮失敗則送出 `context.compaction.failed`，不會在背景工作與目前 Run 之間競爭事件順序。
 
-背景工作同一 Session 最多一個，不送 Run event；`AppendEntry` 的序號鎖負責與目前 Run 的
-transcript 寫入序列化。`context.summary_provider_id` 與 `summary_model` 可把摘要路由到較便宜的
-Provider／Model；未指定時沿用 Session 的模型。模型宣告的 context window 若連輸出保留額都
-容納不下，後端會明確拒絕，不會虛構最低輸入容量後再交給 Provider 失敗。
+完整訊息仍保留在 `entries.jsonl`，模型 context 則改用「較早紀錄摘要＋近期完整訊息」。摘要會
+留下 `compaction` entry、`through_sequence`、壓縮前後 token、保留訊息數與觸發比例；後續
+compaction 在既有摘要上增量合併。摘要輸入依時間採平方遞增的 recency 權重：越舊的內容分配
+越少字元、壓縮越重，越新的工作狀態保留越多細節；模型摘要全部失敗時改用可重現的本機摘要，
+避免單一摘要 Provider 的憑證或連線問題中止 Agent Run。
+
+`context.summary_provider_id` 與 `summary_model` 可把摘要路由到較便宜的 Provider／Model；未指定時
+沿用 Session 的模型。模型宣告的 context window 若連輸出保留額都容納不下，後端會明確拒絕，
+不會虛構最低輸入容量後再交給 Provider 失敗。
 
 ### Tool call 協定不變式
 
@@ -340,9 +388,16 @@ Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成�
 - `document_read`：PDF／PPTX 依頁、DOCX 依區段與段落、XLSX 依工作表與列分段抽取文字；保留 Excel 儲存格座標與公式。掃描型 PDF 不內建 OCR。
 - `shell_exec`：必要高權限工具；Unix 使用 process group，Windows 使用 Job Object，取消或逾時會終止子程序樹；子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
 - `ssh_exec`：使用 Go SSH client；連線憑證只存在後端 profile，模型只取得 profile 名稱。初始連線預設最多三次並使用 keepalive；工作中斷線不自動重跑遠端命令，以免重複副作用。
+- `http_fetch`：唯一由 Agent 直接指定任意網址的內建工具。以 Go `net/http` 讀取 http／https 資源，回傳文字內容；HTML 會先轉成純文字再送進上下文。回應大小、逾時與轉址次數都有上限，私有網段預設拒絕，並且可由管理介面即時關閉。
 - `memory_search`：查詢目前 scope 的有效長期記憶。
 - `memory_remember`：保存耐久資訊並支援去重與取代舊記憶。
 - `memory_forget`：依明確要求軟性遺忘，保留稽核狀態。
+
+`http_fetch` 是唯一可由模型自行決定目標網址的內建對外工具，因此多一層閘門：`NativeTool` 可選擇實作 `tools.ToggleableTool`，
+關閉時工具不會出現在模型的工具清單，執行請求也直接拒絕。開關存在 `ServiceSettings`，由管理介面
+即時套用，不需要改設定檔或重啟後端——工具留在清單上但保證失敗，只會讓模型反覆重試。
+私有網段的判斷放在 Dial 階段而不是網址解析階段，因此 DNS 重新綁定與轉址都由同一條規則攔下；
+Client 也刻意不使用系統 Proxy 設定，避免實際連線目標與網址主機不一致而讓檢查失效。
 
 Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具在 allowlist、session permission profile 屬於
 `permissions.elevated_profiles`。profile 由後端 `permissions` 策略指派，預設不接受 API request 指定；
@@ -352,9 +407,30 @@ Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具�
 
 `directory_create`、`file_write`、`file_edit` 也屬於寫入型高權限工具，使用相同閘門。`ResolvePath` 除了檢查目標，也會解析最深的既有父路徑；即使新檔尚不存在，仍不能藉父層 symlink 寫出 workspace。Unix 與 Windows 的檔案替換分別使用原生 rename／MoveFileEx 語意。
 
-## Provider Router 與 OpenAI-compatible Adapter
+## MCP Client 與外部工具
 
-`modelrouter.Router` 實作 `ports.ProviderCatalog`，以 Provider ID 路由至任意 `ports.Model`。設定以 `providers.<id>.type` 選擇 bootstrap adapter 工廠；目前唯一已實作的 type 是 `openai-compatible`，使用 `POST /v1/chat/completions`。
+`mcpclient.Manager` 讓主系統作為 MCP Host，支援本機 `stdio` 與遠端 `streamable-http`。
+已啟用的 Server 會在背景暖機，完成 `initialize` 與 `tools/list` 後，把遠端工具轉為
+`domain.ToolDefinition`；Server 通知工具清單變動時會重新載入。公開工具名稱會加入 Server
+命名空間，過長時以穩定雜湊截短，避免不同 Server 的同名工具互相覆蓋。
+
+MCP 工具與原生工具進入同一個 `ports.ToolRuntime`：每個工具都標記
+`RequiresPermission=true`，必須通過 elevated profile 與人工 Approval。只有管理者明確開啟
+`trust_annotations` 時，Server 的 `readOnlyHint` 才會用於並行排程；這個提示不會取消權限或
+Approval。進度通知會轉成 `tool.execution.update`，結果文字受全域工具輸出上限約束；Server
+要求額外互動輸入時目前回傳明確錯誤，不會假裝完成。
+
+stdio 子程序只繼承必要的 OS 環境與該 Server 明確設定的變數。Streamable HTTP 可加入 Bearer
+Token 與自訂 headers，並有啟動／呼叫逾時。這些秘密只寫入權限限制檔案；管理 API 僅回傳
+`has_api_key`、`has_environment` 與 `has_headers`，不讀回明文。
+
+## Provider Router、Chat Completions 與 Codex Responses
+
+`modelrouter.Router` 實作 `ports.ProviderCatalog`，以 Provider ID 路由至任意 `ports.Model`。
+設定以 `providers.<id>.type` 選擇 bootstrap adapter 工廠；目前實作兩種 type：
+
+- `openai-compatible`：OpenAI-compatible Chat Completions，可連遠端或本機相容服務。
+- `openai-codex-responses`：固定使用 Codex Responses 協定，透過 ChatGPT／Codex OAuth 取得認證。
 
 Provider 可透過管理頁右上角的啟用 Switch 或 `providers.<id>.enabled` 停用。停用只會從 Router、Workspace、Session 與對話選單移除，原設定與憑證仍保留，管理頁也仍可測試連線。為保持資料一致，系統預設 Provider 及仍被 Workspace 使用的 Provider 不可停用；舊設定未提供 `enabled` 時視為啟用。
 
@@ -370,15 +446,34 @@ OpenAI-compatible adapter 行為如下：
 - 每次請求送出 `X-Client-Request-Id`，並將 Provider 回傳的 `x-request-id` 保存於 assistant message 與 turn record；API key 不會出現在診斷資料。
 - Provider HTTP 錯誤解析為 status、code、request ID、可重試狀態與受限長度訊息。
 
-OpenAI 官方 Chat Completions schema 參考：[OpenAI Chat Completions API](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions)；request ID 診斷參考：[OpenAI API Overview](https://developers.openai.com/api/reference/overview#debugging-requests)。
+Codex Responses adapter 將 Responses 的 message、reasoning 與 function call item 轉成相同的
+Harness 事件與 transcript 結構，工具結果也會在下一輪完整回送。它不依賴 `/models` 目錄；管理
+介面無法取得清單時顯示 `-`，仍允許使用者指定模型名稱。上游回應若帶有 primary／secondary
+rate-limit 視窗，Provider 用量介面會顯示 5 小時與 7 天的剩餘比例；沒有資料時顯示 `-`，不推測
+為 100%。後端啟動時立即刷新一次，之後每 3 分鐘背景更新；Provider 設定異動後也會要求刷新。
+
+ChatGPT／Codex OAuth 使用 authorization-code + PKCE。驗證期間只啟動 loopback callback
+server，登入與帳號選擇在 Browser 完成；access token、refresh token 與 PKCE verifier 不經管理
+API 回傳，Token 另存於權限限制檔案。這是 NR-Intern 的 Provider 整合流程，不代表一般
+OpenAI-compatible Provider 會自動取得相同登入能力。
+
+OpenAI 官方協定參考：[Chat Completions API](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions)、[Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)；request ID 診斷參考：[OpenAI API Overview](https://developers.openai.com/api/reference/overview#debugging-requests)。
 
 ## 程序拓樸
 
 ```text
-HTTP Client ───────────────→ server :8787
-Browser ─→ desktop :8790 ─→ server :8787
-                    │
+HTTP Client ─────────────────────────→ server :8787 ─→ Provider
+Browser ─→ desktop :8790 ───────────→ server :8787 ─→ MCP Server
+                    │                         │
+                    │                         └─→ NetPassClient（選用的對外通道）
                     └─ 僅管理自己啟動的 backend child
 ```
 
-`desktop` 不會停止或重啟已存在的外部後端。桌面 reverse proxy 會在 server 設有 Bearer token 時代為加入，不將 token暴露給 Browser JavaScript。
+`desktop` 不會停止或重啟已存在的外部後端。桌面 reverse proxy 會在 server 設有 Bearer token
+時代為加入，不將 token 暴露給 Browser JavaScript。NetPass 只轉送 backend port，不轉送 desktop
+UI；它是獨立、選用的 Runtime，啟動前必須由使用者明確接受公開網路風險。
+
+macOS 原生視窗啟動時就安裝狀態列項目，提供顯示主視窗、隱藏主視窗與結束程式。對話進行中按下
+關閉會詢問是否隱藏 UI 並讓後端 Run 繼續；狀態列項目與 Dock reopen 都能恢復同一個視窗。若使用者
+再次啟動程式而本機 desktop port 已被既有 NR-Intern 使用，新程序會先驗證 identity endpoint，再
+要求既有程序顯示 UI，不會啟動第二套後端。這項原生狀態列生命週期目前只在 macOS 實作。

@@ -21,6 +21,7 @@
     "file_edit",
     "document_inspect",
     "document_read",
+    "http_fetch",
     "shell_exec",
     "ssh_exec",
     "memory_search",
@@ -38,7 +39,7 @@
     "allow_client_choice": false
   },
   "max_turns": 96,
-  "max_autonomous_tool_turns": 16,
+  "max_autonomous_tool_turns": 0,
   "max_completion_checks": 1,
   "max_wall_clock_seconds": 7200,
   "max_tokens": 0,
@@ -99,5 +100,14 @@
       }
     }
   },
-  "ssh_profiles": {}
+  "ssh_profiles": {},
+  "http_fetch": {
+    "enabled": true,
+    "allow_private_networks": false,
+    "max_response_bytes": 1048576,
+    "timeout_seconds": 30,
+    "max_redirects": 5,
+    "allowed_hosts": [],
+    "blocked_hosts": []
+  }
 }

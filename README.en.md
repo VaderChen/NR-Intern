@@ -6,15 +6,22 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 
 ## Highlights
 
-- Extensible OpenAI-compatible provider routing for remote and local model services.
+- Extensible provider routing for OpenAI-compatible Chat Completions and OpenAI Codex Responses authenticated through ChatGPT/Codex OAuth.
 - A `Workspace → Project → Session` hierarchy with per-conversation provider and model selection.
+- Standing instructions on workspaces and projects: write the working rules once and every conversation and schedule carries them.
 - Multiple ordered work plans with drag-and-drop ordering, step states, and tool-backed evidence.
+- A standalone schedule section: each schedule carries its own recurrence and sandbox, and starts a new conversation on time.
 - Durable runs, replayable SSE, streamed responses, and reconnection support.
+- You can keep typing while a conversation is running; later messages stay in the current UI's send queue and are submitted in order after the active run ends.
 - Automatic context compaction, cross-session memory, and configurable memory scopes.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
+- `http_fetch` reads external resources: HTML becomes plain text, private addresses are refused by default, and the whole tool can be switched off from system settings.
+- A built-in MCP client connects to local stdio or remote Streamable HTTP servers and places their tools under the same permission and approval flow.
+- An optional NetPass reverse proxy can expose the backend API without publishing the desktop control UI.
 - Provider enablement, model discovery, tool permissions, and audit records.
 - Light and dark appearance with Auto, Traditional Chinese, English, Japanese, and Korean interfaces.
 - Desktop support for Windows x64, Windows ARM64, and macOS ARM64.
+- On macOS, a status item is installed at startup. The UI can be hidden while work continues, then restored from the menu or by launching the app again.
 
 The interface language controls only the UI and an uncustomized default name. The agent infers the user's preferred language from the current message, recent conversation, and explicit preferences.
 
@@ -38,7 +45,7 @@ Release packaging and signing are handled through a maintainer-only workflow. Th
 
 ## Data security
 
-- The repository contains sample configuration only. Provider keys, SSH credentials, logs, runtime data, and release artifacts are excluded by `.gitignore`.
+- The repository contains sample configuration only. Provider, OAuth, MCP, and NetPass keys, SSH credentials, logs, runtime data, and release artifacts are excluded by `.gitignore`.
 - Documentation and examples use relative paths, localhost, or example domains; no developer-specific absolute directory is included.
 - Never commit API keys, tokens, private keys, certificates, signing identities, or real service addresses.
 

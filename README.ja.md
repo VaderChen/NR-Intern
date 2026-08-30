@@ -6,15 +6,22 @@ NR-Intern は Go で開発されたデスクトップ AI Agent です。現在�
 
 ## 主な機能
 
-- リモートおよびローカルのモデルサービスに対応する、拡張可能な OpenAI-compatible Provider Router。
+- OpenAI-compatible Chat Completions と、ChatGPT／Codex OAuth で認証する OpenAI Codex Responses に対応した拡張可能な Provider Router。
 - 会話ごとに Provider とモデルを選択できる `Workspace → Project → Session` 構造。
+- Workspace と Project の常時指示。作業ルールを一度書けば、以降の会話とスケジュールに自動的に引き継がれます。
 - 複数の作業計画、ドラッグによる順序変更、ステップ状態、ツール結果に基づく検証証拠。
+- 独立したスケジュール欄。繰り返しとサンドボックスを個別に設定し、時刻になると新しい会話を作成して作業を始めます。
 - Durable Run、再生可能な SSE、ストリーミング応答、再接続。
+- 会話の実行中も続けて入力でき、後続メッセージは現在の UI の送信待ちキューに入り、前の Run が終わると順番に送信されます。
 - Context の自動整理、Session 間の長期メモリ、メモリ範囲の制御。
 - Sandbox と実行承認で保護されたファイル、文書、Shell、SSH、計画ツール。
+- 外部リソースを読み取る `http_fetch`。HTML は自動で純テキストに変換し、プライベートアドレスは既定で拒否、管理画面から丸ごと無効化できます。
+- 内蔵 MCP Client からローカル stdio またはリモート Streamable HTTP Server に接続し、外部ツールにも同じ権限・承認フローを適用します。
+- オプションの NetPass リバースプロキシは、デスクトップ制御 UI を公開せずにバックエンド API を公開できます。
 - Provider の有効化、モデル検出、ツール権限、監査記録。
 - ライト／ダーク表示と、AUTO、繁体字中国語、英語、日本語、韓国語の UI。
 - Windows x64、Windows ARM64、macOS ARM64 のデスクトップ環境。
+- macOS では起動時からステータス項目を表示します。作業を続けたまま UI を隠し、メニューまたはアプリの再起動操作から元のウィンドウを復元できます。
 
 表示言語は UI と未変更の既定名だけに適用されます。Agent は現在のメッセージ、最近の会話、明示された設定から利用者の慣用言語を判断します。
 
@@ -38,7 +45,7 @@ NR-Intern は Go で開発されたデスクトップ AI Agent です。現在�
 
 ## データセキュリティ
 
-- Repository に含まれるのはサンプル設定だけです。Provider キー、SSH 認証情報、ログ、実行データ、リリース成果物は `.gitignore` で除外されます。
+- Repository に含まれるのはサンプル設定だけです。Provider／OAuth／MCP／NetPass キー、SSH 認証情報、ログ、実行データ、リリース成果物は `.gitignore` で除外されます。
 - 文書と例では相対パス、localhost、example domain のみを使用し、開発者固有の絶対ディレクトリを含めません。
 - API Key、Token、秘密鍵、証明書、署名 ID、実サービスのアドレスを commit しないでください。
 

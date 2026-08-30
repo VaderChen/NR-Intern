@@ -246,6 +246,7 @@ paths:
       description: >-
         只將後端 API Port 暴露到 NetPass，不公開桌面 UI。
         呼叫前必須已設定 NetPass API Key，並明確接受使用政策。
+        NetPass 不代替後端認證；公開前應另外設定 api_token。
       requestBody:
         required: true
         content:
@@ -437,6 +438,77 @@ paths:
       description: Project 仍有 Session 時回傳 409，不會隱含級聯刪除。
       responses:
         "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/schedules:
+    get:
+      summary: 列出排程
+      description: 排程是 Workspace 層級的獨立實體，不隸屬於任何 Project 或 Session。
+      parameters:
+        - name: workspace_id
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    post:
+      summary: 建立排程
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateScheduleInput" }
+      responses:
+        "201":
+          description: 已建立
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/schedules/{schedule_id}:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleID"
+    get:
+      summary: 取得排程
+      responses:
+        "200":
+          description: 排程
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    patch:
+      summary: 更新排程
+      description: 變更 recurrence 或 enabled 時，next_run_at 會立即重新計算。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateScheduleInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 刪除排程
+      description: 已由排程建立的 Session 會保留。
+      responses:
+        "204": { description: 已刪除 }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/schedules/{schedule_id}/run:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleID"
+    post:
+      summary: 立刻執行一次排程
+      description: 建立新的 Session 與 Run；排程原本的 next_run_at 不變。
+      responses:
+        "202":
+          description: 已建立 Run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
   /api/v1/agents:
     get:
@@ -887,6 +959,11 @@ components:
       in: path
       required: true
       schema: { type: string }
+    ScheduleID:
+      name: schedule_id
+      in: path
+      required: true
+      schema: { type: string }
     ProjectID:
       name: project_id
       in: path
@@ -1068,6 +1145,7 @@ components:
         workspace_id: { type: string }
         name: { type: string }
         description: { type: string }
+        instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
         sandbox_roots:
           type: array
           items: { type: string }
@@ -1082,6 +1160,7 @@ components:
         name: { type: string, minLength: 1, description: 同一 Workspace 內唯一。 }
         workspace_id: { type: string }
         description: { type: string }
+        instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
         sandbox_roots:
           type: array
           items: { type: string }
@@ -1092,10 +1171,82 @@ components:
       properties:
         name: { type: string, minLength: 1 }
         description: { type: string }
+        instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
         sandbox_roots:
           type: array
           items: { type: string }
           description: 完整取代 Project 的 Sandbox 目錄集合；空陣列表示恢復 Session 私有工作目錄。
+        position: { type: integer, minimum: 0 }
+    Schedule:
+      type: object
+      required: [id, workspace_id, agent_id, name, prompt, enabled, recurrence, position, created_at, updated_at]
+      properties:
+        id: { type: string }
+        workspace_id: { type: string }
+        agent_id: { type: string }
+        name: { type: string, description: 同一 Workspace 內唯一。 }
+        prompt: { type: string, description: 到點後送進新 Session 的使用者訊息。 }
+        enabled: { type: boolean }
+        recurrence: { $ref: "#/components/schemas/ScheduleRecurrence" }
+        sandbox_roots:
+          type: array
+          items: { type: string }
+          description: 後端驗證後才寫入的保留欄位；空陣列表示只使用該次 Session 的私有工作目錄。
+        provider_id: { type: string }
+        model: { type: string }
+        permission_profile: { type: string }
+        position: { type: integer }
+        next_run_at: { type: string, format: date-time, description: 停用時不存在。 }
+        last_run_at: { type: string, format: date-time }
+        last_run_id: { type: string }
+        last_session_id: { type: string }
+        last_status: { type: string, enum: [triggered, failed] }
+        last_error: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    ScheduleRecurrence:
+      type: object
+      required: [frequency]
+      description: 只支援固定間隔、每日與每週；每日與每週採後端所在時區的牆上時間。
+      properties:
+        frequency: { type: string, enum: [interval, daily, weekly] }
+        interval_minutes: { type: integer, minimum: 1, maximum: 10080, description: frequency=interval 時必填。 }
+        time_of_day: { type: string, pattern: "^[0-9]{2}:[0-9]{2}$", description: frequency=daily 或 weekly 時必填。 }
+        weekdays:
+          type: array
+          items: { type: integer, minimum: 0, maximum: 6 }
+          description: frequency=weekly 時至少一天；0 是星期日。
+    CreateScheduleInput:
+      type: object
+      required: [workspace_id, name, prompt, recurrence]
+      properties:
+        workspace_id: { type: string }
+        agent_id: { type: string, description: 省略時使用後端第一個註冊的 Agent。 }
+        name: { type: string, minLength: 1 }
+        prompt: { type: string, minLength: 1, maxLength: 8000 }
+        enabled: { type: boolean, default: true }
+        recurrence: { $ref: "#/components/schemas/ScheduleRecurrence" }
+        sandbox_roots:
+          type: array
+          items: { type: string }
+          description: 可同時指定多個既有的絕對目錄；驗證方式與 Project 相同。
+        provider_id: { type: string }
+        model: { type: string }
+        permission_profile: { type: string }
+    UpdateScheduleInput:
+      type: object
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1 }
+        prompt: { type: string, minLength: 1, maxLength: 8000 }
+        enabled: { type: boolean }
+        recurrence: { $ref: "#/components/schemas/ScheduleRecurrence" }
+        sandbox_roots:
+          type: array
+          items: { type: string }
+        provider_id: { type: string }
+        model: { type: string }
+        permission_profile: { type: string }
         position: { type: integer, minimum: 0 }
     Workspace:
       type: object
@@ -1104,6 +1255,7 @@ components:
         id: { type: string }
         name: { type: string }
         description: { type: string }
+        instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
         provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string }, description: Workspace 自己管理的 Provider 集合與預設來源，不限制 Session override。 }
         default_provider_id: { type: string, description: 必須存在於 provider_ids；作為新對話與未指定 override 時的預設值。 }
         model: { type: string }
@@ -1116,6 +1268,7 @@ components:
       properties:
         name: { type: string, minLength: 1 }
         description: { type: string }
+        instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
         provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
         default_provider_id: { type: string }
         model: { type: string }
@@ -1125,6 +1278,7 @@ components:
       properties:
         name: { type: string, minLength: 1 }
         description: { type: string }
+        instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
         provider_ids: { type: array, minItems: 1, uniqueItems: true, items: { type: string } }
         default_provider_id: { type: string, minLength: 1 }
         model: { type: string }
@@ -1163,6 +1317,14 @@ components:
           minimum: 0
           maximum: 10000
           description: 單次工作工具呼叫上限；0 表示不限制。
+        http_fetch: { $ref: "#/components/schemas/HTTPFetchSettings" }
+    HTTPFetchSettings:
+      type: object
+      required: [enabled, allow_private_networks]
+      description: http_fetch 是唯一可由模型自行指定任意 URL 的原生工具，因此可由管理介面即時開關。
+      properties:
+        enabled: { type: boolean, description: 關閉時工具不會出現在模型的工具清單，執行請求也會被拒絕。 }
+        allow_private_networks: { type: boolean, description: 預設 false；關閉時拒絕連線到 loopback、私有網段、link-local 與 CGNAT 位址。 }
     UpdateServiceSettingsInput:
       type: object
       required: [service_name]
@@ -1172,6 +1334,8 @@ components:
         max_wall_clock_seconds: { type: integer, minimum: 1, maximum: 86400 }
         max_tokens: { type: integer, minimum: 0 }
         max_tool_calls: { type: integer, minimum: 0, maximum: 10000 }
+        http_fetch_enabled: { type: boolean, description: 省略時保留目前設定。 }
+        http_fetch_allow_private_networks: { type: boolean, description: 省略時保留目前設定。 }
     ProviderSettings:
       type: object
       required: [default_provider_id, providers]
@@ -1257,7 +1421,7 @@ components:
         endpoint: { type: string, format: uri }
         api_key_set: { type: boolean }
         name: { type: string }
-        target_port: { type: integer, minimum: 1, maximum: 65535, description: 受 Bearer Token 保護的後端 API Port。 }
+        target_port: { type: integer, minimum: 1, maximum: 65535, description: 後端 API Port；公開前應另外設定後端 Bearer Token。 }
         pid: { type: integer }
         client_id: { type: string }
         public_url: { type: string, format: uri }
@@ -1581,6 +1745,11 @@ components:
       required: [data]
       properties:
         data: { $ref: "#/components/schemas/Session" }
+    ScheduleEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/Schedule" }
     ProjectEnvelope:
       type: object
       required: [data]

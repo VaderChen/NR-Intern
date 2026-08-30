@@ -40,7 +40,7 @@ type Config struct {
 	ToolCallMode string `json:"tool_call_mode"`
 	// MaxTurns 是單次 Run 的安全回合上限，和 Context 容量及自動壓縮無關。
 	MaxTurns int `json:"max_turns"`
-	// MaxAutonomousToolTurns 到達後會停止擴張工具範圍，強制整理最終答案。
+	// MaxAutonomousToolTurns 到達後會停止擴張工具範圍；0 代表不另設固定上限。
 	MaxAutonomousToolTurns int `json:"max_autonomous_tool_turns"`
 	// MaxCompletionChecks 是模型宣稱完成、但仍有未解決工具失敗時的追問次數上限。
 	MaxCompletionChecks int `json:"max_completion_checks"`
@@ -56,6 +56,20 @@ type Config struct {
 	Providers          map[string]ProviderConfig         `json:"providers"`
 	MCPServers         map[string]mcpclient.ServerConfig `json:"mcp_servers,omitempty"`
 	SSHProfiles        map[string]nativessh.Profile      `json:"ssh_profiles,omitempty"`
+	// HTTPFetch 是唯一會離開本機的原生工具，因此邊界獨立於其他工具設定，
+	// 且 Enabled 與 AllowPrivateNetworks 可由管理介面即時調整。
+	HTTPFetch HTTPFetchConfig `json:"http_fetch"`
+}
+
+type HTTPFetchConfig struct {
+	Enabled              bool `json:"enabled"`
+	AllowPrivateNetworks bool `json:"allow_private_networks"`
+	MaxResponseBytes     int  `json:"max_response_bytes"`
+	TimeoutSeconds       int  `json:"timeout_seconds"`
+	MaxRedirects         int  `json:"max_redirects"`
+	// AllowedHosts 非空時只允許清單內的網域與其子網域；BlockedHosts 一律優先拒絕。
+	AllowedHosts []string `json:"allowed_hosts,omitempty"`
+	BlockedHosts []string `json:"blocked_hosts,omitempty"`
 }
 
 // ProviderConfig 以 type 作為 adapter 工廠的辨識欄位。每種協定使用自己的具名
@@ -79,7 +93,7 @@ func DefaultConfig() Config {
 		UILanguage:             DefaultUILanguage,
 		ListenAddress:          "127.0.0.1:8787",
 		DataDir:                filepath.Join("data", "ai-agent"),
-		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "shell_exec", "ssh_exec", "memory_search", "memory_remember", "memory_forget"},
+		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "http_fetch", "shell_exec", "ssh_exec", "memory_search", "memory_remember", "memory_forget"},
 		AllowElevatedTools:     true,
 		MaxTurns:               harness.DefaultMaxTurns,
 		MaxAutonomousToolTurns: harness.DefaultMaxAutonomousToolTurns,
@@ -131,6 +145,13 @@ func DefaultConfig() Config {
 		},
 		MCPServers:  map[string]mcpclient.ServerConfig{},
 		SSHProfiles: map[string]nativessh.Profile{},
+		HTTPFetch: HTTPFetchConfig{
+			Enabled:              true,
+			AllowPrivateNetworks: false,
+			MaxResponseBytes:     1024 * 1024,
+			TimeoutSeconds:       30,
+			MaxRedirects:         5,
+		},
 	}
 }
 
@@ -311,8 +332,8 @@ func validateConfig(config *Config) error {
 	if config.MaxTurns <= 0 || config.MaxTurns > 200 {
 		return fmt.Errorf("max_turns must be between 1 and 200")
 	}
-	if config.MaxAutonomousToolTurns <= 0 || config.MaxAutonomousToolTurns >= config.MaxTurns {
-		return fmt.Errorf("max_autonomous_tool_turns must be between 1 and max_turns-1")
+	if config.MaxAutonomousToolTurns < 0 || config.MaxAutonomousToolTurns >= config.MaxTurns {
+		return fmt.Errorf("max_autonomous_tool_turns must be zero (unlimited) or between 1 and max_turns-1")
 	}
 	config.ToolCallMode = strings.ToLower(strings.TrimSpace(config.ToolCallMode))
 	if !harness.ValidToolCallMode(config.ToolCallMode) {
@@ -334,6 +355,20 @@ func validateConfig(config *Config) error {
 	if config.MaxFileInputBytes <= 0 {
 		config.MaxFileInputBytes = 8 * 1024 * 1024
 	}
+	if config.HTTPFetch.MaxResponseBytes <= 0 {
+		config.HTTPFetch.MaxResponseBytes = 1024 * 1024
+	}
+	if config.HTTPFetch.TimeoutSeconds <= 0 {
+		config.HTTPFetch.TimeoutSeconds = 30
+	}
+	if config.HTTPFetch.TimeoutSeconds > 300 {
+		return fmt.Errorf("http_fetch.timeout_seconds must not exceed 300")
+	}
+	if config.HTTPFetch.MaxRedirects < 0 || config.HTTPFetch.MaxRedirects > 20 {
+		return fmt.Errorf("http_fetch.max_redirects must be between 0 and 20")
+	}
+	config.HTTPFetch.AllowedHosts = normalizeHostList(config.HTTPFetch.AllowedHosts)
+	config.HTTPFetch.BlockedHosts = normalizeHostList(config.HTTPFetch.BlockedHosts)
 	config.DefaultProviderID = strings.TrimSpace(config.DefaultProviderID)
 	if config.DefaultProviderID == "" || len(config.Providers) == 0 {
 		return fmt.Errorf("default_provider_id and providers are required")
@@ -432,6 +467,23 @@ func validateConfig(config *Config) error {
 	}
 	config.DataDir = filepath.Clean(absolute)
 	return nil
+}
+
+func normalizeHostList(values []string) []string {
+	result := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(value), "*.")))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func normalizeUILanguage(value string) (string, bool) {

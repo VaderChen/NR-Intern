@@ -44,6 +44,16 @@
         <div class="section-title">已釘選</div>
         <nav id="pinnedList" class="sessions" aria-label="已釘選對話"></nav>
       </section>
+      <section id="scheduleSection" class="navigation-section schedule-navigation">
+        <div class="navigation-heading">
+          <button id="scheduleToggle" class="section-toggle" type="button" aria-expanded="true" aria-controls="scheduleList">
+            <svg class="caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m7.5 9.5 4.5 4.5 4.5-4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <span class="section-title">排程</span>
+          </button>
+          <button id="newSchedule" class="icon-button" type="button" title="建立排程" aria-label="建立排程" disabled>＋</button>
+        </div>
+        <nav id="scheduleList" class="schedule-list" aria-label="排程"></nav>
+      </section>
       <section class="navigation-section project-navigation">
         <div class="navigation-heading">
           <div class="section-title">專案</div>
@@ -213,6 +223,12 @@
           <label>單次工作 Token 上限<input id="settingMaxTokens" type="number" min="0" step="1000" inputmode="numeric" required></label>
           <label>單次工作工具呼叫上限<input id="settingMaxToolCalls" type="number" min="0" max="10000" step="1" inputmode="numeric" required></label>
           <p class="hint">Token 與工具呼叫填 0 表示不限制；時間上限為 1～1440 分鐘。新數值會套用到之後開始的工作，不影響正在執行中的工作。</p>
+          <fieldset class="settings-fieldset">
+            <legend>對外網路</legend>
+            <label class="check-label"><input id="settingHTTPFetchEnabled" type="checkbox">允許 Agent 讀取外部網路（http_fetch）</label>
+            <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox">允許連線到 localhost 與私有網段</label>
+            <p class="hint">關閉後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。私有網段預設拒絕，避免 Agent 讀取內網服務或雲端 metadata 位址；要讓 Agent 呼叫本機服務時才開啟。</p>
+          </fieldset>
           <button id="saveServiceSettings" class="primary" type="submit">儲存服務設定</button>
         </form>
         <section class="management-section backend-card">
@@ -238,6 +254,8 @@
           <label>說明<textarea id="settingWorkspaceDescription" rows="2"></textarea></label>
           <label>預設 Provider<select id="settingWorkspaceProvider"></select></label>
           <label>預設模型<input id="settingWorkspaceModel" placeholder="使用 Provider 預設模型" autocomplete="off"></label>
+          <label>職務說明<textarea id="settingWorkspaceInstructions" rows="4" placeholder="這個 Workspace 的常駐工作規則；底下所有對話都會自動套用"></textarea></label>
+          <p class="hint">職務說明只寫一次，之後每次對話與每個排程都會自動帶入，不必重述工作規則；Project 也可以再寫自己的說明，範圍較小者優先。上限 8000 字，內容每一輪都會佔用 Context 預算。</p>
           <p class="hint">不同前端分頁可同時選擇不同 Workspace；此處更新只影響之後未指定 override 的 Run。</p>
           <button id="saveWorkspaceSettings" class="primary" type="submit">儲存 Workspace 設定</button>
         </form>
@@ -619,6 +637,7 @@
       <h2>建立新專案</h2>
       <label>名稱<input id="newProjectName" placeholder="例如：NR-Intern" required></label>
       <label>說明<textarea id="newProjectDescription" rows="3" placeholder="選填"></textarea></label>
+      <label>職務說明<textarea id="newProjectInstructions" rows="4" placeholder="這個專案的常駐工作規則；每次對話都會自動套用"></textarea></label>
       <fieldset class="sandbox-fieldset">
         <legend>Sandbox 目錄</legend>
         <p class="hint">可加入多個既有的絕對目錄。Agent 的檔案與 Shell 工具只能在這些範圍內運作。</p>
@@ -641,6 +660,7 @@
       </div>
       <label>名稱<input id="editProjectName" required></label>
       <label>說明<textarea id="editProjectDescription" rows="3" placeholder="選填"></textarea></label>
+      <label>職務說明<textarea id="editProjectInstructions" rows="4" placeholder="這個專案的常駐工作規則；每次對話都會自動套用"></textarea></label>
       <fieldset class="sandbox-fieldset">
         <legend>Sandbox 目錄</legend>
         <p class="hint">可加入多個既有的絕對目錄。儲存後，Agent 的檔案與 Shell 工具會使用更新後的範圍。</p>
@@ -656,6 +676,60 @@
         <span class="dialog-action-group">
           <button type="button" id="cancelProjectSettings" class="ghost">取消</button>
           <button id="saveProjectSettings" value="default" class="primary">儲存</button>
+        </span>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="scheduleDialog" class="project-dialog schedule-dialog">
+    <form method="dialog" id="scheduleForm">
+      <div class="dialog-title-row">
+        <h2 id="scheduleDialogTitle">建立排程</h2>
+        <span id="scheduleDialogState" class="save-state"></span>
+      </div>
+      <label>名稱<input id="scheduleName" placeholder="例如：每日巡檢" required></label>
+      <label>交辦內容<textarea id="schedulePrompt" rows="4" placeholder="到點時要交辦給 Agent 的任務" required></textarea></label>
+      <div class="schedule-recurrence">
+        <label>週期
+          <select id="scheduleFrequency">
+            <option value="interval">固定間隔</option>
+            <option value="daily">每天</option>
+            <option value="weekly">每週</option>
+          </select>
+        </label>
+        <label id="scheduleIntervalField">間隔（分鐘）<input id="scheduleIntervalMinutes" type="number" min="1" max="10080" step="1" value="60"></label>
+        <label id="scheduleTimeField" class="hidden">執行時間<input id="scheduleTimeOfDay" type="time" value="09:00"></label>
+      </div>
+      <fieldset id="scheduleWeekdayField" class="schedule-weekdays hidden">
+        <legend>星期</legend>
+        <div class="schedule-weekday-list">
+          <label class="check-label"><input type="checkbox" data-weekday="1">週一</label>
+          <label class="check-label"><input type="checkbox" data-weekday="2">週二</label>
+          <label class="check-label"><input type="checkbox" data-weekday="3">週三</label>
+          <label class="check-label"><input type="checkbox" data-weekday="4">週四</label>
+          <label class="check-label"><input type="checkbox" data-weekday="5">週五</label>
+          <label class="check-label"><input type="checkbox" data-weekday="6">週六</label>
+          <label class="check-label"><input type="checkbox" data-weekday="0">週日</label>
+        </div>
+      </fieldset>
+      <fieldset class="sandbox-fieldset">
+        <legend>Sandbox 目錄</legend>
+        <p class="hint">排程自己決定沙箱；留空時只使用該次執行的 Session 私有工作目錄。</p>
+        <button id="pickScheduleFolders" class="ghost full folder-picker" type="button">
+          <span class="folder-picker-icon" aria-hidden="true">▱</span>
+          <span><strong>拖入一個或多個目錄</strong><small>或按一下使用系統目錄選擇器</small></span>
+        </button>
+        <p id="scheduleSandboxEmpty" class="sandbox-empty">尚未加入目錄；將使用 Session 私有工作目錄。</p>
+        <div id="scheduleSandboxRoots" class="sandbox-root-list" aria-live="polite"></div>
+      </fieldset>
+      <label class="check-label"><input id="scheduleEnabled" type="checkbox" checked>啟用這個排程</label>
+      <p class="hint">每次到點都會建立新的對話再送出交辦內容；後端沒有執行的時間點不會補跑。</p>
+      <div class="dialog-actions split-actions">
+        <button type="button" id="deleteSchedule" class="danger ghost hidden">刪除排程</button>
+        <span class="dialog-action-group">
+          <button type="button" id="runScheduleNow" class="ghost hidden">立即執行一次</button>
+          <button type="button" id="cancelSchedule" class="ghost">取消</button>
+          <button id="saveSchedule" value="default" class="primary">建立</button>
         </span>
       </div>
     </form>
@@ -707,7 +781,10 @@
       <div id="planListPanel" role="tabpanel" aria-labelledby="activePlanTab">
         <div class="plan-list-toolbar">
           <small id="planListHint">拖曳計畫可調整執行順序</small>
-          <button id="createPlan" class="small primary" type="button">＋ 新增計畫</button>
+          <div class="plan-list-toolbar-actions">
+            <button id="clearCompletedPlans" class="small danger ghost hidden" type="button">清除已完成</button>
+            <button id="createPlan" class="small primary" type="button">＋ 新增計畫</button>
+          </div>
         </div>
         <div id="planEmpty" class="plan-empty">
           <strong id="planEmptyTitle">尚未建立計畫</strong>
@@ -731,6 +808,17 @@
       <div class="dialog-actions">
         <button id="cancelPlanEdit" class="ghost" type="button">取消</button>
         <button id="savePlan" class="primary" type="submit">儲存計畫</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmationDialog" class="confirmation-dialog">
+    <form method="dialog">
+      <h2>確認操作</h2>
+      <p id="confirmationMessage"></p>
+      <div class="dialog-actions">
+        <button class="ghost" type="submit" value="cancel">取消</button>
+        <button class="danger" type="submit" value="confirm">確認</button>
       </div>
     </form>
   </dialog>
