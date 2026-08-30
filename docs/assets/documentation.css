@@ -125,6 +125,30 @@ main,
   gap: 8px;
 }
 
+.github-link {
+  flex: none;
+  padding: 8px 14px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.github-link:hover,
+.github-link:focus-visible {
+  border-color: var(--green);
+  background: var(--green);
+  color: white;
+}
+
+.github-link:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+
 .report-tools {
   display: flex;
   align-items: center;
