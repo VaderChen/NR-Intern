@@ -180,9 +180,9 @@ UI 啟動時先讀取目前 Workspace 的 queued／running／paused／waiting ap
 重新掛接 durable SSE；若後端已將中斷 Run 標記為 retryable failure，也會顯示可重試狀態。這讓
 隱藏視窗、背景執行、瀏覽器重整與桌面程式重開都不會遺失工作生命週期。
 
-## P0／P1 系統能力
+## 工作管理與系統能力
 
-P0 與 P1 管理能力共用同一個後端狀態來源，不在 Browser 端自行推導或保存權限結果。
+管理功能共用同一個後端狀態來源，不在 Browser 端自行推導或保存權限結果。
 
 ### 異常恢復、通知與 Run 控制
 

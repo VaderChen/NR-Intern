@@ -76,7 +76,7 @@ func TestHTTPRejectsUnknownJSONFieldsWithProblemResponse(t *testing.T) {
 	}
 }
 
-func TestP1AdminEndpointsExposePersistentCapabilities(t *testing.T) {
+func TestAdminEndpointsExposePersistentCapabilities(t *testing.T) {
 	runtime := testRuntime(t, "")
 
 	status, decoded := call(t, runtime, http.MethodGet, "/api/v1/admin/status", "")

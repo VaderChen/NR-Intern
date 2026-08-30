@@ -434,7 +434,7 @@ major version 不同或缺少必要功能時，UI 會顯示版本不相容提示
 UI 重開時會查詢目前 Workspace 的 queued、running、paused、waiting approval Run，重新連接其
 SSE；若後端重啟已將 Run 標記為 `server_restarted` 且 `retryable=true`，UI 會保留重試入口。
 
-## P0／P1 管理與復原
+## 管理與復原
 
 後端重啟會把 queued、running、paused 與 waiting approval 的未完成 Run 標記為 `failed`、錯誤碼 `server_restarted` 並保留可重試狀態；原 Run
 不會被覆寫。`pause` 只在目前 Provider request 或工具回合結束後生效，等待人工核准的 Run
