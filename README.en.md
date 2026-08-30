@@ -44,12 +44,14 @@ The frontend checks `/api/v1/admin/status` at startup for the API major version,
 
 ## Documentation
 
-- [Architecture](docs/architecture.html)
-- [Document tools](docs/document-tools.html)
-- [Development](docs/development.html)
-- [HTTP API](docs/http-api.html)
-- [Security](docs/security.html)
-- [OpenAPI contract](docs/openapi.html)
+[Open the documentation website](https://vaderchen.github.io/NR-Intern/)
+
+- [Architecture](https://vaderchen.github.io/NR-Intern/architecture.html)
+- [Document tools](https://vaderchen.github.io/NR-Intern/document-tools.html)
+- [Development](https://vaderchen.github.io/NR-Intern/development.html)
+- [HTTP API](https://vaderchen.github.io/NR-Intern/http-api.html)
+- [Security](https://vaderchen.github.io/NR-Intern/security.html)
+- [OpenAPI contract](https://vaderchen.github.io/NR-Intern/openapi.html)
 
 Release packaging and signing are handled through a maintainer-only workflow. This README does not publish packaging commands, parameters, or signing configuration.
 

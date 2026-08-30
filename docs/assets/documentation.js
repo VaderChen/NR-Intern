@@ -46,12 +46,12 @@
   };
 
   const docs = [
-    { id: "architecture", title: t("架構設計", "Architecture", "アーキテクチャ", "아키텍처"), summary: t("了解 Agent 工作迴圈、Workspace 層級、Run 狀態、桌面拓樸與外部整合。", "Understand the agent loop, workspace hierarchy, run states, desktop topology, and integrations.", "Agent ループ、Workspace 階層、Run 状態、デスクトップ構成、外部連携を理解します。", "Agent 루프, Workspace 계층, Run 상태, 데스크톱 구성 및 외부 통합을 설명합니다."), href: "architecture.html", source: "ai-agent/ARCHITECTURE.md" },
-    { id: "document-tools", title: t("辦公文件工具", "Document tools", "文書ツール", "문서 도구"), summary: t("了解 DOCX、XLSX、PPTX、PDF 的建立、編輯、轉換、驗證與渲染能力。", "Learn how DOCX, XLSX, PPTX, and PDF files are created, edited, converted, validated, and rendered.", "DOCX、XLSX、PPTX、PDF の作成、編集、変換、検証、レンダリングを説明します。", "DOCX, XLSX, PPTX 및 PDF의 생성, 편집, 변환, 검증 및 렌더링 기능을 설명합니다."), href: "document-tools.html", source: "ai-agent/DOCUMENT_TOOLS.md" },
-    { id: "development", title: t("開發說明", "Development guide", "開発ガイド", "개발 안내"), summary: t("從設定、啟動、工具擴充到編譯檢查，快速掌握本機開發流程。", "Set up the service, run the desktop console, extend tools, and perform compile checks.", "設定、起動、ツール拡張、コンパイル確認まで、ローカル開発の流れを説明します。", "설정, 실행, 도구 확장 및 컴파일 확인까지 로컬 개발 흐름을 안내합니다."), href: "development.html", source: "ai-agent/DEVELOPMENT.md" },
-    { id: "http-api", title: t("HTTP API", "HTTP API", "HTTP API", "HTTP API"), summary: t("API 資源、授權、SSE、Run 控制、通知、更新檢查與錯誤格式的使用指南。", "Use API resources, authorization, SSE, run controls, notifications, update checks, and error responses.", "API リソース、認証、SSE、Run 制御、通知、更新確認、エラー形式を説明します。", "API 리소스, 인증, SSE, Run 제어, 알림, 업데이트 확인 및 오류 응답을 안내합니다."), href: "http-api.html", source: "ai-agent/HTTP_API.md" },
-    { id: "security", title: t("安全設計", "Security design", "セキュリティ設計", "보안 설계"), summary: t("說明網路邊界、Sandbox、權限、秘密資料、診斷包與安全備份的保護方式。", "See how network boundaries, sandboxes, permissions, secrets, diagnostics, and backups are protected.", "ネットワーク境界、Sandbox、権限、秘密情報、診断、バックアップの保護方法を説明します。", "네트워크 경계, Sandbox, 권한, 비밀, 진단 및 백업 보호 방식을 설명합니다."), href: "security.html", source: "ai-agent/SECURITY.md" },
-    { id: "openapi", title: t("OpenAPI 契約", "OpenAPI contract", "OpenAPI 契約", "OpenAPI 계약"), summary: t("以 HTML 方式瀏覽 API 分組與相容性說明，並可開啟機器可讀 YAML 契約。", "Browse API groups and compatibility notes in HTML, or open the machine-readable YAML contract.", "API グループと互換性を HTML で確認し、機械可読な YAML 契約も開けます。", "HTML에서 API 그룹과 호환성 정보를 확인하고 기계 판독 가능한 YAML 계약을 열 수 있습니다."), href: "openapi.html", source: "../src/transport/httpapi/openapi.yaml" }
+    { id: "architecture", title: t("架構設計", "Architecture", "アーキテクチャ", "아키텍처"), summary: t("了解 Agent 工作迴圈、Workspace 層級、Run 狀態、桌面拓樸與外部整合。", "Understand the agent loop, workspace hierarchy, run states, desktop topology, and integrations.", "Agent ループ、Workspace 階層、Run 状態、デスクトップ構成、外部連携を理解します。", "Agent 루프, Workspace 계층, Run 상태, 데스크톱 구성 및 외부 통합을 설명합니다."), href: "architecture.html", source: "https://github.com/VaderChen/NR-Intern/blob/main/docs/ai-agent/ARCHITECTURE.md" },
+    { id: "document-tools", title: t("辦公文件工具", "Document tools", "文書ツール", "문서 도구"), summary: t("了解 DOCX、XLSX、PPTX、PDF 的建立、編輯、轉換、驗證與渲染能力。", "Learn how DOCX, XLSX, PPTX, and PDF files are created, edited, converted, validated, and rendered.", "DOCX、XLSX、PPTX、PDF の作成、編集、変換、検証、レンダリングを説明します。", "DOCX, XLSX, PPTX 및 PDF의 생성, 편집, 변환, 검증 및 렌더링 기능을 설명합니다."), href: "document-tools.html", source: "https://github.com/VaderChen/NR-Intern/blob/main/docs/ai-agent/DOCUMENT_TOOLS.md" },
+    { id: "development", title: t("開發說明", "Development guide", "開発ガイド", "개발 안내"), summary: t("從設定、啟動、工具擴充到編譯檢查，快速掌握本機開發流程。", "Set up the service, run the desktop console, extend tools, and perform compile checks.", "設定、起動、ツール拡張、コンパイル確認まで、ローカル開発の流れを説明します。", "설정, 실행, 도구 확장 및 컴파일 확인까지 로컬 개발 흐름을 안내합니다."), href: "development.html", source: "https://github.com/VaderChen/NR-Intern/blob/main/docs/ai-agent/DEVELOPMENT.md" },
+    { id: "http-api", title: t("HTTP API", "HTTP API", "HTTP API", "HTTP API"), summary: t("API 資源、授權、SSE、Run 控制、通知、更新檢查與錯誤格式的使用指南。", "Use API resources, authorization, SSE, run controls, notifications, update checks, and error responses.", "API リソース、認証、SSE、Run 制御、通知、更新確認、エラー形式を説明します。", "API 리소스, 인증, SSE, Run 제어, 알림, 업데이트 확인 및 오류 응답을 안내합니다."), href: "http-api.html", source: "https://github.com/VaderChen/NR-Intern/blob/main/docs/ai-agent/HTTP_API.md" },
+    { id: "security", title: t("安全設計", "Security design", "セキュリティ設計", "보안 설계"), summary: t("說明網路邊界、Sandbox、權限、秘密資料、診斷包與安全備份的保護方式。", "See how network boundaries, sandboxes, permissions, secrets, diagnostics, and backups are protected.", "ネットワーク境界、Sandbox、権限、秘密情報、診断、バックアップの保護方法を説明します。", "네트워크 경계, Sandbox, 권한, 비밀, 진단 및 백업 보호 방식을 설명합니다."), href: "security.html", source: "https://github.com/VaderChen/NR-Intern/blob/main/docs/ai-agent/SECURITY.md" },
+    { id: "openapi", title: t("OpenAPI 契約", "OpenAPI contract", "OpenAPI 契約", "OpenAPI 계약"), summary: t("以 HTML 方式瀏覽 API 分組與相容性說明，並可開啟機器可讀 YAML 契約。", "Browse API groups and compatibility notes in HTML, or open the machine-readable YAML contract.", "API グループと互換性を HTML で確認し、機械可読な YAML 契約も開けます。", "HTML에서 API 그룹과 호환성 정보를 확인하고 기계 판독 가능한 YAML 계약을 열 수 있습니다."), href: "openapi.html", source: "https://github.com/VaderChen/NR-Intern/blob/main/src/transport/httpapi/openapi.yaml" }
   ];
 
   const content = {
@@ -149,7 +149,14 @@
       const sourceElement = document.querySelector("[data-document-source]");
       if (titleElement) titleElement.textContent = title;
       if (summaryElement) summaryElement.textContent = definition.summary[language] || definition.summary.en;
-      if (contentElement) contentElement.innerHTML = content[documentId][language] || content[documentId].en;
+      if (contentElement) {
+        contentElement.innerHTML = content[documentId][language] || content[documentId].en;
+        contentElement.querySelectorAll("a.source-link").forEach((link) => {
+          link.href = definition.source;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+        });
+      }
       if (sourceElement) {
         sourceElement.href = definition.source;
         sourceElement.textContent = translate("common.sourceLink", language);

@@ -45,12 +45,14 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 ## 文件
 
-- [架構設計](docs/architecture.html)
-- [辦公文件工具](docs/document-tools.html)
-- [開發說明](docs/development.html)
-- [HTTP API](docs/http-api.html)
-- [安全設計](docs/security.html)
-- [OpenAPI 契約](docs/openapi.html)
+[開啟線上文件網站](https://vaderchen.github.io/NR-Intern/)
+
+- [架構設計](https://vaderchen.github.io/NR-Intern/architecture.html)
+- [辦公文件工具](https://vaderchen.github.io/NR-Intern/document-tools.html)
+- [開發說明](https://vaderchen.github.io/NR-Intern/development.html)
+- [HTTP API](https://vaderchen.github.io/NR-Intern/http-api.html)
+- [安全設計](https://vaderchen.github.io/NR-Intern/security.html)
+- [OpenAPI 契約](https://vaderchen.github.io/NR-Intern/openapi.html)
 
 發行封裝與簽章由維護者的內部流程處理；README 不提供封裝命令、參數或簽章設定。
 

@@ -41,12 +41,14 @@ NR-Intern은 Go로 개발된 데스크톱 AI Agent입니다. 현재 대화, 검�
 
 ## 문서
 
-- [아키텍처](docs/architecture.html)
-- [문서 도구](docs/document-tools.html)
-- [개발 안내](docs/development.html)
-- [HTTP API](docs/http-api.html)
-- [보안](docs/security.html)
-- [OpenAPI 계약](docs/openapi.html)
+[문서 웹사이트 열기](https://vaderchen.github.io/NR-Intern/)
+
+- [아키텍처](https://vaderchen.github.io/NR-Intern/architecture.html)
+- [문서 도구](https://vaderchen.github.io/NR-Intern/document-tools.html)
+- [개발 안내](https://vaderchen.github.io/NR-Intern/development.html)
+- [HTTP API](https://vaderchen.github.io/NR-Intern/http-api.html)
+- [보안](https://vaderchen.github.io/NR-Intern/security.html)
+- [OpenAPI 계약](https://vaderchen.github.io/NR-Intern/openapi.html)
 
 릴리스 패키징과 서명은 관리자 전용 내부 절차로 처리합니다. 이 README에는 패키징 명령, 매개변수 또는 서명 설정을 공개하지 않습니다.
 

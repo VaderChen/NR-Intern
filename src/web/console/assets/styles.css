@@ -399,11 +399,13 @@ details[open] > .reasoning-summary::after { transform: rotate(45deg); }
 .reasoning-content { padding: 0 11px 9px; font-size: 12px; }
 .reasoning-content > hr { margin: 13px 0; background: var(--line-strong); opacity: .8; }
 .message-reasoning[open] > .reasoning-content, .session-content-reasoning[open] > .reasoning-content { border-top: 1px solid var(--line); padding-top: 9px; }
-.message.reasoning-only { margin-bottom: 12px; }
+.message.reasoning-only { display: flex; flex-direction: column; margin-bottom: 12px; }
+.message.reasoning-only > .message-reasoning { margin-bottom: 0; }
 .message.reasoning-only > .content { display: none; }
 .agent-processing { display: none; min-height: 22px; align-items: center; gap: 6px; }
 .message.assistant.processing .agent-processing { display: flex; }
-.message.reasoning-only.processing > .agent-processing { margin-top: 24px; }
+.message.reasoning-only.processing { gap: 24px; }
+.message.reasoning-only.processing > .agent-processing { margin-top: 0; }
 .agent-processing span { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); opacity: .24; animation: agent-processing-wave 1.15s ease-in-out infinite; }
 .agent-processing span:nth-child(2) { animation-delay: .14s; }
 .agent-processing span:nth-child(3) { animation-delay: .28s; }
