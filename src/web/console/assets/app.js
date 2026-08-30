@@ -71,6 +71,7 @@ const state = {
   contextCapabilityCache: {},
   contextCompactionSessionId: "",
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("collapsedProjects") || "[]")),
+  projectSectionCollapsed: localStorage.getItem("projectSectionCollapsed") === "1",
   schedules: [],
   scheduleSectionCollapsed: localStorage.getItem("scheduleSectionCollapsed") === "1",
   scheduleSandboxRoots: [],
@@ -83,7 +84,7 @@ let nativeConversationActivity = null;
 const $ = (id) => document.getElementById(id);
 const defaultServiceNames = Object.freeze({
   "zh-TW": "永不休息的實習生",
-  en: "Tireless Intern",
+  en: "Never Rest Intern",
   ja: "休まないインターン",
   ko: "쉬지 않는 인턴",
 });
@@ -604,19 +605,26 @@ function renderNavigation() {
   $("pinnedSection").classList.toggle("hidden", pinned.length === 0);
   $("pinnedList").replaceChildren(...pinned.map((session) => sessionNode(session, true)));
 
+  const projectSectionCollapsed = state.projectSectionCollapsed;
+  const projectSectionToggle = $("projectSectionToggle");
+  projectSectionToggle.setAttribute("aria-expanded", String(!projectSectionCollapsed));
+  projectSectionToggle.querySelector(".caret")?.classList.toggle("collapsed", projectSectionCollapsed);
   const projectList = $("projectList");
+  projectList.classList.toggle("hidden", projectSectionCollapsed);
   projectList.replaceChildren();
-  for (const project of state.projects) {
-    const sessions = orderedProjectSessions(state.sessions.filter((session) => session.project_id === project.id && !session.pinned));
-    projectList.append(projectNode(project, sessions));
-  }
-  const ungrouped = orderedProjectSessions(state.sessions.filter((session) => !session.project_id && !session.pinned));
-  if (ungrouped.length > 0) projectList.append(projectNode(null, ungrouped));
-  if (state.projects.length === 0 && ungrouped.length === 0 && state.backendHealthy) {
-    const empty = document.createElement("p");
-    empty.className = "navigation-empty";
-    empty.textContent = "尚無專案，先建立一個專案。";
-    projectList.append(empty);
+  if (!projectSectionCollapsed) {
+    for (const project of state.projects) {
+      const sessions = orderedProjectSessions(state.sessions.filter((session) => session.project_id === project.id && !session.pinned));
+      projectList.append(projectNode(project, sessions));
+    }
+    const ungrouped = orderedProjectSessions(state.sessions.filter((session) => !session.project_id && !session.pinned));
+    if (ungrouped.length > 0) projectList.append(projectNode(null, ungrouped));
+    if (state.projects.length === 0 && ungrouped.length === 0 && state.backendHealthy) {
+      const empty = document.createElement("p");
+      empty.className = "navigation-empty";
+      empty.textContent = "尚無專案，先建立一個專案。";
+      projectList.append(empty);
+    }
   }
   renderSchedules();
 }
@@ -1048,6 +1056,12 @@ function toggleScheduleSection() {
   state.scheduleSectionCollapsed = !state.scheduleSectionCollapsed;
   localStorage.setItem("scheduleSectionCollapsed", state.scheduleSectionCollapsed ? "1" : "0");
   renderSchedules();
+}
+
+function toggleProjectSection() {
+  state.projectSectionCollapsed = !state.projectSectionCollapsed;
+  localStorage.setItem("projectSectionCollapsed", state.projectSectionCollapsed ? "1" : "0");
+  renderNavigation();
 }
 
 function renderSchedules() {
@@ -5446,6 +5460,7 @@ $("newProject").addEventListener("click", () => {
   resetProjectForm();
   $("projectDialog").showModal();
 });
+$("projectSectionToggle").addEventListener("click", toggleProjectSection);
 $("scheduleToggle").addEventListener("click", toggleScheduleSection);
 $("newSchedule").addEventListener("click", () => openScheduleDialog(null));
 $("scheduleFrequency").addEventListener("change", syncScheduleFrequencyFields);

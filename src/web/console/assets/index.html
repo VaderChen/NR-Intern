@@ -54,9 +54,12 @@
         </div>
         <nav id="scheduleList" class="schedule-list" aria-label="排程"></nav>
       </section>
-      <section class="navigation-section project-navigation">
+      <section id="projectSection" class="navigation-section project-navigation">
         <div class="navigation-heading">
-          <div class="section-title">專案</div>
+          <button id="projectSectionToggle" class="section-toggle" type="button" aria-expanded="true" aria-controls="projectList">
+            <svg class="caret" viewBox="0 0 24 24" aria-hidden="true"><path d="m7.5 9.5 4.5 4.5 4.5-4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <span class="section-title">專案</span>
+          </button>
           <button id="newProject" class="icon-button" type="button" title="建立專案" aria-label="建立專案" disabled>＋</button>
         </div>
         <nav id="projectList" class="project-list" aria-label="專案與對話"></nav>
