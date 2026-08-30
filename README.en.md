@@ -18,6 +18,7 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - You can keep typing while a conversation is running; later messages are stored in the browser's IndexedDB Durable Outbox and submitted in order after the active run ends. Network retries reuse the same Idempotency-Key.
 - Automatic context compaction, cross-session memory, and configurable memory scopes.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
+- Bounded, cancellable waiting with `wait_for`, plus `ssh_wait` polling for read-only remote checks so deployments are confirmed by bytes, SHA-256, or service readiness instead of an early upload return.
 - `http_fetch` reads external resources: HTML becomes plain text, localhost and private addresses are allowed by default, and the whole tool can be switched off from system settings.
 - A built-in MCP client connects to local stdio or remote Streamable HTTP servers and places their tools under the same permission and approval flow.
 - An optional NetPass reverse proxy can expose the backend API without publishing the desktop control UI.
@@ -43,11 +44,12 @@ The frontend checks `/api/v1/admin/status` at startup for the API major version,
 
 ## Documentation
 
-- [Architecture](docs/ai-agent/ARCHITECTURE.md)
-- [Development](docs/ai-agent/DEVELOPMENT.md)
-- [HTTP API](docs/ai-agent/HTTP_API.md)
-- [Security](docs/ai-agent/SECURITY.md)
-- [OpenAPI contract](src/transport/httpapi/openapi.yaml)
+- [Architecture](docs/architecture.html)
+- [Document tools](docs/document-tools.html)
+- [Development](docs/development.html)
+- [HTTP API](docs/http-api.html)
+- [Security](docs/security.html)
+- [OpenAPI contract](docs/openapi.html)
 
 Release packaging and signing are handled through a maintainer-only workflow. This README does not publish packaging commands, parameters, or signing configuration.
 

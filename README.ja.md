@@ -18,6 +18,7 @@ NR-Intern は Go で開発されたデスクトップ AI Agent です。現在�
 - 会話の実行中も続けて入力でき、後続メッセージは現在の UI の送信待ちキューに入り、前の Run が終わると順番に送信されます。
 - Context の自動整理、Session 間の長期メモリ、メモリ範囲の制御。
 - Sandbox と実行承認で保護されたファイル、文書、Shell、SSH、計画ツール。
+- 非同期処理にはキャンセル可能な `wait_for` を使え、リモートデプロイは `ssh_wait` で読み取り専用の確認を繰り返し、bytes、SHA-256、サービス準備完了を確認してから完了と判定します。
 - 外部リソースを読み取る `http_fetch`。HTML は自動で純テキストに変換し、localhost とプライベートアドレスは既定で許可、管理画面から丸ごと無効化できます。
 - 内蔵 MCP Client からローカル stdio またはリモート Streamable HTTP Server に接続し、外部ツールにも同じ権限・承認フローを適用します。
 - オプションの NetPass リバースプロキシは、デスクトップ制御 UI を公開せずにバックエンド API を公開できます。
@@ -40,11 +41,12 @@ NR-Intern は Go で開発されたデスクトップ AI Agent です。現在�
 
 ## ドキュメント
 
-- [アーキテクチャ](docs/ai-agent/ARCHITECTURE.md)
-- [開発ガイド](docs/ai-agent/DEVELOPMENT.md)
-- [HTTP API](docs/ai-agent/HTTP_API.md)
-- [セキュリティ](docs/ai-agent/SECURITY.md)
-- [OpenAPI 契約](src/transport/httpapi/openapi.yaml)
+- [アーキテクチャ](docs/architecture.html)
+- [文書ツール](docs/document-tools.html)
+- [開発ガイド](docs/development.html)
+- [HTTP API](docs/http-api.html)
+- [セキュリティ](docs/security.html)
+- [OpenAPI 契約](docs/openapi.html)
 
 リリースのパッケージ化と署名はメンテナー専用の内部手順で行います。この README ではパッケージ化コマンド、パラメーター、署名設定を公開しません。
 

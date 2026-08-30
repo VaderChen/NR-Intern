@@ -17,6 +17,8 @@ const maxParallelTools = 8
 
 const (
 	systemShellToolName      = "shell_exec"
+	waitToolName             = "wait_for"
+	sshWaitToolName          = "ssh_wait"
 	toolStageSystemShell     = "system_shell"
 	toolStageBuiltinFallback = "builtin_fallback"
 )
@@ -104,9 +106,10 @@ func availableToolNamesSorted(definitions []domain.ToolDefinition) []string {
 }
 
 // stagedToolDefinitions 實作每個 Run 的兩階段工具供應策略：只要 Session
-// 有 shell_exec，第一階段就只公開 Shell，讓 LLM 優先使用目前 OS 的系統程式。
-// Shell 真正執行失敗後才把完整原生工具目錄公開。若部署根本沒有 Shell，則
-// 直接回到完整目錄，避免把 Agent 變成完全沒有外部能力的文字模型。
+// 有 shell_exec，第一階段就公開 Shell、等待工具與 SSH 唯讀檢查，讓 LLM 優先
+// 使用目前 OS 的系統程式，同時能等待非同步作業並確認遠端狀態。Shell 真正
+// 執行失敗後才把完整原生工具目錄公開。若部署根本沒有 Shell，則直接回到完整
+// 目錄，避免把 Agent 變成完全沒有外部能力的文字模型。
 func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback bool) []domain.ToolDefinition {
 	if builtinFallback || !definitionNamed(definitions, systemShellToolName) {
 		return definitions
@@ -114,7 +117,7 @@ func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback 
 	result := make([]domain.ToolDefinition, 0, 4)
 	for _, definition := range definitions {
 		name := strings.ToLower(strings.TrimSpace(definition.Name))
-		if name == systemShellToolName || strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__") {
+		if name == systemShellToolName || name == waitToolName || name == sshWaitToolName || strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__") {
 			result = append(result, definition)
 		}
 	}

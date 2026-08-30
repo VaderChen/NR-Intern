@@ -18,6 +18,7 @@ NR-Intern은 Go로 개발된 데스크톱 AI Agent입니다. 현재 대화, 검�
 - 대화가 실행 중이어도 계속 입력할 수 있으며, 후속 메시지는 현재 UI의 전송 대기열에 들어가 이전 Run이 끝나면 순서대로 전송됩니다.
 - Context 자동 정리, Session 간 장기 메모리 및 메모리 범위 제어.
 - Sandbox와 실행 승인을 적용한 파일, 문서, Shell, SSH 및 계획 도구.
+- 비동기 작업은 취소 가능한 `wait_for`로 대기할 수 있고, 원격 배포는 `ssh_wait`로 읽기 전용 검사를 반복해 bytes, SHA-256 또는 서비스 준비 상태를 확인한 뒤 완료로 판단합니다.
 - 외부 자원을 읽는 `http_fetch`. HTML은 자동으로 일반 텍스트가 되고, localhost와 사설 주소는 기본 허용이며, 시스템 설정에서 통째로 끌 수 있습니다.
 - 내장 MCP Client로 로컬 stdio 또는 원격 Streamable HTTP Server에 연결하고 외부 도구에도 동일한 권한 및 승인 절차를 적용합니다.
 - 선택형 NetPass 리버스 프록시는 데스크톱 제어 UI를 공개하지 않고 백엔드 API만 외부에 제공할 수 있습니다.
@@ -40,11 +41,12 @@ NR-Intern은 Go로 개발된 데스크톱 AI Agent입니다. 현재 대화, 검�
 
 ## 문서
 
-- [아키텍처](docs/ai-agent/ARCHITECTURE.md)
-- [개발 안내](docs/ai-agent/DEVELOPMENT.md)
-- [HTTP API](docs/ai-agent/HTTP_API.md)
-- [보안](docs/ai-agent/SECURITY.md)
-- [OpenAPI 계약](src/transport/httpapi/openapi.yaml)
+- [아키텍처](docs/architecture.html)
+- [문서 도구](docs/document-tools.html)
+- [개발 안내](docs/development.html)
+- [HTTP API](docs/http-api.html)
+- [보안](docs/security.html)
+- [OpenAPI 계약](docs/openapi.html)
 
 릴리스 패키징과 서명은 관리자 전용 내부 절차로 처리합니다. 이 README에는 패키징 명령, 매개변수 또는 서명 설정을 공개하지 않습니다.
 

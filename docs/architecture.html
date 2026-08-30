@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" data-i18n-meta="common.description" content="NR-Intern 的功能、架構、文件工具、HTTP API、安全設計與 OpenAPI 文件。">
+  <title>架構設計 · NR-Intern</title>
+  <link rel="stylesheet" href="assets/documentation.css">
+  <script src="assets/documentation.js" defer></script>
+</head>
+<body data-document="architecture">
+  <header class="site-header">
+    <div class="brand-row">
+      <a class="brand" href="index.html" data-i18n-aria="common.homeAria" aria-label="NR-Intern 文件首頁"><span class="brand-mark" aria-hidden="true"></span><span data-i18n="common.brand">NR-Intern · Documentation</span></a>
+      <div class="report-tools"><nav class="report-nav" data-document-navigation data-i18n-aria="common.navigationAria" aria-label="文件導覽"></nav><div class="language-switcher" role="group" data-i18n-aria="common.languageAria" aria-label="文件語言"><button type="button" data-document-language="auto">AUTO</button><button type="button" data-document-language="zh-TW">繁中</button><button type="button" data-document-language="en">English</button><button type="button" data-document-language="ja">日本語</button><button type="button" data-document-language="ko">한국어</button></div></div>
+    </div>
+    <section class="hero"><div><p class="eyebrow" data-i18n="common.documentEyebrow">Technical documentation</p><h1 data-document-title>架構設計</h1><p class="lede" data-document-summary>了解 Agent 工作迴圈、Workspace 層級、Run 狀態、桌面拓樸與外部整合。</p></div><aside class="hero-meta" data-i18n-aria="common.infoAria" aria-label="文件資訊"><dl><div><dt data-i18n="common.formatLabel">格式</dt><dd>HTML</dd></div><div><dt data-i18n="common.languagesLabel">語言</dt><dd data-i18n="common.languagesValue">5 種</dd></div><div><dt data-i18n="common.sourceLabel">完整原稿</dt><dd><a data-document-source href="ai-agent/ARCHITECTURE.md" data-i18n="common.sourceLink">開啟原始檔 →</a></dd></div></dl></aside></section>
+  </header>
+  <main><article class="panel documentation-article" data-document-content><section><h2>設計目標</h2><p>NR-Intern 是可獨立啟動的桌面 AI Agent，Browser、HTTP Client 與桌面 Console 共用同一套後端 API。</p><div class="feature-grid"><div class="feature-card"><h3>Harness 工作迴圈</h3><p>模型要求工具時執行並回填結果，沒有工具呼叫時完成回覆。</p></div><div class="feature-card"><h3>Durable Run</h3><p>Run、SSE 事件、訊息與工具結果可重播，斷線不會自動取消工作。</p></div></div></section><section><h2>Agent 工作迴圈</h2><ol class="doc-section-list"><li>寫入 session transcript，載入計畫與工作規則。</li><li>呼叫模型、執行工具、保存結果並進入下一回合。</li><li>沒有工具呼叫時寫入 assistant message，完成 Run。</li></ol></section></article><section class="panel documentation-article" aria-labelledby="remote-deployment-title"><h2 id="remote-deployment-title" data-i18n="docs.remoteDeployment.title">遠端部署的完成確認</h2><p data-i18n="docs.remoteDeployment.lead">上傳命令返回不代表檔案已完整抵達。副作用命令只執行一次，等待與檢查必須分開。</p><div class="article-grid"><div class="feature-card"><h3>wait_for</h3><p data-i18n="docs.remoteDeployment.wait">`wait_for` 提供受 Run context 控制的可取消等待與進度回報。</p></div><div class="feature-card"><h3>ssh_wait</h3><p data-i18n="docs.remoteDeployment.check">`ssh_wait` 以後端 profile 重新建立 SSH session，輪詢唯讀、冪等的檢查命令；可比對 exit code、stdout 包含／完全相等與連續穩定次數。</p></div></div><div class="callout docs-callout"><p data-i18n="docs.remoteDeployment.complete">只有 bytes、SHA-256、原子改名後檔案或服務就緒狀態等遠端證據符合預期，才可宣稱部署完成；逾時必須如實保留未確認狀態。</p></div></section></main>
+  <footer class="site-footer"><p data-i18n="common.sourceNote">此頁為功能導向的 HTML 閱讀版本；原始檔保留完整實作細節。</p><p><a href="index.html" data-i18n="common.backIndex">所有文件</a> · <a href="../README.md" data-i18n="common.backProject">返回專案首頁 →</a></p></footer>
+</body>
+</html>

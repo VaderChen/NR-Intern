@@ -32,7 +32,9 @@
     "document_render",
     "http_fetch",
     "shell_exec",
+    "wait_for",
     "ssh_exec",
+    "ssh_wait",
     "memory_search",
     "memory_remember",
     "memory_forget"

@@ -461,6 +461,8 @@ Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成�
 - `document_render`：elevated 工具；PDF 由 Poppler 輸出逐頁 PNG，Office 文件先用獨立 LibreOffice profile 轉成 PDF。後端只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受模型指定任意 executable。
 - `shell_exec`：必要高權限工具；Unix 使用 process group，Windows 使用 Job Object，取消或逾時會終止子程序樹；子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
 - `ssh_exec`：使用 Go SSH client；連線憑證只存在後端 profile，模型只取得 profile 名稱。初始連線預設最多三次並使用 keepalive；工作中斷線不自動重跑遠端命令，以免重複副作用。
+- `wait_for`：不執行命令的可取消等待，具有最大秒數與進度事件；適合讓非同步上傳或服務啟動完成後再進行下一次檢查。
+- `ssh_wait`：只輪詢唯讀、冪等的遠端檢查命令，每次檢查重新建立 SSH session，支援預期 exit code、stdout 包含／完全相等與連續穩定檢查；逾時不會被視為部署成功。
 - `http_fetch`：唯一由 Agent 直接指定任意網址的內建工具。以 Go `net/http` 讀取 http／https 資源，回傳文字內容；HTML 會先轉成純文字再送進上下文。回應大小、逾時與轉址次數都有上限，localhost 與私有網段預設允許，並且可由管理介面即時關閉。
 - `memory_search`：查詢目前 scope 的有效長期記憶。
 - `memory_remember`：保存耐久資訊並支援去重與取代舊記憶。

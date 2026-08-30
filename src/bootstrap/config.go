@@ -95,7 +95,7 @@ func DefaultConfig() Config {
 		NotificationsEnabled:   false,
 		ListenAddress:          "127.0.0.1:8787",
 		DataDir:                filepath.Join("data", "ai-agent"),
-		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "document_compare", "document_validate", "document_fonts", "document_create", "document_edit", "document_convert", "pdf_pages", "document_render", "http_fetch", "shell_exec", "ssh_exec", "memory_search", "memory_remember", "memory_forget"},
+		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "document_compare", "document_validate", "document_fonts", "document_create", "document_edit", "document_convert", "pdf_pages", "document_render", "http_fetch", "shell_exec", "wait_for", "ssh_exec", "ssh_wait", "memory_search", "memory_remember", "memory_forget"},
 		AllowElevatedTools:     true,
 		MaxTurns:               harness.DefaultMaxTurns,
 		MaxAutonomousToolTurns: harness.DefaultMaxAutonomousToolTurns,

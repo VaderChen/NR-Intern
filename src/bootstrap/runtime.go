@@ -23,6 +23,7 @@ import (
 	nativeplans "AgenticService/src/tools/native/plans"
 	nativeshell "AgenticService/src/tools/native/shell"
 	nativessh "AgenticService/src/tools/native/ssh"
+	nativewait "AgenticService/src/tools/native/wait"
 	"AgenticService/src/transport/httpapi"
 	"context"
 	"fmt"
@@ -92,6 +93,7 @@ var serviceCapabilities = []string{
 	"search.v1",
 	"admin-backup.v1",
 	"admin-permissions.v1",
+	"remote-deployment-check.v1",
 	"update-check.v1",
 }
 
@@ -241,6 +243,7 @@ func Build(config Config) (*Runtime, error) {
 		nativedocuments.NewPDFPagesTool(config.MaxFileInputBytes, 128*1024*1024),
 		nativedocuments.NewRenderTool(128*1024*1024, config.MaxToolOutputBytes),
 		nativeshell.New(config.MaxToolOutputBytes, 30*time.Minute),
+		nativewait.New(30 * time.Minute),
 	}
 	httpFetch := nativenetwork.New(nativenetwork.Options{
 		MaxResponseBytes: config.HTTPFetch.MaxResponseBytes,
@@ -267,7 +270,10 @@ func Build(config Config) (*Runtime, error) {
 		}
 	}
 	if len(config.SSHProfiles) > 0 {
-		nativeToolValues = append(nativeToolValues, nativessh.New(config.SSHProfiles, config.MaxToolOutputBytes, 30*time.Minute))
+		nativeToolValues = append(nativeToolValues,
+			nativessh.New(config.SSHProfiles, config.MaxToolOutputBytes, 30*time.Minute),
+			nativessh.NewWaitTool(config.SSHProfiles, config.MaxToolOutputBytes, 30*time.Minute),
+		)
 	}
 	nativeTools, err := tools.NewRegistry(tools.RegistryConfig{
 		AllowedNames:  config.AllowedTools,
@@ -332,6 +338,7 @@ func Build(config Config) (*Runtime, error) {
 			"long-term-memory",
 			"native-tools",
 			"native-file-editing",
+			"remote-deployment-verification",
 			"mcp-client",
 			"cancellation",
 		},

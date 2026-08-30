@@ -21,8 +21,10 @@
     "document_convert",
     "pdf_pages",
     "document_render",
+    "wait_for",
     "shell_exec",
     "ssh_exec",
+    "ssh_wait",
     "memory_search",
     "memory_remember",
     "memory_forget"

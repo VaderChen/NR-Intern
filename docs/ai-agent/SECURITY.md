@@ -148,6 +148,8 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - Shell 子程序只繼承必要 OS 環境，避免無條件洩漏 Provider API key 或後端 token；timeout/cancel 會終止程序樹。
 - SSH 憑證只存在後端 profile。正式環境應設定 known_hosts 或 SHA-256 host key；`insecure_ignore_host_key` 只供明確接受風險的隔離環境。
 - SSH 初始連線最多三次；遠端命令執行中斷線不自動重跑，避免重複副作用。
+- `ssh_wait` 只能用於 Agent 指定的唯讀、冪等檢查命令；它會重新建立 session 進行輪詢，且仍需要 elevated profile 與人工 Approval。上傳／部署命令不得放入輪詢 command，避免因重試造成重複副作用。
+- `wait_for` 不執行 Shell 命令，只在 Run context 與最大等待時間內暫停並發出進度；等待完成本身不構成遠端部署成功證據。
 
 ## 本機資料
 

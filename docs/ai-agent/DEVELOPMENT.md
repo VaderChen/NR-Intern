@@ -97,6 +97,8 @@ Provider ID 必須已存在於 `providers`。留空時摘要沿用 Session 的 P
 `allowed_hosts` 非空時採白名單，`blocked_hosts` 永遠優先。`allow_private_networks` 預設為 `true`，允許
 localhost、loopback、私有網段、link-local、CGNAT 與 multicast；不需要存取私有服務時可關閉。
 
+遠端部署若包含非同步上傳，應把上傳／部署命令與狀態確認分開：副作用命令只執行一次，必要時以 `wait_for` 等待，再使用 `ssh_wait` 以同一 SSH profile 執行唯讀檢查。檢查命令可用 `output_equals` 或 `output_contains` 比對預期 bytes／SHA-256／就緒訊息，並可用 `stable_checks` 要求連續多次符合；`ssh_wait` 逾時時必須保留未完成狀態。
+
 ## 獨立後端
 
 ```bash

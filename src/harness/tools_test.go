@@ -93,6 +93,16 @@ func TestStagedToolDefinitionsAlwaysExposePlanningControls(t *testing.T) {
 	}
 }
 
+func TestStagedToolDefinitionsExposeWaitAlongsideShell(t *testing.T) {
+	definitions := []domain.ToolDefinition{
+		{Name: "file_read"}, {Name: "shell_exec"}, {Name: "wait_for", ReadOnly: true}, {Name: "ssh_wait", ReadOnly: true},
+	}
+	active := stagedToolDefinitions(definitions, false)
+	if got := availableToolNamesSorted(active); strings.Join(got, ",") != "shell_exec,ssh_wait,wait_for" {
+		t.Fatalf("active tools = %v, want shell_exec,ssh_wait,wait_for", got)
+	}
+}
+
 // TestRunExecutesReadOnlyToolsInParallel 用會合點證明工具真的同時在跑：
 // 三個工具必須都抵達才會被放行，依序執行永遠湊不齊。
 func TestRunExecutesReadOnlyToolsInParallel(t *testing.T) {

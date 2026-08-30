@@ -1353,8 +1353,8 @@ func toolSelectionPhasePrompt(builtinFallback bool) string {
 	}
 	return `## 工具供應階段
 
-目前是 OS 系統工具優先階段。本輪的工作工具只提供 shell_exec；plan_get、plan_create、plan_step_update 屬於 Harness 計畫控制工具，仍可使用。檔案、搜尋、比較、編輯、SSH 與其他內建工具尚未公開。
-需要查詢或操作主機狀態時，請先依 Host 執行環境透過 shell_exec 實際呼叫合適的系統程式；不可只把命令交給使用者。若 Shell 實際執行失敗，Harness 會在下一輪自動提供內建工具作為備援。`
+目前是 OS 系統工具優先階段。本輪的工作工具提供 shell_exec、wait_for 與 ssh_wait（若已啟用）；plan_get、plan_create、plan_step_update 屬於 Harness 計畫控制工具，仍可使用。檔案、搜尋、比較、編輯、SSH 執行與其他內建工具尚未公開。
+需要查詢或操作主機狀態時，請先依 Host 執行環境透過 shell_exec 實際呼叫合適的系統程式；不可只把命令交給使用者。需要等待非同步作業時使用 wait_for，遠端部署狀態確認使用 ssh_wait；兩者完成後仍須依結果重新檢查。若 Shell 實際執行失敗，Harness 會在下一輪自動提供完整內建工具作為備援。`
 }
 
 // explorationPhasePrompt 將大型目錄／專案探索固定成 Pi coding-agent 類型的
@@ -1379,6 +1379,8 @@ func explorationPhasePrompt(builtinFallback bool) string {
 若目標是 PDF、DOCX、XLSX 或 PPTX 辦公文件，系統 Shell 階段先呼叫 Host 可用的文件程式；Shell 實際失敗並進入內建備援後，讀取既有文件必須先用 document_inspect 取得頁數、區段、工作表或投影片，再用 document_read 分段抽取內容；建立文件使用 document_create，局部編輯使用 document_edit 並另存新檔；內容差異使用 document_compare，格式遷移使用 document_convert，PDF 頁面整理使用 pdf_pages；完成後先用 document_validate 做結構驗證，有可用後端時再以 document_render 做逐頁視覺檢查。掃描型 PDF 若沒有文字層，必須如實說明需要 OCR，不得假裝已讀取影像文字。
 
 若使用者要求修改，先定位目標與相依關係，再執行最小必要變更；不要把「繼續探索」本身當成任務完成條件。
+
+若工作包含遠端部署或上傳，完成判定必須以遠端檢查為準：上傳命令返回、暫存檔存在或檔案大小暫時增加，都不是部署完成證據。上傳／部署副作用命令只執行一次；需要等待時可使用 wait_for，遠端檢查使用 ssh_wait，以同一個 SSH profile 反覆執行唯讀、冪等的檢查命令。優先驗證預期 bytes、SHA-256、原子改名後的檔案或服務就緒狀態，並視需要設定 output_equals、output_contains 或 stable_checks。ssh_wait 逾時或最後檢查未符合條件時，必須如實回報尚未確認完成，不得宣稱部署成功。
 
 若工作包含寫入或編輯，採用單一資源生命週期：先確認成功條件，再執行最小寫入，接著以工具結果中的 bytes、Unicode characters、lines、hash 或其他結構化欄位判斷是否達標。結果明確未達標時，可以針對不同且已確認的差距繼續做最小修正；不得只換一份近似內容就反覆完整覆寫。同一失敗原因再次出現時，必須改變控制參數或策略，不得用相同策略重試。`
 }

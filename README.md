@@ -18,6 +18,7 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 - 對話執行中仍可繼續輸入，後續訊息會寫入 Browser IndexedDB 的 Durable Outbox，上一輪結束後依序送出；網路中斷時保留固定 Idempotency-Key 供安全重試。
 - Context 自動整理、跨 Session 長期記憶與記憶範圍控制。
 - 原生檔案、文件、Shell、SSH 與計畫工具，搭配 Sandbox 及執行審核。
+- 非同步工作可使用 `wait_for` 進行可取消等待，遠端部署可用 `ssh_wait` 輪詢唯讀檢查，確認檔案大小、SHA-256 或服務就緒後才算完成。
 - `http_fetch` 對外讀取網路資源：HTML 自動轉純文字，localhost 與私有網段預設允許，並可從管理介面直接關閉。
 - 內建 MCP Client，可連接本機 stdio 或遠端 Streamable HTTP Server，將外部工具納入相同的權限與審核流程。
 - 選用的 NetPass 反向代理可公開後端 API；桌面控制 UI 不會經由通道公開。
@@ -44,12 +45,12 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 ## 文件
 
-- [架構設計](docs/ai-agent/ARCHITECTURE.md)
-- [辦公文件工具](docs/ai-agent/DOCUMENT_TOOLS.md)
-- [開發說明](docs/ai-agent/DEVELOPMENT.md)
-- [HTTP API](docs/ai-agent/HTTP_API.md)
-- [安全設計](docs/ai-agent/SECURITY.md)
-- [OpenAPI 契約](src/transport/httpapi/openapi.yaml)
+- [架構設計](docs/architecture.html)
+- [辦公文件工具](docs/document-tools.html)
+- [開發說明](docs/development.html)
+- [HTTP API](docs/http-api.html)
+- [安全設計](docs/security.html)
+- [OpenAPI 契約](docs/openapi.html)
 
 發行封裝與簽章由維護者的內部流程處理；README 不提供封裝命令、參數或簽章設定。
 

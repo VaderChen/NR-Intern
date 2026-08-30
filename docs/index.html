@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" data-i18n-meta="common.description" content="NR-Intern 的功能、架構、文件工具、HTTP API、安全設計與 OpenAPI 文件。">
+  <title data-i18n="common.docsTitle">NR-Intern 文件</title>
+  <link rel="stylesheet" href="assets/documentation.css">
+  <script src="assets/documentation.js" defer></script>
+</head>
+<body data-document="index" data-title-key="common.docsTitle">
+  <header class="site-header">
+    <div class="brand-row">
+      <a class="brand" href="index.html" data-i18n-aria="common.homeAria" aria-label="NR-Intern 文件首頁">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span data-i18n="common.brand">NR-Intern · Documentation</span>
+      </a>
+      <div class="report-tools">
+        <nav class="report-nav" data-document-navigation data-i18n-aria="common.navigationAria" aria-label="文件導覽"></nav>
+        <div class="language-switcher" role="group" data-i18n-aria="common.languageAria" aria-label="文件語言">
+          <button type="button" data-document-language="auto">AUTO</button>
+          <button type="button" data-document-language="zh-TW">繁中</button>
+          <button type="button" data-document-language="en">English</button>
+          <button type="button" data-document-language="ja">日本語</button>
+          <button type="button" data-document-language="ko">한국어</button>
+        </div>
+      </div>
+    </div>
+
+    <section class="hero">
+      <div>
+        <p class="eyebrow" data-i18n="common.eyebrow">Documentation</p>
+        <h1 data-i18n="common.docsTitle">NR-Intern 文件</h1>
+        <p class="lede" data-i18n="common.docsLead">以 HTML 呈現的公開文件，集中說明 NR-Intern 的產品能力、系統設計、開發方式、API 與安全邊界。</p>
+      </div>
+        <aside class="hero-meta" data-i18n-aria="common.infoAria" aria-label="文件資訊">
+        <dl>
+          <div><dt data-i18n="common.formatLabel">格式</dt><dd data-i18n="common.formatValue">HTML</dd></div>
+          <div><dt data-i18n="common.languagesLabel">語言</dt><dd data-i18n="common.languagesValue">5 種</dd></div>
+          <div><dt data-i18n="common.updatedLabel">內容</dt><dd data-i18n="common.updatedValue">功能導向</dd></div>
+        </dl>
+      </aside>
+    </section>
+  </header>
+
+  <main>
+    <section class="panel" aria-labelledby="documentation-list">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow" data-i18n="common.browseEyebrow">Browse</p>
+          <h2 id="documentation-list" data-i18n="common.browseTitle">文件總覽</h2>
+        </div>
+        <p data-i18n="common.browseLead">選擇一份文件，使用右上角語言切換器閱讀繁中、英文、日文或韓文版本。</p>
+      </div>
+      <div class="feature-grid">
+        <article class="doc-card">
+          <h3 data-i18n="docs.architecture.title">架構設計</h3>
+          <p data-i18n="docs.architecture.summary">了解 Agent 工作迴圈、Workspace 層級、Run 狀態、桌面拓樸與外部整合。</p>
+          <a href="architecture.html" data-i18n="common.readDocument">閱讀文件 →</a>
+        </article>
+        <article class="doc-card">
+          <h3 data-i18n="docs.documentTools.title">辦公文件工具</h3>
+          <p data-i18n="docs.documentTools.summary">了解 DOCX、XLSX、PPTX、PDF 的建立、編輯、轉換、驗證與渲染能力。</p>
+          <a href="document-tools.html" data-i18n="common.readDocument">閱讀文件 →</a>
+        </article>
+        <article class="doc-card">
+          <h3 data-i18n="docs.development.title">開發說明</h3>
+          <p data-i18n="docs.development.summary">從設定、啟動、工具擴充到編譯檢查，快速掌握本機開發流程。</p>
+          <a href="development.html" data-i18n="common.readDocument">閱讀文件 →</a>
+        </article>
+        <article class="doc-card">
+          <h3 data-i18n="docs.httpAPI.title">HTTP API</h3>
+          <p data-i18n="docs.httpAPI.summary">API 資源、授權、SSE、Run 控制、通知、更新檢查與錯誤格式的使用指南。</p>
+          <a href="http-api.html" data-i18n="common.readDocument">閱讀文件 →</a>
+        </article>
+        <article class="doc-card">
+          <h3 data-i18n="docs.security.title">安全設計</h3>
+          <p data-i18n="docs.security.summary">說明網路邊界、Sandbox、權限、秘密資料、診斷包與安全備份的保護方式。</p>
+          <a href="security.html" data-i18n="common.readDocument">閱讀文件 →</a>
+        </article>
+        <article class="doc-card">
+          <h3 data-i18n="docs.openapi.title">OpenAPI 契約</h3>
+          <p data-i18n="docs.openapi.summary">以 HTML 方式瀏覽 API 分組與相容性說明，並可開啟機器可讀 YAML 契約。</p>
+          <a href="openapi.html" data-i18n="common.readDocument">閱讀文件 →</a>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow" data-i18n="common.referenceEyebrow">Reference</p>
+          <h2 data-i18n="common.referenceTitle">公開文件與技術原稿</h2>
+        </div>
+      </div>
+      <p class="docs-intro" data-i18n="common.referenceLead">上方 HTML 頁面是面向使用者的閱讀版本；專案仍保留 Markdown 與 YAML 原稿，方便開發者查閱完整細節與機器可讀契約。</p>
+      <div class="inline-link-list">
+        <a href="../README.md" data-i18n="common.projectReadme">專案 README</a>
+        <a href="ai-agent/ARCHITECTURE.md" data-i18n="common.sourceMarkdown">架構 Markdown 原稿</a>
+        <a href="../src/transport/httpapi/openapi.yaml" data-i18n="common.sourceOpenAPI">OpenAPI YAML 原稿</a>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p data-i18n="common.footer">NR-Intern 公開文件 · 功能與特色導向</p>
+    <p><a href="../README.md" data-i18n="common.backProject">返回專案首頁 →</a></p>
+  </footer>
+</body>
+</html>
