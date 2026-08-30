@@ -25,6 +25,7 @@ const (
 
 var releaseVersionPattern = regexp.MustCompile(`^1\.(\d{2})\.(\d{2})(\d{2}) build (\d{2})(\d{2})$`)
 var windowsAbsolutePathPattern = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
+var developerIDIdentityPattern = regexp.MustCompile(`"(Developer ID Application:[^"]+)"`)
 
 type target struct {
 	os   string
@@ -339,16 +340,52 @@ func buildMacApplication(platformDirectory string, version releaseVersion, value
 	}
 	if runtime.GOOS == "darwin" {
 		if codesign, err := exec.LookPath("codesign"); err == nil {
-			command := exec.Command(codesign, "--force", "--deep", "--sign", "-", appDirectory)
+			identity, automatic, err := resolveMacSigningIdentity()
+			if err != nil {
+				return err
+			}
+			command := exec.Command(codesign, "--force", "--deep", "--sign", identity, appDirectory)
 			command.Stdout = os.Stdout
 			command.Stderr = os.Stderr
 			if err := command.Run(); err != nil {
-				return fmt.Errorf("替 macOS App 套用 ad-hoc 簽章: %w", err)
+				return fmt.Errorf("替 macOS App 套用簽章 %q: %w", identity, err)
+			}
+			if identity == "-" {
+				_, _ = fmt.Fprintln(os.Stderr,
+					"warning: macOS App 使用 ad-hoc 簽章；重建後系統可能再次要求螢幕錄製授權。可設定 NR_INTERN_CODESIGN_IDENTITY 使用固定簽章身分")
+			} else if automatic {
+				_, _ = fmt.Fprintf(os.Stdout, "signed %s with automatically selected %s\n", appDirectory, identity)
 			}
 		}
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "packaged %s\n", appDirectory)
 	return nil
+}
+
+// resolveMacSigningIdentity 優先採用明確設定；未設定時只自動選擇適合
+// 站外發行的 Developer ID Application。固定簽章讓 macOS TCC 能在 App
+// 重建後仍以相同指定需求辨識它，避免螢幕錄製等權限反覆失效。
+func resolveMacSigningIdentity() (identity string, automatic bool, err error) {
+	if configured, exists := os.LookupEnv("NR_INTERN_CODESIGN_IDENTITY"); exists {
+		configured = strings.TrimSpace(configured)
+		if configured == "" {
+			return "", false, fmt.Errorf("NR_INTERN_CODESIGN_IDENTITY 不可為空；若要強制使用 ad-hoc 簽章請設定為 -")
+		}
+		return configured, false, nil
+	}
+	security, lookupErr := exec.LookPath("security")
+	if lookupErr != nil {
+		return "-", false, nil
+	}
+	output, commandErr := exec.Command(security, "find-identity", "-v", "-p", "codesigning").CombinedOutput()
+	if commandErr != nil {
+		return "", false, fmt.Errorf("查詢 macOS 程式簽章身分: %w", commandErr)
+	}
+	match := developerIDIdentityPattern.FindSubmatch(output)
+	if len(match) < 2 {
+		return "-", false, nil
+	}
+	return string(match[1]), true, nil
 }
 
 func macInfoPlist(version releaseVersion) string {
