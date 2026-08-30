@@ -3,7 +3,6 @@
 
   const STORAGE_KEY = "nrIntern.documentationLanguage";
   const LANGUAGES = ["zh-TW", "en", "ja", "ko"];
-  const label = { auto: "AUTO", "zh-TW": "繁中", en: "English", ja: "日本語", ko: "한국어" };
   const t = (zh, en, ja, ko) => ({ "zh-TW": zh, en, ja, ko });
   const I18N = {
     "common.description": t("NR-Intern 的功能、架構、文件工具、HTTP API、安全設計與 OpenAPI 文件。", "NR-Intern features, architecture, document tools, HTTP API, security design, and OpenAPI documentation.", "NR-Intern の機能、アーキテクチャ、文書ツール、HTTP API、セキュリティ設計、OpenAPI ドキュメント。", "NR-Intern의 기능, 아키텍처, 문서 도구, HTTP API, 보안 설계 및 OpenAPI 문서입니다."),
@@ -170,17 +169,15 @@
     if (navigation) {
       navigation.innerHTML = docs.map((item) => "<a href=\"" + item.href + "\"" + (item.id === documentId ? " aria-current=\"page\"" : "") + ">" + (item.title[language] || item.title.en) + "</a>").join("");
     }
-    document.querySelectorAll("[data-document-language]").forEach((button) => {
-      button.setAttribute("aria-pressed", button.dataset.documentLanguage === requested ? "true" : "false");
-      button.setAttribute("aria-label", label[button.dataset.documentLanguage]);
-    });
+    const languageSelect = document.querySelector("[data-document-language-select]");
+    if (languageSelect) languageSelect.value = requested;
   };
 
   const stored = localStorage.getItem(STORAGE_KEY) || "auto";
-  document.querySelectorAll("[data-document-language]").forEach((button) => {
-    button.addEventListener("click", () => {
-      localStorage.setItem(STORAGE_KEY, button.dataset.documentLanguage);
-      applyLanguage(button.dataset.documentLanguage);
+  document.querySelectorAll("[data-document-language-select]").forEach((select) => {
+    select.addEventListener("change", () => {
+      localStorage.setItem(STORAGE_KEY, select.value);
+      applyLanguage(select.value);
     });
   });
   applyLanguage(stored);

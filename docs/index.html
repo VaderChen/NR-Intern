@@ -17,12 +17,14 @@
       </a>
       <div class="report-tools">
         <nav class="report-nav" data-document-navigation data-i18n-aria="common.navigationAria" aria-label="文件導覽"></nav>
-        <div class="language-switcher" role="group" data-i18n-aria="common.languageAria" aria-label="文件語言">
-          <button type="button" data-document-language="auto">AUTO</button>
-          <button type="button" data-document-language="zh-TW">繁中</button>
-          <button type="button" data-document-language="en">English</button>
-          <button type="button" data-document-language="ja">日本語</button>
-          <button type="button" data-document-language="ko">한국어</button>
+        <div class="language-switcher">
+          <select data-document-language-select data-i18n-aria="common.languageAria" aria-label="文件語言">
+            <option value="auto">AUTO</option>
+            <option value="zh-TW">繁中</option>
+            <option value="en">English</option>
+            <option value="ja">日本語</option>
+            <option value="ko">한국어</option>
+          </select>
         </div>
       </div>
     </div>
