@@ -127,6 +127,7 @@ main,
 
 .github-link {
   flex: none;
+  margin-right: auto;
   padding: 8px 14px;
   border: 1px solid var(--line);
   border-radius: 999px;
