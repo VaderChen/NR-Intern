@@ -74,6 +74,7 @@ main,
 }
 
 .site-header {
+  container-type: inline-size;
   padding: 38px 0 24px;
 }
 
@@ -119,6 +120,7 @@ main,
 
 .report-nav {
   display: flex;
+  min-width: 0;
   flex-wrap: wrap;
   gap: 8px;
 }
@@ -141,6 +143,7 @@ main,
 }
 
 .language-switcher button {
+  flex: none;
   min-height: 30px;
   padding: 0 11px;
   border: 0;
@@ -151,6 +154,7 @@ main,
   font-size: 11px;
   font-weight: 800;
   letter-spacing: .02em;
+  white-space: nowrap;
   cursor: pointer;
 }
 
@@ -178,6 +182,27 @@ main,
   font-size: 0.9rem;
   font-weight: 700;
   text-decoration: none;
+  white-space: nowrap;
+}
+
+@container (max-width: 1199px) {
+  .brand-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .report-tools {
+    width: 100%;
+    align-items: stretch;
+  }
+
+  .report-nav {
+    justify-content: flex-start;
+  }
+
+  .language-switcher {
+    align-self: flex-end;
+  }
 }
 
 .report-nav a[aria-current="page"],
@@ -789,6 +814,15 @@ pre code {
     width: 100%;
     align-items: flex-start;
     justify-content: space-between;
+    flex-direction: column;
+  }
+
+  .report-nav {
+    width: 100%;
+  }
+
+  .language-switcher {
+    align-self: flex-end;
   }
 
   .bar-row {
