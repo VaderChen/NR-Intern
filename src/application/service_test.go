@@ -19,6 +19,8 @@ type fakeEngine struct {
 	sessions map[string]domain.Session
 	counter  int
 	run      func(context.Context, domain.RunInput, ports.AgentEventSink) (domain.RunResult, error)
+	// retractedMessageID 記下最後一次「重新提問」撤回的起點，供測試檢查。
+	retractedMessageID string
 }
 
 func (e *fakeEngine) SetPermanentToolApproval(_ context.Context, sessionID string, enabled bool) (domain.Session, error) {
@@ -52,6 +54,8 @@ func (e *fakeEngine) CreateSession(_ context.Context, input domain.CreateSession
 		ProjectID:         input.ProjectID,
 		ProviderID:        input.ProviderID,
 		Model:             input.Model,
+		ThinkingMode:      input.ThinkingMode,
+		LockPlans:         input.LockPlans,
 		PermissionProfile: input.PermissionProfile,
 	}
 	e.sessions[session.ID] = session
@@ -94,6 +98,12 @@ func (e *fakeEngine) UpdateSession(_ context.Context, sessionID string, input do
 	if input.Model != nil {
 		session.Model = *input.Model
 	}
+	if input.ThinkingMode != nil {
+		session.ThinkingMode = *input.ThinkingMode
+	}
+	if input.LockPlans != nil {
+		session.LockPlans = *input.LockPlans
+	}
 	e.sessions[sessionID] = session
 	return session, nil
 }
@@ -103,6 +113,11 @@ func (e *fakeEngine) DeleteSession(context.Context, string) error { return nil }
 func (e *fakeEngine) ListMessages(context.Context, string) ([]domain.Message, error) { return nil, nil }
 
 func (e *fakeEngine) ListEntries(context.Context, string) ([]domain.SessionEntry, error) {
+	return nil, nil
+}
+
+func (e *fakeEngine) RetractMessages(_ context.Context, _, messageID string) ([]domain.Message, error) {
+	e.retractedMessageID = messageID
 	return nil, nil
 }
 
@@ -411,7 +426,7 @@ func TestUserCanCreateAndReadSessionPlan(t *testing.T) {
 
 func TestUserCanCreateAndReorderMultipleSessionPlans(t *testing.T) {
 	service, _ := newTestService(t, lockedPolicy())
-	session, err := service.CreateSession(context.Background(), "agent_test", domain.CreateSessionInput{WorkspaceID: "workspace_1"})
+	session, err := service.CreateSession(context.Background(), "agent_test", domain.CreateSessionInput{WorkspaceID: "workspace_1", LockPlans: true})
 	if err != nil {
 		t.Fatalf("CreateSession: %v", err)
 	}
@@ -556,6 +571,100 @@ func waitForRunStatus(t *testing.T, service *Service, runID string, wanted domai
 	}
 	run, _ := service.GetRun(context.Background(), runID)
 	t.Fatalf("run status = %q, want %q", run.Status, wanted)
+}
+
+// TestCancelRunPersistsTerminalStateBeforeEngineReturns 覆蓋不遵守 context
+// 的引擎：停止 API 必須先讓 UI 看見終止，不能把第三方實作的收尾速度當成前提。
+func TestCancelRunPersistsTerminalStateBeforeEngineReturns(t *testing.T) {
+	engine := newFakeEngine()
+	const sessionID = "session_cancel_immediate"
+	engine.sessions[sessionID] = domain.Session{ID: sessionID, AgentID: "agent_test", WorkspaceID: "workspace_1"}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	engine.run = func(context.Context, domain.RunInput, ports.AgentEventSink) (domain.RunResult, error) {
+		close(started)
+		<-release
+		return domain.RunResult{}, nil
+	}
+	registry, err := NewRegistry(engine)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	dataDir := t.TempDir()
+	runs, err := filestore.NewRunRepository(dataDir)
+	if err != nil {
+		t.Fatalf("NewRunRepository: %v", err)
+	}
+	events, err := filestore.NewRunEventRepository(dataDir)
+	if err != nil {
+		t.Fatalf("NewRunEventRepository: %v", err)
+	}
+	plans, err := filestore.NewPlanRepository(dataDir)
+	if err != nil {
+		t.Fatalf("NewPlanRepository: %v", err)
+	}
+	service, err := NewService(Dependencies{
+		Registry: registry, Runs: runs, Events: events, Projects: fakeProjects{}, Workspaces: fakeWorkspaces{},
+		Providers: fakeProviders{}, Plans: plans, Permissions: lockedPolicy(), Logger: logging.Discard(),
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	stopEngine := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		stopEngine()
+		_ = service.Close(context.Background())
+	})
+
+	run, err := service.StartRun(context.Background(), domain.RunInput{SessionID: sessionID, UserInput: "stop me"})
+	if err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("engine did not start")
+	}
+	waitForRunStatus(t, service, run.ID, domain.RunStatusRunning)
+
+	canceled, err := service.CancelRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("CancelRun: %v", err)
+	}
+	if canceled.Status != domain.RunStatusCanceled {
+		t.Fatalf("CancelRun status = %q, want canceled", canceled.Status)
+	}
+	persisted, err := service.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("GetRun after cancel: %v", err)
+	}
+	if persisted.Status != domain.RunStatusCanceled {
+		t.Fatalf("persisted status = %q, want canceled", persisted.Status)
+	}
+
+	stopEngine()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := service.GetRun(context.Background(), run.ID)
+		if getErr == nil && current.Status != domain.RunStatusCanceled {
+			t.Fatalf("status after ignored cancellation returned = %q, want canceled", current.Status)
+		}
+		service.mu.Lock()
+		active := len(service.active)
+		service.mu.Unlock()
+		if active == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	values, err := events.List(context.Background(), run.ID, 0)
+	if err != nil {
+		t.Fatalf("ListRunEvents: %v", err)
+	}
+	if len(values) == 0 || values[len(values)-1].Type != "run.canceled" {
+		t.Fatalf("last event = %+v, want run.canceled", values)
+	}
 }
 
 func TestRetryRunCreatesNewRunFromOriginalInput(t *testing.T) {

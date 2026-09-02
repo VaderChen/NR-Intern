@@ -47,11 +47,12 @@ func (r *Runtime) UpdateMCPSettings(ctx context.Context, input domain.UpdateMCPS
 		if _, exists := next[id]; exists {
 			return domain.MCPSettings{}, fmt.Errorf("%w: duplicate MCP id %q", domain.ErrConflict, id)
 		}
+		trustAnnotations := setting.TrustAnnotations
 		value := mcpclient.ServerConfig{
 			ID: id, DisplayName: setting.DisplayName, Enabled: setting.Enabled, Transport: setting.Transport,
 			Command: setting.Command, Args: setting.Args, Environment: setting.Environment, WorkDir: setting.WorkDir,
 			URL: setting.URL, Headers: setting.Headers, StartupTimeoutSeconds: setting.StartupTimeoutSeconds,
-			CallTimeoutSeconds: setting.CallTimeoutSeconds, TrustAnnotations: setting.TrustAnnotations,
+			CallTimeoutSeconds: setting.CallTimeoutSeconds, TrustAnnotations: &trustAnnotations,
 		}
 		if previous, exists := existing[id]; exists {
 			if setting.APIKey == nil {
@@ -63,9 +64,27 @@ func (r *Runtime) UpdateMCPSettings(ctx context.Context, input domain.UpdateMCPS
 			if setting.Headers == nil {
 				value.Headers = previous.Headers
 			}
+			if setting.EnabledTools == nil {
+				value.EnabledTools = previous.EnabledTools
+			}
+			if setting.Username == nil {
+				value.Username = previous.Username
+			}
+			if setting.Password == nil {
+				value.Password = previous.Password
+			}
+		}
+		if setting.EnabledTools != nil {
+			value.EnabledTools = append([]string(nil), (*setting.EnabledTools)...)
 		}
 		if setting.APIKey != nil {
 			value.APIKey = strings.TrimSpace(*setting.APIKey)
+		}
+		if setting.Username != nil {
+			value.Username = strings.TrimSpace(*setting.Username)
+		}
+		if setting.Password != nil {
+			value.Password = *setting.Password
 		}
 		normalized, err := value.Normalize()
 		if err != nil {
@@ -127,8 +146,10 @@ func mcpSettingsView(configs map[string]mcpclient.ServerConfig, statuses []mcpcl
 			ID: config.ID, DisplayName: config.DisplayName, Enabled: config.Enabled, Transport: config.Transport,
 			Command: config.Command, Args: append([]string(nil), config.Args...), HasEnvironment: len(config.Environment) > 0,
 			WorkDir: config.WorkDir, URL: config.URL, HasAPIKey: config.APIKey != "", HasHeaders: len(config.Headers) > 0,
+			HasBasicAuth:          config.Username != "" || config.Password != "",
 			StartupTimeoutSeconds: config.StartupTimeoutSeconds, CallTimeoutSeconds: config.CallTimeoutSeconds,
-			TrustAnnotations: config.TrustAnnotations, Status: status.Status, Error: status.Error, ToolCount: status.ToolCount,
+			TrustAnnotations: config.TrustsAnnotations(), AuthMode: config.AuthMode(),
+			Status: status.Status, Error: status.Error, ToolCount: status.ToolCount,
 		}
 		if !status.UpdatedAt.IsZero() {
 			setting.UpdatedAt = status.UpdatedAt.Format(time.RFC3339)
@@ -136,6 +157,11 @@ func mcpSettingsView(configs map[string]mcpclient.ServerConfig, statuses []mcpcl
 		for _, tool := range status.Tools {
 			setting.Tools = append(setting.Tools, domain.MCPToolSetting{Name: tool.Name, DisplayName: tool.DisplayName})
 		}
+		for _, tool := range status.AvailableTools {
+			setting.AvailableTools = append(setting.AvailableTools, domain.MCPToolSetting{Name: tool.Name, DisplayName: tool.DisplayName})
+		}
+		enabled := append([]string(nil), config.EnabledTools...)
+		setting.EnabledTools = &enabled
 		result.Servers = append(result.Servers, setting)
 	}
 	return result

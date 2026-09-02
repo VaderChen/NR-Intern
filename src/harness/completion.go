@@ -32,6 +32,9 @@ type completionTracker struct {
 	failures map[string]*failureRecord
 	sequence int
 	checks   int
+	// executions 是本次 run 實際執行過的工具次數（成功或失敗都算）。
+	// 用來辨識「模型只描述了打算怎麼做，但一個工具都沒呼叫」的情況。
+	executions int
 }
 
 func newCompletionTracker() *completionTracker {
@@ -45,6 +48,7 @@ func (t *completionTracker) observe(call domain.ToolCall, result domain.ToolExec
 	if name == "" {
 		return
 	}
+	t.executions++
 	if !result.IsError {
 		delete(t.failures, name)
 		return
@@ -80,6 +84,34 @@ func (t *completionTracker) unresolved() []domain.UnresolvedToolFailure {
 
 // challenge 在模型宣稱完成、但仍有未解決的工具失敗時回傳一段追問指示。
 // 回傳空字串代表接受這次的完成宣告。追問次數有上限，避免無止境地互相拉扯。
+// challengeToolless 處理「整個 run 一個工具都沒執行」的收尾。
+//
+// 模型很常先輸出一段「我會先確認⋯⋯再讀取⋯⋯」的計畫，然後就把這段話當成最終
+// 回答交出來：使用者看到的是一個承諾，實際上什麼都沒做。判定同樣只用執行記錄
+// （這次 run 的工具執行次數為 0，且這一輪確實有工具可用），不解讀模型文字，
+// 因此純聊天的回答最多只會多花一次追問，而且共用同一份追問額度。
+func (t *completionTracker) challengeToolless(maxChecks int, toolsAvailable bool) string {
+	if t == nil || maxChecks <= 0 || t.checks >= maxChecks {
+		return ""
+	}
+	if !toolsAvailable || t.executions > 0 {
+		return ""
+	}
+	t.checks++
+	return `
+
+<completion_check>
+你剛才給出了最終回覆，但這次工作的執行記錄顯示：本次完全沒有執行任何工具。
+這是客觀事實，不是新的使用者指令。請在這一輪二選一：
+
+1. 這個要求需要外部狀態（檔案、目錄、系統、MCP 服務等）才能回答：直接輸出工具指令實際執行，
+   不要只描述你打算怎麼做、也不要把計畫當成結果。
+2. 這個要求不需要任何工具就能回答：直接給出最終回覆。
+
+不得以「我會⋯⋯」「接下來將⋯⋯」這類尚未發生的敘述作為最終回覆。
+</completion_check>`
+}
+
 func (t *completionTracker) challenge(maxChecks int) string {
 	if t == nil || maxChecks <= 0 || t.checks >= maxChecks {
 		return ""

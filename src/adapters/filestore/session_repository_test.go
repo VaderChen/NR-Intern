@@ -374,3 +374,64 @@ func BenchmarkListEntriesAfterCompaction(b *testing.B) {
 		}
 	}
 }
+
+// 重新提問要把上一次的問答清掉，但 transcript 是稽核記錄：撤回只影響對話組裝，
+// 原始 entry 必須留著。
+func TestRetractedMessagesLeaveTheConversationButStayInTheTranscript(t *testing.T) {
+	repository, session := newTestRepository(t)
+	ctx := context.Background()
+	appendMessage := func(id, role, content string) {
+		t.Helper()
+		if _, err := repository.AppendEntry(ctx, session.ID, domain.SessionEntry{
+			SessionID: session.ID,
+			Type:      domain.SessionEntryMessage,
+			Message:   &domain.Message{ID: id, SessionID: session.ID, Role: role, Content: content},
+		}); err != nil {
+			t.Fatalf("AppendEntry: %v", err)
+		}
+	}
+	appendMessage("msg_1", "user", "第一個問題")
+	appendMessage("msg_2", "assistant", "第一個回答")
+	appendMessage("msg_3", "user", "我一共有多少工序")
+	appendMessage("msg_4", "assistant", "失敗的回答")
+
+	if _, err := repository.AppendEntry(ctx, session.ID, domain.SessionEntry{
+		SessionID: session.ID,
+		Type:      domain.SessionEntryMessagesRetracted,
+		Data:      map[string]any{"from_message_id": "msg_3", "reason": "reask"},
+	}); err != nil {
+		t.Fatalf("AppendEntry: %v", err)
+	}
+
+	messages, err := repository.ListMessages(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(messages) != 2 || messages[0].ID != "msg_1" || messages[1].ID != "msg_2" {
+		t.Fatalf("conversation after retraction = %+v", messages)
+	}
+
+	entries, err := repository.ListEntries(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("ListEntries: %v", err)
+	}
+	kept := 0
+	for _, entry := range entries {
+		if entry.Message != nil && (entry.Message.ID == "msg_3" || entry.Message.ID == "msg_4") {
+			kept++
+		}
+	}
+	if kept != 2 {
+		t.Fatalf("retracted messages were removed from the transcript: %d of 2 kept", kept)
+	}
+
+	// 重問之後的新訊息照常接在後面。
+	appendMessage("msg_5", "user", "我一共有多少工序")
+	messages, err = repository.ListMessages(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	if len(messages) != 3 || messages[2].ID != "msg_5" {
+		t.Fatalf("conversation after re-asking = %+v", messages)
+	}
+}

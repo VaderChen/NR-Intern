@@ -12,7 +12,7 @@
 - Agent 採 Harness 工作迴圈；簡單任務不強制規劃，長任務則可建立結構化計畫並逐步驗證。
 - Agent 原生工具使用 Go 實作，不依賴 `grep`、`find`、`diff`、`ssh` 等本機外部指令。
 - Provider Router 以相同介面承載 OpenAI-compatible Chat Completions 與 OpenAI Codex Responses；認證與協定差異留在 adapter／bootstrap 邊界。
-- 主系統可作為 MCP Client，連接本機 stdio 或遠端 Streamable HTTP Server，再把工具納入既有 Harness 權限與稽核流程。
+- 主系統可作為 MCP Client，連接本機 stdio、舊版 SSE 或遠端 Streamable HTTP Server，再把工具納入既有 Harness 權限與稽核流程。
 - 管理層級固定為 `Workspace → Project → Session`，不同前端可同時操作不同 Workspace。
 
 設計參考 `pi` 的 Agent Loop：模型輸出工具呼叫時執行工具，將結果加入訊息，再進入下一回合；沒有工具呼叫時完成回覆。參考來源：[pi agent package](https://github.com/earendil-works/pi/tree/main/packages/agent)。
@@ -35,7 +35,7 @@ src/
 ├── tokens/                     # 不依賴 Provider tokenizer 的 token 估算
 ├── modelrouter/                # Provider ID → ports.Model adapter 路由
 ├── providerauth/               # ChatGPT／Codex OAuth PKCE、loopback callback 與 Token 保存
-├── mcpclient/                  # stdio／Streamable HTTP MCP Client 與遠端工具轉接
+├── mcpclient/                  # stdio／SSE／Streamable HTTP MCP Client 與遠端工具轉接
 ├── netpass/                    # 選用的 NetPassClient 子程序與反向代理狀態
 ├── application/                # use case、Agent registry、run/session 協調與排程執行器；不依賴具體 Harness
 ├── adapters/
@@ -82,7 +82,7 @@ src/
 - `agent.start` / `agent.end`
 - `turn.start` / `turn.end`
 - `message.start` / `message.delta` / `message.end`
-- `message.thinking_delta`：模型 reasoning 內容的增量；完成後寫入對應 assistant message，重播時仍可檢視
+- `message.thinking_delta`：模型 reasoning 內容的增量；只保留在目前 Run 記憶體，重播與重新載入 transcript 不還原
 - `tool_call.delta`：工具參數的串流片段，帶 `index`、`tool_call_id` 與 `tool_name`
 - `turn.usage`：Provider 回報的 token 使用量
 - `tool.execution.start` / `tool.execution.update` / `tool.execution.end`
@@ -98,9 +98,11 @@ Console 建立多份計畫、收合步驟與拖曳排序，Agent 遇到多步驟
 `plan_create` 新增。兩者讀寫同一個 `PlanRepository`，因此切換對話、重新載入前端或後端
 重啟都不會遺失進度。舊版單計畫 JSON 會在下一次寫入時自動升級為 version 2 集合格式。
 
-每個 Session 最多只有第一份未完成計畫為 `active`，後續均為 `queued`；active 完成或刪除
-後，Repository 會自動啟用下一份。排序要求完整且不重複的 ID 集合；已有步驟進度的 active
-計畫不能被移到其他未完成計畫後面，避免 UI 顯示順序與 Agent 實際執行順序分裂。
+`lock_plans=true` 時，每個 Session 最多只有第一份未完成計畫為 `active`，後續均為 `queued`；
+active 完成或刪除後，Repository 會自動啟用下一份。`lock_plans=false`（預設）時，未完成計畫
+可以同時為 `active`，不同計畫可由不同 Run 平行執行。兩種模式都要求排序列表完整且不重複；
+已有步驟進度的 active 計畫不能被移到其他未完成計畫後面，避免 UI 顯示順序與 Agent 實際執行
+順序分裂。
 
 每一步由 Domain 強制依序轉移：`pending → in_progress → verifying → completed`。只有目前
 步驟可開始；進入 `completed` 前必須已在 `verifying`，並提供實際工具檢查所得的
@@ -108,7 +110,30 @@ Console 建立多份計畫、收合步驟與拖曳排序，Agent 遇到多步驟
 Harness 就會攔截模型過早產生的 final answer，要求繼續執行與驗證；攔截次數有上限，
 避免 Provider 不遵循工具協定時形成無限迴圈。
 
-計畫工具屬於 Harness 控制工具，在 Shell-first 與內建備援階段都可使用；實際檔案、系統或
+## 工具供應階段
+
+Session 有 `shell_exec` 時，每個 Run 從「系統工具優先階段」開始，本輪公開：
+
+- **唯讀工具**（`file_read`、`directory_list`、`file_search`、`file_compare`、
+  `memory_search`、`wait_for`、`ssh_wait`），但不含辦公文件家族。
+- `shell_exec`，以及 Harness 計畫控制工具與已連線的 MCP 工具。
+
+寫入型內建工具（建立目錄、寫檔、編輯、文件產出）與 `ssh_exec` 仍維持 Shell 優先：需要這類
+副作用時先用 `shell_exec` 實際執行，Shell 真正執行失敗後才由備援階段公開完整目錄。人工拒絕、
+Approval 中斷或 loop guard 都不算 Shell 失敗，不能藉此解鎖。
+
+辦公文件家族（`documents` 類別，共十個工具）留到備援階段：第一階段的工具目錄會整份進入
+每一次請求的提示，instruction 模式更是直接以文字列出 schema，而這個家族工具最多、schema
+最長，卻只有處理 PDF／DOCX／XLSX／PPTX 時才用得到。把它留在備援階段，常見的「讀檔案、
+查目錄、呼叫 MCP」維持一輪完成，又不必為每次對話都付整份文件工具的提示成本。
+
+唯讀工具提前公開是刻意的取捨：先前它們要等一次 Shell 失敗才解鎖，等於每個「讀檔案、盤點目錄」
+的需求都固定多花一輪跑一個註定失敗的命令卻沒有任何產出。唯讀工具沒有副作用，提前公開不會
+放寬權限邊界；原生高權限工具仍須 elevated profile 與人工 Approval，MCP 唯讀例外則只在管理者
+信任 Server 的 `readOnlyHint` 時成立。階段提示也會列出本輪可直接呼叫的 MCP 工具名稱，避免模型
+誤以為 MCP 要等到備援階段才能用而先花一輪描述計畫。
+
+計畫工具屬於 Harness 控制工具，在系統工具優先與內建備援階段都可使用；實際檔案、系統或
 外部狀態仍由當輪公開的工作工具處理。只有計畫工具的回合不消耗 autonomous work-tool
 turn 配額，但仍受整體 `max_turns` 與已啟用的 `max_tool_calls` 限制。
 
@@ -131,6 +156,17 @@ context，會中止仍在等待的模型或工具；token 依 Provider 回傳的
 如果上限觸發時仍有尚未執行的 tool call，Harness 會寫入帶
 `metadata.synthesized=true` 的 budget 工具結果。這些結果不代表工具曾執行，目的在於
 避免正常的預算收尾破壞 assistant/tool 配對協定。
+
+### Run／Session 用量與成本
+
+Harness 會在每輪 Provider 回報 usage 時累加 input、output 與 total token；Run 收尾時由
+Application 保存一次 `Run.Usage` 快照，即使 Run 失敗或取消，也保留錯誤前已收到的用量。
+重試會建立新的 Run 並保留原 Run，因此每個 Run 的統計彼此獨立，不會因重試或重新讀取重複計算。
+
+Session 的 `Usage` 不寫入 `session.json`，而是每次由既有 Run 清單即時彙總，並依
+Provider／Model 提供 `by_model` 明細。`model_prices` 設定以 Provider ID 與模型名稱索引，
+單價單位為每百萬 token 的 USD；沒有對應價格時只回傳 token，不提供估算金額。歷史 Run 的
+估算成本在收尾時保存，日後調整價格表不會改寫既有紀錄。
 
 ### Human-in-the-loop Approval
 
@@ -162,7 +198,8 @@ Session 對原 Run 的邏輯預約，因此其他已排隊 Run 不會插入尚�
 不可併發呼叫。**`BeforeTool` 與 `AfterTool` hook 因此必須是併發安全的。**
 
 工具執行完成後的結果寫入使用不受取消影響的 context：工具可能已經產生副作用，結果不能因為
-`CancelRun` 而消失。取消會在目前工具結果落盤後才中止 run，未執行的 tool call 不會留下假結果。
+`CancelRun` 而消失；Run 狀態則會先立即標記為 `canceled`，讓 UI 不必等待底層工具收尾。未
+執行的 tool call 不會留下假結果。
 
 Run 建立與 HTTP request 生命週期分離：`POST` 先回傳 durable queued Run，背景 worker 使用後端持有的 context 繼續執行。所有 event 先 append 到 `runs/events/<run-id>.jsonl`，再通知目前的 SSE 訂閱者；訂閱通知只負責喚醒，Client 一律依最後 sequence 從 durable log 取資料，因此通知合併或短暫離線不會形成事件缺口。
 
@@ -177,8 +214,10 @@ Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。這�
 transcript。
 
 UI 啟動時先讀取目前 Workspace 的 queued／running／paused／waiting approval Run，依 Session
-重新掛接 durable SSE；若後端已將中斷 Run 標記為 retryable failure，也會顯示可重試狀態。這讓
-隱藏視窗、背景執行、瀏覽器重整與桌面程式重開都不會遺失工作生命週期。
+重新掛接 durable SSE；若後端已將中斷 Run 標記為 retryable failure，也會顯示可重試狀態。恢復
+視窗按下取消時只停止該 Session 的 UI 恢復，不取消後端背景 Run，並在目前 UI 生命週期內記住
+這個 Session 的排除狀態，避免後續查詢再次自動掛回。這讓隱藏視窗、背景執行、瀏覽器重整與
+桌面程式重開都不會遺失工作生命週期。
 
 ## 工作管理與系統能力
 
@@ -198,8 +237,11 @@ Filestore 啟動時會檢查所有 queued、running、paused 與 waiting approva
 
 Run 控制提供 `pause`、`resume` 與 `cancel-all`。暫停只設定 durable 狀態，Harness 在
 目前 Provider request、工具執行與事件寫入完成後，於下一個安全回合邊界等待；不強制中止已送出
-的 Provider HTTP request。Run 狀態與控制事件共用序列化鎖，避免 `run.paused`／`run.resumed`
-與 terminal event 使用重複 sequence。等待人工核准的 Run 不接受一般 pause，必須核准、拒絕或取消。
+的 Provider HTTP request。取消則會先將 Run durable 標記為 `canceled` 並送出 terminal event，
+因此 UI 不會因第三方 Provider 不理會 context 而一直顯示執行中；底層請求仍會收到取消訊號並在
+背景收尾。Run 狀態與控制事件共用序列化鎖，避免 `run.paused`／`run.resumed` 與 terminal event
+使用重複 sequence；取消後的 late event 也不會排在 `run.canceled` 之後。等待人工核准的 Run
+不接受一般 pause，必須核准、拒絕或取消。
 
 ### 診斷、搜尋、備份與權限中心
 
@@ -227,6 +269,12 @@ plans、attachments、memories、schedules、notifications 與非秘密的 servi
 對 Session、輸入、附件 IDs、Provider 與 Model 產生持久化 Idempotency fingerprint；同一
 Session 的同一 `Idempotency-Key` 只有在 fingerprint 相同時才回傳原 Run，內容不同則回傳
 `409 Conflict`。
+
+macOS 的 WKWebView 容器不會自動建立主選單，因此系統層級快捷鍵預設全部失效。桌面啟動時會補上
+App 選單（⌘Q 結束、⌘H 隱藏、⌥⌘H 隱藏其他）、編輯選單（⌘Z／⇧⌘Z／⌘X／⌘C／⌘V／⌥⇧⌘V／⌘A）
+與視窗選單（⌘M 最小化、⌘W 關閉）。安裝前以 selector 檢查是否已有同一動作，避免與 webview 版本
+自帶的選單重複；⌘W 仍走既有的 `windowShouldClose:` 流程，工作進行中只隱藏視窗。Windows WebView2
+與 Linux 瀏覽器由各自引擎處理 Ctrl 快捷鍵。
 
 桌面生命週期方面，macOS 使用原生 status item；Windows 使用 Win32 Notify Icon，啟動就建立
 Tray，左鍵開啟 UI、右鍵選單提供開啟與結束。Windows 沒有可用原生視窗時，Tray 仍持有桌面
@@ -361,8 +409,9 @@ tool result；沒有對應 tool call 的 tool 訊息會被丟棄。中斷、當�
 thinking 與 usage 同樣需要能被獨立辨識。相容服務的思考欄位名稱不一致，
 adapter 同時接受 `reasoning_content` 與 `reasoning`。
 
-Provider 有回傳 reasoning 時，串流期間透過事件顯示，完成後寫入 assistant message 的
-`reasoning` 欄位；工具決策與工具輸出仍維持內部資料，不混入最終回答內容。
+Provider 有回傳 reasoning 時，串流期間透過事件顯示，但不寫入 assistant message 或持久化
+transcript；重新載入對話時沒有歷史 reasoning 記憶。工具決策與工具輸出仍維持內部資料，不混入
+最終回答內容。
 Provider 只有在尚未送出任何可見模型輸出時才可重試；text、thinking 或 tool-call delta
 任一已送出後若串流中斷，必須直接回報錯誤，避免 durable event log 出現重複片段。
 
@@ -405,6 +454,109 @@ CJK 字元約 1 token、ASCII 約 0.25 token。以英文為前提的 characters/
 每次 turn 的 stop reason 與 token 使用量、工具執行結果、context compaction、
 Provider 重試、以及被拒絕的高權限工具呼叫（屬於安全事件）。
 
+## 每輪提示的固定成本
+
+`system`、`host`、`tools`、`phase`、`context` 這幾段在每一次模型請求都會重送，因此它們的長度
+就是每一輪的固定思考負擔。Harness 只送與本輪實際可用能力相關的內容：
+
+- 工具目錄依「工具供應階段」公開的集合產生，辦公文件家族留到備援階段。
+- 探索與收斂策略依本輪公開的工具挑段落：沒有文件工具就不送辦公文件流程，沒有 SSH 工具就不送
+  遠端部署驗證，沒有內建寫入工具就不送寫入生命週期。MCP 工具的副作用由遠端服務定義；唯讀
+  例外遵守 `trust_annotations`，其餘仍套用 permission profile 與人工 Approval。
+- Session 還沒有任何計畫時，計畫規則只送一句「簡單工作不必建立計畫」，完整的五步生命週期等到
+  真的有計畫時才送。
+
+以一句話的查詢為例（第一階段、無計畫），這幾段從 4,226 字降到 2,424 字；工具目錄同時從 18 個
+工具（6,621 字）降到 12 個（4,574 字）。省下的不只是 token：多送的每一段都在鼓勵模型多想一輪。
+
+複合問題（「有多少部門跟人員」）需要兩份彼此獨立的資料。instruction 協定原本限制一輪只能輸出
+一個 JSON object，模型只能先花一輪規劃怎麼分次查；實際執行端本來就支援一輪多個工具呼叫
+（唯讀且免核准的會並行），因此協定放寬為可在同一輪輸出多個 `tool_use` object 或一個 JSON
+陣列，上限沿用 `maxParallelTools`。批次中只要有一個工具名稱不存在，整批進入協定修正，不會
+只執行一半。彼此有相依關係的呼叫仍應分輪，先取得前一個結果再決定下一個。
+
+使用者不會每次都指名「使用某某 MCP」。為了讓模型不必靠英文工具名跨語言猜測，工具供應階段
+會列出本輪可呼叫的 MCP 工具與其說明（`mcp__mars-mes__query_work_orders：查詢製令`），
+instruction 模式的工具目錄也帶上 `label`（MCP 的 title），並明確要求「直接呼叫語意最接近的
+工具，不要因為使用者沒有指名服務就改成詢問或先描述計畫」。說明品質取決於 MCP Server 自己
+宣告的 title 與 description；Server 什麼都沒宣告時只能顯示工具名。
+
+Server instructions 屬於整個 MCP Server，過去在 instruction 模式被複製到該 Server 的每一個
+工具定義裡（20 個工具就是同一段文字出現 20 次），現在改為每個 Server 只列一次。
+
+native 模式下工具清單已經走 OpenAI-compatible 的 `tools` 欄位，文字提示只補「必須透過
+tool_calls 呼叫、不可要求使用者代為執行」這類規則，不再重列一次工具名稱與說明——同一份
+資訊送兩次，對小型與本機模型只是多一份要讀的內容。Server instructions 不在 `tools` 欄位裡，
+仍會保留。
+
+`## 使用者可見的工作進度` 只在這次 Run 可能產生 reasoning 時才送出；thinking 設為 `none`
+時整段略過，避免多送一段用不到的寫作規範，也不會誘使模型額外生成進度文字。
+
+模型看到的工具目錄只保留挑選與呼叫工具需要的欄位（name、label、description、input_schema、
+output_schema、read_only、requires_permission）。`platforms` 與 `capabilities` 是工具目錄 UI
+用的中繼資料，留在 `domain.ToolDefinition` 供管理介面使用，但不進提示——六個內建工具實測可省
+734 字（4,661 → 3,927），工具越多省得越多。
+
+工具結果本身也是每一輪的成本。宣告 output schema 的 MCP Server 會依規格同時回傳
+`structuredContent` 與內容相同的 text block；兩份都收進工具結果，等於同一筆資料在 transcript
+存兩次、之後每一輪都重讀兩次。`mcpclient` 只在文字區塊沒有涵蓋同一份 JSON 時才附加結構化結果，
+結構化資料仍完整保留在工具結果的 metadata 供介面使用。
+
+`src/harness/mars_scenario_smoke_test.go` 用真的 MCP Server 重現實際情境並量出每一輪送出的字數：
+先問製令數量再換題目問部門、複合問題一輪送出兩個工具、清單型查詢回傳 500 筆機台、
+超大結果被 context 預算截斷、以及同一輪兩個需要核准的工具。改動提示、工具結果格式或協定時，
+這組測試會直接顯示成本變化。
+
+單一工具結果進入模型前受 `context.max_tool_result_characters`（預設 24,000 字）限制；截斷時附上
+的說明會要求模型縮小查詢範圍或加上篩選條件再查一次，而不是憑半份資料推測整體。清單型查詢
+（「列出所有機台」）即使被截斷也不會讓提示無限膨脹，但每一輪仍要重讀這 24,000 字——真正的
+解法是讓 MCP 工具支援統計或分頁，而不是回傳整份資料集。
+
+## 工具集與工具呼叫協定的開關
+
+工具目錄每一輪都會整份進入提示，工具越多，小型與本機模型越慢也越容易挑錯。因此有三個
+可在管理介面即時切換、不需重啟後端的開關：
+
+- **擴充工具集**（`extended_tools`，預設關閉）：關閉時只公開精簡集合——`shell_exec`、
+  `file_read`、`directory_list`、`file_search` 與三個計畫控制工具，取設定檔 `allowed_tools`
+  的交集，不會放大原本的授權範圍。需要文件處理、寫入、SSH 或記憶工具時再打開。
+  檢索（下一項）會在這個結果之上再過濾一次。
+- **工具檢索**（`tool_retrieval`，預設開啟）：見下一節。內建工具與 MCP 工具都適用。
+- **工具呼叫協定**（`tool_call_mode`，預設 `native`）：多數推論引擎會以 grammar 約束
+  `tool_calls` 輸出，比要求模型自行輸出 JSON 指令可靠得多；Provider 不支援原生工具呼叫時
+  才切到 `instruction`。Provider 設定頁的「測試」會回報該 endpoint 是否支援。
+
+三者都寫入 `service-settings.json`，設定檔提供的值是初始值。切換後下一個 Run 生效，
+執行中的 Run 保留啟動時的設定。
+
+## 工具檢索
+
+外掛型 MCP Server 動輒公開數十上百個工具。工具定義（名稱、說明、JSON schema）每一次請求
+都整份送出，實測有 Server 讓一句「HELLO」變成 111,172 tokens——本機模型光是預填提示就跑
+不完。精簡工具集那個開關幫不上忙：它砍的是 7 個內建工具，佔比不到 1%。
+
+問題也不是「哪些工具用不到」——使用者通常全部都要用——而是「這一輪用得到哪些」。
+因此 `harness.toolRetriever` 在每個 Run 開始時對工具目錄做一次檢索。內建工具同樣納入：
+擴充工具集打開後有近二十個內建工具，`document_*`、`ssh_*` 的 schema 都不小，而任何一次需求
+通常只會用到其中一兩個。核心工具（`coreToolNames`：Shell、讀檔、列目錄、搜尋、計畫控制與
+等待）不參與檢索——階段提示直接點名它們，少了任何一個模型會先卡一輪。
+
+1. **第一層過濾**：以這次的使用者輸入、加上同一個 session 最近幾則使用者訊息為查詢，
+   取相關度最高的工具（上限 `mcpRetrievalLimit`）
+   進入模型目錄。工具名稱、標題與說明建立索引；ASCII 取詞、CJK 取 bigram，因此中文問題
+   不需要斷詞就能對上中文說明。出現在 60% 以上工具裡的共通詞權重歸零，避免外掛型 Server
+   一律叫 `*_query` 的命名讓任何問題都命中整份目錄。目錄在 `mcpRetrievalThreshold`
+   （12 個工具）以下時完全不啟動，小型 Server 行為不變。
+2. **沒被選中的工具照樣存在**：模型可呼叫 `find_tools`，以關鍵字取回工具名稱與參數
+   schema（過大的 schema 會降級成只保留形狀，而不是截斷成無法解析的 JSON），取回後即可
+   直接呼叫。這是檢索失準時的退路，因此這個工具永遠在目錄裡，且提示會明講「目錄沒列出
+   不代表做不到」。
+3. **目錄與可呼叫集合刻意不同**：目錄決定模型看得到什麼，執行端接受的是完整工具集合。
+   模型若已從 history 或使用者指名知道工具名稱，直接呼叫就會執行，不必多花一輪重新檢索。
+   呼叫過與取回過的工具會留在該 Run 的目錄裡，連續使用同一個工具不會每輪重找。
+
+實測（`tool_retrieval_smoke_test.go`）：67 個工具的目錄，工具負載從 30,210 字降到 1,399 字。
+
 ## 完成度判定
 
 Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成宣告。模型可以在工具失敗之後
@@ -419,7 +571,30 @@ Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成�
 2. 把追問內容注入**下一輪的 system prompt**（不是偽裝成使用者訊息，避免污染對話記錄）。
 3. 繼續迴圈，讓模型面對事實後重新決定要繼續工作還是誠實說明未完成的部分。
 
-追問次數由 `max_completion_checks` 限制（預設 1，設為 0 停用），避免無止境拉扯。
+完成度閘門另外處理一種同樣「宣稱與實際不符」的情況：**整個 run 一個工具都沒有執行**。
+模型很常先輸出一段「我會先確認⋯⋯再讀取⋯⋯」的計畫，然後把這段話當成最終回答交出去，
+使用者看到的是一個承諾，實際上什麼都沒做。判定同樣只用執行記錄（工具執行次數為 0，
+且該輪確實有工具可用），不解讀模型文字；追問內容要求模型二選一：需要外部狀態就直接輸出
+工具指令，不需要工具就直接回答。`run.completion_check` 事件與 transcript entry 會帶
+`reason=no_tool_executed`，與「工具失敗後宣稱完成」區分。
+
+兩種追問共用同一份額度，由 `max_completion_checks` 限制（預設 1，設為 0 停用），
+避免無止境拉扯；純聊天的回答最多只會多一次追問。
+
+追問與否必須在寫入 assistant 訊息**之前**決定：被追問的那一段只是中間產物，會標記
+`internal=true`、`phase=completion_check` 保留在稽核 transcript，但不出現在對話裡。
+少了這個順序，使用者會看到兩份幾乎一樣的答案——被追問的那份，加上重新產生的那份。
+計畫完成度閘門原本就是這個作法。
+
+System prompt 另外約束回答格式：多筆項目、逐項清單或每筆有多個可比較欄位時優先用 Markdown
+表格（Console 已支援表格渲染與橫向捲動），並說明是否還有未列出的項目；只有一兩筆或每筆只有
+單一值時不必硬做表格。
+
+收斂階段的提示另外要求答案交代依據：實際查了哪個服務或工具、查詢範圍與過濾條件、
+支撐結論的關鍵數據，以及取樣、時間點等會影響判讀的限制。只回一句結論（例如
+「目前共有 264 筆製令。」）數字就算正確，使用者也無法判斷可信度。同一段規則明確要求
+長度與問題複雜度相稱，避免反向變成覆述工作過程；這段規則只在工具結果已進入 history 的
+收斂階段加入，純聊天的回答不受影響。
 無論是否追問過，最終的 `RunResult.Completion` 都會帶上未解決的失敗清單，
 讓 API 呼叫端能區分「工具全部成功後完成」與「工具失敗後照樣宣稱完成」——
 在此之前這兩者都只是 `status=completed`。
@@ -490,20 +665,53 @@ Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具�
 
 ## MCP Client 與外部工具
 
-`mcpclient.Manager` 讓主系統作為 MCP Host，支援本機 `stdio` 與遠端 `streamable-http`。
+`mcpclient.Manager` 讓主系統作為 MCP Host，支援本機 `stdio`、舊版 `sse` 與遠端
+`streamable-http`。OpenAI-compatible Provider 預設使用原生 `tools`／`tool_calls` 欄位，
+因此 MCP 工具會直接交給模型選擇，不再只依賴文字指令格式。
 已啟用的 Server 會在背景暖機，完成 `initialize` 與 `tools/list` 後，把遠端工具轉為
 `domain.ToolDefinition`；Server 通知工具清單變動時會重新載入。公開工具名稱會加入 Server
 命名空間，過長時以穩定雜湊截短，避免不同 Server 的同名工具互相覆蓋。
 
-MCP 工具與原生工具進入同一個 `ports.ToolRuntime`：每個工具都標記
-`RequiresPermission=true`，必須通過 elevated profile 與人工 Approval。只有管理者明確開啟
-`trust_annotations` 時，Server 的 `readOnlyHint` 才會用於並行排程；這個提示不會取消權限或
-Approval。進度通知會轉成 `tool.execution.update`，結果文字受全域工具輸出上限約束；Server
-要求額外互動輸入時目前回傳明確錯誤，不會假裝完成。
+MCP 工具與原生工具進入同一個 `ports.ToolRuntime`，並先通過同一個 elevated permission profile。
+唯讀工具是否免逐次人工 Approval 取決於 Server 宣告的 `readOnlyHint` 與管理者設定的
+`trust_annotations`；這個選項**預設開啟**（設定檔未提供時採預設值，明確設為 false 則沿用）。
+未信任的 Server 或非唯讀工具仍須逐次核准。豁免會發出 `run.approval_skipped`
+（`reason=read_only_tool`）留下紀錄，`trust_annotations` 同時仍用於唯讀並行排程。進度通知會轉成 `tool.execution.update`，結果文字受全域工具輸出上限約束；結構化
+結果會一併提供給模型。Server 要求額外互動輸入時，會把 `input_required`、輸入請求與
+`requestState` 回傳給模型，模型可補上控制欄位後重試，不會假裝完成。
 
-stdio 子程序只繼承必要的 OS 環境與該 Server 明確設定的變數。Streamable HTTP 可加入 Bearer
-Token 與自訂 headers，並有啟動／呼叫逾時。這些秘密只寫入權限限制檔案；管理 API 僅回傳
+連線壽命由三層機制維持，長時間執行的 Session 不必靠使用者手動重新連線：
+
+- Client 端 keepalive 每 30 秒 ping 一次（容忍一次失敗），避免閒置連線被伺服器或反向代理
+  默默回收；連線真的結束時，`session.Wait()` 的監看會立即清掉狀態與工具快取。
+- 每次使用前先確認連線可用：已結束的連線直接重建；閒置超過 20 秒的連線會先 ping 再使用。
+  ping 沒有副作用，因此這個檢查對所有工具都安全。
+- 呼叫失敗時區分「伺服器沒有收下」與「可能已執行」。`session not found`、session 過期與
+  連線根本沒建立起來代表遠端不可能執行過工具，這種情況重新連線後重送一次，不受
+  idempotent 宣告限制；其餘連線層錯誤維持只有 Server 宣告 idempotent 的工具才重試，
+  避免同一個副作用執行兩次。
+
+`call_timeout_seconds` 是「沒有回應或進度更新」的容忍時間，不是總時長上限：MCP Server 只要
+持續送出進度通知就能繼續執行，長時間的遠端工作不會在固定秒數被砍掉；整體時間仍由 Run 的
+wall-clock 預算控制。停滯逾時的訊息會明確說明是多久沒有回應，而不是回報一個籠統的
+context 錯誤。
+
+延長不是無限的：單次呼叫另有絕對上限（閒置視窗的 4 倍，最多 24 小時）。Server 一直送進度卻
+永遠不回結果時仍會收斂，並在錯誤訊息附上期間收到幾次進度，避免畫面上出現永遠轉不完的圈。
+等待期間每 15 秒送出一次 `tool.execution.update`（`phase=mcp_waiting`），內容包含是哪一個
+MCP、已等待多久、收到幾次進度；等待人工核准時同樣每 30 秒回報一次
+（`phase=waiting_approval`）。核准對話框可能因為切換對話而沒被看到，這兩個回報讓「到底卡在
+哪一段」直接出現在執行過程裡，而不是只有一個沒有說明的轉圈圈。
+
+stdio 子程序只繼承必要的 OS 環境與該 Server 明確設定的變數。SSE 與 Streamable HTTP 可加入
+Bearer Token、Basic Auth 與自訂 headers，並有啟動／呼叫逾時。這些秘密只寫入權限限制檔案；管理 API 僅回傳
 `has_api_key`、`has_environment` 與 `has_headers`，不讀回明文。
+
+因為明文不會回傳，管理 API 另外回報 `auth_mode`（`none`／`bearer`／`basic`／`headers`），
+也就是後端這一刻實際會送出的驗證方式；憑證被拒絕時，錯誤訊息會直接指出送出的是哪一種
+（例如「HTTP 401 Unauthorized；目前送出的驗證方式是 Basic Auth（帳號 xxx）」），
+使用者不必猜「金鑰到底有沒有被使用」。優先順序是 Bearer Token → Basic Auth → 自訂 headers；
+`stdio` 不使用 HTTP 驗證，憑證請放在該 Server 的環境變數。
 
 ## Provider Router、Chat Completions 與 Codex Responses
 
@@ -552,7 +760,8 @@ Browser ─→ desktop :8790 ───────────→ server :8787 �
 
 `desktop` 不會停止或重啟已存在的外部後端。桌面 reverse proxy 會在 server 設有 Bearer token
 時代為加入，不將 token 暴露給 Browser JavaScript。NetPass 只轉送 backend port，不轉送 desktop
-UI；它是獨立、選用的 Runtime，啟動前必須由使用者明確接受公開網路風險。
+UI；它是獨立、選用的 Runtime，啟動前必須由使用者明確接受公開網路風險。桌面自行啟動的
+backend child 會記錄父程序 PID；父程序消失時 child 會自動結束，避免 UI 關閉後留下孤兒後端。
 
 macOS 原生視窗啟動時就安裝狀態列項目，提供顯示主視窗、隱藏主視窗與結束程式。對話進行中按下
 關閉會詢問是否隱藏 UI 並讓後端 Run 繼續；狀態列項目與 Dock reopen 都能恢復同一個視窗。若使用者

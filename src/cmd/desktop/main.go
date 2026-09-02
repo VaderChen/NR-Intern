@@ -19,6 +19,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,18 +27,19 @@ import (
 )
 
 type options struct {
-	configPath    string
-	uiListen      string
-	backendURL    string
-	backendBinary string
-	backendToken  string
-	autoStart     bool
-	nativeWindow  bool
-	openBrowser   bool
-	backendChild  bool
-	backendListen string
-	workingDir    string
-	startupSignal string
+	configPath       string
+	uiListen         string
+	backendURL       string
+	backendBinary    string
+	backendToken     string
+	autoStart        bool
+	nativeWindow     bool
+	openBrowser      bool
+	backendChild     bool
+	backendListen    string
+	backendParentPID int
+	workingDir       string
+	startupSignal    string
 }
 
 func main() {
@@ -52,6 +54,7 @@ func main() {
 	flag.BoolVar(&value.openBrowser, "open", true, "原生視窗不可用時開啟預設瀏覽器")
 	flag.BoolVar(&value.backendChild, "backend-child", false, "內部後端子程序模式")
 	flag.StringVar(&value.backendListen, "backend-listen", "", "內部後端子程序監聽位址")
+	flag.IntVar(&value.backendParentPID, "backend-parent-pid", 0, "內部後端父程序 PID")
 	flag.StringVar(&value.workingDir, "working-dir", "", "桌面程式與後端使用的工作目錄")
 	flag.StringVar(&value.startupSignal, "startup-signal", "", "內部啟動畫面就緒訊號檔")
 	flag.Parse()
@@ -95,7 +98,11 @@ func runDesktop(value options) error {
 	backendExecutable := value.backendBinary
 	if backendExecutable == "" {
 		backendExecutable = executable
-		arguments = append(arguments, "-backend-child=true", "-backend-listen", backendAddress)
+		arguments = append(arguments,
+			"-backend-child=true",
+			"-backend-listen", backendAddress,
+			"-backend-parent-pid", strconv.Itoa(os.Getpid()),
+		)
 	} else {
 		arguments = append(arguments, "-listen", backendAddress)
 	}
@@ -265,6 +272,10 @@ func writeStartupReady(path string) error {
 }
 
 func runBackendChild(value options) {
+	if value.backendParentPID > 0 && !backendParentAlive(value.backendParentPID) {
+		slog.Warn("backend parent process is no longer alive; exiting")
+		return
+	}
 	config, err := bootstrap.LoadConfig(value.configPath)
 	if err != nil {
 		fatal(err)
@@ -285,10 +296,25 @@ func runBackendChild(value options) {
 	}()
 	stopContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	<-stopContext.Done()
+	if value.backendParentPID > 0 {
+		parentLost := make(chan struct{})
+		go watchParentProcess(stopContext.Done(), value.backendParentPID, parentLost)
+		select {
+		case <-stopContext.Done():
+		case <-parentLost:
+			slog.Warn("backend parent process disappeared; shutting down")
+			stop()
+		}
+	} else {
+		<-stopContext.Done()
+	}
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownContext)
+}
+
+func backendParentAlive(pid int) bool {
+	return os.Getppid() == pid && parentProcessAlive(pid)
 }
 
 func backendHost(rawURL string) (string, error) {

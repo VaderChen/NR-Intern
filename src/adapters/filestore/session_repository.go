@@ -55,6 +55,11 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 	if agentID == "" {
 		return domain.Session{}, fmt.Errorf("%w: agent id is required", domain.ErrInvalidInput)
 	}
+	thinkingMode, err := domain.NormalizeThinkingMode(input.ThinkingMode)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	input.ThinkingMode = thinkingMode
 	position := 0
 	existing, err := r.List(ctx, agentID)
 	if err != nil {
@@ -96,6 +101,8 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 		Title:             valueutil.FirstNonEmpty(input.Title, localNow.Format("01/02 15:04")),
 		ProviderID:        strings.TrimSpace(input.ProviderID),
 		Model:             strings.TrimSpace(input.Model),
+		ThinkingMode:      input.ThinkingMode,
+		LockPlans:         input.LockPlans,
 		PermissionProfile: permissionProfile,
 		Pinned:            input.Pinned,
 		Position:          position,
@@ -257,6 +264,7 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 			entry.Message.CreatedAt = entry.CreatedAt
 		}
 	}
+	entry = withoutPersistedReasoning(entry)
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return domain.SessionEntry{}, fmt.Errorf("encode session entry: %w", err)
@@ -373,6 +381,7 @@ func (r *SessionRepository) scanEntries(ctx context.Context, sessionID string, a
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return fmt.Errorf("decode session entry: %w", err)
 		}
+		entry = withoutPersistedReasoning(entry)
 		if err := visit(entry); err != nil {
 			return err
 		}
@@ -453,12 +462,26 @@ func (r *SessionRepository) ListEntries(ctx context.Context, sessionID string) (
 		if err := json.Unmarshal(line, &entry); err != nil {
 			return fmt.Errorf("decode session entry: %w", err)
 		}
+		entry = withoutPersistedReasoning(entry)
 		entries = append(entries, entry)
 		return nil
 	}); err != nil {
 		return nil, fmt.Errorf("scan session transcript: %w", err)
 	}
 	return entries, nil
+}
+
+// withoutPersistedReasoning 將思考內容限制在目前 Run 的記憶體生命週期內。
+// 寫入端負責避免新增資料落盤，讀取端則兼容清除功能上線前已存在的 transcript，
+// 確保歷史 API、Context 組裝與匯出都不會再次暴露舊的 reasoning。
+func withoutPersistedReasoning(entry domain.SessionEntry) domain.SessionEntry {
+	if entry.Message == nil || !strings.EqualFold(entry.Message.Role, "assistant") {
+		return entry
+	}
+	message := *entry.Message
+	message.Reasoning = ""
+	entry.Message = &message
+	return entry
 }
 
 func (r *SessionRepository) ListMessages(ctx context.Context, sessionID string) ([]domain.Message, error) {
@@ -468,12 +491,29 @@ func (r *SessionRepository) ListMessages(ctx context.Context, sessionID string) 
 	}
 	messages := make([]domain.Message, 0, len(entries))
 	for _, entry := range entries {
-		if entry.Type != "message" || entry.Message == nil {
+		// 撤回記錄把訊息串截到指定訊息之前：重新提問時，上一次的問題、回答與
+		// 工具過程都不再屬於這個對話，但原始 entry 仍留在 transcript 供稽核。
+		if from := domain.RetractedFromMessageID(entry); from != "" {
+			if index := indexOfMessageID(messages, from); index >= 0 {
+				messages = messages[:index]
+			}
+			continue
+		}
+		if entry.Type != domain.SessionEntryMessage || entry.Message == nil {
 			continue
 		}
 		messages = append(messages, *entry.Message)
 	}
 	return messages, nil
+}
+
+func indexOfMessageID(messages []domain.Message, messageID string) int {
+	for index, message := range messages {
+		if message.ID == messageID {
+			return index
+		}
+	}
+	return -1
 }
 
 func (r *SessionRepository) sessionDir(sessionID string) (string, error) {

@@ -26,7 +26,7 @@ Authorization: Bearer <token>
 | POST | `/api/v1/notifications/read-all` | 將全部通知標為已讀 |
 | DELETE | `/api/v1/notifications/read` | 清除已讀通知 |
 | GET | `/api/v1/search` | 搜尋 Workspace、Project、Session、Message、Plan 與 Schedule 的短摘要 |
-| GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、通知中心、Run 上限與 `http_fetch` 開關 |
+| GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、通知中心、Run 上限、工具供應方式與 `http_fetch` 開關 |
 | GET／PUT | `/api/v1/admin/provider-settings` | 讀取或完整取代脫敏 Provider 設定 |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/models` | 重新取得模型目錄；沒有目錄時回傳空陣列 |
 | POST | `/api/v1/admin/provider-settings/{provider_id}/test` | 送出最小模型請求並測試工具呼叫 |
@@ -69,7 +69,7 @@ Authorization: Bearer <token>
 | POST | `/api/v1/agents/{agent_id}/sessions` | 建立 Session |
 | PUT | `/api/v1/agents/{agent_id}/sessions/order` | 調整同一 Project 內未釘選 Session 的完整順序 |
 | GET | `/api/v1/sessions/{session_id}` | 讀取 Session |
-| PATCH | `/api/v1/sessions/{session_id}` | 更新標題、Provider、模型、權限或記憶 scope |
+| PATCH | `/api/v1/sessions/{session_id}` | 更新標題、Provider、模型、思考程度、計畫鎖定、權限或記憶 scope |
 | DELETE | `/api/v1/sessions/{session_id}` | 刪除 Session 與 workspace |
 | GET | `/api/v1/sessions/{session_id}/plan` | 讀取 Session 計畫；未建立時 `data` 為 `null` |
 | PUT | `/api/v1/sessions/{session_id}/plan` | 由使用者建立或重建計畫 |
@@ -80,6 +80,7 @@ Authorization: Bearer <token>
 | DELETE | `/api/v1/sessions/{session_id}/plans/{plan_id}` | 刪除指定計畫 |
 | PUT | `/api/v1/sessions/{session_id}/plans/order` | 以完整 `plan_ids` 列表調整執行順序 |
 | GET | `/api/v1/sessions/{session_id}/messages` | Transcript messages |
+| POST | `/api/v1/sessions/{session_id}/messages/{message_id}/retract` | 撤回一則尚未固定的使用者訊息並建立重新提問流程 |
 | POST | `/api/v1/sessions/{session_id}/attachments` | 上傳這次對話要使用的附件 |
 | GET | `/api/v1/sessions/{session_id}/entries` | 分頁讀取完整 Harness 稽核 entries |
 | GET | `/api/v1/sessions/{session_id}/runs` | Session 的 Runs |
@@ -95,10 +96,41 @@ Authorization: Bearer <token>
 | POST | `/api/v1/runs/{run_id}/decision` | 核准或拒絕等待中的高風險工具 |
 | POST | `/api/v1/runs/{run_id}/retry` | 以原始輸入建立新的可追溯 Run |
 
+取消端點回傳的 Run 會立即是 `canceled`，並寫入 `run.canceled` terminal event；底層 Provider
+會同步收到取消訊號，但若第三方實作不遵守 context，仍可能在背景完成收尾。這段收尾不會再
+把 Run 改回 `running` 或 `completed`。
+
 Run 達到後端設定的回合、wall-clock、token 或工具呼叫上限時仍以 `completed`
 收尾；`result.budget_exceeded` 會回傳觸發資源、限制值、觀察值與累計用量，
 `metadata.termination` 則為 `budget_exceeded`。事件流會先送出
 `run.budget_exceeded`，最後仍以 `run.completed` 結束。
+
+### 用量與成本
+
+`GET /api/v1/runs`、`GET /api/v1/runs/{run_id}`、Session 相關端點與 JSON 匯出會帶出用量：
+
+- Run 的 `usage` 保存該次實際收到的 input／output／total token，以及收尾時依
+  `model_prices` 計算的 `estimated_cost_usd`；沒有價格設定時省略成本欄位。
+- Session 的 `usage` 是所有 Run 的累計，包含 token 總數與依 Provider／Model 分組的
+  `by_model`。若任一有用量的 Run 沒有價格，Session 總成本也省略，避免顯示不完整的金額。
+- `model_prices` 位於後端 JSON 設定檔，單價為每百萬 token 的 USD，不能由模型或一般 Run
+  request 提供。範例：
+
+```json
+{
+  "model_prices": {
+    "openai-compatible": {
+      "gpt-4o-mini": {
+        "input_per_million": 0.15,
+        "output_per_million": 0.60,
+        "currency": "USD"
+      }
+    }
+  }
+}
+```
+
+取消或失敗的 Run 仍保存錯誤前已收到的用量；`retry` 會建立獨立 Run，不會覆寫原紀錄。
 
 高風險工具執行前，Run 會進入 `waiting_approval` 並帶回 `pending_approval`。送出決策時
 必須回傳同一個 `approval_id`，避免舊畫面的決策誤套到後續工具：
@@ -152,7 +184,7 @@ OpenAI Codex Responses 不提供模型目錄時，models endpoint 回傳空陣�
 ### MCP Client
 
 MCP 設定以完整 `servers` 集合更新。每個 Server 支援本機 `stdio` 或遠端
-`streamable-http`；遠端連線可設定 Bearer Token 與自訂 headers，本機程序可設定 args、工作目錄
+`sse` 或 `streamable-http`；遠端連線可設定 Bearer Token、Basic Auth 與自訂 headers，本機程序可設定 args、工作目錄
 與明確的 environment。秘密欄位省略時保留既有值，API Key 傳空字串、environment／headers 傳
 空物件時清除。
 
@@ -173,9 +205,9 @@ MCP 設定以完整 `servers` 集合更新。每個 Server 支援本機 `stdio` 
 }
 ```
 
-儲存後連線在背景暖機；`POST .../{mcp_id}/test` 會強制重連並刷新工具清單。所有 MCP 工具都進入
-Session permission 與人工 Approval 流程。`trust_annotations=true` 只允許 Server 的
-`readOnlyHint` 影響並行排程，不代表跳過權限或 Approval。
+儲存後連線在背景暖機；`POST .../{mcp_id}/test` 會強制重連並刷新工具清單。所有 MCP 工具都先
+進入 Session permission；Server 的 `readOnlyHint` 只有在 `trust_annotations=true` 時才會被採信，
+此時唯讀工具可免逐次人工 Approval，但仍受權限、工具事件與輸出限制。其他工具仍須 Approval。
 
 ### NetPass 反向代理
 
@@ -261,12 +293,19 @@ Session 建立後可更新執行設定，但不能經由 HTTP API 變更 `worksp
 ```bash
 curl -X PATCH http://127.0.0.1:8787/api/v1/sessions/SESSION_ID \
   -H 'Content-Type: application/json' \
-  -d '{"title":"正式工作區","project_id":"PROJECT_ID","model":"gpt-5.4","permission_profile":"trusted","memory_scope":"project-a","pinned":true}'
+  -d '{"title":"正式工作區","project_id":"PROJECT_ID","model":"gpt-5.4","thinking_mode":"medium","lock_plans":true,"permission_profile":"trusted","memory_scope":"project-a","pinned":true}'
 ```
 
-所有欄位皆為選填，但 request 至少必須包含一個欄位。`memory_scope` 傳入空字串會移除 Session override，恢復 Agent 預設 scope。
+所有欄位皆為選填，但 request 至少必須包含一個欄位。`thinking_mode` 傳入空字串或 `auto` 會移除
+Session override，恢復 Provider／後端預設；`lock_plans` 預設為 `false`。`memory_scope` 傳入空字串
+會移除 Session override，恢復 Agent 預設 scope。
 
 Session 有 queued 或 running Run 時，更新與刪除都回傳 `409 Conflict`；請先等待完成或明確取消 Run，避免執行途中更換權限／Provider 或刪除工具目錄。
+
+後端重新啟動時，所有停在 queued／running／paused／waiting_approval 的 Run 會被標記為
+`failed`（`error.code=server_restarted`、`retryable=true`），不會留下永遠佔住 Session 的殭屍 Run。
+執行中的 Run 另外受 `max_wall_clock_seconds` 約束：那個上限是 Run context 的 deadline，
+因此連「等待人工核准」也會在上限到達時結束，不需要人工清理。
 
 ## Session 計畫
 
@@ -285,10 +324,11 @@ curl -X POST http://127.0.0.1:8787/api/v1/sessions/SESSION_ID/plans \
   }'
 ```
 
-列表中第一份未完成計畫為 `active`，後續計畫為 `queued`；active 完成後會自動啟用下一份。
-Console 可收合各計畫，並以拖曳後送出完整 `plan_ids` 調整順序；「清除已完成」只會刪除
-`completed` 與 `canceled`，不影響 `active` 或 `queued`。已經開始執行的 active
-計畫不能移到其他未完成計畫之後。Run 執行期間不能由 HTTP 新增、重建、刪除或排序計畫，
+`lock_plans=true` 時，列表中第一份未完成計畫為 `active`，後續計畫為 `queued`；active 完成後
+會自動啟用下一份。`lock_plans=false`（預設）時，未完成計畫可同時為 `active`，不同計畫可由
+不同 Run 平行執行。Console 可收合各計畫，並以拖曳後送出完整 `plan_ids` 調整順序；「清除已完成」
+只會刪除 `completed` 與 `canceled`，不影響未完成計畫。已經開始執行的 active 計畫不能移到其他
+未完成計畫之後。Run 執行期間不能由 HTTP 新增、重建、刪除或排序計畫，
 以免 UI 與 Agent 同時改寫。Agent 使用 `plan_get`、`plan_create`、`plan_step_update` 控制
 同一個有序佇列；Domain 只接受
 `pending → in_progress → verifying → completed` 的依序流程，且 completed 必須附上
@@ -423,7 +463,7 @@ Browser Console 的策略是：斷線後最多重連 3 次，依序等待 400、
 {
   "api_version": "1.0",
   "event_schema_version": "1.0",
-  "capabilities": ["durable-outbox.v1", "run-recovery.v1", "run-retry.v1"]
+  "capabilities": ["durable-outbox.v1", "run-cancel-immediate.v1", "run-recovery.v1", "run-retry.v1"]
 }
 ```
 
@@ -433,12 +473,15 @@ major version 不同或缺少必要功能時，UI 會顯示版本不相容提示
 
 UI 重開時會查詢目前 Workspace 的 queued、running、paused、waiting approval Run，重新連接其
 SSE；若後端重啟已將 Run 標記為 `server_restarted` 且 `retryable=true`，UI 會保留重試入口。
+恢復對話視窗按下「取消」只會停止該 Session 的 UI 恢復與 SSE 重連，不會取消後端仍在背景
+執行的 Run；之後同一個 UI 生命週期內也不會因 Session 狀態查詢再次自動掛回。
 
 ## 管理與復原
 
 後端重啟會把 queued、running、paused 與 waiting approval 的未完成 Run 標記為 `failed`、錯誤碼 `server_restarted` 並保留可重試狀態；原 Run
 不會被覆寫。`pause` 只在目前 Provider request 或工具回合結束後生效，等待人工核准的 Run
-不能一般暫停；`cancel-all` 則對所有尚未 terminal 的 Run 送出取消要求。
+不能一般暫停；`cancel-all` 則對所有尚未 terminal 的 Run 送出取消要求，並立即反映為
+`canceled`。
 
 通知中心只回傳工作狀態摘要，最多保留 1000 筆，支援 `unread_only=true`、單筆／全部已讀與
 清除已讀。全域搜尋的 `q` 最多 200 字元、回傳最多 100 筆，每筆只有短 snippet，不回傳完整

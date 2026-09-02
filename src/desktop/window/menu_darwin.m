@@ -7,6 +7,53 @@ static NSObject<NSWindowDelegate, NSApplicationDelegate> *nr_window_lifecycle_de
 static NSStatusItem *nr_status_item = nil;
 static NSMenu *nr_status_menu = nil;
 static BOOL nr_conversation_active = NO;
+static NSString *nr_window_frame_name = @"NRInternMainWindowFrame.v1";
+
+static void nr_save_main_window_frame(void) {
+  if (nr_main_window != nil) {
+    [nr_main_window saveFrameUsingName:nr_window_frame_name];
+  }
+}
+
+static BOOL nr_window_titlebar_is_visible(NSWindow *window) {
+  if (window == nil) {
+    return NO;
+  }
+  NSRect frame = window.frame;
+  CGFloat titlebarHeight = MIN(36.0, frame.size.height);
+  NSRect titlebar = NSMakeRect(frame.origin.x,
+                               NSMaxY(frame) - titlebarHeight,
+                               frame.size.width,
+                               titlebarHeight);
+  for (NSScreen *screen in NSScreen.screens) {
+    NSRect intersection = NSIntersectionRect(titlebar, screen.visibleFrame);
+    if (!NSIsEmptyRect(intersection) && intersection.size.width >= 96.0 &&
+        intersection.size.height >= 12.0) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static void nr_move_window_to_visible_screen(NSWindow *window) {
+  if (window == nil || nr_window_titlebar_is_visible(window)) {
+    return;
+  }
+  NSScreen *screen = NSScreen.mainScreen;
+  if (screen == nil && NSScreen.screens.count > 0) {
+    screen = NSScreen.screens.firstObject;
+  }
+  if (screen == nil) {
+    return;
+  }
+  NSRect frame = window.frame;
+  NSRect visible = screen.visibleFrame;
+  frame.size.width = MIN(frame.size.width, visible.size.width);
+  frame.size.height = MIN(frame.size.height, visible.size.height);
+  frame.origin.x = NSMidX(visible) - frame.size.width / 2.0;
+  frame.origin.y = NSMidY(visible) - frame.size.height / 2.0;
+  [window setFrame:frame display:NO];
+}
 
 static NSMenuItem *nr_status_menu_item(NSString *title, SEL action, id target) {
   NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:title
@@ -125,6 +172,7 @@ static void nr_remove_status_item(void) {
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
+  nr_save_main_window_frame();
   if ([_originalWindowDelegate respondsToSelector:@selector(windowWillClose:)]) {
     [_originalWindowDelegate windowWillClose:notification];
   }
@@ -158,6 +206,7 @@ static void nr_remove_status_item(void) {
   if (nr_main_window == nil) {
     return;
   }
+  nr_save_main_window_frame();
   nr_show_status_item(self, @selector(restoreWindow:));
   [nr_main_window orderOut:nil];
   [NSApplication.sharedApplication setActivationPolicy:NSApplicationActivationPolicyAccessory];
@@ -210,6 +259,65 @@ static NSMenuItem *nr_menu_item(NSString *title, SEL action, NSString *key,
   return item;
 }
 
+// nr_menu_contains_action 以 selector 判斷選單是否已經有某個標準動作，
+// 比對標題會因為語言或 webview 版本不同而失準。
+static BOOL nr_menu_contains_action(NSMenu *menu, SEL action) {
+  for (NSMenuItem *item in menu.itemArray) {
+    if (item.action == action) {
+      return YES;
+    }
+    if (item.submenu != nil && nr_menu_contains_action(item.submenu, action)) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+// nr_install_application_menu 補上 App 選單。WKWebView 容器不會自己建立它，
+// 少了這個選單，⌘Q 結束、⌘H 隱藏這些使用者視為理所當然的系統快捷鍵全都沒有作用。
+static void nr_install_application_menu(NSMenu *mainMenu) {
+  if (nr_menu_contains_action(mainMenu, @selector(terminate:))) {
+    return;
+  }
+  NSString *name = NSRunningApplication.currentApplication.localizedName;
+  if (name.length == 0) {
+    name = @"NR-Intern";
+  }
+  const NSEventModifierFlags command = NSEventModifierFlagCommand;
+  NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:name action:nil keyEquivalent:@""];
+  NSMenu *menu = [[NSMenu alloc] initWithTitle:name];
+  [menu addItem:nr_menu_item([@"關於 " stringByAppendingString:name],
+                             @selector(orderFrontStandardAboutPanel:), @"",
+                             0)];
+  [menu addItem:NSMenuItem.separatorItem];
+  [menu addItem:nr_menu_item([@"隱藏 " stringByAppendingString:name], @selector(hide:), @"h", command)];
+  [menu addItem:nr_menu_item(@"隱藏其他", @selector(hideOtherApplications:), @"h",
+                             command | NSEventModifierFlagOption)];
+  [menu addItem:nr_menu_item(@"顯示全部", @selector(unhideAllApplications:), @"", 0)];
+  [menu addItem:NSMenuItem.separatorItem];
+  [menu addItem:nr_menu_item([@"結束 " stringByAppendingString:name], @selector(terminate:), @"q", command)];
+  root.submenu = menu;
+  [mainMenu insertItem:root atIndex:0];
+}
+
+// nr_install_window_menu 補上視窗選單：⌘M 最小化與 ⌘W 關閉同樣是系統層級的
+// 標準快捷鍵。⌘W 會走既有的 windowShouldClose: 流程，工作進行中仍只是隱藏視窗。
+static void nr_install_window_menu(NSMenu *mainMenu) {
+  if (nr_menu_contains_action(mainMenu, @selector(performMiniaturize:))) {
+    return;
+  }
+  const NSEventModifierFlags command = NSEventModifierFlagCommand;
+  NSMenuItem *root = [[NSMenuItem alloc] initWithTitle:@"視窗" action:nil keyEquivalent:@""];
+  NSMenu *menu = [[NSMenu alloc] initWithTitle:@"視窗"];
+  [menu addItem:nr_menu_item(@"最小化", @selector(performMiniaturize:), @"m", command)];
+  [menu addItem:nr_menu_item(@"縮放", @selector(performZoom:), @"", 0)];
+  [menu addItem:NSMenuItem.separatorItem];
+  [menu addItem:nr_menu_item(@"關閉視窗", @selector(performClose:), @"w", command)];
+  root.submenu = menu;
+  [mainMenu addItem:root];
+  NSApplication.sharedApplication.windowsMenu = menu;
+}
+
 void nr_install_standard_menus(void) {
   NSApplication *application = NSApplication.sharedApplication;
   NSMenu *mainMenu = application.mainMenu;
@@ -218,30 +326,33 @@ void nr_install_standard_menus(void) {
     application.mainMenu = mainMenu;
   }
 
-  for (NSMenuItem *item in mainMenu.itemArray) {
-    if ([item.submenu.title isEqualToString:@"編輯"]) {
-      return;
-    }
+  nr_install_application_menu(mainMenu);
+
+  if (!nr_menu_contains_action(mainMenu, @selector(paste:))) {
+    NSMenuItem *editRoot = [[NSMenuItem alloc] initWithTitle:@"編輯"
+                                                     action:nil
+                                              keyEquivalent:@""];
+    NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"編輯"];
+    const NSEventModifierFlags command = NSEventModifierFlagCommand;
+
+    [editMenu addItem:nr_menu_item(@"復原", @selector(undo:), @"z", command)];
+    [editMenu addItem:nr_menu_item(@"重做", @selector(redo:), @"z",
+                                   command | NSEventModifierFlagShift)];
+    [editMenu addItem:NSMenuItem.separatorItem];
+    [editMenu addItem:nr_menu_item(@"剪下", @selector(cut:), @"x", command)];
+    [editMenu addItem:nr_menu_item(@"複製", @selector(copy:), @"c", command)];
+    [editMenu addItem:nr_menu_item(@"貼上", @selector(paste:), @"v", command)];
+    [editMenu addItem:nr_menu_item(@"貼上並符合樣式", @selector(pasteAsPlainText:), @"v",
+                                   command | NSEventModifierFlagOption |
+                                       NSEventModifierFlagShift)];
+    [editMenu addItem:NSMenuItem.separatorItem];
+    [editMenu addItem:nr_menu_item(@"全選", @selector(selectAll:), @"a", command)];
+
+    editRoot.submenu = editMenu;
+    [mainMenu addItem:editRoot];
   }
 
-  NSMenuItem *editRoot = [[NSMenuItem alloc] initWithTitle:@"編輯"
-                                                   action:nil
-                                            keyEquivalent:@""];
-  NSMenu *editMenu = [[NSMenu alloc] initWithTitle:@"編輯"];
-  const NSEventModifierFlags command = NSEventModifierFlagCommand;
-
-  [editMenu addItem:nr_menu_item(@"復原", @selector(undo:), @"z", command)];
-  [editMenu addItem:nr_menu_item(@"重做", @selector(redo:), @"z",
-                                 command | NSEventModifierFlagShift)];
-  [editMenu addItem:NSMenuItem.separatorItem];
-  [editMenu addItem:nr_menu_item(@"剪下", @selector(cut:), @"x", command)];
-  [editMenu addItem:nr_menu_item(@"複製", @selector(copy:), @"c", command)];
-  [editMenu addItem:nr_menu_item(@"貼上", @selector(paste:), @"v", command)];
-  [editMenu addItem:NSMenuItem.separatorItem];
-  [editMenu addItem:nr_menu_item(@"全選", @selector(selectAll:), @"a", command)];
-
-  editRoot.submenu = editMenu;
-  [mainMenu addItem:editRoot];
+  nr_install_window_menu(mainMenu);
 }
 
 void nr_activate_application(void) {
@@ -262,6 +373,16 @@ void nr_install_window_lifecycle(void *window_handle) {
   window.delegate = nr_window_lifecycle_delegate;
   NSApplication.sharedApplication.delegate = nr_window_lifecycle_delegate;
   nr_show_status_item(nr_window_lifecycle_delegate, @selector(restoreWindow:));
+}
+
+void nr_restore_window_frame(void *window_handle) {
+  NSWindow *window = (NSWindow *)window_handle;
+  if (window == nil) {
+    return;
+  }
+  [window setFrameAutosaveName:nr_window_frame_name];
+  [window setFrameUsingName:nr_window_frame_name];
+  nr_move_window_to_visible_screen(window);
 }
 
 void nr_set_conversation_active(int active) {
@@ -291,6 +412,7 @@ void nr_hide_application_window(void) {
 }
 
 void nr_uninstall_window_lifecycle(void) {
+  nr_save_main_window_frame();
   if (nr_main_window != nil && nr_main_window.delegate == nr_window_lifecycle_delegate) {
     nr_main_window.delegate = nr_original_window_delegate;
   }

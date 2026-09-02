@@ -36,6 +36,10 @@ func (s *Service) ExportSession(ctx context.Context, sessionID string, includeEn
 	if err != nil {
 		return SessionExport{}, err
 	}
+	session, err = s.decorateSessionUsage(ctx, session)
+	if err != nil {
+		return SessionExport{}, err
+	}
 	export := SessionExport{
 		Session:  session,
 		Messages: messages,
@@ -78,6 +82,15 @@ func (e SessionExport) Markdown() string {
 	}
 	if e.Session.Model != "" {
 		fmt.Fprintf(&builder, "- Model: `%s`\n", e.Session.Model)
+	}
+	if usage := e.Session.Usage; usage != nil {
+		fmt.Fprintf(&builder, "- Token usage: input %d, output %d, total %d\n", usage.InputTokens, usage.OutputTokens, usage.TotalTokens)
+		if usage.EstimatedCostUSD != nil {
+			fmt.Fprintf(&builder, "- Estimated cost (USD): %.6f\n", *usage.EstimatedCostUSD)
+		}
+		for _, modelUsage := range usage.ByModel {
+			fmt.Fprintf(&builder, "- Usage by model: `%s/%s` total %d\n", modelUsage.ProviderID, modelUsage.Model, modelUsage.TotalTokens)
+		}
 	}
 	for index, plan := range e.Plans {
 		fmt.Fprintf(&builder, "## 計畫 %d：%s\n\n", index+1, plan.Title)

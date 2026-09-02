@@ -9,6 +9,7 @@ import (
 	nativessh "AgenticService/src/tools/native/ssh"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -47,19 +48,30 @@ type Config struct {
 	MaxCompletionChecks int `json:"max_completion_checks"`
 	MaxWallClockSeconds int `json:"max_wall_clock_seconds"`
 	// MaxTokens 與 MaxToolCalls 設為 0 時不限制，仍可由設定或環境變數重新啟用。
-	MaxTokens          int                               `json:"max_tokens"`
-	MaxToolCalls       int                               `json:"max_tool_calls"`
-	MaxToolOutputBytes int                               `json:"max_tool_output_bytes"`
-	MaxFileInputBytes  int                               `json:"max_file_input_bytes"`
-	Context            harness.ContextConfig             `json:"context"`
-	Memory             memory.Config                     `json:"memory"`
-	DefaultProviderID  string                            `json:"default_provider_id"`
-	Providers          map[string]ProviderConfig         `json:"providers"`
-	MCPServers         map[string]mcpclient.ServerConfig `json:"mcp_servers,omitempty"`
-	SSHProfiles        map[string]nativessh.Profile      `json:"ssh_profiles,omitempty"`
+	MaxTokens          int                                     `json:"max_tokens"`
+	MaxToolCalls       int                                     `json:"max_tool_calls"`
+	MaxToolOutputBytes int                                     `json:"max_tool_output_bytes"`
+	MaxFileInputBytes  int                                     `json:"max_file_input_bytes"`
+	Context            harness.ContextConfig                   `json:"context"`
+	Memory             memory.Config                           `json:"memory"`
+	DefaultProviderID  string                                  `json:"default_provider_id"`
+	Providers          map[string]ProviderConfig               `json:"providers"`
+	ModelPrices        map[string]map[string]domain.ModelPrice `json:"model_prices,omitempty"`
+	MCPServers         map[string]mcpclient.ServerConfig       `json:"mcp_servers,omitempty"`
+	SSHProfiles        map[string]nativessh.Profile            `json:"ssh_profiles,omitempty"`
 	// HTTPFetch 是唯一會離開本機的原生工具，因此邊界獨立於其他工具設定，
 	// 且 Enabled 與 AllowPrivateNetworks 可由管理介面即時調整。
 	HTTPFetch HTTPFetchConfig `json:"http_fetch"`
+	// ExtendedTools 決定要公開精簡工具集還是 AllowedTools 的完整集合。預設精簡：
+	// 工具目錄每一輪都會整份進入提示，工具越多，小型與本機模型越慢也越容易挑錯。
+	ExtendedTools bool `json:"extended_tools"`
+	// ToolRetrieval 讓工具目錄先經檢索再進入提示，內建工具與 MCP 工具都適用。
+	// 預設開啟：外掛型 MCP Server 動輒公開上百個工具，整份送出可以讓一句
+	// 「HELLO」變成十萬 tokens。
+	ToolRetrieval bool `json:"tool_retrieval"`
+	// LegacyMCPToolRetrieval 是這個開關的舊名稱。設定檔以 DisallowUnknownFields
+	// 解碼，欄位直接改名會讓既有設定檔開不起來，因此保留讀取。
+	LegacyMCPToolRetrieval *bool `json:"mcp_tool_retrieval,omitempty"`
 }
 
 type HTTPFetchConfig struct {
@@ -99,11 +111,15 @@ func DefaultConfig() Config {
 		AllowElevatedTools:     true,
 		MaxTurns:               harness.DefaultMaxTurns,
 		MaxAutonomousToolTurns: harness.DefaultMaxAutonomousToolTurns,
-		ToolCallMode:           string(harness.ToolCallModeInstruction),
-		MaxCompletionChecks:    harness.DefaultMaxCompletionChecks,
-		MaxWallClockSeconds:    2 * 60 * 60,
-		MaxTokens:              0,
-		MaxToolCalls:           0,
+		// 預設 native：由 Provider 的 tools／tool_calls 欄位傳遞工具，多數推論引擎會以
+		// grammar 約束輸出，比要求模型自行輸出 JSON 指令可靠得多（小型與本機模型尤其明顯）。
+		// Provider 不支援時可在管理介面切回 instruction。
+		ToolCallMode:        string(harness.ToolCallModeNative),
+		ToolRetrieval:       true,
+		MaxCompletionChecks: harness.DefaultMaxCompletionChecks,
+		MaxWallClockSeconds: 2 * 60 * 60,
+		MaxTokens:           0,
+		MaxToolCalls:        0,
 		// 單機 Harness 預設允許 Sandbox 內的寫入與 Shell，但每次高風險工具仍須人工 Approval。
 		// 不開放 Client 自行指定 profile；對外部署可將 AllowElevatedTools 關閉以停用全部寫入型工具。
 		Permissions: domain.PermissionPolicy{
@@ -129,6 +145,7 @@ func DefaultConfig() Config {
 			AllowWrites:           true,
 		},
 		DefaultProviderID: "openai-compatible",
+		ModelPrices:       map[string]map[string]domain.ModelPrice{},
 		Providers: map[string]ProviderConfig{
 			"openai-compatible": {
 				Type:        "openai-compatible",
@@ -176,6 +193,10 @@ func LoadConfig(path string) (Config, error) {
 		if closeErr != nil {
 			return Config{}, fmt.Errorf("close config: %w", closeErr)
 		}
+	}
+	if config.LegacyMCPToolRetrieval != nil {
+		config.ToolRetrieval = *config.LegacyMCPToolRetrieval
+		config.LegacyMCPToolRetrieval = nil
 	}
 	applyEnvironment(&config)
 	if err := loadPersistedServiceSettings(&config); err != nil {
@@ -436,6 +457,40 @@ func validateConfig(config *Config) error {
 			return fmt.Errorf("unsupported provider type %q for %q", provider.Type, id)
 		}
 	}
+	normalizedPrices := make(map[string]map[string]domain.ModelPrice, len(config.ModelPrices))
+	for providerID, models := range config.ModelPrices {
+		providerID = strings.TrimSpace(providerID)
+		if providerID == "" {
+			return fmt.Errorf("model_prices provider id is required")
+		}
+		if _, exists := config.Providers[providerID]; !exists {
+			return fmt.Errorf("model_prices provider %q is not configured", providerID)
+		}
+		normalizedModels := make(map[string]domain.ModelPrice, len(models))
+		for model, price := range models {
+			model = strings.TrimSpace(model)
+			if model == "" {
+				return fmt.Errorf("model_prices.%s model is required", providerID)
+			}
+			if math.IsNaN(price.InputPerMillion) || math.IsInf(price.InputPerMillion, 0) || price.InputPerMillion < 0 || price.InputPerMillion > 1_000_000 {
+				return fmt.Errorf("model_prices.%s.%s input_per_million must be between 0 and 1000000", providerID, model)
+			}
+			if math.IsNaN(price.OutputPerMillion) || math.IsInf(price.OutputPerMillion, 0) || price.OutputPerMillion < 0 || price.OutputPerMillion > 1_000_000 {
+				return fmt.Errorf("model_prices.%s.%s output_per_million must be between 0 and 1000000", providerID, model)
+			}
+			currency := strings.ToUpper(strings.TrimSpace(price.Currency))
+			if currency == "" {
+				currency = "USD"
+			}
+			if currency != "USD" {
+				return fmt.Errorf("model_prices.%s.%s currency must be USD", providerID, model)
+			}
+			price.Currency = currency
+			normalizedModels[model] = price
+		}
+		normalizedPrices[providerID] = normalizedModels
+	}
+	config.ModelPrices = normalizedPrices
 	if config.Context.MaxEstimatedTokens <= 0 {
 		return fmt.Errorf("context.max_estimated_tokens must be greater than zero")
 	}
@@ -469,6 +524,42 @@ func validateConfig(config *Config) error {
 	}
 	config.DataDir = filepath.Clean(absolute)
 	return nil
+}
+
+// LeanToolNames 是精簡工具集：一個通用主機工具、最基本的讀取能力與計畫控制。
+// 其餘工具（文件處理、寫入、SSH、記憶、比較等）在管理介面打開「擴充工具集」後才公開。
+// MCP 工具由各自的 Server 設定控制，不受這個清單限制。
+var LeanToolNames = []string{
+	"shell_exec",
+	"file_read",
+	"directory_list",
+	"file_search",
+	"plan_get",
+	"plan_create",
+	"plan_step_update",
+}
+
+// EffectiveAllowedTools 依「擴充工具集」開關計算本次實際公開的原生工具集合。
+// 關閉時取精簡集合與設定檔 allowlist 的交集；allowlist 為空代表原本不設限，
+// 此時直接使用精簡集合。
+func EffectiveAllowedTools(config Config) []string {
+	if config.ExtendedTools {
+		return append([]string(nil), config.AllowedTools...)
+	}
+	if len(config.AllowedTools) == 0 {
+		return append([]string(nil), LeanToolNames...)
+	}
+	configured := make(map[string]struct{}, len(config.AllowedTools))
+	for _, name := range config.AllowedTools {
+		configured[strings.TrimSpace(name)] = struct{}{}
+	}
+	result := make([]string, 0, len(LeanToolNames))
+	for _, name := range LeanToolNames {
+		if _, exists := configured[name]; exists {
+			result = append(result, name)
+		}
+	}
+	return result
 }
 
 func normalizeHostList(values []string) []string {

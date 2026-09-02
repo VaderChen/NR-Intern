@@ -221,6 +221,15 @@ func toolDisabledReason(value NativeTool) (string, bool) {
 	return reason, true
 }
 
+// SetAllowedNames 讓管理介面在不重啟後端的情況下調整工具集。
+// 空集合代表不設限制（維持既有語意）。
+func (r *Registry) SetAllowedNames(names []string) {
+	allowed := stringSet(names)
+	r.mu.Lock()
+	r.allowed = allowed
+	r.mu.Unlock()
+}
+
 func (r *Registry) isAllowed(name string) bool {
 	if len(r.allowed) == 0 {
 		return true
@@ -290,6 +299,12 @@ func cloneDefinition(value domain.ToolDefinition) domain.ToolDefinition {
 		result.InputSchema = make(map[string]any, len(value.InputSchema))
 		for key, item := range value.InputSchema {
 			result.InputSchema[key] = item
+		}
+	}
+	if value.OutputSchema != nil {
+		result.OutputSchema = make(map[string]any, len(value.OutputSchema))
+		for key, item := range value.OutputSchema {
+			result.OutputSchema[key] = item
 		}
 	}
 	return result

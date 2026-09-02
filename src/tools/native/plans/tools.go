@@ -26,7 +26,7 @@ func NewUpdateStepTool(repository ports.PlanRepository) *UpdateStepTool {
 func (t *GetTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
 		Name: "plan_get", Label: "讀取工作計畫", Version: "1.0.0", Category: "planning",
-		Description: "依執行順序讀取目前 Session 的全部結構化計畫與步驟狀態。current_plan 是唯一可執行的進行中計畫。",
+		Description: "讀取目前 Session 的全部結構化計畫與步驟狀態；是否只能執行 current_plan 取決於 Session 的鎖定計畫設定。",
 		Platforms:   []string{"darwin", "linux", "windows"}, Capabilities: []string{"planning", "progress-tracking"}, ReadOnly: true,
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}},
 	}
@@ -36,11 +36,15 @@ func (t *GetTool) Execute(ctx context.Context, invocation tools.Invocation, _ po
 	if t == nil || t.Repository == nil {
 		return failure(invocation.Call, "plan repository is unavailable"), nil
 	}
-	values, err := t.Repository.List(ctx, invocation.Session.ID)
+	values, err := t.Repository.Reconcile(ctx, invocation.Session.ID, invocation.Session.LockPlans)
 	if err != nil {
 		return failure(invocation.Call, err.Error()), nil
 	}
-	return jsonExecution(invocation.Call, map[string]any{"plans": values, "current_plan": activePlan(values)})
+	result := map[string]any{"plans": values, "current_plan": activePlan(values)}
+	if !invocation.Session.LockPlans {
+		result["active_plans"] = activePlans(values)
+	}
+	return jsonExecution(invocation.Call, result)
 }
 
 func (t *CreateTool) Definition() domain.ToolDefinition {
@@ -74,6 +78,9 @@ func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _
 	if t == nil || t.Repository == nil {
 		return failure(invocation.Call, "plan repository is unavailable"), nil
 	}
+	if _, err := t.Repository.Reconcile(ctx, invocation.Session.ID, invocation.Session.LockPlans); err != nil {
+		return failure(invocation.Call, err.Error()), nil
+	}
 	stepsData, err := json.Marshal(invocation.Call.Arguments["steps"])
 	if err != nil {
 		return failure(invocation.Call, "steps are invalid"), nil
@@ -93,7 +100,18 @@ func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _
 	if err != nil {
 		return failure(invocation.Call, err.Error()), nil
 	}
-	nextAction := "queued behind the current active plan"
+	values, err := t.Repository.Reconcile(ctx, invocation.Session.ID, invocation.Session.LockPlans)
+	if err != nil {
+		return failure(invocation.Call, err.Error()), nil
+	}
+	value, err = findPlan(values, value.ID)
+	if err != nil {
+		return failure(invocation.Call, err.Error()), nil
+	}
+	nextAction := "available for selection with plan_id"
+	if invocation.Session.LockPlans {
+		nextAction = "queued behind the current active plan"
+	}
 	if value.Status == domain.PlanStatusActive {
 		nextAction = "start the first pending step"
 	}
@@ -103,7 +121,7 @@ func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _
 func (t *UpdateStepTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
 		Name: "plan_step_update", Label: "更新計畫步驟", Version: "1.0.0", Category: "planning",
-		Description: "更新指定計畫的步驟；未提供 plan_id 時使用目前 active 計畫。合法流程是 pending→in_progress→verifying→completed；完成後會自動啟用下一份 queued 計畫。",
+		Description: "更新指定計畫的步驟；鎖定計畫時未提供 plan_id 會使用 current_plan，未鎖定時建議明確指定 plan_id。合法流程是 pending→in_progress→verifying→completed。",
 		Platforms:   []string{"darwin", "linux", "windows"}, Capabilities: []string{"progress-tracking", "verification-gate"},
 		InputSchema: map[string]any{
 			"type": "object",
@@ -124,7 +142,7 @@ func (t *UpdateStepTool) Execute(ctx context.Context, invocation tools.Invocatio
 	}
 	planID := stringArgument(invocation.Call.Arguments, "plan_id")
 	if planID == "" {
-		values, err := t.Repository.List(ctx, invocation.Session.ID)
+		values, err := t.Repository.Reconcile(ctx, invocation.Session.ID, invocation.Session.LockPlans)
 		if err != nil {
 			return failure(invocation.Call, err.Error()), nil
 		}
@@ -148,6 +166,14 @@ func (t *UpdateStepTool) Execute(ctx context.Context, invocation tools.Invocatio
 	if err != nil {
 		return failure(invocation.Call, err.Error()), nil
 	}
+	values, err := t.Repository.Reconcile(ctx, invocation.Session.ID, invocation.Session.LockPlans)
+	if err != nil {
+		return failure(invocation.Call, err.Error()), nil
+	}
+	value, err = findPlan(values, value.ID)
+	if err != nil {
+		return failure(invocation.Call, err.Error()), nil
+	}
 	return jsonExecution(invocation.Call, map[string]any{"plan": value})
 }
 
@@ -163,6 +189,25 @@ func activePlan(values []domain.Plan) *domain.Plan {
 		}
 	}
 	return nil
+}
+
+func activePlans(values []domain.Plan) []domain.Plan {
+	result := make([]domain.Plan, 0, len(values))
+	for _, value := range values {
+		if value.Status == domain.PlanStatusActive {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
+func findPlan(values []domain.Plan, planID string) (domain.Plan, error) {
+	for _, value := range values {
+		if value.ID == strings.TrimSpace(planID) {
+			return value, nil
+		}
+	}
+	return domain.Plan{}, fmt.Errorf("%w: plan %q", domain.ErrNotFound, planID)
 }
 
 func jsonExecution(call domain.ToolCall, value any) (domain.ToolExecution, error) {

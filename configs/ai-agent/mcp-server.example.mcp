@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "local-example": {
+      "display_name": "Local MCP example",
+      "command": "npx",
+      "args": ["-y", "@example/mcp-server"],
+      "env": {
+        "MCP_API_TOKEN": ""
+      }
+    },
+    "remote-example": {
+      "display_name": "Remote MCP example",
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "X-API-Key": "${MCP_API_KEY}"
+      }
+    },
+    "legacy-sse-example": {
+      "display_name": "Legacy SSE example",
+      "type": "sse",
+      "url": "https://example.com/sse"
+    }
+  }
+}

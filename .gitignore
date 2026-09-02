@@ -2,6 +2,7 @@
 /data/
 /bin/
 /dist/
+/desktop
 /Icon/
 /.icon-build-test/
 /.release-check/

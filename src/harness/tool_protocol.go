@@ -22,6 +22,9 @@ const (
 var (
 	taggedToolInstructionPattern  = regexp.MustCompile(`(?is)<\s*(tool_call|tool_use)\s*>(.*?)<\s*/\s*(tool_call|tool_use)\s*>`)
 	bracketToolInstructionPattern = regexp.MustCompile(`(?is)\[\s*(tool_call|tool_use)\s*\](.*?)\[\s*/\s*(tool_call|tool_use)\s*\]`)
+	// toolInstructionPrefixPattern 只比對 JSON object 的開頭鍵，避免把一般文字裡
+	// 提到的大括號誤判成被截斷的工具指令。
+	toolInstructionPrefixPattern = regexp.MustCompile(`(?is)^\{\s*"(type|tool|tool_name|action)"\s*:\s*"[^"]*"`)
 )
 
 func NormalizeToolCallMode(value string) ToolCallMode {
@@ -43,13 +46,17 @@ func ValidToolCallMode(value string) bool {
 }
 
 type instructionToolCatalogEntry struct {
-	Name               string         `json:"name"`
-	Description        string         `json:"description,omitempty"`
-	InputSchema        map[string]any `json:"input_schema"`
-	Platforms          []string       `json:"platforms,omitempty"`
-	Capabilities       []string       `json:"capabilities,omitempty"`
-	ReadOnly           bool           `json:"read_only"`
-	RequiresPermission bool           `json:"requires_permission"`
+	Name string `json:"name"`
+	// Label 是工具的顯示名稱。MCP Server 的 title 常常比 name 更貼近使用者的說法
+	// （例如「查詢製令」對上 query_work_orders），少了它模型就得自己跨語言猜。
+	Label        string         `json:"label,omitempty"`
+	Description  string         `json:"description,omitempty"`
+	InputSchema  map[string]any `json:"input_schema"`
+	OutputSchema map[string]any `json:"output_schema,omitempty"`
+	// Platforms 與 Capabilities 刻意不進模型看到的目錄：那是工具目錄 UI 用的中繼資料，
+	// 對「該叫哪個工具、參數怎麼填」沒有幫助，卻要每一輪重送一次。
+	ReadOnly           bool `json:"read_only"`
+	RequiresPermission bool `json:"requires_permission"`
 }
 
 type instructionToolUse struct {
@@ -82,10 +89,10 @@ func toolInstructionPrompt(definitions []domain.ToolDefinition) string {
 		}
 		catalog = append(catalog, instructionToolCatalogEntry{
 			Name:               strings.TrimSpace(definition.Name),
+			Label:              strings.TrimSpace(definition.Label),
 			Description:        strings.TrimSpace(definition.Description),
 			InputSchema:        schema,
-			Platforms:          append([]string(nil), definition.Platforms...),
-			Capabilities:       append([]string(nil), definition.Capabilities...),
+			OutputSchema:       definition.OutputSchema,
 			ReadOnly:           definition.ReadOnly,
 			RequiresPermission: definition.RequiresPermission,
 		})
@@ -98,12 +105,58 @@ func toolInstructionPrompt(definitions []domain.ToolDefinition) string {
 
 當任務需要讀取檔案、列出目錄、搜尋、Shell、SSH、記憶或任何外部狀態時，你必須先要求後端執行工具，不可直接假設結果，也不可聲稱工具未提供。
 
-需要工具時，每一輪只能輸出一個嚴格 JSON object，不得加入 Markdown code fence、前言、結語、to=tool、函式標記或其他文字：
+需要工具時只輸出嚴格 JSON，不得加入 Markdown code fence、前言、結語、to=tool、函式標記或其他文字：
 {"type":"tool_use","tool":"工具名稱","input":{},"reason":"簡短理由"}
+
+一個問題需要多份彼此獨立的資料時（例如同時要部門數與人員數），在同一輪直接輸出多個 tool_use object 或一個 JSON 陣列，Harness 會一起執行；不要先用一輪描述打算怎麼分次查。彼此有相依關係時才分輪，先取得前一個結果再決定下一個。
 
 後端會執行工具，並在下一輪提供 type=tool_result 的 JSON 訊息。請根據該結果決定下一個工具；工具失敗時應修正參數或改用其他可用工具。只有已取得足以回答使用者的實際結果後，才輸出一般文字作為最終答案。最終答案不得包含工具指令 JSON。
 
-可用工具目錄：` + string(encoded)
+若工具結果指出 input_required，請依結果中的輸入請求補齊資料，使用同一工具重試；MCP 的多輪控制欄位只能放在工具 input 的 "_mcp_input_responses" 與 "_mcp_request_state"，不可猜測或省略請求 ID。
+
+可用工具目錄：` + string(encoded) + serverInstructionsSection(definitions)
+}
+
+// serverInstructionsSection 把同一個 MCP Server 的說明只放一次。
+//
+// Server instructions 屬於整個 Server，過去被複製到該 Server 的每一個工具定義裡：
+// 20 個工具就等於同一段文字在每一輪的提示中出現 20 次。
+func serverInstructionsSection(definitions []domain.ToolDefinition) string {
+	seen := map[string]bool{}
+	lines := make([]string, 0, 4)
+	for _, definition := range definitions {
+		instructions := strings.TrimSpace(definition.ServerInstructions)
+		if instructions == "" || seen[instructions] {
+			continue
+		}
+		seen[instructions] = true
+		if server := mcpServerID(definition); server != "" {
+			lines = append(lines, "- "+server+"："+instructions)
+			continue
+		}
+		lines = append(lines, "- "+instructions)
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "\n\nMCP Server 說明（同一個 Server 的所有工具共用）：\n" + strings.Join(lines, "\n")
+}
+
+func mcpServerID(definition domain.ToolDefinition) string {
+	for _, capability := range definition.Capabilities {
+		if value := strings.TrimSpace(capability); strings.HasPrefix(strings.ToLower(value), "mcp:") {
+			return strings.TrimSpace(value[len("mcp:"):])
+		}
+	}
+	name := strings.TrimSpace(definition.Name)
+	if !strings.HasPrefix(strings.ToLower(name), "mcp__") {
+		return ""
+	}
+	remainder := name[len("mcp__"):]
+	if index := strings.Index(remainder, "__"); index > 0 {
+		return remainder[:index]
+	}
+	return ""
 }
 
 // instructionMessages 將內部結構化 transcript 轉成純文字協定，避免舊代理
@@ -145,6 +198,46 @@ func instructionMessages(messages []domain.Message) []domain.Message {
 // parseInstructionToolCall 接受嚴格 JSON，以及舊 AgenticService 曾使用的標籤包裝。
 // 最後的 to=<known tool> 只作 Provider 格式退化時的通用相容路徑；工具名稱仍須
 // 出現在目前 catalog，參數也必須是完整 JSON object，後續照常經過 Sandbox 與權限檢查。
+// parseInstructionToolCalls 允許同一輪輸出多個工具指令。
+//
+// 複合問題（「有多少部門跟人員」）需要兩份彼此獨立的資料。過去協定限制一輪只能輸出
+// 一個 JSON object，模型只好花回合去規劃怎麼分次查——畫面上就是一句
+// 「Planning parallel queries…」然後什麼都沒發生。實際執行端本來就支援一輪多個工具
+// 呼叫（唯讀且免核准的會並行），因此協定跟著放寬。
+func parseInstructionToolCalls(content string, definitions []domain.ToolDefinition) ([]domain.ToolCall, bool, error) {
+	trimmed := strings.TrimSpace(content)
+	if trimmed == "" {
+		return nil, false, nil
+	}
+	stripped := stripJSONFence(trimmed)
+	calls := make([]domain.ToolCall, 0, 2)
+	for _, candidate := range jsonObjects(stripped) {
+		call, matched, err := decodeInstructionToolCall(candidate)
+		if err != nil {
+			return nil, false, err
+		}
+		if !matched {
+			continue
+		}
+		if !instructionToolExists(call.Name, definitions) {
+			return nil, false, fmt.Errorf("%w: tool instruction references unavailable tool %q", domain.ErrProviderProtocol, call.Name)
+		}
+		calls = append(calls, call)
+		if len(calls) == maxParallelTools {
+			break
+		}
+	}
+	if len(calls) > 1 {
+		return calls, true, nil
+	}
+	// 單一指令仍走原本的完整比對，涵蓋標籤包裝與 to=<tool> 等退化格式。
+	call, matched, err := parseInstructionToolCall(content, definitions)
+	if err != nil || !matched {
+		return nil, false, err
+	}
+	return []domain.ToolCall{call}, true, nil
+}
+
 func parseInstructionToolCall(content string, definitions []domain.ToolDefinition) (domain.ToolCall, bool, error) {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
@@ -196,7 +289,36 @@ func parseInstructionToolCall(content string, definitions []domain.ToolDefinitio
 		}
 		return domain.ToolCall{ID: domain.NewID("call"), Name: name, Arguments: arguments}, true, nil
 	}
+	if unterminatedToolInstruction(trimmed) {
+		return domain.ToolCall{}, false, fmt.Errorf("%w: tool instruction JSON is incomplete, most likely cut off by the output length limit; send a smaller instruction (for example write long scripts to a file first, then run the file)", domain.ErrProviderProtocol)
+	}
 	return domain.ToolCall{}, false, nil
+}
+
+// unterminatedToolInstruction 辨識「開頭像工具指令、但 JSON 沒有收尾」的輸出。
+//
+// 模型把大段腳本塞進單一指令時很容易被輸出長度上限截斷，截斷後的 JSON 不是平衡
+// object，原本會被當成一般文字直接回覆使用者——畫面上就出現半截的 tool_use JSON，
+// 甚至連參數裡的憑證都一起顯示。這種輸出必須走協定修正流程，不能當成最終回答。
+func unterminatedToolInstruction(content string) bool {
+	for offset := 0; offset < len(content); {
+		relativeStart := strings.Index(content[offset:], "{")
+		if relativeStart < 0 {
+			return false
+		}
+		start := offset + relativeStart
+		remainder := content[start:]
+		if object := balancedJSONObject(remainder); object != "" {
+			// 完整的 object 內部不可能藏著被截斷的指令，直接跳過整段。
+			offset = start + len(object)
+			continue
+		}
+		if toolInstructionPrefixPattern.MatchString(remainder) {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
 }
 
 func instructionToolExists(name string, definitions []domain.ToolDefinition) bool {

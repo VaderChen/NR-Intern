@@ -123,6 +123,11 @@
         <div class="session-heading">
           <h1 id="sessionTitle">選擇或建立對話</h1>
           <small id="agentLabel">General Harness Agent</small>
+          <div id="sessionUsage" class="session-usage hidden" role="status">
+            <span id="sessionUsageTokens"></span>
+            <span aria-hidden="true">·</span>
+            <span id="sessionUsageCost"></span>
+          </div>
         </div>
         <div class="topbar-meta">
           <div class="global-search-control">
@@ -153,6 +158,18 @@
                 <span>模型</span>
                 <select id="sessionModelSelect" aria-label="對話模型"></select>
               </label>
+              <label title="此對話的 Thinking 思考程度">
+                <span>Thinking</span>
+                <select id="sessionThinkingSelect" aria-label="對話 Thinking 思考程度">
+                  <option value="">自動</option>
+                  <option value="none">關閉思考</option>
+                  <option value="minimal">極低</option>
+                  <option value="low">低</option>
+                  <option value="medium">中</option>
+                  <option value="high">高</option>
+                  <option value="xhigh">極高</option>
+                </select>
+              </label>
             </section>
           </div>
         </div>
@@ -170,11 +187,11 @@
         <span class="context-compaction-dots" aria-hidden="true"><i></i><i></i><i></i></span>
       </section>
 
-      <section id="activity" class="activity hidden" aria-live="polite">
-        <span id="activityText"></span>
-        <button id="retryRun" class="small hidden" type="button">重試 Run</button>
-      </section>
       <div class="conversation-actions">
+        <section id="activity" class="activity hidden" aria-live="polite">
+          <span id="activityText"></span>
+          <button id="retryRun" class="small hidden" type="button">重試 Run</button>
+        </section>
         <div id="contextUsageControl" class="context-usage-control hidden">
           <button id="contextUsageButton" class="context-usage-trigger ghost" type="button" aria-haspopup="true" aria-expanded="false" title="查看上下文用量" aria-label="查看上下文用量">
             <span>上下文</span><strong id="contextUsagePercent">-</strong>
@@ -237,6 +254,7 @@
           </div>
         </div>
       </form>
+      <div id="toast" class="toast hidden" role="status"></div>
     </main>
 
     <section id="managementPanel" class="management-page hidden" aria-label="系統管理">
@@ -251,6 +269,7 @@
         <button id="systemToolsManagementTab" class="panel-tab" data-panel="systemTools" role="tab" aria-selected="false" aria-controls="systemToolsPanel">系統工具</button>
         <button id="mcpManagementTab" class="panel-tab" data-panel="mcp" role="tab" aria-selected="false" aria-controls="mcpPanel">使用 MCP</button>
         <button id="reverseProxyManagementTab" class="panel-tab" data-panel="reverseProxy" role="tab" aria-selected="false" aria-controls="reverseProxyPanel">反向代理</button>
+        <button id="toolSettingsManagementTab" class="panel-tab" data-panel="toolSettings" role="tab" aria-selected="false" aria-controls="toolSettingsPanel">工具設定</button>
         <button id="toolsManagementTab" class="panel-tab" data-panel="tools" role="tab" aria-selected="false" aria-controls="toolsPanel">工具列表</button>
         <button id="permissionsManagementTab" class="panel-tab" data-panel="permissions" role="tab" aria-selected="false" aria-controls="permissionsPanel">權限中心</button>
         <button id="aboutManagementTab" class="panel-tab" data-panel="about" role="tab" aria-selected="false" aria-controls="aboutPanel">關於</button>
@@ -278,12 +297,6 @@
             <legend>通知</legend>
             <label class="check-label"><input id="settingNotificationsEnabled" type="checkbox">啟用通知中心</label>
             <p class="hint">預設關閉。開啟後才會顯示通知圖示，並保存 Run、工具授權與版本更新摘要。</p>
-          </fieldset>
-          <fieldset class="settings-fieldset">
-            <legend>對外網路</legend>
-            <label class="check-label"><input id="settingHTTPFetchEnabled" type="checkbox">允許 Agent 讀取外部網路（http_fetch）</label>
-            <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox" checked>允許連線到 localhost 與私有網段</label>
-            <p class="hint">關閉第一項後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。第二項預設允許連線到 localhost、內網與雲端 metadata 位址；若不需要存取私有服務，建議關閉。</p>
           </fieldset>
           <div class="management-form-actions">
             <button id="saveServiceSettings" class="primary" type="submit">儲存服務設定</button>
@@ -468,12 +481,17 @@
               <div><h2>MCP Server 清單</h2><p class="hint">主系統會連線到這些 MCP Server，並把其工具提供給 Agent 使用。</p></div>
               <button id="addMCPSetting" class="icon-button" type="button" title="新增 MCP Server" aria-label="新增 MCP Server">＋</button>
             </div>
+            <button id="mcpImportDropzone" class="mcp-import-dropzone" type="button" aria-controls="mcpImportFile">
+              <span class="mcp-import-icon" aria-hidden="true">⇩</span>
+              <span><strong>拖入 .mcp 設定檔</strong><small>或按一下選取 JSON 設定</small></span>
+            </button>
+            <input id="mcpImportFile" class="hidden" type="file" accept=".mcp,.json,application/json">
             <div id="mcpSettingsList" class="provider-settings-list"></div>
           </section>
 
           <form id="mcpSettingsForm" class="management-section provider-settings-editor hidden">
             <div class="section-head">
-              <div><h2 id="mcpSettingsEditorTitle">MCP Server 設定</h2><p class="hint">支援本機 stdio 與遠端 Streamable HTTP；儲存後會在背景建立連線。</p></div>
+              <div><h2 id="mcpSettingsEditorTitle">MCP Server 設定</h2><p class="hint">支援本機 stdio、舊版 SSE 與遠端 Streamable HTTP；儲存後會在背景建立連線。</p></div>
               <div class="provider-editor-head-actions">
                 <label class="switch-label">
                   <input id="mcpSettingEnabled" type="checkbox" role="switch" aria-label="啟用 MCP Server">
@@ -487,6 +505,7 @@
               <label>MCP ID<input id="mcpSettingID" maxlength="80" pattern="[A-Za-z0-9_-]+" autocomplete="off" required></label>
               <label>傳輸方式<select id="mcpSettingTransport">
                 <option value="stdio">Stdio</option>
+                <option value="sse">SSE（舊版）</option>
                 <option value="streamable-http">Streamable HTTP</option>
               </select></label>
               <label class="provider-field-full">顯示名稱<input id="mcpSettingDisplayName" maxlength="80" autocomplete="off"></label>
@@ -506,7 +525,15 @@
                     <input id="mcpSettingAPIKey" type="password" autocomplete="new-password" placeholder="輸入 MCP Server 金鑰">
                     <small id="mcpAPIKeyState">金鑰不會從後端讀回；留空會保留目前設定。</small>
                   </label>
-                  <label id="mcpSettingClearKeyRow" class="check-label hidden"><input id="mcpSettingClearKey" type="checkbox">清除目前已儲存的 MCP 金鑰</label>
+                  <button id="mcpSettingClearKey" class="mcp-clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 MCP 金鑰</button>
+                  <label>帳號
+                    <input id="mcpSettingUsername" autocomplete="username" placeholder="輸入 MCP Server 帳號">
+                    <small id="mcpBasicAuthState">帳號密碼不會從後端讀回；留空會保留目前設定。</small>
+                  </label>
+                  <label>密碼
+                    <input id="mcpSettingPassword" type="password" autocomplete="current-password" placeholder="輸入 MCP Server 密碼">
+                  </label>
+                  <button id="mcpSettingClearBasicAuth" class="mcp-clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的帳號密碼</button>
                 </div>
                 <label class="provider-field-full">HTTP Headers（JSON 物件）
                   <textarea id="mcpSettingHeaders" rows="3" spellcheck="false" placeholder='{"Authorization":"Bearer ..."}'></textarea>
@@ -517,10 +544,18 @@
               <label>工具呼叫逾時（秒）<input id="mcpSettingCallTimeout" type="number" min="1" max="86400" required></label>
             </div>
             <label class="check-label"><input id="mcpSettingTrustAnnotations" type="checkbox">信任 Server 宣告的唯讀工具屬性</label>
+            <p class="hint">開啟後，這個 Server 宣告為唯讀的工具不需要逐次人工核准，也可以並行執行；有副作用的工具仍然要核准。唯讀宣告來自 Server 本身，請只對信任的 Server 開啟。</p>
             <section class="mcp-runtime-status">
-              <div class="section-head"><strong>連線狀態</strong><span id="mcpConnectionState" class="tool-status">未連線</span></div>
+              <div class="section-head">
+                <strong>連線狀態</strong>
+                <div class="mcp-runtime-status-actions">
+                  <button id="mcpToolListToggle" class="small ghost mcp-tool-list-toggle" type="button" aria-expanded="false" aria-controls="mcpToolList" title="展開功能表" aria-label="展開功能表"><span>功能表</span><span id="mcpToolListCount" class="mcp-tool-list-count" aria-hidden="true">0</span></button>
+                  <span id="mcpConnectionState" class="tool-status">未連線</span>
+                </div>
+              </div>
+              <small id="mcpAuthModeState" class="hint"></small>
               <small id="mcpConnectionError" class="hint"></small>
-              <div id="mcpToolList" class="mcp-tool-list"></div>
+              <div id="mcpToolList" class="mcp-tool-list hidden"></div>
             </section>
             <div class="provider-editor-actions">
               <button id="deleteMCPSetting" class="danger ghost" type="button">刪除 MCP Server</button>
@@ -535,6 +570,28 @@
           <section id="noMCPSettings" class="management-section quiet provider-settings-empty">請選擇 MCP Server，或建立新的設定。</section>
         </div>
       </div>
+
+      <dialog id="mcpImportDialog" class="mcp-import-dialog">
+        <form id="mcpImportForm">
+          <div class="dialog-title-row">
+            <div>
+              <h2>匯入 MCP 設定</h2>
+              <small id="mcpImportFileName" class="quiet"></small>
+            </div>
+            <button id="closeMCPImport" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+          </div>
+          <div class="mcp-import-intro">
+            <p id="mcpImportHint" class="hint">請確認連線資訊；檔案中的金鑰與其他敏感值不會直接匯入。</p>
+            <div id="mcpImportAuthMethodBar" class="mcp-import-auth-method-bar"></div>
+          </div>
+          <div id="mcpImportServerList" class="mcp-import-server-list"></div>
+          <label class="check-label mcp-import-overwrite"><input id="mcpImportOverwrite" type="checkbox">覆蓋相同 MCP ID 的既有設定</label>
+          <div class="dialog-actions">
+            <button id="cancelMCPImport" class="ghost" type="button">取消</button>
+            <button id="installMCPImport" class="primary" type="submit">確認並安裝</button>
+          </div>
+        </form>
+      </dialog>
 
       <div id="reverseProxyPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="reverseProxyManagementTab">
         <form id="reverseProxySettingsForm" class="management-section reverse-proxy-card">
@@ -592,6 +649,28 @@
             <button id="stopReverseProxy" class="danger ghost hidden" type="button">停止反向代理</button>
             <button id="saveReverseProxy" class="ghost" type="submit">儲存設定</button>
             <button id="startReverseProxy" class="primary" type="button">啟動反向代理</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="toolSettingsPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="toolSettingsManagementTab">
+        <form id="toolSettings" class="management-section">
+          <div class="section-head"><h2>工具設定</h2><span id="toolSettingsState" class="save-state"></span></div>
+          <fieldset class="settings-fieldset">
+            <legend>工具與協定</legend>
+            <label class="check-label"><input id="settingExtendedTools" type="checkbox">擴充工具集</label>
+            <label class="check-label"><input id="settingInstructionToolCalls" type="checkbox">改用指令模式工具呼叫</label>
+            <label class="check-label"><input id="settingToolRetrieval" type="checkbox" checked>工具目錄先經檢索再進入提示</label>
+            <p class="hint">工具目錄每一輪都會整份送進提示。預設只公開精簡工具集（Shell、讀檔、列目錄、搜尋與計畫控制）；需要文件處理、寫入、SSH 或記憶工具時再開啟擴充工具集。檢索會再過濾一次：可選工具超過 12 個時，只有與這次需求相關的工具進入提示，內建工具與 MCP 工具都適用，其餘工具 Agent 仍可用 find_tools 找回來直接呼叫，沒有任何工具被停用；關閉檢索會讓整份目錄進入每一次請求，大型 MCP Server 可能讓單次請求膨脹到數萬 tokens。工具呼叫預設使用 Provider 的原生 tool_calls 欄位；Provider 不支援時才改用指令模式，由模型自行輸出 JSON 指令。</p>
+          </fieldset>
+          <fieldset class="settings-fieldset">
+            <legend>對外網路</legend>
+            <label class="check-label"><input id="settingHTTPFetchEnabled" type="checkbox">允許 Agent 讀取外部網路（http_fetch）</label>
+            <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox" checked>允許連線到 localhost 與私有網段</label>
+            <p class="hint">關閉第一項後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。第二項預設允許連線到 localhost、內網與雲端 metadata 位址；若不需要存取私有服務，建議關閉。</p>
+          </fieldset>
+          <div class="management-form-actions">
+            <button id="saveToolSettings" class="primary" type="submit">儲存工具設定</button>
           </div>
         </form>
       </div>
@@ -693,6 +772,18 @@
       <span id="copyContextResourceLabel">複製</span>
     </button>
   </div>
+
+  <dialog id="restoreRunsDialog" class="restore-runs-dialog">
+    <form id="restoreRunsForm">
+      <h2>恢復背景對話</h2>
+      <p class="hint">上次關閉時有尚未結束的對話。請勾選要重新連線的項目，確認後才會恢復；取消只停止恢復該 Session 的對話。</p>
+      <div id="restoreRunsList" class="restore-runs-list" aria-live="polite"></div>
+      <div class="dialog-actions">
+        <button type="button" id="cancelRestoreRuns" class="ghost">取消</button>
+        <button id="confirmRestoreRuns" value="confirm" class="primary">恢復選取項目</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="sessionDialog">
     <form method="dialog" id="sessionForm">
@@ -880,7 +971,14 @@
         <h2>工作計畫</h2>
         <small id="planDialogMeta" class="quiet">依序執行並驗證每一個步驟</small>
       </div>
-      <button id="closePlan" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+      <div class="plan-dialog-title-actions">
+        <label class="switch-label plan-lock-control" title="開啟後，同一 Session 只會依序執行一份未完成計畫">
+          <span>鎖定計畫</span>
+          <input id="lockPlansSwitch" type="checkbox" role="switch" aria-label="鎖定計畫">
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+        <button id="closePlan" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+      </div>
     </div>
     <section id="planView">
       <div class="plan-tabs" role="tablist" aria-label="計畫狀態">
@@ -1042,7 +1140,6 @@
     </div>
   </dialog>
 
-  <div id="toast" class="toast hidden" role="status"></div>
   <script src="/vendor/marked/marked.umd.js" defer></script>
   <script src="/vendor/dompurify/purify.min.js" defer></script>
   <script src="/vendor/katex/katex.min.js" defer></script>

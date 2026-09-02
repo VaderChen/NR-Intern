@@ -18,6 +18,8 @@ type AgentEngine interface {
 	SetPermanentToolApproval(context.Context, string, bool) (domain.Session, error)
 	DeleteSession(context.Context, string) error
 	ListMessages(context.Context, string) ([]domain.Message, error)
+	// RetractMessages 讓「重新提問」把某一則使用者訊息之後的內容移出對話。
+	RetractMessages(context.Context, string, string) ([]domain.Message, error)
 	ListEntries(context.Context, string) ([]domain.SessionEntry, error)
 	Run(context.Context, domain.RunInput, AgentEventSink) (domain.RunResult, error)
 }

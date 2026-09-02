@@ -10,6 +10,18 @@ type ServiceSettings struct {
 	MaxTokens            int               `json:"max_tokens"`
 	MaxToolCalls         int               `json:"max_tool_calls"`
 	HTTPFetch            HTTPFetchSettings `json:"http_fetch"`
+	// ExtendedTools 關閉時只公開精簡工具集。工具目錄會整份進入每一輪的提示，
+	// 小型或本機模型在十幾個工具之間挑選既慢又容易挑錯；預設精簡，需要完整能力
+	// （文件處理、SSH、寫入型工具等）時再由管理介面打開。
+	ExtendedTools bool `json:"extended_tools"`
+	// ToolCallMode 是工具呼叫協定：native 使用 OpenAI-compatible tool_calls 欄位，
+	// instruction 由 Harness 要求模型輸出結構化 JSON 指令。Provider 不支援原生工具
+	// 呼叫時才需要切到 instruction。
+	ToolCallMode string `json:"tool_call_mode"`
+	// ToolRetrieval 開啟時，工具目錄只有與本次需求相關的工具會進入提示，內建
+	// 工具與 MCP 工具都適用；其餘工具仍可由模型以 find_tools 取回後呼叫，沒有
+	// 任何工具被停用。關閉後整份目錄會進入每一次請求。
+	ToolRetrieval bool `json:"tool_retrieval"`
 }
 
 // HTTPFetchSettings 是 http_fetch 工具的即時開關。
@@ -31,6 +43,9 @@ type UpdateServiceSettingsInput struct {
 	MaxTokens            *int    `json:"max_tokens,omitempty"`
 	MaxToolCalls         *int    `json:"max_tool_calls,omitempty"`
 	// HTTPFetchEnabled 與 HTTPFetchAllowPrivateNetworks 省略時保留目前設定。
-	HTTPFetchEnabled              *bool `json:"http_fetch_enabled,omitempty"`
-	HTTPFetchAllowPrivateNetworks *bool `json:"http_fetch_allow_private_networks,omitempty"`
+	HTTPFetchEnabled              *bool   `json:"http_fetch_enabled,omitempty"`
+	HTTPFetchAllowPrivateNetworks *bool   `json:"http_fetch_allow_private_networks,omitempty"`
+	ExtendedTools                 *bool   `json:"extended_tools,omitempty"`
+	ToolCallMode                  *string `json:"tool_call_mode,omitempty"`
+	ToolRetrieval                 *bool   `json:"tool_retrieval,omitempty"`
 }

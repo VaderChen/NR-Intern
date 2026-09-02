@@ -9,12 +9,14 @@ import (
 )
 
 func TestRunStopsRepeatingWhenActivePlanMakesNoProgress(t *testing.T) {
-	sessions := newMemorySessions(testSession())
+	session := testSession()
+	session.LockPlans = true
+	sessions := newMemorySessions(session)
 	plans, err := filestore.NewPlanRepository(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewPlanRepository: %v", err)
 	}
-	value, err := domain.NewPlan(testSession().ID, domain.CreatePlanInput{
+	value, err := domain.NewPlan(session.ID, domain.CreatePlanInput{
 		Title: "尚未完成的計畫", Steps: []domain.CreatePlanStepInput{{Title: "執行修改", Verification: "測試通過"}},
 	}, time.Now())
 	if err != nil {
@@ -30,7 +32,7 @@ func TestRunStopsRepeatingWhenActivePlanMakesNoProgress(t *testing.T) {
 	}}
 	runner := newTestRunner(sessions, model, &fakeTools{})
 	runner.Plans = plans
-	result, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "執行長任務"}, nil)
+	result, err := runner.Run(context.Background(), Input{Session: session, UserInput: "執行長任務"}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -43,7 +45,7 @@ func TestRunStopsRepeatingWhenActivePlanMakesNoProgress(t *testing.T) {
 	if len(model.requests) != 2 {
 		t.Fatalf("model requests = %d, want one completion reminder and one visible stop", len(model.requests))
 	}
-	messages, err := sessions.ListMessages(context.Background(), testSession().ID)
+	messages, err := sessions.ListMessages(context.Background(), session.ID)
 	if err != nil {
 		t.Fatalf("ListMessages: %v", err)
 	}

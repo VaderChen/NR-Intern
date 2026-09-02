@@ -19,3 +19,9 @@ func Pick(ctx context.Context) ([]string, error) {
 func Dropped(ctx context.Context) ([]string, error) {
 	return dropped(ctx)
 }
+
+// DroppedFiles 讀取目前由作業系統拖入 Desktop 視窗的檔案路徑。
+// 路徑只供 Desktop 層立即讀取，不直接回傳給前端。
+func DroppedFiles(ctx context.Context) ([]string, error) {
+	return droppedFiles(ctx)
+}

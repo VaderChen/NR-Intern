@@ -15,6 +15,7 @@ type runBudgetTracker struct {
 	turns     int
 	tokens    int
 	toolCalls int
+	reported  domain.Usage
 }
 
 func newRunBudgetTracker(budget domain.RunBudget, startedAt time.Time) *runBudgetTracker {
@@ -49,11 +50,23 @@ func (t *runBudgetTracker) turnsExceeded() *domain.RunBudgetExceeded {
 }
 
 func (t *runBudgetTracker) addUsage(usage domain.Usage) *domain.RunBudgetExceeded {
+	t.addReportedUsage(usage)
 	t.tokens += usageTokens(usage)
 	if t.budget.MaxTokens > 0 && t.tokens >= t.budget.MaxTokens {
 		return t.exceeded(domain.RunBudgetResourceTokens, int64(t.budget.MaxTokens), int64(t.tokens))
 	}
 	return nil
+}
+
+// addReportedUsage 保存 Provider 已回報的用量，但不觸發預算判斷；串流在
+// Provider 回傳錯誤時仍可能先送出 usage，統計不能因此遺失，而既有 budget
+// 行為也不能因錯誤回應而改變。
+func (t *runBudgetTracker) addReportedUsage(usage domain.Usage) {
+	t.reported.Add(usage)
+}
+
+func (t *runBudgetTracker) usageSnapshot() domain.Usage {
+	return t.reported
 }
 
 // planToolCalls 只允許在剩餘額度內的前綴。模型同一輪要求的其餘呼叫會得到合成的
@@ -112,8 +125,5 @@ func (t *runBudgetTracker) usage() domain.RunBudgetUsage {
 }
 
 func usageTokens(usage domain.Usage) int {
-	if usage.TotalTokens > 0 {
-		return usage.TotalTokens
-	}
-	return usage.InputTokens + usage.OutputTokens
+	return usage.Total()
 }

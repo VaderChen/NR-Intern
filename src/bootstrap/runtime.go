@@ -85,6 +85,7 @@ type RunCounts struct {
 var serviceCapabilities = []string{
 	"attachments.v1",
 	"durable-outbox.v1",
+	"run-cancel-immediate.v1",
 	"notifications.v1",
 	"run-control.v1",
 	"run-events.v1",
@@ -98,27 +99,34 @@ var serviceCapabilities = []string{
 }
 
 type RedactedConfig struct {
-	ServiceName          string                      `json:"service_name"`
-	UILanguage           string                      `json:"ui_language"`
-	NotificationsEnabled bool                        `json:"notifications_enabled"`
-	ListenAddress        string                      `json:"listen_address"`
-	DataDir              string                      `json:"data_dir"`
-	APITokenConfigured   bool                        `json:"api_token_configured"`
-	AllowedOrigins       []string                    `json:"allowed_origins,omitempty"`
-	AllowedTools         []string                    `json:"allowed_tools,omitempty"`
-	AllowElevatedTools   bool                        `json:"allow_elevated_tools"`
-	Permissions          domain.PermissionPolicy     `json:"permissions"`
-	MaxTurns             int                         `json:"max_turns"`
-	MaxWallClockSeconds  int                         `json:"max_wall_clock_seconds"`
-	MaxTokens            int                         `json:"max_tokens"`
-	MaxToolCalls         int                         `json:"max_tool_calls"`
-	HTTPFetch            domain.HTTPFetchSettings    `json:"http_fetch"`
-	Context              harness.ContextConfig       `json:"context"`
-	Memory               memory.Config               `json:"memory"`
-	DefaultProviderID    string                      `json:"default_provider_id"`
-	Providers            []domain.ProviderDescriptor `json:"providers"`
-	SSHProfiles          []string                    `json:"ssh_profiles,omitempty"`
-	MCPServers           []string                    `json:"mcp_servers,omitempty"`
+	ServiceName          string                   `json:"service_name"`
+	UILanguage           string                   `json:"ui_language"`
+	NotificationsEnabled bool                     `json:"notifications_enabled"`
+	ListenAddress        string                   `json:"listen_address"`
+	DataDir              string                   `json:"data_dir"`
+	APITokenConfigured   bool                     `json:"api_token_configured"`
+	AllowedOrigins       []string                 `json:"allowed_origins,omitempty"`
+	AllowedTools         []string                 `json:"allowed_tools,omitempty"`
+	AllowElevatedTools   bool                     `json:"allow_elevated_tools"`
+	Permissions          domain.PermissionPolicy  `json:"permissions"`
+	MaxTurns             int                      `json:"max_turns"`
+	MaxWallClockSeconds  int                      `json:"max_wall_clock_seconds"`
+	MaxTokens            int                      `json:"max_tokens"`
+	MaxToolCalls         int                      `json:"max_tool_calls"`
+	HTTPFetch            domain.HTTPFetchSettings `json:"http_fetch"`
+	// ExtendedTools、ToolCallMode 與 ToolRetrieval 是管理介面開機時唯一的
+	// 設定來源；漏掉任何一個，畫面就會顯示預設值而不是實際生效的設定，
+	// 使用者下一次存檔還會把後端一併改回預設。
+	ExtendedTools     bool                                    `json:"extended_tools"`
+	ToolCallMode      string                                  `json:"tool_call_mode"`
+	ToolRetrieval     bool                                    `json:"tool_retrieval"`
+	Context           harness.ContextConfig                   `json:"context"`
+	Memory            memory.Config                           `json:"memory"`
+	DefaultProviderID string                                  `json:"default_provider_id"`
+	Providers         []domain.ProviderDescriptor             `json:"providers"`
+	ModelPrices       map[string]map[string]domain.ModelPrice `json:"model_prices,omitempty"`
+	SSHProfiles       []string                                `json:"ssh_profiles,omitempty"`
+	MCPServers        []string                                `json:"mcp_servers,omitempty"`
 }
 
 type ManagementDiagnostics struct {
@@ -276,7 +284,7 @@ func Build(config Config) (*Runtime, error) {
 		)
 	}
 	nativeTools, err := tools.NewRegistry(tools.RegistryConfig{
-		AllowedNames:  config.AllowedTools,
+		AllowedNames:  EffectiveAllowedTools(config),
 		AllowElevated: config.AllowElevatedTools,
 		Permissions:   config.Permissions,
 		Logger:        logger,
@@ -303,11 +311,12 @@ func Build(config Config) (*Runtime, error) {
 	approvalToolNames = append(approvalToolNames, "mcp__*")
 	approvalCoordinator := approval.NewCoordinator(approvalToolNames)
 	runner := &harness.Runner{
-		Model:        model,
-		Tools:        toolRuntime,
-		Sessions:     sessions,
-		Plans:        plans,
-		ToolCallMode: harness.NormalizeToolCallMode(config.ToolCallMode),
+		Model:                 model,
+		Tools:                 toolRuntime,
+		Sessions:              sessions,
+		Plans:                 plans,
+		ToolCallMode:          harness.NormalizeToolCallMode(config.ToolCallMode),
+		ToolRetrievalDisabled: !config.ToolRetrieval,
 		Context: &harness.ContextManager{
 			Model:        model,
 			Sessions:     sessions,
@@ -364,6 +373,7 @@ func Build(config Config) (*Runtime, error) {
 		Schedules:            schedules,
 		Notifications:        notifications,
 		NotificationsEnabled: config.NotificationsEnabled,
+		ModelPrices:          config.ModelPrices,
 		Permissions:          config.Permissions,
 		Logger:               logger,
 	})
@@ -492,6 +502,18 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if input.HTTPFetchAllowPrivateNetworks != nil {
 		updatedConfig.HTTPFetch.AllowPrivateNetworks = *input.HTTPFetchAllowPrivateNetworks
 	}
+	if input.ExtendedTools != nil {
+		updatedConfig.ExtendedTools = *input.ExtendedTools
+	}
+	if input.ToolRetrieval != nil {
+		updatedConfig.ToolRetrieval = *input.ToolRetrieval
+	}
+	if input.ToolCallMode != nil {
+		if !harness.ValidToolCallMode(*input.ToolCallMode) {
+			return domain.ServiceSettings{}, fmt.Errorf("%w: tool_call_mode must be native or instruction", domain.ErrInvalidInput)
+		}
+		updatedConfig.ToolCallMode = string(harness.NormalizeToolCallMode(*input.ToolCallMode))
+	}
 	if err := validateAdjustableRunLimits(updatedConfig.MaxWallClockSeconds, updatedConfig.MaxTokens, updatedConfig.MaxToolCalls); err != nil {
 		return domain.ServiceSettings{}, fmt.Errorf("%w: %v", domain.ErrInvalidInput, err)
 	}
@@ -510,6 +532,14 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if r.HTTPFetch != nil {
 		r.HTTPFetch.ApplySettings(settings.HTTPFetch)
 	}
+	// 工具集與工具呼叫模式都不必重啟後端：下一個 Run 就採用新設定。
+	if r.NativeTools != nil {
+		r.NativeTools.SetAllowedNames(EffectiveAllowedTools(updatedConfig))
+	}
+	if r.Agent != nil {
+		r.Agent.SetToolCallMode(harness.NormalizeToolCallMode(updatedConfig.ToolCallMode))
+		r.Agent.SetToolRetrieval(updatedConfig.ToolRetrieval)
+	}
 	return settings, nil
 }
 
@@ -526,6 +556,9 @@ func serviceSettingsFromConfig(config Config) domain.ServiceSettings {
 		MaxTokens:            config.MaxTokens,
 		MaxToolCalls:         config.MaxToolCalls,
 		HTTPFetch:            httpFetchSettingsFromConfig(config),
+		ExtendedTools:        config.ExtendedTools,
+		ToolCallMode:         string(harness.NormalizeToolCallMode(config.ToolCallMode)),
+		ToolRetrieval:        config.ToolRetrieval,
 	}
 }
 
@@ -608,14 +641,20 @@ func providerRouterValue(id, displayName, protocol string, adapter *openaicompat
 	diagnostics := adapter.Diagnostics()
 	return modelrouter.Provider{
 		Descriptor: domain.ProviderDescriptor{
-			ID:                      id,
-			DisplayName:             effectiveProviderDisplayName(displayName, id),
-			Protocol:                protocol,
-			Endpoint:                diagnostics.Endpoint,
-			DefaultModel:            diagnostics.DefaultModel,
-			Streaming:               diagnostics.Streaming,
-			HasAPIKey:               diagnostics.HasAPIKey,
-			SupportsNativeToolCalls: strings.EqualFold(strings.TrimSpace(protocol), "openai-codex-responses"),
+			ID:           id,
+			DisplayName:  effectiveProviderDisplayName(displayName, id),
+			Protocol:     protocol,
+			Endpoint:     diagnostics.Endpoint,
+			DefaultModel: diagnostics.DefaultModel,
+			Streaming:    diagnostics.Streaming,
+			HasAPIKey:    diagnostics.HasAPIKey,
+			// OpenAI-compatible Chat Completions and Codex Responses both expose
+			// the native tools/tool_calls contract.  Previously only the Codex
+			// adapter advertised this capability, which forced ordinary
+			// OpenAI-compatible MCP requests through the weaker text-instruction
+			// fallback; many models would then describe the intended MCP call
+			// instead of emitting one.
+			SupportsNativeToolCalls: strings.EqualFold(strings.TrimSpace(protocol), "openai-compatible") || strings.EqualFold(strings.TrimSpace(protocol), "openai-codex-responses"),
 			ContextWindow:           diagnostics.ContextWindow,
 			MaxOutputTokens:         diagnostics.MaxOutputTokens,
 		},
@@ -1312,10 +1351,14 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 			MaxTokens:            config.MaxTokens,
 			MaxToolCalls:         config.MaxToolCalls,
 			HTTPFetch:            httpFetchSettingsFromConfig(config),
+			ExtendedTools:        config.ExtendedTools,
+			ToolCallMode:         string(harness.NormalizeToolCallMode(config.ToolCallMode)),
+			ToolRetrieval:        config.ToolRetrieval,
 			Context:              config.Context,
 			Memory:               config.Memory,
 			DefaultProviderID:    r.Model.DefaultProviderID(),
 			Providers:            r.Model.ListProviders(),
+			ModelPrices:          config.ModelPrices,
 			SSHProfiles:          profileNames,
 			MCPServers:           mcpServerNames,
 		},
@@ -1381,6 +1424,16 @@ func systemPrompt() string {
 ## 回覆語言
 
 自動判斷並優先使用使用者的慣用語言回答。綜合目前訊息、近期對話與使用者明確表達的語言偏好判斷；不要因為介面語言、程式碼、路徑、引用文字或偶爾夾用其他語言就改變主要回答語言。若使用者在目前要求中明確指定語言，以最新指示為準。
+
+思考與回答使用同一種語言：reasoning／thinking 也要用上面判斷出來的語言，不要用第三種語言思考。
+
+## 可見推論摘要
+
+若輸出 reasoning／thinking，僅提供給使用者可讀的精簡進度摘要，不要輸出內部思考草稿。每次只保留必要事實、關鍵判斷與下一步，最多 1–2 句；不重述需求、不寒暄、不填充語句、不描述顯而易見的操作，也不要重複已說過的結論。沒有新進度或重要判斷時，不要新增摘要。實際思考深度依使用者選擇的 thinking 設定，這些規則只控制可見文字的表達方式。
+
+## 回答格式
+
+回答包含多筆項目、逐項清單，或每筆有多個可比較欄位時，優先用 Markdown 表格呈現；欄位以使用者關心的識別碼、狀態與數量為主，不要為了湊欄位塞入無關資訊。資料筆數多時先呈現與問題直接相關的部分，並說明是否還有未列出的項目。只有一兩筆、或每筆只有單一值時用一句話說明即可，不必硬做表格。
 
 不要把所有問題都先拆成固定計畫：簡單任務直接執行。遇到多個相依動作、預期需要多輪工具、跨多個檔案，或 Session 已有計畫的長任務時，使用 Harness 提供的結構化計畫並依序執行、驗證。需要資訊時直接使用合適工具；工具結果不足或失敗時，依新狀態調整。
 

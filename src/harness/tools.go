@@ -4,6 +4,7 @@ import (
 	"AgenticService/src/domain"
 	"AgenticService/src/ports"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -86,6 +87,22 @@ func parallelizableToolNames(definitions []domain.ToolDefinition, approvals port
 	return result
 }
 
+// approvalExemptToolNames 回傳本輪不需要人工核准的工具。
+//
+// 唯讀工具沒有副作用，每次呼叫都要人按一次核准只是把使用者訓練成無條件點「同意」，
+// 反而讓真正有副作用的操作更容易被順手放行。MCP 工具的唯讀屬性來自 Server 自己宣告的
+// readOnlyHint，只有在管理者對該 Server 開啟 trust_annotations 後才會被採信；沒有開啟時
+// 這些工具不算唯讀，仍然逐次核准。
+func approvalExemptToolNames(definitions []domain.ToolDefinition) map[string]bool {
+	result := make(map[string]bool, len(definitions))
+	for _, definition := range definitions {
+		if definition.ReadOnly {
+			result[strings.TrimSpace(definition.Name)] = true
+		}
+	}
+	return result
+}
+
 func availableToolNames(definitions []domain.ToolDefinition) map[string]bool {
 	result := make(map[string]bool, len(definitions))
 	for _, definition := range definitions {
@@ -105,23 +122,41 @@ func availableToolNamesSorted(definitions []domain.ToolDefinition) []string {
 	return result
 }
 
-// stagedToolDefinitions 實作每個 Run 的兩階段工具供應策略：只要 Session
-// 有 shell_exec，第一階段就公開 Shell、等待工具與 SSH 唯讀檢查，讓 LLM 優先
-// 使用目前 OS 的系統程式，同時能等待非同步作業並確認遠端狀態。Shell 真正
-// 執行失敗後才把完整原生工具目錄公開。若部署根本沒有 Shell，則直接回到完整
-// 目錄，避免把 Agent 變成完全沒有外部能力的文字模型。
+// stagedToolDefinitions 決定「系統工具優先階段」本輪公開哪些工具。
+//
+// 兩階段策略的原意是讓 LLM 優先使用目前 OS 的系統程式，Shell 真正執行失敗後才
+// 公開完整原生工具目錄；部署根本沒有 Shell 時直接回到完整目錄，避免把 Agent 變成
+// 沒有外部能力的文字模型。
+//
+// 唯讀工具一律直接公開：先前它們要等 shell_exec 實際失敗過一次才解鎖，等於每個
+// 「讀檔案／盤點目錄」的需求都固定多花一輪跑一個註定失敗的命令，卻沒有任何產出。
+// 唯讀工具沒有副作用，提前公開不會放寬任何權限邊界（elevated 與 Approval 仍照舊）。
+// 寫入型內建工具維持原本的 Shell 優先策略，失敗後才由備援階段公開。
 func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback bool) []domain.ToolDefinition {
 	if builtinFallback || !definitionNamed(definitions, systemShellToolName) {
 		return definitions
 	}
-	result := make([]domain.ToolDefinition, 0, 4)
+	result := make([]domain.ToolDefinition, 0, len(definitions))
 	for _, definition := range definitions {
 		name := strings.ToLower(strings.TrimSpace(definition.Name))
-		if name == systemShellToolName || name == waitToolName || name == sshWaitToolName || strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__") {
+		staged := (definition.ReadOnly && !deferredFirstStageCategory(definition.Category)) ||
+			name == systemShellToolName || name == waitToolName || name == sshWaitToolName ||
+			strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__")
+		if staged {
 			result = append(result, definition)
 		}
 	}
 	return result
+}
+
+// deferredFirstStageCategory 把體積大又少用的工具家族留到備援階段。
+//
+// 第一階段的工具目錄會整份進入每一次請求的提示，instruction 模式更是直接以文字列出
+// schema。辦公文件家族有十個工具、schema 也最長，但只有處理 PDF／DOCX／XLSX／PPTX 時
+// 才用得到；把它們留在備援階段，能讓「讀檔案、查目錄、呼叫 MCP」這些常見需求維持
+// 一輪完成，又不必為每次對話都付整份文件工具的提示成本。
+func deferredFirstStageCategory(category string) bool {
+	return strings.EqualFold(strings.TrimSpace(category), "documents")
 }
 
 func containsNonPlanningTool(calls []domain.ToolCall) bool {
@@ -179,10 +214,10 @@ func groupToolCalls(calls []domain.ToolCall, parallelizable map[string]bool) [][
 
 // runToolGroup 執行一個群組並依原順序回傳結果。
 // 單一元素的群組不開 goroutine，讓依序執行的路徑與過去完全一致。
-func (r *Runner) runToolGroup(ctx context.Context, session domain.Session, group []domain.ToolCall, sink *serializedSink, runID string, available map[string]bool, approvals *runApprovalState, loopGuard *toolLoopGuard) []toolOutcome {
+func (r *Runner) runToolGroup(ctx context.Context, session domain.Session, group []domain.ToolCall, sink *serializedSink, runID string, available, approvalExempt map[string]bool, approvals *runApprovalState, loopGuard *toolLoopGuard, retriever *toolRetriever) []toolOutcome {
 	outcomes := make([]toolOutcome, len(group))
 	if len(group) == 1 {
-		outcomes[0] = r.executeToolCall(ctx, session, group[0], sink, runID, available[group[0].Name], approvals, loopGuard)
+		outcomes[0] = r.executeToolCall(ctx, session, group[0], sink, runID, available[group[0].Name], approvalExempt[group[0].Name], approvals, loopGuard, retriever)
 		return outcomes
 	}
 	var waiter sync.WaitGroup
@@ -190,7 +225,7 @@ func (r *Runner) runToolGroup(ctx context.Context, session domain.Session, group
 		waiter.Add(1)
 		go func(index int, call domain.ToolCall) {
 			defer waiter.Done()
-			outcomes[index] = r.executeToolCall(ctx, session, call, sink, runID, available[call.Name], approvals, loopGuard)
+			outcomes[index] = r.executeToolCall(ctx, session, call, sink, runID, available[call.Name], approvalExempt[call.Name], approvals, loopGuard, retriever)
 		}(index, call)
 	}
 	waiter.Wait()
@@ -201,8 +236,14 @@ func (r *Runner) runToolGroup(ctx context.Context, session domain.Session, group
 // 工具失敗是要交回模型的觀察，不是 run 的失敗。
 //
 // 並行群組會同時呼叫這個方法，因此 BeforeTool 與 AfterTool hook 必須是併發安全的。
-func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, call domain.ToolCall, sink *serializedSink, runID string, available bool, approvals *runApprovalState, loopGuard *toolLoopGuard) toolOutcome {
+func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, call domain.ToolCall, sink *serializedSink, runID string, available, approvalExempt bool, approvals *runApprovalState, loopGuard *toolLoopGuard, retriever *toolRetriever) toolOutcome {
 	startedAt := time.Now().UTC()
+	// find_tools 是 Harness 自己的工具目錄檢索，不下放到任何 Runtime，
+	// 也不需要核准：它只讀取本 run 已經取得的工具定義。
+	if retriever.enabled() && strings.EqualFold(strings.TrimSpace(call.Name), findToolsToolName) {
+		result := retriever.execute(call)
+		return toolOutcome{call: call, result: result, startedAt: startedAt, duration: time.Since(startedAt)}
+	}
 	if !available {
 		return toolOutcome{
 			call: call,
@@ -220,6 +261,11 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			duration:  time.Since(startedAt),
 		}
 	}
+	// 呼叫過的工具留在目錄裡：同一個工具往往要連續用好幾輪（換參數、翻頁、
+	// 用第一次的結果再查一次），每輪都要重新檢索一次是白費回合。
+	if retriever.enabled() && !retrievalExempt(call.Name) {
+		retriever.reveal(call.Name)
+	}
 	if guarded, skip := loopGuard.before(call); skip {
 		return toolOutcome{call: call, result: guarded, startedAt: startedAt, duration: time.Since(startedAt)}
 	}
@@ -233,7 +279,15 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			refused = true
 		}
 	}
-	if !refused && r.Approvals != nil && !approvals.approved() && r.Approvals.Required(call.Name) {
+	if !refused && approvalExempt && r.Approvals != nil && r.Approvals.Required(call.Name) {
+		// 留下紀錄：使用者要能看出這次呼叫為什麼沒有跳核准。
+		_ = sink.emitEvent("run.approval_skipped", map[string]any{
+			"tool_call_id": call.ID,
+			"tool_name":    call.Name,
+			"reason":       "read_only_tool",
+		})
+	}
+	if !refused && !approvalExempt && r.Approvals != nil && !approvals.approved() && r.Approvals.Required(call.Name) {
 		request := domain.ToolApprovalRequest{
 			ID:          domain.NewID("approval"),
 			RunID:       strings.TrimSpace(runID),
@@ -251,7 +305,9 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			r.Approvals.Cancel(request.ID)
 			return toolOutcome{call: call, startedAt: startedAt, duration: time.Since(startedAt), err: err}
 		}
+		stopApprovalHeartbeat := startApprovalHeartbeat(ctx, sink, call, request)
 		decision, err := r.Approvals.Wait(ctx, request.ID)
+		stopApprovalHeartbeat()
 		if err != nil {
 			result.Content = err.Error()
 			result.IsError = true
@@ -298,6 +354,44 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	result.ToolName = call.Name
 	loopGuard.observe(call, result)
 	return toolOutcome{call: call, result: result, startedAt: startedAt, duration: time.Since(startedAt)}
+}
+
+// approvalHeartbeatInterval 決定等待人工核准時的狀態回報頻率。
+// 核准對話框可能因為切換對話而沒被看到，這時 Run 會安靜地卡住直到 wall-clock
+// 預算用完；定期回報讓「在等你按核准」直接出現在執行過程裡。
+var approvalHeartbeatInterval = 30 * time.Second
+
+func startApprovalHeartbeat(ctx context.Context, sink *serializedSink, call domain.ToolCall, request domain.ToolApprovalRequest) func() {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(approvalHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				elapsed := time.Since(request.RequestedAt).Round(time.Second)
+				_ = sink.emitEvent("tool.execution.update", map[string]any{
+					"tool_call_id": call.ID,
+					"tool_name":    call.Name,
+					"update": domain.ToolExecution{
+						ToolCallID: call.ID,
+						ToolName:   call.Name,
+						Content:    fmt.Sprintf("等待人工核准 %s（已 %s）", call.Name, elapsed),
+						Details: map[string]any{
+							"phase":           "waiting_approval",
+							"approval_id":     request.ID,
+							"elapsed_seconds": int(elapsed.Seconds()),
+						},
+					},
+				})
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 var hiddenApprovalArgumentNames = map[string]bool{

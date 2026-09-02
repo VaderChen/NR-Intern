@@ -177,7 +177,9 @@ fi
 typeset -a mac_apps
 mac_apps=("$DIST_OUTPUT_DIR"/*/macos-arm64/NR-Intern.app(N/om))
 if (( ${#mac_apps[@]} > 0 )); then
-	MAC_APP="${mac_apps[1]}"
+	# 舊版 App 執行中時，build.command 會保留舊目錄；必須使用排序後
+	# 最新的 Bundle，否則重啟仍會載入舊版而看不到修正。
+	MAC_APP="${mac_apps[-1]}"
 	if /usr/bin/open -n -F -i /dev/null -o "$DESKTOP_LOG" --stderr "$DESKTOP_LOG" "$MAC_APP" --args \
 		-config "$CONFIG_PATH" -working-dir "$PROJECT_ROOT" -open=false "$@" "${startup_signal_arguments[@]}"; then
 		STARTUP_SIGNAL_HANDED_OFF=1

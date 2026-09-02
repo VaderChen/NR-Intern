@@ -94,7 +94,7 @@ func TestAdminEndpointsExposePersistentCapabilities(t *testing.T) {
 			seen[name] = true
 		}
 	}
-	for _, required := range []string{"durable-outbox.v1", "run-recovery.v1", "run-retry.v1", "search.v1", "admin-backup.v1", "admin-permissions.v1", "update-check.v1"} {
+	for _, required := range []string{"durable-outbox.v1", "run-cancel-immediate.v1", "run-recovery.v1", "run-retry.v1", "search.v1", "admin-backup.v1", "admin-permissions.v1", "update-check.v1"} {
 		if !seen[required] {
 			t.Errorf("missing capability %q in %v", required, capabilities)
 		}

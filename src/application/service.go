@@ -22,8 +22,9 @@ import (
 type EventSink func(domain.Event) error
 
 type activeRun struct {
-	sessionID string
-	cancel    context.CancelFunc
+	sessionID       string
+	cancel          context.CancelFunc
+	cancelRequested bool
 }
 
 type Service struct {
@@ -40,6 +41,7 @@ type Service struct {
 	schedules            ports.ScheduleRepository
 	notifications        ports.NotificationRepository
 	notificationsEnabled atomic.Bool
+	modelPrices          map[string]map[string]domain.ModelPrice
 	// permissions 是後端唯一的 permission profile 依據。
 	// 呼叫端要求的 profile 必須先經過這裡解析，才不會讓 API request 自行決定提權。
 	permissions domain.PermissionPolicy
@@ -85,6 +87,7 @@ type Dependencies struct {
 	// Notifications 可以是 nil，讓精簡測試與嵌入式使用者不必啟用通知儲存。
 	Notifications        ports.NotificationRepository
 	NotificationsEnabled bool
+	ModelPrices          map[string]map[string]domain.ModelPrice
 	Permissions          domain.PermissionPolicy
 	Logger               *slog.Logger
 }
@@ -109,6 +112,7 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		attachments:    dependencies.Attachments,
 		schedules:      dependencies.Schedules,
 		notifications:  dependencies.Notifications,
+		modelPrices:    cloneModelPrices(dependencies.ModelPrices),
 		permissions:    dependencies.Permissions.Normalize(),
 		logger:         logging.Or(dependencies.Logger),
 		now:            time.Now,
@@ -152,6 +156,11 @@ func (s *Service) CreateSession(ctx context.Context, agentID string, input domai
 	input.WorkspaceID = strings.TrimSpace(input.WorkspaceID)
 	input.ProjectID = strings.TrimSpace(input.ProjectID)
 	input.ProviderID = strings.TrimSpace(input.ProviderID)
+	thinkingMode, err := domain.NormalizeThinkingMode(input.ThinkingMode)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	input.ThinkingMode = thinkingMode
 	input.Metadata = valueutil.CloneMap(input.Metadata)
 	delete(input.Metadata, "workspace_root")
 	delete(input.Metadata, "sandbox_roots")
@@ -192,7 +201,11 @@ func (s *Service) ListSessions(ctx context.Context, agentID string) ([]domain.Se
 	if err != nil {
 		return nil, err
 	}
-	return engine.ListSessions(ctx)
+	values, err := engine.ListSessions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.decorateSessionsUsage(ctx, values)
 }
 
 // ReorderSessions 只接受同一 Workspace、同一 Project 內完整且不重複的未釘選
@@ -257,12 +270,15 @@ func (s *Service) ReorderSessions(ctx context.Context, agentID string, input dom
 		changed = append(changed, current)
 		updated = append(updated, value)
 	}
-	return updated, nil
+	return s.decorateSessionsUsage(ctx, updated)
 }
 
 func (s *Service) GetSession(ctx context.Context, sessionID string) (domain.Session, error) {
 	_, session, err := s.resolveSession(ctx, sessionID)
-	return session, err
+	if err != nil {
+		return domain.Session{}, err
+	}
+	return s.decorateSessionUsage(ctx, session)
 }
 
 func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
@@ -323,7 +339,23 @@ func (s *Service) UpdateSession(ctx context.Context, sessionID string, input dom
 		}
 		input.PermissionProfile = &profile
 	}
-	return engine.UpdateSession(ctx, sessionID, input)
+	if input.ThinkingMode != nil {
+		thinkingMode, normalizeErr := domain.NormalizeThinkingMode(*input.ThinkingMode)
+		if normalizeErr != nil {
+			return domain.Session{}, normalizeErr
+		}
+		input.ThinkingMode = &thinkingMode
+	}
+	updated, err := engine.UpdateSession(ctx, sessionID, input)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	if input.LockPlans != nil {
+		if _, err := s.plans.Reconcile(ctx, updated.ID, updated.LockPlans); err != nil {
+			return domain.Session{}, err
+		}
+	}
+	return s.decorateSessionUsage(ctx, updated)
 }
 
 func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectInput) (domain.Project, error) {
@@ -559,6 +591,22 @@ func (s *Service) ListMessages(ctx context.Context, sessionID string) ([]domain.
 	return engine.ListMessages(ctx, sessionID)
 }
 
+// RetractMessages 支援「重新提問」：把最後一則使用者訊息與其後的回答、工具過程
+// 移出對話，讓同一個問題可以在乾淨的狀態下重跑。有 Run 在跑時不接受，否則會與
+// 正在寫入 transcript 的流程互相踩踏。
+func (s *Service) RetractMessages(ctx context.Context, sessionID, messageID string) ([]domain.Message, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	engine, _, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if s.hasActiveSession(sessionID) {
+		return nil, fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
+	}
+	return engine.RetractMessages(ctx, sessionID, messageID)
+}
+
 func (s *Service) ListEntries(ctx context.Context, sessionID string) ([]domain.SessionEntry, error) {
 	engine, _, err := s.resolveSession(ctx, sessionID)
 	if err != nil {
@@ -573,6 +621,26 @@ func (s *Service) ListRuns(ctx context.Context, sessionID string) ([]domain.Run,
 
 func (s *Service) GetRun(ctx context.Context, runID string) (domain.Run, error) {
 	return s.runs.Get(ctx, strings.TrimSpace(runID))
+}
+
+func (s *Service) decorateSessionsUsage(ctx context.Context, sessions []domain.Session) ([]domain.Session, error) {
+	for index := range sessions {
+		value, err := s.decorateSessionUsage(ctx, sessions[index])
+		if err != nil {
+			return nil, err
+		}
+		sessions[index] = value
+	}
+	return sessions, nil
+}
+
+func (s *Service) decorateSessionUsage(ctx context.Context, session domain.Session) (domain.Session, error) {
+	runs, err := s.runs.List(ctx, session.ID)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	session.Usage = summarizeSessionUsage(runs)
+	return session, nil
 }
 
 func (s *Service) ListRunEvents(ctx context.Context, runID string, afterSequence int64) ([]domain.Event, error) {
@@ -614,6 +682,27 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	// attachments 同樣是後端解析 Attachment ID 後產生的可信 manifest；Client
 	// 直接夾帶同名 metadata 不能注入任意主機路徑。
 	delete(input.Metadata, "attachments")
+	// ThinkingMode 是明確的 Run override；為相容舊 Client，也接受 metadata 中的
+	// thinking_mode。若兩者都沒有，才沿用 Session 設定；空值表示 Provider 預設。
+	rawThinkingMode := strings.TrimSpace(input.ThinkingMode)
+	if rawThinkingMode == "" {
+		if value, exists := input.Metadata["thinking_mode"]; exists {
+			legacy, ok := value.(string)
+			if !ok && value != nil {
+				return domain.Run{}, fmt.Errorf("%w: thinking_mode must be a string", domain.ErrInvalidInput)
+			}
+			rawThinkingMode = legacy
+		} else {
+			rawThinkingMode = session.ThinkingMode
+		}
+	}
+	thinkingMode, err := domain.NormalizeThinkingMode(rawThinkingMode)
+	if err != nil {
+		return domain.Run{}, err
+	}
+	input.ThinkingMode = thinkingMode
+	// 保存到 Run metadata，讓重試時不會因 Session 後來變更而改變原本的設定。
+	input.Metadata["thinking_mode"] = thinkingMode
 	sandboxRoots := []string{}
 	// 後端內部流程（排程執行器）帶進來的沙箱優先，讓相對路徑以它為基準。
 	for _, root := range input.SandboxRoots {
@@ -741,12 +830,14 @@ func runInputFingerprint(input domain.RunInput) (string, error) {
 		AttachmentIDs []string `json:"attachment_ids,omitempty"`
 		ProviderID    string   `json:"provider_id,omitempty"`
 		Model         string   `json:"model,omitempty"`
+		ThinkingMode  string   `json:"thinking_mode,omitempty"`
 	}{
 		SessionID:     input.SessionID,
 		Input:         input.UserInput,
 		AttachmentIDs: append([]string(nil), input.AttachmentIDs...),
 		ProviderID:    input.ProviderID,
 		Model:         input.Model,
+		ThinkingMode:  input.ThinkingMode,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -761,6 +852,9 @@ func sameIdempotentRun(run domain.Run, input domain.RunInput, fingerprint string
 		return run.IdempotencyFingerprint == fingerprint
 	}
 	if run.SessionID != input.SessionID || run.Input != input.UserInput || run.ProviderID != input.ProviderID || run.Model != input.Model {
+		return false
+	}
+	if thinkingMode, ok := run.Metadata["thinking_mode"].(string); ok && thinkingMode != input.ThinkingMode {
 		return false
 	}
 	if len(run.AttachmentIDs) != len(input.AttachmentIDs) {
@@ -868,8 +962,48 @@ func (s *Service) CancelRun(ctx context.Context, runID string) (domain.Run, erro
 		}
 		return run, fmt.Errorf("%w: run is not active", domain.ErrConflict)
 	}
+	// 先記錄取消意圖，再中止 context；執行緒可能剛好位於完成轉換的邊界，
+	// 這個旗標讓它不會在取消請求之後把舊快照寫回 completed。
+	s.mu.Lock()
+	if current, exists := s.active[run.ID]; exists {
+		current.cancelRequested = true
+		s.active[run.ID] = current
+	}
+	s.mu.Unlock()
 	active.cancel()
-	return run, nil
+	return s.persistImmediateCancellation(run)
+}
+
+// persistImmediateCancellation 讓控制 API 立即反映使用者的停止意圖，
+// 不把完成時間綁在第三方 Provider 是否正確遵守 context 取消上。
+func (s *Service) persistImmediateCancellation(run domain.Run) (domain.Run, error) {
+	latest, err := s.runs.Get(context.Background(), run.ID)
+	if err != nil {
+		return run, err
+	}
+	if terminalRun(latest.Status) {
+		return latest, nil
+	}
+	completedAt := s.now().UTC()
+	latest.Status = domain.RunStatusCanceled
+	latest.PendingApproval = nil
+	latest.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
+	latest.CompletedAt = &completedAt
+	if err := s.runs.Save(context.Background(), latest); err != nil {
+		return run, err
+	}
+	payload := map[string]any{"status": latest.Status, "error": latest.Error}
+	if latest.Usage != nil {
+		payload["usage"] = *latest.Usage
+	}
+	if err := s.appendControlEvent(latest, "run.canceled", payload); err != nil {
+		// Run 狀態已經 durable；事件可由啟動時的 reconcile 補齊，不能讓
+		// 使用者看到取消 API 失敗而重送，造成控制結果更加不確定。
+		s.logger.Error("run cancellation event write failed", "run_id", latest.ID, "error", err)
+		s.notifyRun(latest.ID)
+	}
+	s.notifyRunFinished(latest)
+	return latest, nil
 }
 
 func (s *Service) DecideRun(ctx context.Context, runID string, input domain.ToolApprovalDecisionInput) (domain.Run, error) {
@@ -1054,8 +1188,15 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 	startedAt := s.now().UTC()
 	run.Status = domain.RunStatusRunning
 	run.StartedAt = &startedAt
-	if err := s.runs.Save(context.Background(), run); err != nil {
-		s.finishFailed(run, "run_state_write_failed", err, true, &sequence)
+	s.mu.Lock()
+	if current, canceled := s.active[run.ID]; canceled && current.cancelRequested {
+		s.mu.Unlock()
+		return
+	}
+	runSaveErr := s.runs.Save(context.Background(), run)
+	s.mu.Unlock()
+	if runSaveErr != nil {
+		s.finishFailed(run, "run_state_write_failed", runSaveErr, true, &sequence)
 		return
 	}
 	if err := s.appendEvent(run, &sequence, "run.started", map[string]any{"status": run.Status}); err != nil {
@@ -1111,14 +1252,17 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 		}
 	})
 	if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, domain.ErrCanceled) {
+		saveRunUsage(&run, &result, s.modelPrices)
 		s.finishCanceled(run, valueutil.FirstError(runErr, ctx.Err()), &sequence)
 		return
 	}
 	if runErr != nil {
+		saveRunUsage(&run, &result, s.modelPrices)
 		code, retryable := classifyRunFailure(runErr)
 		s.finishFailed(run, code, runErr, retryable, &sequence)
 		return
 	}
+	saveRunUsage(&run, &result, s.modelPrices)
 	if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
 		s.finishCanceled(run, err, &sequence)
 		return
@@ -1142,6 +1286,10 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 	var saveErr error
 	for {
 		s.mu.Lock()
+		if current, canceled := s.active[run.ID]; canceled && current.cancelRequested {
+			s.mu.Unlock()
+			return
+		}
 		if !s.pausedRuns[run.ID] {
 			s.logger.Info("run completed", "run_id", run.ID, "session_id", run.SessionID, "duration_ms", completedAt.Sub(startedAt).Milliseconds(), "event_count", sequence)
 			saveErr = s.runs.Save(context.Background(), run)
@@ -1195,6 +1343,11 @@ func (s *Service) appendControlEvent(run domain.Run, eventType string, payload m
 }
 
 func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType string, payload map[string]any) error {
+	// 取消會先落盤再寫 terminal event；若底層 Provider 在取消後仍送出回呼，
+	// 不得讓 late event 排到 run.canceled 之後，破壞事件串流的終止語意。
+	if latest, err := s.runs.Get(context.Background(), run.ID); err == nil && terminalRun(latest.Status) && eventType != "run."+string(latest.Status) {
+		return fmt.Errorf("%w: cannot append %s after run.%s", domain.ErrConflict, eventType, latest.Status)
+	}
 	if latest := s.eventSequences[run.ID]; latest > *sequence {
 		*sequence = latest
 	}
@@ -1221,6 +1374,21 @@ func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType s
 
 func (s *Service) finishCanceled(run domain.Run, cause error, sequence *int64) {
 	s.logger.Info("run canceled", "run_id", run.ID, "session_id", run.SessionID, "cause", cause)
+	if latest, err := s.runs.Get(context.Background(), run.ID); err == nil {
+		if latest.Status == domain.RunStatusCanceled {
+			// CancelRun 可能已先把狀態寫成 canceled，而 Provider 稍後才
+			// 回傳取消結果；只補上最後收到的用量，不重複寫 terminal event。
+			if run.Usage != nil {
+				latest.Usage = run.Usage
+				_ = s.runs.Save(context.Background(), latest)
+			}
+			return
+		}
+		if terminalRun(latest.Status) {
+			return
+		}
+		run = latest
+	}
 	completedAt := s.now().UTC()
 	run.Status = domain.RunStatusCanceled
 	run.PendingApproval = nil
@@ -1232,7 +1400,11 @@ func (s *Service) finishCanceled(run domain.Run, cause error, sequence *int64) {
 	s.mu.Lock()
 	_ = s.runs.Save(context.Background(), run)
 	s.mu.Unlock()
-	_ = s.appendEvent(run, sequence, "run.canceled", map[string]any{"status": run.Status, "error": run.Error})
+	payload := map[string]any{"status": run.Status, "error": run.Error}
+	if run.Usage != nil {
+		payload["usage"] = *run.Usage
+	}
+	_ = s.appendEvent(run, sequence, "run.canceled", payload)
 	s.notifyRunFinished(run)
 }
 
@@ -1246,7 +1418,11 @@ func (s *Service) finishFailed(run domain.Run, code string, cause error, retryab
 	s.mu.Lock()
 	_ = s.runs.Save(context.Background(), run)
 	s.mu.Unlock()
-	_ = s.appendEvent(run, sequence, "run.failed", map[string]any{"status": run.Status, "error": run.Error})
+	payload := map[string]any{"status": run.Status, "error": run.Error}
+	if run.Usage != nil {
+		payload["usage"] = *run.Usage
+	}
+	_ = s.appendEvent(run, sequence, "run.failed", payload)
 	s.notifyRunFinished(run)
 }
 
@@ -1362,6 +1538,9 @@ func (s *Service) clearRunPauseLocked(runID string) {
 
 func (s *Service) waitIfRunPaused(ctx context.Context, runID string) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		s.mu.Lock()
 		paused := s.pausedRuns[runID]
 		signal := s.runSignals[runID]
@@ -1428,6 +1607,9 @@ func (s *Service) reconcileTerminalEvents(ctx context.Context) error {
 		payload := map[string]any{"status": run.Status}
 		if run.Result != nil {
 			payload["result"] = *run.Result
+		}
+		if run.Usage != nil {
+			payload["usage"] = *run.Usage
 		}
 		if run.Error != nil {
 			payload["error"] = run.Error

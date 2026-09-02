@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"AgenticService/src/domain"
 	"log/slog"
 	"testing"
 )
@@ -66,6 +67,32 @@ func TestValidateConfigRejectsDisabledDefaultProvider(t *testing.T) {
 	config.Providers[config.DefaultProviderID] = provider
 	if err := validateConfig(&config); err == nil {
 		t.Fatal("disabled default provider was accepted")
+	}
+}
+
+func TestValidateConfigNormalizesModelPrices(t *testing.T) {
+	config := DefaultConfig()
+	config.ModelPrices = map[string]map[string]domain.ModelPrice{
+		"openai-compatible": {
+			" gpt-4o-mini ": {InputPerMillion: 0.15, OutputPerMillion: 0.6},
+		},
+	}
+	if err := validateConfig(&config); err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+	price, ok := config.ModelPrices["openai-compatible"]["gpt-4o-mini"]
+	if !ok || price.Currency != "USD" {
+		t.Fatalf("normalized model price = %+v, want USD entry", config.ModelPrices)
+	}
+}
+
+func TestValidateConfigRejectsInvalidModelPrice(t *testing.T) {
+	config := DefaultConfig()
+	config.ModelPrices = map[string]map[string]domain.ModelPrice{
+		"openai-compatible": {"gpt-4o-mini": {InputPerMillion: -1}},
+	}
+	if err := validateConfig(&config); err == nil {
+		t.Fatal("negative model price was accepted")
 	}
 }
 

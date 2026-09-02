@@ -189,6 +189,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session_id}/plans/{plan_id}", h.updatePlan)
 	h.mux.HandleFunc("DELETE /api/v1/sessions/{session_id}/plans/{plan_id}", h.deletePlanByID)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}/messages", h.listMessages)
+	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/messages/{message_id}/retract", h.retractMessages)
 	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/attachments", h.uploadSessionAttachments)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}/entries", h.listEntries)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}/runs", h.listSessionRuns)
@@ -924,6 +925,17 @@ func (h *Handler) deleteSession(writer http.ResponseWriter, request *http.Reques
 
 func (h *Handler) listMessages(writer http.ResponseWriter, request *http.Request) {
 	value, err := h.service.ListMessages(request.Context(), request.PathValue("session_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+// retractMessages 讓「重新提問」把最後一則使用者訊息與其後的內容移出對話。
+// transcript 不會被刪除，只是追加一筆撤回記錄。
+func (h *Handler) retractMessages(writer http.ResponseWriter, request *http.Request) {
+	value, err := h.service.RetractMessages(request.Context(), request.PathValue("session_id"), request.PathValue("message_id"))
 	if err != nil {
 		writeProblem(writer, request, err)
 		return

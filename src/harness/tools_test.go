@@ -422,8 +422,9 @@ func TestPersistedPermanentApprovalSkipsPromptInFutureRun(t *testing.T) {
 }
 
 // TestRunIsolatesApprovalRequiredReadOnlyTools 端到端證明：即使工具是 read-only，
-// 只要需要核准就必須各自成組，不能併發。
-func TestRunIsolatesApprovalRequiredReadOnlyTools(t *testing.T) {
+// 唯讀工具即使被列進核准清單也不再逐次詢問（沒有副作用的呼叫不值得換一次點擊），
+// 但仍維持各自成組、不併發執行的排程，避免日後核准清單可設定時出現併發衝突。
+func TestRunSkipsApprovalForReadOnlyToolsAndStillSerializesThem(t *testing.T) {
 	approvals := &fakeApprovals{required: map[string]bool{"file_read": true}}
 	var mu sync.Mutex
 	active := 0
@@ -464,7 +465,7 @@ func TestRunIsolatesApprovalRequiredReadOnlyTools(t *testing.T) {
 	if overlapped {
 		t.Fatal("approval-required tools ran concurrently; the coordinator only allows one pending approval per run")
 	}
-	if len(approvals.begun) != 2 {
-		t.Fatalf("began %d approvals, want 2", len(approvals.begun))
+	if len(approvals.begun) != 0 {
+		t.Fatalf("began %d approvals; read-only tools must not ask for approval", len(approvals.begun))
 	}
 }

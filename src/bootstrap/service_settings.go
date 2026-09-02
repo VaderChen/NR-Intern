@@ -19,8 +19,13 @@ type storedServiceSettings struct {
 	MaxTokens            *int   `json:"max_tokens,omitempty"`
 	MaxToolCalls         *int   `json:"max_tool_calls,omitempty"`
 	// 指標型別讓「設定檔提供、管理介面沒動過」與「管理介面明確關閉」可以區分。
-	HTTPFetchEnabled              *bool `json:"http_fetch_enabled,omitempty"`
-	HTTPFetchAllowPrivateNetworks *bool `json:"http_fetch_allow_private_networks,omitempty"`
+	HTTPFetchEnabled              *bool   `json:"http_fetch_enabled,omitempty"`
+	HTTPFetchAllowPrivateNetworks *bool   `json:"http_fetch_allow_private_networks,omitempty"`
+	ExtendedTools                 *bool   `json:"extended_tools,omitempty"`
+	ToolCallMode                  *string `json:"tool_call_mode,omitempty"`
+	ToolRetrieval                 *bool   `json:"tool_retrieval,omitempty"`
+	// LegacyMCPToolRetrieval 是 ToolRetrieval 的舊名稱，只讀不寫。
+	LegacyMCPToolRetrieval *bool `json:"mcp_tool_retrieval,omitempty"`
 }
 
 func loadPersistedServiceSettings(config *Config) error {
@@ -70,6 +75,20 @@ func loadPersistedServiceSettings(config *Config) error {
 	if stored.HTTPFetchAllowPrivateNetworks != nil {
 		config.HTTPFetch.AllowPrivateNetworks = *stored.HTTPFetchAllowPrivateNetworks
 	}
+	if stored.ExtendedTools != nil {
+		config.ExtendedTools = *stored.ExtendedTools
+	}
+	if stored.ToolCallMode != nil {
+		config.ToolCallMode = *stored.ToolCallMode
+	}
+	// 舊的 service-settings.json 沒有這個欄位，nil 會保留 DefaultConfig 的 true：
+	// 升級上來的安裝不會突然變回整份目錄進提示的行為。
+	if stored.LegacyMCPToolRetrieval != nil {
+		config.ToolRetrieval = *stored.LegacyMCPToolRetrieval
+	}
+	if stored.ToolRetrieval != nil {
+		config.ToolRetrieval = *stored.ToolRetrieval
+	}
 	return nil
 }
 
@@ -87,6 +106,9 @@ func persistServiceSettings(dataDir string, settings domain.ServiceSettings) err
 
 		HTTPFetchEnabled:              boolPointer(settings.HTTPFetch.Enabled),
 		HTTPFetchAllowPrivateNetworks: boolPointer(settings.HTTPFetch.AllowPrivateNetworks),
+		ExtendedTools:                 boolPointer(settings.ExtendedTools),
+		ToolCallMode:                  stringPointer(settings.ToolCallMode),
+		ToolRetrieval:                 boolPointer(settings.ToolRetrieval),
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode service settings: %w", err)
@@ -118,6 +140,10 @@ func persistServiceSettings(dataDir string, settings domain.ServiceSettings) err
 		return fmt.Errorf("replace service settings: %w", err)
 	}
 	return nil
+}
+
+func stringPointer(value string) *string {
+	return &value
 }
 
 func intPointer(value int) *int {

@@ -163,7 +163,15 @@ func cloneRun(run domain.Run) domain.Run {
 	}
 	if run.Result != nil {
 		result := *run.Result
+		if run.Result.Usage != nil {
+			usage := *run.Result.Usage
+			result.Usage = &usage
+		}
 		copyRun.Result = &result
+	}
+	if run.Usage != nil {
+		usage := *run.Usage
+		copyRun.Usage = &usage
 	}
 	if run.Error != nil {
 		runError := *run.Error

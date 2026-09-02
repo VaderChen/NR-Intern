@@ -26,7 +26,8 @@ func TestToolInstructionPromptPublishesStrictDecisionProtocol(t *testing.T) {
 		`{"type":"tool_use","tool":"工具名稱","input":{},"reason":"簡短理由"}`,
 		`"name":"directory_list"`,
 		`"path":{"type":"string"}`,
-		"每一輪只能輸出一個嚴格 JSON object",
+		"需要工具時只輸出嚴格 JSON",
+		"在同一輪直接輸出多個 tool_use object 或一個 JSON 陣列",
 	} {
 		if !strings.Contains(prompt, expected) {
 			t.Errorf("prompt does not contain %q: %s", expected, prompt)

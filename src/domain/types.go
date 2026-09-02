@@ -18,14 +18,18 @@ type AgentDescriptor struct {
 }
 
 type Session struct {
-	ID                string `json:"id"`
-	AgentID           string `json:"agent_id"`
-	WorkspaceID       string `json:"workspace_id,omitempty"`
-	ProjectID         string `json:"project_id,omitempty"`
-	Title             string `json:"title"`
-	ProviderID        string `json:"provider_id,omitempty"`
-	Model             string `json:"model,omitempty"`
-	PermissionProfile string `json:"permission_profile,omitempty"`
+	ID          string `json:"id"`
+	AgentID     string `json:"agent_id"`
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	ProjectID   string `json:"project_id,omitempty"`
+	Title       string `json:"title"`
+	ProviderID  string `json:"provider_id,omitempty"`
+	Model       string `json:"model,omitempty"`
+	// Usage 是由 Application 依 Run 清單即時彙總的資訊，不會由 Session PATCH 寫回。
+	Usage             *SessionUsage `json:"usage,omitempty"`
+	ThinkingMode      string        `json:"thinking_mode,omitempty"`
+	LockPlans         bool          `json:"lock_plans,omitempty"`
+	PermissionProfile string        `json:"permission_profile,omitempty"`
 	// PermanentToolApproval 只允許由目前 Session 的人工核准流程設定；一般
 	// Session PATCH 不得直接開啟，避免 Client 繞過高風險工具審核。
 	PermanentToolApproval bool           `json:"permanent_tool_approval,omitempty"`
@@ -75,6 +79,8 @@ type CreateSessionInput struct {
 	ProjectID         string         `json:"project_id,omitempty"`
 	ProviderID        string         `json:"provider_id,omitempty"`
 	Model             string         `json:"model,omitempty"`
+	ThinkingMode      string         `json:"thinking_mode,omitempty"`
+	LockPlans         bool           `json:"lock_plans,omitempty"`
 	PermissionProfile string         `json:"permission_profile,omitempty"`
 	Pinned            bool           `json:"pinned,omitempty"`
 	Metadata          map[string]any `json:"metadata,omitempty"`
@@ -86,6 +92,8 @@ type UpdateSessionInput struct {
 	ProjectID         *string `json:"project_id,omitempty"`
 	ProviderID        *string `json:"provider_id,omitempty"`
 	Model             *string `json:"model,omitempty"`
+	ThinkingMode      *string `json:"thinking_mode,omitempty"`
+	LockPlans         *bool   `json:"lock_plans,omitempty"`
 	PermissionProfile *string `json:"permission_profile,omitempty"`
 	MemoryScope       *string `json:"memory_scope,omitempty"`
 	Pinned            *bool   `json:"pinned,omitempty"`
@@ -184,6 +192,7 @@ type RunInput struct {
 	AttachmentIDs []string `json:"attachment_ids,omitempty"`
 	ProviderID    string   `json:"provider_id,omitempty"`
 	Model         string   `json:"model,omitempty"`
+	ThinkingMode  string   `json:"thinking_mode,omitempty"`
 	// SandboxRoots 只由後端內部流程填入（目前是排程執行器），JSON 不解析。
 	// 這些路徑在寫入來源實體時就已驗證，HTTP 呼叫端無法藉此擴大沙箱。
 	SandboxRoots   []string       `json:"-"`
@@ -322,6 +331,7 @@ type ToolApprovalDecision struct {
 
 type RunResult struct {
 	Message        Message            `json:"message"`
+	Usage          *RunUsage          `json:"usage,omitempty"`
 	BudgetExceeded *RunBudgetExceeded `json:"budget_exceeded,omitempty"`
 	// Completion 說明這次的完成宣告是否經過追問、以及是否仍有未解決的工具失敗。
 	// 沒有它時，「工具全部成功後完成」與「工具失敗後照樣宣稱完成」在 API 上無法區分。
@@ -346,14 +356,17 @@ type Run struct {
 	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 	// IdempotencyFingerprint 用來拒絕同一 Idempotency-Key 搭配不同內容的重送，
 	// 避免網路重試把另一個工作誤認成原本的 Run。
-	IdempotencyFingerprint string               `json:"idempotency_fingerprint,omitempty"`
-	Result                 *RunResult           `json:"result,omitempty"`
-	Error                  *RunError            `json:"error,omitempty"`
-	PendingApproval        *ToolApprovalRequest `json:"pending_approval,omitempty"`
-	Metadata               map[string]any       `json:"metadata,omitempty"`
-	CreatedAt              time.Time            `json:"created_at"`
-	StartedAt              *time.Time           `json:"started_at,omitempty"`
-	CompletedAt            *time.Time           `json:"completed_at,omitempty"`
+	IdempotencyFingerprint string     `json:"idempotency_fingerprint,omitempty"`
+	Result                 *RunResult `json:"result,omitempty"`
+	// Usage 保存 Run 實際收到的模型 token；成本是收尾當下依設定價格估算，
+	// 讓歷史 Run 不會因日後價格表變動而被重新改寫。
+	Usage           *RunUsage            `json:"usage,omitempty"`
+	Error           *RunError            `json:"error,omitempty"`
+	PendingApproval *ToolApprovalRequest `json:"pending_approval,omitempty"`
+	Metadata        map[string]any       `json:"metadata,omitempty"`
+	CreatedAt       time.Time            `json:"created_at"`
+	StartedAt       *time.Time           `json:"started_at,omitempty"`
+	CompletedAt     *time.Time           `json:"completed_at,omitempty"`
 }
 
 type EngineEvent struct {

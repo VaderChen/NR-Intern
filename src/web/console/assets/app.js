@@ -12,6 +12,7 @@ const state = {
   mcpSettings: null,
   selectedMCPSettingsID: "",
   mcpSettingsDraft: null,
+  mcpImportDraft: null,
   reverseProxy: null,
   reverseProxyHydrated: false,
   reverseProxyLoading: false,
@@ -68,8 +69,14 @@ const state = {
   outboxLoaded: false,
   outboxAvailable: true,
   queueDraining: false,
+  activeRuns: new Map(),
+  retryableRuns: new Map(),
+  restoreSkippedRunIDs: new Set(),
+  restoreSkippedSessionIDs: new Set(),
   trackedRunId: "",
   runStartedAt: new Map(),
+  // lastRunDuration 記住每個 Session 最後一次 Run 花了多久，Run 結束後留在狀態列。
+  lastRunDuration: new Map(),
   sessionSelectionVersion: 0,
   sessionRuntimeSaving: false,
   messageAutoScroll: true,
@@ -79,6 +86,7 @@ const state = {
   contextCapabilitiesRequest: 0,
   contextCapabilityCache: {},
   contextCompactionSessionId: "",
+  contextCompactionSessions: new Set(),
   collapsedProjects: new Set(JSON.parse(localStorage.getItem("collapsedProjects") || "[]")),
   projectSectionCollapsed: localStorage.getItem("projectSectionCollapsed") === "1",
   schedules: [],
@@ -89,6 +97,7 @@ const state = {
   scheduleSandboxRoots: [],
   editingSchedule: null,
   scheduleSaving: false,
+  restoreCandidates: [],
 };
 
 let nativeConversationActivity = null;
@@ -112,6 +121,7 @@ const transientStatuses = new Set([502, 503, 504]);
 const supportedBackendAPIMajor = 1;
 const requiredBackendCapabilities = Object.freeze([
   "durable-outbox.v1",
+  "run-cancel-immediate.v1",
   "run-events.v1",
   "run-recovery.v1",
   "run-retry.v1",
@@ -121,6 +131,16 @@ const requiredBackendCapabilities = Object.freeze([
 const translate = (source) => window.NRInternI18n?.t(source) ?? source;
 const scheduleWeekdayNames = ["週日", "週一", "週二", "週三", "週四", "週五", "週六"];
 const scheduleRefreshIntervalMilliseconds = 30_000;
+const activeRunStatuses = new Set(["queued", "running", "paused", "waiting_approval"]);
+const waitingForModelPrefix = "等待模型回應";
+// 前幾秒不顯示等待訊息：正常速度的回答不需要被提醒「還在等」。
+const waitingForModelDelayMilliseconds = 5000;
+const mcpAuthModeLabels = Object.freeze({
+  none: "不使用驗證",
+  bearer: "Bearer Token（金鑰）",
+  basic: "Basic Auth（帳號密碼）",
+  headers: "自訂 HTTP Headers",
+});
 const displayModes = new Set(["auto", "light", "dark"]);
 const uiLanguagePreferences = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
 const systemColorScheme = window.matchMedia("(prefers-color-scheme: dark)");
@@ -239,6 +259,10 @@ function normalizedServiceSettings(value = {}) {
       enabled: Boolean(httpFetch.enabled ?? currentHTTPFetch.enabled),
       allow_private_networks: Boolean(httpFetch.allow_private_networks ?? currentHTTPFetch.allow_private_networks ?? true),
     },
+    extended_tools: Boolean(value.extended_tools ?? current.extended_tools ?? false),
+    tool_call_mode: (value.tool_call_mode ?? current.tool_call_mode) === "instruction" ? "instruction" : "native",
+    // 預設 true：舊的後端沒有這個欄位時，畫面要顯示實際生效的行為。
+    tool_retrieval: Boolean(value.tool_retrieval ?? current.tool_retrieval ?? true),
   };
 }
 
@@ -252,6 +276,11 @@ function applyServiceSettings(value) {
   if ($("settingMaxWallClockMinutes")) $("settingMaxWallClockMinutes").value = String(Math.ceil(settings.max_wall_clock_seconds / 60));
   if ($("settingMaxTokens")) $("settingMaxTokens").value = String(settings.max_tokens);
   if ($("settingMaxToolCalls")) $("settingMaxToolCalls").value = String(settings.max_tool_calls);
+  if ($("settingExtendedTools")) {
+    $("settingExtendedTools").checked = settings.extended_tools;
+    $("settingInstructionToolCalls").checked = settings.tool_call_mode === "instruction";
+    $("settingToolRetrieval").checked = settings.tool_retrieval;
+  }
   if ($("settingHTTPFetchEnabled")) {
     $("settingHTTPFetchEnabled").checked = settings.http_fetch.enabled;
     $("settingHTTPFetchPrivateNetworks").checked = settings.http_fetch.allow_private_networks;
@@ -818,7 +847,7 @@ async function refreshBackend() {
     $("newManagementWorkspace").disabled = !state.backendHealthy || state.running;
     $("workspaceSelect").disabled = !state.backendHealthy || state.running;
     $("workspaceManagementSelect").disabled = !state.backendHealthy || state.running;
-    $("newProject").disabled = !state.backendHealthy || !state.workspace || state.running;
+    $("newProject").disabled = !state.backendHealthy || !state.workspace;
     $("newSchedule").disabled = !state.backendHealthy || !state.workspace;
     $("openManagement").disabled = !state.backendHealthy;
     $("providerUsageButton").disabled = !state.backendHealthy;
@@ -845,6 +874,10 @@ function scheduleBackendRefresh() {
 
 function resetWorkspace() {
   clearPendingAttachments();
+  if ($("restoreRunsDialog")?.open) $("restoreRunsDialog").close("cancel");
+  state.restoreCandidates = [];
+  state.restoreSkippedRunIDs.clear();
+  state.restoreSkippedSessionIDs.clear();
   // 後端離線時仍保留 durable outbox；恢復連線後再繼續送出。
   if ($("promptQueue")) renderPromptQueue();
   state.agent = null;
@@ -872,6 +905,8 @@ function resetWorkspace() {
   state.sessionDragProjectID = "";
   state.sessionOrderSaving = false;
   state.sessionRuntimeSaving = false;
+  state.activeRuns.clear();
+  state.retryableRuns.clear();
   state.runningSessionId = "";
   state.currentRunStatus = "";
   state.runActivityText = "";
@@ -881,6 +916,9 @@ function resetWorkspace() {
   state.pendingApprovalSessionId = "";
   state.liveMessage = null;
   state.runStartedAt.clear();
+  state.contextCompactionSessions.clear();
+  state.contextCompactionSessionId = "";
+  syncRunStateAliases();
   state.contextUsage = null;
   state.contextCapabilities = null;
   state.contextCapabilitiesRequest += 1;
@@ -941,7 +979,7 @@ async function loadApplicationState() {
   await restoreWorkspaceRun();
   if (notificationCenterEnabled()) void loadNotifications();
   void drainPromptQueue();
-  $("newProject").disabled = state.running;
+  $("newProject").disabled = !state.backendHealthy || !state.workspace;
   $("newManagementWorkspace").disabled = state.running;
   $("workspaceSelect").disabled = state.running;
   $("workspaceManagementSelect").disabled = state.running;
@@ -1087,10 +1125,10 @@ function projectNode(project, sessions) {
     actions.className = "project-row-actions";
     const newConversation = iconButton(chatBubbleIcon(), "在此專案建立對話", () => openSessionDialog(project.id));
     newConversation.classList.add("project-chat-button");
-    newConversation.disabled = state.running || !state.backendHealthy || !state.agent;
+    newConversation.disabled = !state.backendHealthy || !state.agent;
     const manage = iconButton("⋯", "管理專案", () => manageProject(project));
     manage.classList.add("project-manage-button");
-    manage.disabled = state.running || !state.backendHealthy;
+    manage.disabled = !state.backendHealthy;
     actions.append(manage, newConversation);
     header.append(actions);
   }
@@ -1112,11 +1150,11 @@ function projectNode(project, sessions) {
 
 function sessionNode(session, pinnedContext) {
   const row = document.createElement("div");
-  const running = state.running && state.runningSessionId === session.id;
+  const running = sessionRunIsActive(session.id);
   row.className = `session-row ${state.session?.id === session.id ? "active" : ""} ${running ? "running" : ""}`;
   row.dataset.sessionId = session.id;
   row.dataset.projectId = session.project_id || "";
-  row.draggable = !pinnedContext && !state.running && !state.sessionOrderSaving;
+  row.draggable = !pinnedContext && !sessionRunIsActive(session.id) && !state.sessionOrderSaving;
   if (row.draggable) {
     row.addEventListener("dragstart", (event) => startSessionDrag(event, row, session));
     row.addEventListener("dragend", clearSessionDragState);
@@ -1150,7 +1188,7 @@ function sessionNode(session, pinnedContext) {
   for (let index = 0; index < 3; index += 1) runIndicator.append(document.createElement("i"));
   const pin = iconButton(session.pinned ? "◆" : "◇", session.pinned ? "取消釘選" : "釘選", () => setPinned(session, !session.pinned));
   pin.classList.add("pin-button");
-  pin.disabled = state.running;
+  pin.disabled = sessionRunIsActive(session.id);
   if (pinnedContext) pin.classList.add("pinned");
   row.append(button, runIndicator, pin);
   return row;
@@ -1360,9 +1398,9 @@ function showProjectContextMenu(project, clientX, clientY, focusMenu) {
   const hasDirectory = Array.isArray(project.sandbox_roots) && project.sandbox_roots.some((root) => String(root || "").trim());
   $("openContextProjectDirectory").disabled = !hasDirectory;
   $("openContextProjectDirectory").title = hasDirectory ? "開啟專案目錄" : "此專案尚未設定 Sandbox 目錄";
-  $("manageContextProject").disabled = state.running || !state.backendHealthy;
-  $("deleteContextProject").disabled = state.running || !state.backendHealthy;
-  $("newContextProjectSession").disabled = state.running || !state.backendHealthy || !state.agent;
+  $("manageContextProject").disabled = !state.backendHealthy;
+  $("deleteContextProject").disabled = !state.backendHealthy;
+  $("newContextProjectSession").disabled = !state.backendHealthy || !state.agent;
   menu.style.left = "0px";
   menu.style.top = "0px";
   menu.classList.remove("hidden");
@@ -1388,7 +1426,7 @@ function showSessionContextMenu(session, clientX, clientY, focusMenu) {
   state.contextSession = session;
   $("pinContextSessionLabel").textContent = session.pinned ? "取消釘選" : "釘選對話";
   for (const id of ["renameContextSession", "pinContextSession", "deleteContextSession"]) {
-    $(id).disabled = state.running;
+    $(id).disabled = sessionRunIsActive(session.id);
   }
   menu.style.left = "0px";
   menu.style.top = "0px";
@@ -1520,7 +1558,7 @@ function scheduleNode(schedule) {
   actions.className = "schedule-row-actions";
   const run = iconButton(schedulePlayIcon(), "立即執行一次", () => void runScheduleNow(schedule));
   run.classList.add("schedule-run-button");
-  run.disabled = state.running || !state.backendHealthy;
+  run.disabled = !state.backendHealthy;
   const manage = iconButton("⋯", "管理排程", () => openScheduleDialog(schedule));
   manage.classList.add("schedule-manage-button");
   manage.disabled = !state.backendHealthy;
@@ -1659,6 +1697,40 @@ function formatContextTokenCount(value) {
   if (!Number.isFinite(number) || number < 0) return "-";
   const language = window.NRInternI18n?.language || "zh-TW";
   return new Intl.NumberFormat(language, { maximumFractionDigits: 0 }).format(number);
+}
+
+function formatSessionUsageCost(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return "—";
+  const language = window.NRInternI18n?.language || "zh-TW";
+  return new Intl.NumberFormat(language, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 6,
+  }).format(number);
+}
+
+function renderSessionUsage() {
+  const control = $("sessionUsage");
+  if (!control) return;
+  const usage = state.session?.usage;
+  control.classList.toggle("hidden", !state.session || !usage);
+  if (!state.session || !usage) return;
+  const total = Number(usage.total_tokens);
+  const tokenText = Number.isFinite(total) && total >= 0
+    ? `${formatContextTokenCount(total)} ${translate("tokens")}`
+    : `— ${translate("tokens")}`;
+  $("sessionUsageTokens").textContent = tokenText;
+  const hasCost = usage.estimated_cost_usd !== undefined && usage.estimated_cost_usd !== null;
+  $("sessionUsageCost").textContent = hasCost
+    ? formatSessionUsageCost(usage.estimated_cost_usd)
+    : "—";
+  const title = hasCost
+    ? `${translate("Session 用量")} · ${translate("估算成本")}`
+    : `${translate("Session 用量")} · ${translate("尚未設定模型價格")}`;
+  control.title = title;
+  control.setAttribute("aria-label", `${tokenText} · ${$("sessionUsageCost").textContent}`);
 }
 
 function contextUsageSnapshot() {
@@ -2046,6 +2118,7 @@ function syncSessionRuntimeControlState() {
   const providerID = state.session?.provider_id || state.workspace?.default_provider_id || "";
   $("sessionProviderSelect").disabled = disabled;
   $("sessionModelSelect").disabled = disabled || sessionRuntimeModels(providerID).length === 0;
+  $("sessionThinkingSelect").disabled = disabled;
   $("sessionRuntimeControls").setAttribute("aria-busy", state.sessionRuntimeSaving ? "true" : "false");
 }
 
@@ -2058,6 +2131,7 @@ function syncSessionRuntimeControls({ loadModels = true } = {}) {
     closeModelPopover();
     $("sessionProviderSelect").replaceChildren();
     $("sessionModelSelect").replaceChildren();
+    $("sessionThinkingSelect").value = "";
     $("modelCapsuleValue").textContent = "—";
     syncSessionRuntimeControlState();
     return;
@@ -2084,6 +2158,11 @@ function syncSessionRuntimeControls({ loadModels = true } = {}) {
   }
   const validModel = models.includes(model);
   modelSelect.value = validModel ? model : models[0] || "";
+  const thinkingMode = String(session.thinking_mode || session.metadata?.thinking_mode || "").trim().toLowerCase();
+  const thinkingSelect = $("sessionThinkingSelect");
+  thinkingSelect.value = [...thinkingSelect.options].some((option) => option.value === thinkingMode)
+    ? thinkingMode
+    : "";
   syncModelCapsule(providerID, modelSelect.value, catalog);
   syncSessionRuntimeControlState();
 
@@ -2110,6 +2189,31 @@ async function ensureSessionProviderModels(providerID, sessionID) {
   return state.providerModelLists[providerID] || [];
 }
 
+// sessionBusyError 判斷後端是否因為「這個對話還有排隊或執行中的 Run」而拒絕。
+// 後端的原始訊息（conflict: session has a queued or running run）對使用者沒有意義，
+// 而且通常代表前端的 Run 狀態已經和後端不同步。
+function sessionBusyError(error) {
+  const detail = String(error?.message || "").toLowerCase();
+  return detail.includes("queued or running run") || detail.includes("queued, running");
+}
+
+// resyncActiveRun 重新向後端確認這個對話是否真的還有進行中的 Run。
+// 前端以為已經結束、後端還沒收尾時，畫面必須回到「執行中」，使用者才能取消它，
+// 而不是反覆看到一則看不懂的錯誤。
+async function resyncActiveRun(sessionID) {
+  if (!sessionID) return false;
+  try {
+    const values = await request(`/api/v1/sessions/${encodeURIComponent(sessionID)}/runs`, { reconnects: 1 });
+    const active = (Array.isArray(values) ? values : []).find((run) => activeRunStatuses.has(run.status));
+    if (!active) return false;
+    attachExistingRun(active);
+    syncSelectedRunUI();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function updateSessionRuntime(sessionID, input) {
   state.sessionRuntimeSaving = true;
   syncSessionRuntimeControlState();
@@ -2128,11 +2232,19 @@ async function updateSessionRuntime(sessionID, input) {
     return updated;
   } catch (error) {
     if (state.session?.id === sessionID) syncSessionRuntimeControls({ loadModels: false });
+    if (sessionBusyError(error)) {
+      const restored = await resyncActiveRun(sessionID);
+      toast(restored
+        ? translate("這個對話還有進行中的工作，完成或取消後才能調整 Provider 與模型")
+        : translate("後端仍在收尾上一個工作，稍待幾秒再試一次"));
+      return null;
+    }
     toast(error.message);
     return null;
   } finally {
     state.sessionRuntimeSaving = false;
     syncSessionRuntimeControlState();
+    syncPlanLockControl();
   }
 }
 
@@ -2158,6 +2270,12 @@ async function changeSessionModel(event) {
   const sessionID = state.session?.id;
   if (!sessionID || selectedSessionIsRunning()) return;
   await updateSessionRuntime(sessionID, { model: event.target.value });
+}
+
+async function changeSessionThinking(event) {
+  const sessionID = state.session?.id;
+  if (!sessionID || selectedSessionIsRunning()) return;
+  await updateSessionRuntime(sessionID, { thinking_mode: event.target.value });
 }
 
 function renderWorkspaceOptions() {
@@ -2225,6 +2343,9 @@ function clearSessionUI() {
   state.contextCapabilitiesRequest += 1;
   closeContextUsagePopover();
   $("sessionTitle").textContent = state.workspace?.name || "選擇或建立對話";
+  $("sessionUsage").classList.add("hidden");
+  $("sessionUsageTokens").textContent = "";
+  $("sessionUsageCost").textContent = "";
   const workspaceModel = displayedModelForProvider(state.workspace?.default_provider_id, state.workspace?.model);
   $("agentLabel").textContent = state.workspace
     ? `${providerDisplayName(state.workspace.default_provider_id) || state.workspace.default_provider_id}${workspaceModel ? ` · ${workspaceModel}` : ""}`
@@ -2260,6 +2381,8 @@ function syncWorkspaceSettings() {
 
 async function selectSession(session) {
   const selectionVersion = ++state.sessionSelectionVersion;
+  const previousRun = activeRunFor(state.session?.id);
+  if (previousRun) previousRun.liveMessage = null;
   state.liveMessage = null;
   state.messageAutoScroll = true;
   if (session?.id && session.id !== state.attachmentSessionId) clearPendingAttachments();
@@ -2290,33 +2413,104 @@ async function selectSession(session) {
 }
 
 async function restoreWorkspaceRun() {
-  if (state.running || !state.workspace) return;
+  if (!state.workspace) return;
   try {
     const values = await request("/api/v1/runs?status=queued,running,paused,waiting_approval", { reconnects: 1 });
     const sessions = new Map(state.sessions.map((session) => [session.id, session]));
-    const run = (Array.isArray(values) ? values : [])
+    const activeRuns = (Array.isArray(values) ? values : [])
       .filter((value) => sessions.has(value.session_id))
-      .sort((left, right) => new Date(right.created_at) - new Date(left.created_at))[0];
-    if (run) await selectSession(sessions.get(run.session_id));
+      .sort((left, right) => new Date(right.created_at) - new Date(left.created_at));
+    const selectedRuns = await chooseRunsToRestore(activeRuns);
+    for (const run of selectedRuns) attachExistingRun(run);
+    const latest = selectedRuns[0];
+    if (latest && state.session?.id !== latest.session_id) await selectSession(sessions.get(latest.session_id));
+    else syncSelectedRunUI();
   } catch (_) {
     // 相容檢查已保護正式後端；這裡的失敗不能阻斷使用者瀏覽既有對話。
   }
 }
 
+const restoreRunStatusLabels = Object.freeze({
+  queued: "排隊中",
+  running: "執行中",
+  paused: "已暫停",
+  waiting_approval: "等待核准",
+});
+
+function renderRestoreRunOptions({ preserveSelection = false } = {}) {
+  const list = $("restoreRunsList");
+  if (!list) return;
+  const selectedIDs = preserveSelection
+    ? new Set([...list.querySelectorAll("input[type=checkbox]:checked")].map((input) => input.value))
+    : new Set(state.restoreCandidates.map((run) => run.id));
+  list.replaceChildren(...state.restoreCandidates.map((run) => {
+    const option = document.createElement("label");
+    option.className = "restore-run-option";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = run.id;
+    checkbox.checked = selectedIDs.has(run.id);
+    checkbox.setAttribute("aria-label", translate("恢復這個對話"));
+    const copy = document.createElement("span");
+    copy.className = "restore-run-copy";
+    const title = document.createElement("strong");
+    title.textContent = state.sessions.find((session) => session.id === run.session_id)?.title || translate("未命名");
+    title.setAttribute("data-i18n-ignore", "true");
+    const status = document.createElement("small");
+    status.textContent = translate(restoreRunStatusLabels[run.status] || "執行中");
+    const updated = document.createElement("small");
+    const updatedAt = run.updated_at || run.created_at;
+    updated.textContent = `${translate("上次更新")}：${updatedAt ? new Date(updatedAt).toLocaleString() : "—"}`;
+    copy.append(title, status, updated);
+    option.append(checkbox, copy);
+    return option;
+  }));
+}
+
+function chooseRunsToRestore(runs) {
+  if (!runs.length) return Promise.resolve([]);
+  const dialog = $("restoreRunsDialog");
+  if (!dialog) return Promise.resolve(runs);
+  state.restoreCandidates = runs;
+  renderRestoreRunOptions();
+  dialog.showModal();
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      const candidates = [...state.restoreCandidates];
+      const selected = dialog.returnValue === "confirm"
+        ? candidates.filter((run) => [...$("restoreRunsList").querySelectorAll("input[type=checkbox]:checked")].some((input) => input.value === run.id))
+        : [];
+      const selectedIDs = new Set(selected.map((run) => run.id));
+      const selectedSessionIDs = new Set(selected.map((run) => run.session_id));
+      for (const run of candidates) {
+        if (!selectedIDs.has(run.id)) state.restoreSkippedRunIDs.add(run.id);
+        if (!selectedSessionIDs.has(run.session_id)) state.restoreSkippedSessionIDs.add(run.session_id);
+      }
+      state.restoreCandidates = [];
+      resolve(selected);
+    }, { once: true });
+  });
+}
+
 async function loadSessionRunState(sessionID) {
-  if (!sessionID || (state.running && state.runningSessionId !== sessionID)) return;
+  if (!sessionID) return;
   try {
     const values = await request(`/api/v1/runs?session_id=${encodeURIComponent(sessionID)}`);
     const runs = Array.isArray(values) ? values : [];
-    const active = runs.find((value) => ["queued", "running", "paused", "waiting_approval"].includes(value.status));
-    if (active && !state.running) {
+    const active = runs.find((value) => activeRunStatuses.has(value.status));
+    // 啟動時選擇不恢復，只代表「不要自動切過去跟著看」，不代表這個 Run 不存在：
+    // 後端仍然禁止修改有進行中 Run 的 Session。使用者自己打開這個對話時就要看到
+    // 真實狀態，才有辦法取消它，而不是每次調整設定都撞到 409。
+    if (active && !activeRunFor(sessionID)) {
       attachExistingRun(active);
+      state.restoreSkippedRunIDs.delete(active.id);
+      state.restoreSkippedSessionIDs.delete(sessionID);
       return;
     }
-    if (state.running) return;
     const retryable = runs.find((value) => ["failed", "canceled"].includes(value.status) && value.error?.retryable);
-    state.retryableRunId = retryable?.id || "";
-    state.retryableSessionId = retryable ? sessionID : "";
+    if (retryable) state.retryableRuns.set(sessionID, retryable);
+    else state.retryableRuns.delete(sessionID);
+    syncRunStateAliases();
     syncSelectedRunUI();
   } catch (_) {
     // 對話內容仍可讀取；Run 狀態下次切換或輪詢時再補查。
@@ -2324,48 +2518,45 @@ async function loadSessionRunState(sessionID) {
 }
 
 function attachExistingRun(run) {
-  if (!run?.id || state.running) return;
+  if (!run?.id || activeRunFor(run.session_id)) return;
   const sessionID = run.session_id;
-  state.running = true;
-  state.runningSessionId = sessionID;
-  state.currentRunId = run.id;
-  state.currentRunStatus = run.status || "running";
-  state.trackedRunId = run.id;
-  state.canceling = false;
-  state.runActivityText = run.status === "paused" ? "Run 已暫停" : "";
-  state.runDraft = {
-    sessionId: sessionID,
-    operationId: run.id,
-    messageId: "",
-    content: "",
-    reasoning: "",
-    internal: false,
-    processing: true,
-  };
+  const runState = addActiveRun(newRunState(sessionID, run));
   if (run.pending_approval) showApproval(run.pending_approval, sessionID);
   renderNavigation();
   syncSelectedRunUI();
-  void runWithReconnect({ runId: run.id, sessionId: sessionID, lastSequence: 0 })
+  void runWithReconnect({ runId: run.id, sessionId: sessionID, lastSequence: 0, runState })
     .catch((error) => {
-      if (state.trackedRunId === run.id) setRunActivity(`背景 Run 連線中斷：${error.message}`, sessionID);
+      if (activeRunFor(sessionID) === runState) setRunActivity(`背景 Run 連線中斷：${error.message}`, sessionID);
     })
     .finally(async () => {
-      if (state.trackedRunId !== run.id) return;
-      state.trackedRunId = "";
-      state.running = false;
-      state.runningSessionId = "";
-      state.currentRunId = "";
-      state.currentRunStatus = "";
-      state.runActivityText = "";
-      state.runDraft = null;
-      state.liveMessage = null;
-      if ($("approvalDialog").open) $("approvalDialog").close();
-      syncSelectedRunUI();
-      renderNavigation();
-      if (state.session?.id === sessionID) await loadMessages().catch(() => {});
-      await loadSessions().catch(() => {});
-      if (state.promptQueue.some((item) => item.status === "pending")) void drainPromptQueue();
+      await finishActiveRun(runState);
     });
+}
+
+async function finishActiveRun(runState) {
+  if (!removeActiveRun(runState)) return;
+  runState.eventController?.abort();
+  // 連線中斷等情況不會送出 run.completed／run.failed，這裡用 console 自己的
+  // 起算時間補上，狀態列才不會什麼都不留。
+  if (!state.lastRunDuration.has(runState.sessionId) && Number.isFinite(runState.startedAtMilliseconds)) {
+    const elapsed = Date.now() - runState.startedAtMilliseconds;
+    if (elapsed > 0) state.lastRunDuration.set(runState.sessionId, elapsed);
+  }
+  if (runState.runId) state.runStartedAt.delete(runState.runId);
+  setContextCompactionState(runState.sessionId, false);
+  if (state.session?.id === runState.sessionId) {
+    setAgentProcessing(runState.liveMessage || state.liveMessage, false);
+    if ($("approvalDialog").open && state.pendingApprovalSessionId === runState.sessionId) {
+      $("approvalDialog").close();
+    }
+  }
+  runState.liveMessage = null;
+  syncRunStateAliases();
+  syncSelectedRunUI();
+  renderNavigation();
+  if (state.session?.id === runState.sessionId) await loadMessages().catch(() => {});
+  await loadSessions().catch(() => {});
+  if (hasLaunchablePromptQueue()) void drainPromptQueue();
 }
 
 function syncSessionUI() {
@@ -2373,8 +2564,10 @@ function syncSessionUI() {
   if (!session) return;
   $("sessionTitle").textContent = session.title || "未命名";
   const providerID = session.provider_id || state.workspace?.default_provider_id || "";
-  const model = displayedModelForProvider(providerID, session.model);
-  $("agentLabel").textContent = `${providerDisplayName(providerID) || providerID}${model ? ` · ${model}` : ""}`;
+  // 只留 Provider：模型名稱右上角的膠囊已經顯示，重複列在這裡只會把標題列撐長，
+  // 長模型名（本機模型動輒三四十個字元）會直接壓到搜尋框上。
+  $("agentLabel").textContent = providerDisplayName(providerID) || providerID;
+  renderSessionUsage();
   syncSessionRuntimeControls();
   syncPlanButton();
   const contextIdentity = activeContextIdentity(session);
@@ -2397,6 +2590,7 @@ function syncSessionUI() {
   $("settingMemoryScope").value = session.metadata?.memory_scope || "";
   $("settingPinned").checked = Boolean(session.pinned);
   $("managementSubtitle").textContent = session.title || "Session";
+  syncPlanLockControl();
   refreshOpenProviderUsage();
 }
 
@@ -2415,7 +2609,74 @@ const planStatusLabels = {
 const terminalPlanStatuses = new Set(["completed", "canceled"]);
 
 function sessionRunIsActive(sessionID = state.session?.id) {
-  return Boolean(state.running && sessionID && state.runningSessionId === sessionID);
+  return Boolean(sessionID && state.activeRuns.has(sessionID));
+}
+
+function activeRunFor(sessionID = state.session?.id) {
+  return sessionID ? state.activeRuns.get(sessionID) || null : null;
+}
+
+function hasActiveRuns() {
+  return state.activeRuns.size > 0;
+}
+
+function newRunState(sessionID, run = {}) {
+  const runID = String(run.id || "");
+  return {
+    sessionId: sessionID,
+    runId: runID,
+    status: run.status || "queued",
+    activityText: run.status === "paused" ? "Run 已暫停" : "",
+    startedAtMilliseconds: Date.now(),
+    canceling: false,
+    terminal: false,
+    terminalHandled: false,
+    eventController: new AbortController(),
+    pendingApproval: run.pending_approval || null,
+    runDraft: {
+      sessionId: sessionID,
+      operationId: runID,
+      messageId: "",
+      content: "",
+      reasoning: "",
+      internal: false,
+      processing: true,
+    },
+    liveMessage: null,
+  };
+}
+
+function syncRunStateAliases() {
+  const selected = activeRunFor();
+  const retryable = state.session?.id ? state.retryableRuns.get(state.session.id) : null;
+  state.running = hasActiveRuns();
+  state.runningSessionId = selected?.sessionId || "";
+  state.trackedRunId = selected?.runId || "";
+  state.currentRunId = selected?.runId || "";
+  state.currentRunStatus = selected?.status || "";
+  state.runActivityText = selected?.activityText || "";
+  state.canceling = Boolean(selected?.canceling);
+  state.pendingApproval = selected?.pendingApproval || null;
+  state.pendingApprovalSessionId = selected?.pendingApproval ? selected.sessionId : "";
+  state.liveMessage = selected?.liveMessage || null;
+  state.runDraft = selected?.runDraft || null;
+  state.retryableRunId = selected ? "" : (retryable?.id || "");
+  state.retryableSessionId = selected ? "" : (retryable ? state.session.id : "");
+}
+
+function addActiveRun(runState) {
+  if (!runState?.sessionId) return null;
+  state.lastRunDuration.delete(runState.sessionId);
+  state.activeRuns.set(runState.sessionId, runState);
+  syncRunStateAliases();
+  return runState;
+}
+
+function removeActiveRun(runState) {
+  if (!runState || state.activeRuns.get(runState.sessionId) !== runState) return false;
+  state.activeRuns.delete(runState.sessionId);
+  syncRunStateAliases();
+  return true;
 }
 
 async function loadPlans(sessionID = state.session?.id) {
@@ -2426,10 +2687,7 @@ async function loadPlans(sessionID = state.session?.id) {
   const active = state.plans.find((plan) => plan.status === "active");
   if (!state.planExpansionInitialized) {
     state.expandedPlanIDs.clear();
-    if (active) state.expandedPlanIDs.add(active.id);
     state.planExpansionInitialized = true;
-  } else if (active && active.id !== state.activePlanID) {
-    state.expandedPlanIDs.add(active.id);
   }
   state.activePlanID = active?.id || "";
   const validIDs = new Set(state.plans.map((plan) => plan.id));
@@ -2458,6 +2716,7 @@ function renderPlanDialog() {
   $("planForm").classList.add("hidden");
   $("planView").classList.remove("hidden");
   const plans = state.plans;
+  syncPlanLockControl();
   const active = plans.find((plan) => plan.status === "active");
   const ongoingPlans = plans.filter((plan) => !terminalPlanStatuses.has(plan.status));
   const completedPlans = plans.filter((plan) => terminalPlanStatuses.has(plan.status));
@@ -2479,7 +2738,11 @@ function renderPlanDialog() {
   $("createPlan").classList.toggle("hidden", plans.length === 0);
   $("clearCompletedPlans").classList.toggle("hidden", !showingCompleted || completedPlans.length === 0);
   $("clearCompletedPlans").disabled = sessionRunIsActive();
-  $("planListHint").textContent = showingCompleted ? "已完成與已取消的計畫" : "拖曳計畫可調整執行順序";
+  $("planListHint").textContent = showingCompleted
+    ? "已完成與已取消的計畫"
+    : state.session?.lock_plans
+      ? "已鎖定：未完成計畫會依序執行"
+      : "未鎖定：可依需求選擇未完成計畫";
   if (plans.length === 0) {
     $("planEmptyTitle").textContent = "尚未建立計畫";
     $("planEmptyDescription").textContent = "你可以先拆解長任務；Agent 遇到多步驟工作時也能自行建立計畫。";
@@ -2499,11 +2762,33 @@ function renderPlanDialog() {
   visiblePlans.forEach((plan, index) => list.append(renderPlanCard(plan, index, visiblePlans.length)));
 }
 
+function syncPlanLockControl() {
+  const control = $("lockPlansSwitch");
+  if (!control) return;
+  const disabled = !state.session || selectedSessionIsRunning() || state.sessionRuntimeSaving;
+  control.checked = Boolean(state.session?.lock_plans);
+  control.disabled = disabled;
+  control.setAttribute("aria-checked", String(control.checked));
+  control.closest(".switch-label")?.classList.toggle("switch-disabled", disabled);
+}
+
+async function changePlanLock(event) {
+  const sessionID = state.session?.id;
+  if (!sessionID || selectedSessionIsRunning()) return;
+  const value = Boolean(event.target.checked);
+  const updated = await updateSessionRuntime(sessionID, { lock_plans: value });
+  if (!updated) return;
+  await loadPlans(sessionID).catch(() => {});
+  if ($("planDialog").open && $("planForm").classList.contains("hidden")) renderPlanDialog();
+}
+
 function renderPlanCard(plan, index, visiblePlanCount) {
   const locked = sessionRunIsActive();
   const terminal = terminalPlanStatuses.has(plan.status);
   const sortable = !terminal && state.planTab === "active";
   const expanded = state.expandedPlanIDs.has(plan.id);
+  const steps = Array.isArray(plan.steps) ? plan.steps : [];
+  const executedStepCount = steps.filter((step) => ["completed", "skipped"].includes(step.status)).length;
   const card = document.createElement("article");
   card.className = "plan-card";
   card.dataset.planId = plan.id;
@@ -2531,6 +2816,11 @@ function renderPlanCard(plan, index, visiblePlanCount) {
   const objective = document.createElement("p");
   objective.textContent = plan.objective || "未另外說明整體目標";
   summary.append(title, objective);
+  const progress = document.createElement("span");
+  progress.className = "plan-step-progress";
+  progress.textContent = `${executedStepCount}/${steps.length}`;
+  progress.title = `已執行 ${executedStepCount}/${steps.length} 個步驟`;
+  progress.setAttribute("aria-label", progress.title);
   const status = document.createElement("span");
   status.className = "plan-status";
   status.textContent = planStatusLabels[plan.status] || plan.status;
@@ -2557,15 +2847,15 @@ function renderPlanCard(plan, index, visiblePlanCount) {
     else state.expandedPlanIDs.add(plan.id);
     renderPlanDialog();
   });
-  header.append(handle, order, summary, status, quickActions, toggle);
+  header.append(handle, order, summary, progress, status, quickActions, toggle);
   card.append(header);
 
   const details = document.createElement("div");
   details.className = "plan-card-details";
   details.classList.toggle("hidden", !expanded);
-  const steps = document.createElement("ol");
-  steps.className = "plan-step-list";
-  for (const step of plan.steps) steps.append(renderPlanStep(step));
+  const stepList = document.createElement("ol");
+  stepList.className = "plan-step-list";
+  for (const step of steps) stepList.append(renderPlanStep(step));
   const actions = document.createElement("div");
   actions.className = "plan-card-actions";
   const remove = document.createElement("button");
@@ -2582,7 +2872,7 @@ function renderPlanCard(plan, index, visiblePlanCount) {
   rebuild.addEventListener("click", () => editPlan(plan));
   if (!terminal) actions.append(remove);
   actions.append(rebuild);
-  details.append(steps, actions);
+  details.append(stepList, actions);
   card.append(details);
   return card;
 }
@@ -2907,6 +3197,12 @@ async function loadMessages() {
       if (appendMessage(entry.message, { operationId: activeOperationID })) visibleEntries += 1;
       continue;
     }
+    if (entry.type === "messages_retracted") {
+      // 撤回：這一段不再屬於對話，連同該問題的回答、處理過程與失敗提示一起移除。
+      const from = String(entry.data?.from_message_id || "").trim();
+      if (from) visibleEntries -= removeMessagesFrom(container, from);
+      continue;
+    }
     if (entry.type === "operation_finished") {
       const operationID = String(entry.data?.operation_id || entry.data?.run_id || activeOperationID || "");
       const recordedDuration = Number(entry.data?.duration_ms);
@@ -2927,7 +3223,51 @@ async function loadMessages() {
   $("emptyState").classList.toggle("hidden", visibleEntries > 0);
   container.classList.toggle("hidden", visibleEntries === 0);
   renderContextUsage();
+  syncReaskButton();
   scrollMessages({ force: true });
+}
+
+// removeMessagesFrom 移除指定訊息與其後的所有節點，回傳移除的數量。
+function removeMessagesFrom(container, messageID) {
+  const escaped = window.CSS?.escape ? window.CSS.escape(messageID) : messageID.replace(/["\\]/g, "\\$&");
+  let node = container.querySelector(`[data-message-id="${escaped}"]`);
+  let removed = 0;
+  while (node) {
+    const next = node.nextElementSibling;
+    node.remove();
+    removed += 1;
+    node = next;
+  }
+  return removed;
+}
+
+// syncReaskButton 只讓最後一則使用者訊息顯示重新提問，而且執行中不顯示：
+// 那個位置在執行中屬於停止按鈕，撤回也會被後端以衝突擋下來。
+function syncReaskButton() {
+  const buttons = [...document.querySelectorAll(".message.user .message-action-reask")];
+  const running = selectedSessionIsRunning();
+  buttons.forEach((button, index) => {
+    button.classList.toggle("hidden", running || index !== buttons.length - 1);
+  });
+}
+
+// reaskMessage 把這則提問之後的內容移出對話，再用同樣的內容重問一次。
+async function reaskMessage(message) {
+  const sessionID = state.session?.id;
+  const messageID = String(message?.id || "").trim();
+  if (!sessionID || !messageID || selectedSessionIsRunning()) return;
+  const attachmentIds = (Array.isArray(message.metadata?.attachments) ? message.metadata.attachments : [])
+    .map((attachment) => String(attachment?.id || "").trim())
+    .filter(Boolean);
+  try {
+    await request(`/api/v1/sessions/${encodeURIComponent(sessionID)}/messages/${encodeURIComponent(messageID)}/retract`, { method: "POST" });
+  } catch (error) {
+    toast(error.message);
+    return;
+  }
+  await loadMessages().catch(() => {});
+  const input = String(message.content || "").trim() || "請檢視附件。";
+  await enqueuePrompt(input, { attachmentIds });
 }
 
 function splitTaggedThinkingContent(value) {
@@ -2959,26 +3299,120 @@ function normalizeAssistantThinking(message) {
   const tagged = splitTaggedThinkingContent(message.content);
   if (!tagged.found) return message;
   const existing = String(message.reasoning || "").trim();
-  const reasoning = !existing ? tagged.reasoning
-    : !tagged.reasoning || tagged.reasoning === existing ? existing
-    : `${existing}\n\n${tagged.reasoning}`;
+  const reasoning = joinReasoningParts(existing, tagged.reasoning);
   return { ...message, content: tagged.content, reasoning };
 }
 
-function joinReasoningParts(...values) {
-  const parts = [];
+function reasoningSegmentKey(value) {
+  return String(value || "")
+    .replace(/\u00a0/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function reasoningSegments(value) {
+  return String(value || "")
+    .trim()
+    .split(/\n\s*-{3,}\s*(?:\n|$)/u)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+}
+
+function uniqueReasoningSegments(values) {
+  const segments = [];
+  const seen = new Set();
   for (const value of values) {
-    const normalized = String(value || "").trim();
-    if (!normalized || parts.includes(normalized)) continue;
-    parts.push(normalized);
+    for (const segment of reasoningSegments(value)) {
+      const key = reasoningSegmentKey(segment);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      segments.push(segment);
+    }
   }
-  return parts.join("\n\n");
+  return segments;
+}
+
+function dedupeRepeatedReasoningBlocks(value) {
+  const blocks = String(value || "")
+    .trim()
+    .split(/\n{2,}/u)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  const result = [];
+  for (let index = 0; index < blocks.length;) {
+    let repeatedLength = 0;
+    const maximumLength = Math.min(result.length, blocks.length - index);
+    // Provider 有時會把同一組「標題＋說明」連續送兩次；只比對目前
+    // 結尾的連續區塊，避免誤刪不同階段中刻意重複的單句。
+    for (let length = maximumLength; length > 0; length -= 1) {
+      let matched = true;
+      for (let offset = 0; offset < length; offset += 1) {
+        if (reasoningSegmentKey(result[result.length - length + offset])
+          !== reasoningSegmentKey(blocks[index + offset])) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) {
+        repeatedLength = length;
+        break;
+      }
+    }
+    if (repeatedLength > 0) {
+      index += repeatedLength;
+      continue;
+    }
+    result.push(blocks[index]);
+    index += 1;
+  }
+  return result.join("\n\n");
+}
+
+function dedupeReasoningContent(value) {
+  return uniqueReasoningSegments([dedupeRepeatedReasoningBlocks(value)]).join("\n\n---\n\n");
+}
+
+function mergeReasoningText(currentValue, nextValue, separator = "\n\n") {
+  const current = dedupeReasoningContent(currentValue);
+  const next = dedupeReasoningContent(nextValue);
+  if (!current) return next;
+  if (!next) return current;
+  const currentKey = reasoningSegmentKey(current);
+  const nextKey = reasoningSegmentKey(next);
+  if (currentKey === nextKey) return current.length >= next.length ? current : next;
+  // message.end 通常帶完整 reasoning；若串流草稿已是其中一部分，直接
+  // 採用較完整的值，避免把同一輪內容再附加一次。
+  if (nextKey.includes(currentKey)) return next;
+  if (currentKey.includes(nextKey)) return current;
+  return `${current}${separator}${next}`;
+}
+
+function appendReasoningDelta(currentValue, deltaValue) {
+  const current = String(currentValue || "");
+  const delta = String(deltaValue || "");
+  if (!current || !delta) return current + delta;
+  const currentKey = reasoningSegmentKey(current);
+  const deltaKey = reasoningSegmentKey(delta);
+  if (!deltaKey) return current;
+  // 有些相容 Provider 會同時從 reasoning 欄位與 <think> content 欄位送出
+  // 同一片段；也有 Provider 會重送完整累積值。這兩種都不能再次附加。
+  if (currentKey === deltaKey) return current;
+  if (deltaKey.startsWith(currentKey)) return delta;
+  // 只對具有足夠內容或 Markdown 結構的重疊片段去重，避免模型正常連續
+  // 輸出單一中文字元或短詞時，被誤認為是重送。
+  if ((deltaKey.length >= 8 || /[\n*#]/u.test(deltaKey)) && currentKey.endsWith(deltaKey)) return current;
+  return current + delta;
+}
+
+function joinReasoningParts(...values) {
+  return values.reduce((current, value) => mergeReasoningText(current, value), "");
 }
 
 function appendMessage(message, options = {}) {
   if (!message) return null;
   message = normalizeAssistantThinking(message);
-  if (!message.content && !message.reasoning && message.role !== "assistant") return null;
+  const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
+  if (!message.content && !message.reasoning && !hasToolCalls && !options.placeholder) return null;
   // tool 與內部階段訊息是 Harness transcript，不是對使用者顯示的聊天內容。
   // 它們仍保留在後端稽核與下一輪 LLM context 中。
   if (message.role === "tool") return null;
@@ -3004,9 +3438,13 @@ function appendMessage(message, options = {}) {
     appendMessageAttachments(bubble, message.metadata?.attachments);
     const actions = document.createElement("div");
     actions.className = "message-actions";
-    const copy = iconButton(messageCopyIcon(), "複製訊息", () => copyMessage(message.content));
+    const copy = iconButton(messageCopyIcon(), translate("複製訊息"), () => copyMessage(message.content));
     copy.classList.add("message-action-button");
     actions.append(copy);
+    // 重新提問只出現在最後一則提問上；由 syncReaskButton 決定顯示哪一個。
+    const reask = iconButton(messageReaskIcon(), translate("重新提問"), () => void reaskMessage(message));
+    reask.classList.add("message-action-button", "message-action-reask", "hidden");
+    actions.append(reask);
     article.append(bubble, actions);
   } else if (message.role === "assistant") {
     const reasoning = createReasoningBlock(message.reasoning || "");
@@ -3068,16 +3506,35 @@ function appendMessageAttachments(container, attachments) {
 }
 
 function createReasoningBlock(value, className = "message-reasoning") {
+  const source = dedupeReasoningContent(value);
   const block = document.createElement("details");
   block.className = className;
-  block.dataset.segmentCount = value ? "1" : "0";
+  block.dataset.segmentCount = String(reasoningSegments(source).length);
   const summary = document.createElement("summary");
   summary.className = "reasoning-summary";
+  const summaryLabel = document.createElement("span");
+  summaryLabel.className = "reasoning-summary-label";
+  summary.append(summaryLabel);
+  summary.addEventListener("click", () => {
+    // 只記錄使用者主動操作；自動揭露最新段落不能把較早段落的狀態重設。
+    block.dataset.userOpen = String(!block.open);
+  });
   const content = document.createElement("div");
   content.className = "reasoning-content";
-  renderRichContent(content, normalizeReasoningMarkdown(value));
-  block.append(summary, content);
-  block.classList.toggle("hidden", !value);
+  renderRichContent(content, normalizeReasoningMarkdown(source));
+  const footerToggle = document.createElement("button");
+  footerToggle.type = "button";
+  footerToggle.className = "reasoning-footer-toggle";
+  footerToggle.innerHTML = '<span class="reasoning-footer-label"></span><span class="reasoning-footer-icon" aria-hidden="true"></span>';
+  footerToggle.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    block.dataset.userOpen = "false";
+    block.open = false;
+  });
+  block.append(summary, content, footerToggle);
+  block.addEventListener("toggle", () => updateReasoningSummary(block));
+  block.classList.toggle("hidden", !source);
   updateReasoningSummary(block);
   return block;
 }
@@ -3093,13 +3550,11 @@ function setMessageReasoning(messageNode, value, append = false) {
   const existing = richContentSource(content).trim();
   const hasExistingSegment = Boolean(existing);
   const source = normalizeReasoningMarkdown(append && hasExistingSegment
-    ? `${existing}\n\n---\n\n${String(value).trim()}`
-    : value);
+    ? mergeReasoningText(existing, value, "\n\n---\n\n")
+    : dedupeReasoningContent(value));
   if (append) scheduleRichContent(content, source);
   else renderRichContent(content, source);
-  const previousCount = Math.max(0, Number(block.dataset.segmentCount) || 0);
-  if (append && hasExistingSegment) block.dataset.segmentCount = String(previousCount + 1);
-  else if (value && previousCount === 0) block.dataset.segmentCount = "1";
+  block.dataset.segmentCount = String(reasoningSegments(source).length);
   block.classList.remove("hidden");
   updateReasoningSummary(block);
   updateLiveReasoningDuration(messageNode.dataset.operationId || "");
@@ -3156,27 +3611,63 @@ function updateReasoningSummary(block, durationMilliseconds = null) {
   const summary = block?.querySelector(".reasoning-summary");
   if (!summary) return;
   const segmentCount = Math.max(0, Number(block.dataset.segmentCount) || 0);
-  let label = "處理過程";
+  let label = translate("處理過程");
   if (segmentCount > 0) label += ` · ${segmentCount}段`;
   const storedDuration = Number(block.dataset.durationMilliseconds);
   const duration = Number.isFinite(durationMilliseconds) && durationMilliseconds >= 0
     ? durationMilliseconds
     : storedDuration;
   if (Number.isFinite(duration) && duration >= 0) label += ` · ${formatProcessingDuration(duration)}`;
-  summary.textContent = label;
+  const summaryLabel = summary.querySelector(".reasoning-summary-label") || summary;
+  summaryLabel.textContent = label;
+  const actionLabel = translate(block.open ? "收合處理過程" : "展開處理過程");
+  summary.title = actionLabel;
+  summary.setAttribute("aria-label", actionLabel);
+  const footerToggle = block.querySelector(".reasoning-footer-toggle");
+  if (footerToggle) {
+    const footerLabel = footerToggle.querySelector(".reasoning-footer-label");
+    if (footerLabel) footerLabel.textContent = translate("收合處理過程");
+    footerToggle.title = translate("收合處理過程");
+    footerToggle.setAttribute("aria-label", translate("收合處理過程"));
+  }
 }
 
 function updateLiveReasoningDurations() {
+  updateWaitingForModelActivity();
   if (state.runStartedAt.size === 0) return;
   const now = Date.now();
   for (const operationID of state.runStartedAt.keys()) updateLiveReasoningDuration(operationID, now);
+}
+
+// updateWaitingForModelActivity 在模型還沒吐出任何文字或工具指令時交代「還在等模型」。
+//
+// 這段期間畫面上只有三個跳動的點：模型想很久跟真的卡死看起來一模一樣，使用者只能自己
+// 猜要不要重來。狀態列改成帶秒數的等待說明，其他更具體的狀態（重連、等待 MCP、等待核准）
+// 一旦出現就不覆蓋。
+function updateWaitingForModelActivity() {
+  const sessionID = state.session?.id;
+  const runState = activeRunFor(sessionID);
+  if (!runState) return;
+  const draft = runState.runDraft;
+  const started = state.runStartedAt.get(draft?.operationId || runState.runId || "");
+  const current = runState.activityText || "";
+  if (current && !current.startsWith(waitingForModelPrefix)) return;
+  if (!started || (draft && (draft.content || draft.reasoning))) {
+    if (current.startsWith(waitingForModelPrefix)) setRunActivity("", sessionID);
+    return;
+  }
+  const elapsed = Date.now() - started;
+  if (elapsed < waitingForModelDelayMilliseconds) return;
+  setRunActivity(`${waitingForModelPrefix}（${formatProcessingDuration(elapsed)}）`, sessionID);
 }
 
 function formatProcessingDuration(durationMilliseconds) {
   const totalSeconds = Math.max(1, Math.round(durationMilliseconds / 1000));
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
-  return `${minutes}分${String(seconds).padStart(2, "0")}秒`;
+  // 單位跟著介面語言走：這個字串會出現在完整句子裡（「本次回應共使用 …」），
+  // 英文句子配中文單位讀起來就是壞的。日文沿用 分／秒，沒有對照就是原文。
+  return `${minutes}${translate("分")}${String(seconds).padStart(2, "0")}${translate("秒")}`;
 }
 
 function appendRunOutcome(outcome) {
@@ -3207,6 +3698,24 @@ function messageCopyIcon() {
   path.setAttribute("stroke-linecap", "round");
   path.setAttribute("stroke-linejoin", "round");
   path.setAttribute("d", "M9 8h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1Zm-5 8H3V4a1 1 0 0 1 1-1h12v1");
+  svg.append(path);
+  return svg;
+}
+
+// messageReaskIcon 是「重新提問」的循環箭頭。
+function messageReaskIcon() {
+  const namespace = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(namespace, "svg");
+  svg.classList.add("message-action-icon");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  const path = document.createElementNS(namespace, "path");
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.8");
+  path.setAttribute("stroke-linecap", "round");
+  path.setAttribute("stroke-linejoin", "round");
+  path.setAttribute("d", "M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4");
   svg.append(path);
   return svg;
 }
@@ -3245,20 +3754,22 @@ function showActivity(text) {
   $("activity").classList.toggle("hidden", !text);
   const retryVisible = Boolean(state.retryableRunId)
     && Boolean(text)
-    && !state.running
+    && !selectedSessionIsRunning()
     && (!state.retryableSessionId || state.retryableSessionId === state.session?.id);
   $("retryRun").classList.toggle("hidden", !retryVisible);
 }
 
 function selectedSessionIsRunning() {
-  return Boolean(state.running && state.session?.id && state.session.id === state.runningSessionId);
+  return Boolean(state.session?.id && activeRunFor(state.session.id));
 }
 
 function ensureRunDraft(sessionID, operationID = "", messageID = "") {
-  const current = state.runDraft;
+  const runState = activeRunFor(sessionID);
+  if (!runState) return null;
+  const current = runState.runDraft;
   const startsNewMessage = Boolean(messageID && current?.messageId && current.messageId !== messageID);
   if (!current || current.sessionId !== sessionID || startsNewMessage) {
-    state.runDraft = {
+    runState.runDraft = {
       sessionId: sessionID,
       operationId: operationID,
       messageId: messageID,
@@ -3267,16 +3778,19 @@ function ensureRunDraft(sessionID, operationID = "", messageID = "") {
       internal: false,
       processing: true,
     };
-    return state.runDraft;
+    syncRunStateAliases();
+    return runState.runDraft;
   }
   if (operationID) current.operationId = operationID;
   if (messageID) current.messageId = messageID;
   return current;
 }
 
-function continueRunProcessing(sessionID, operationID = state.currentRunId) {
-  state.liveMessage = null;
-  state.runDraft = {
+function continueRunProcessing(sessionID, operationID = activeRunFor(sessionID)?.runId || "") {
+  const runState = activeRunFor(sessionID);
+  if (!runState) return;
+  runState.liveMessage = null;
+  runState.runDraft = {
     sessionId: sessionID,
     operationId: operationID,
     messageId: "",
@@ -3285,6 +3799,7 @@ function continueRunProcessing(sessionID, operationID = state.currentRunId) {
     internal: false,
     processing: true,
   };
+  syncRunStateAliases();
   if (state.session?.id === sessionID) {
     renderSelectedRunDraft();
     scrollMessages();
@@ -3293,17 +3808,23 @@ function continueRunProcessing(sessionID, operationID = state.currentRunId) {
 
 function renderSelectedRunDraft() {
   if (!selectedSessionIsRunning()) return null;
-  const draft = ensureRunDraft(state.runningSessionId, state.currentRunId);
+  const sessionID = state.session.id;
+  const runState = activeRunFor(sessionID);
+  const draft = runState?.runDraft || ensureRunDraft(sessionID, runState?.runId || "");
+  if (!runState || !draft) return null;
   const messageID = draft.messageId || `active-run-${draft.operationId || draft.sessionId}`;
   let messageNode = findMessage(messageID);
   if (!messageNode
-    && state.liveMessage?.isConnected
-    && state.liveMessage.dataset.runDraftPlaceholder === "true") {
-    messageNode = state.liveMessage;
+    && runState.liveMessage?.isConnected
+    && runState.liveMessage.dataset.runDraftPlaceholder === "true") {
+    messageNode = runState.liveMessage;
     messageNode.dataset.messageId = messageID;
   }
   if (!messageNode) {
-    messageNode = appendMessage({ role: "assistant", id: messageID, content: "" }, { operationId: draft.operationId });
+    messageNode = appendMessage(
+      { role: "assistant", id: messageID, content: "" },
+      { operationId: draft.operationId, placeholder: true },
+    );
   }
   if (!messageNode) return null;
   messageNode.dataset.runDraftPlaceholder = draft.messageId ? "false" : "true";
@@ -3316,6 +3837,7 @@ function renderSelectedRunDraft() {
   }
   messageNode.classList.toggle("reasoning-only", Boolean(draft.internal));
   setAgentProcessing(messageNode, draft.processing);
+  runState.liveMessage = messageNode;
   state.liveMessage = messageNode;
   $("emptyState").classList.add("hidden");
   $("messages").classList.remove("hidden");
@@ -3325,27 +3847,29 @@ function renderSelectedRunDraft() {
 function revealLatestReasoning(messageNode, operationID = "") {
   const current = messageNode?.querySelector(":scope > .message-reasoning:not(.hidden)");
   if (!current) return;
-  if (operationID) {
-    for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
-      if (node === messageNode || node.dataset.operationId !== operationID) continue;
-      const block = node.querySelector(":scope > .message-reasoning");
-      if (block) block.open = false;
-    }
-  }
+  // 最新段落預設展開，但使用者一旦主動收合，就尊重該選擇。
+  if (current.dataset.userOpen === "false") return;
   current.open = true;
+  updateReasoningSummary(current);
 }
 
 function setRunActivity(text, sessionID = state.runningSessionId) {
-  if (!sessionID || sessionID !== state.runningSessionId) return;
-  state.runActivityText = text || "";
-  if (state.session?.id === sessionID) showActivity(state.runActivityText);
+  const runState = activeRunFor(sessionID);
+  if (!runState) return;
+  runState.activityText = text || "";
+  syncRunStateAliases();
+  // 等待狀態只放在對話區底部的狀態列：處理過程要留給實際做了什麼，
+  // 每 15 秒更新一次的等待秒數放進去會把版面吃掉。
+  if (state.session?.id === sessionID) showActivity(runState.activityText);
 }
 
 function syncSelectedRunUI() {
+  syncRunStateAliases();
   const selectedRunning = selectedSessionIsRunning();
-	// 同一對話執行期間仍可持續輸入；若目前 Run 在另一個對話背景執行，
-	// 則先維持停用，避免單一前端串流同時追蹤不同 Session。
-  $("prompt").disabled = !state.session || (state.running && !selectedRunning);
+  syncReaskButton();
+	// 每個 Session 各自執行；目前選取的 Session 可繼續輸入並排入自身佇列，
+	// 其他 Session 的 Run 只在側欄顯示背景執行狀態。
+  $("prompt").disabled = !state.session;
 	syncSessionRuntimeControlState();
 	syncRunActionButton();
 	renderPromptQueue();
@@ -3354,8 +3878,8 @@ function syncSelectedRunUI() {
 		// 重連等需要使用者注意的狀態。
 		showActivity(state.runActivityText);
     renderSelectedRunDraft();
-    if (state.pendingApproval && state.pendingApprovalSessionId === state.session?.id && !$("approvalDialog").open) {
-      $("approvalDialog").show();
+    if (state.pendingApproval && state.pendingApprovalSessionId === state.session?.id) {
+      showApproval(state.pendingApproval, state.session.id);
     }
     return;
   }
@@ -3365,18 +3889,17 @@ function syncSelectedRunUI() {
     showActivity("");
     return;
   }
-  showActivity("");
+  showActivity(runDurationText(state.session?.id || ""));
 }
 
 function syncRunActionButton() {
   const button = $("send");
   if (!button) return;
   const selectedRunning = selectedSessionIsRunning();
-  const backgroundRun = state.running && !selectedRunning;
   const label = selectedRunning ? "加入待送佇列" : "送出訊息";
   button.setAttribute("aria-label", label);
   button.title = label;
-  button.disabled = !state.session || backgroundRun;
+  button.disabled = !state.session;
   // 執行中由停止按鈕占用同一個操作位置；使用者仍可按 Enter
   // 送出輸入內容，讓 sendPrompt 將它加入目前對話的待送佇列。
   button.classList.toggle("hidden", selectedRunning);
@@ -3393,21 +3916,26 @@ function syncRunActionButton() {
 
 function setContextCompactionState(sessionID, active) {
   if (active) {
-    state.contextCompactionSessionId = sessionID;
-  } else if (!sessionID || state.contextCompactionSessionId === sessionID) {
-    state.contextCompactionSessionId = "";
+    state.contextCompactionSessions.add(sessionID);
+  } else if (!sessionID) {
+    state.contextCompactionSessions.clear();
+  } else {
+    state.contextCompactionSessions.delete(sessionID);
   }
+  state.contextCompactionSessionId = state.contextCompactionSessions.has(state.session?.id)
+    ? state.session.id
+    : "";
   renderContextCompactionState();
 }
 
 function renderContextCompactionState() {
-  const active = Boolean(state.contextCompactionSessionId && state.contextCompactionSessionId === state.session?.id);
+  const active = Boolean(state.session?.id && state.contextCompactionSessions.has(state.session.id));
   $("contextCompactionIndicator")?.classList.toggle("hidden", !active);
   $("contextUsageButton")?.classList.toggle("is-compacting", active);
 }
 
 function syncNativeConversationActivity() {
-  const active = Boolean(state.running || state.queueDraining || state.promptQueue.length > 0);
+  const active = Boolean(state.running || state.queueDraining || hasLaunchablePromptQueue());
   if (nativeConversationActivity === active) return;
   nativeConversationActivity = active;
   if (typeof window.nrInternSetConversationActive !== "function") return;
@@ -3455,7 +3983,7 @@ function defaultAttachmentName(file, index) {
 }
 
 function addPendingAttachments(files) {
-  if (!state.session || (state.running && !selectedSessionIsRunning())) return;
+  if (!state.session) return;
   const existing = new Set(state.pendingAttachments.map((item) => item.key));
   let rejectedSize = 0;
   let rejectedCount = 0;
@@ -3657,6 +4185,15 @@ async function loadPromptOutbox() {
   }
 }
 
+function promptQueueCanAutoLaunch(item) {
+  return item?.status === "pending"
+    && !state.restoreSkippedSessionIDs.has(item.sessionId);
+}
+
+function hasLaunchablePromptQueue() {
+  return state.promptQueue.some(promptQueueCanAutoLaunch);
+}
+
 function dataTransferHasFiles(dataTransfer) {
   return [...(dataTransfer?.types || [])].includes("Files") || (dataTransfer?.files?.length || 0) > 0;
 }
@@ -3739,23 +4276,18 @@ async function retryQueuedPrompt(queueID) {
   void drainPromptQueue();
 }
 
-async function sendPrompt(event) {
-  event.preventDefault();
-  let input = normalizeFullwidthASCII($("prompt").value).trim();
-  const pending = [...state.pendingAttachments];
-  if ((!input && pending.length === 0) || !state.session) return;
-  if (state.running && !selectedSessionIsRunning()) {
-    toast("另一個對話正在執行，請回到該對話加入佇列");
-    return;
-  }
-  if (!input) input = "請檢視附件。";
-  const queued = state.running || state.promptQueue.length > 0;
+// enqueuePrompt 是所有送出路徑的共同入口（輸入框、重新提問、佇列補送）：
+// outbox 與佇列規則只寫一次，重新提問才不會有一套自己的送出流程。
+async function enqueuePrompt(input, { attachments = [], attachmentIds = [] } = {}) {
+  if (!state.session) return false;
+  const queued = selectedSessionIsRunning()
+    || state.promptQueue.some((item) => item.sessionId === state.session.id && item.status !== "failed");
   const item = {
     id: crypto.randomUUID(),
     sessionId: state.session.id,
     input,
-    attachments: pending,
-    attachmentIds: [],
+    attachments,
+    attachmentIds,
     idempotencyKey: crypto.randomUUID(),
     status: "pending",
     runId: "",
@@ -3767,47 +4299,60 @@ async function sendPrompt(event) {
     await savePromptOutboxItem(item);
   } catch (error) {
     toast(error.message);
-    return;
+    return false;
   }
   state.promptQueue.push(item);
-  $("prompt").value = "";
-  if (pending.length) clearPendingAttachments();
   renderPromptQueue();
   syncRunActionButton();
   if (queued) toast(`已加入待送佇列（共 ${state.promptQueue.length} 則）`);
   void drainPromptQueue();
+  return true;
+}
+
+async function sendPrompt(event) {
+  event.preventDefault();
+  let input = normalizeFullwidthASCII($("prompt").value).trim();
+  const pending = [...state.pendingAttachments];
+  if ((!input && pending.length === 0) || !state.session) return;
+  if (!input) input = "請檢視附件。";
+  if (!(await enqueuePrompt(input, { attachments: pending }))) return;
+  $("prompt").value = "";
+  if (pending.length) clearPendingAttachments();
 }
 
 async function drainPromptQueue() {
-  if (!state.outboxLoaded || state.queueDraining || state.running || !state.backendHealthy) return;
+  if (!state.outboxLoaded || state.queueDraining || !state.backendHealthy || !hasLaunchablePromptQueue()) return;
   state.queueDraining = true;
-  let finishedSessionID = "";
   try {
-    while (true) {
-      while (state.promptQueue.length > 0 && !state.running) {
-        const item = state.promptQueue.find((value) => value.status === "pending");
-        if (!item) break;
-        finishedSessionID = item.sessionId;
+    const occupied = new Set([
+      ...state.activeRuns.keys(),
+      ...state.promptQueue.filter((item) => item.status === "sending").map((item) => item.sessionId),
+    ]);
+    const launchable = [];
+    for (const item of state.promptQueue) {
+      if (!promptQueueCanAutoLaunch(item) || occupied.has(item.sessionId)) continue;
+      occupied.add(item.sessionId);
+      item.status = "sending";
+      launchable.push(item);
+    }
+    renderPromptQueue();
+    // 每個 Session 同時最多一個 Run，但不同 Session 可以並行執行。
+    for (const item of launchable) {
+      void (async () => {
         const completed = await executePrompt(item);
-        if (!completed) break;
-        state.promptQueue = state.promptQueue.filter((value) => value.id !== item.id);
-        await deletePromptOutboxItem(item.id).catch((error) => toast(error.message));
+        if (completed) {
+          state.promptQueue = state.promptQueue.filter((value) => value.id !== item.id);
+          await deletePromptOutboxItem(item.id).catch((error) => toast(error.message));
+        }
         renderPromptQueue();
-      }
-      if (finishedSessionID) {
-        const refreshSessionID = finishedSessionID;
-        finishedSessionID = "";
-        if (state.session?.id === refreshSessionID) await loadMessages().catch(() => {});
-        await loadSessions().catch(() => {});
-        refreshOpenProviderUsage();
-      }
-      if (state.promptQueue.length === 0) break;
+        void drainPromptQueue();
+      })();
     }
   } finally {
     state.queueDraining = false;
     renderPromptQueue();
     syncRunActionButton();
-    if (state.promptQueue.length > 0) void drainPromptQueue();
+    if (hasLaunchablePromptQueue()) void drainPromptQueue();
   }
 }
 
@@ -3826,31 +4371,13 @@ async function executePrompt(item) {
     toast(error.message);
     return false;
   }
-  state.running = true;
-  state.runningSessionId = sessionID;
-	state.runActivityText = "";
-  state.canceling = false;
-  state.currentRunId = "";
-  state.currentRunStatus = "";
-  state.retryableRunId = "";
-  state.retryableSessionId = "";
-  state.pendingApproval = null;
-  state.pendingApprovalSessionId = "";
-  state.runDraft = {
-    sessionId: sessionID,
-    operationId: "",
-    messageId: "",
-    content: "",
-    reasoning: "",
-    internal: false,
-    processing: true,
-  };
-  $("newProject").disabled = true;
-  $("newWorkspace").disabled = true;
-  $("newManagementWorkspace").disabled = true;
-  $("workspaceSelect").disabled = true;
-  $("emptyState").classList.add("hidden");
-  $("messages").classList.remove("hidden");
+  const runState = addActiveRun(newRunState(sessionID));
+  state.retryableRuns.delete(sessionID);
+  syncRunStateAliases();
+  if (state.session?.id === sessionID) {
+    $("emptyState").classList.add("hidden");
+    $("messages").classList.remove("hidden");
+  }
   renderNavigation();
   try {
     const attachments = item.attachmentIds.length > 0
@@ -3878,6 +4405,7 @@ async function executePrompt(item) {
       idempotencyKey: item.idempotencyKey,
       runId: item.runId,
       lastSequence: item.lastSequence,
+      runState,
       onRunIdentified: async (runID, lastSequence) => {
         item.runId = runID;
         item.lastSequence = lastSequence;
@@ -3896,44 +4424,28 @@ async function executePrompt(item) {
     toast(error.message);
     return false;
   } finally {
-    if (state.currentRunId) state.runStartedAt.delete(state.currentRunId);
-    setContextCompactionState(sessionID, false);
-    state.running = false;
-    state.runningSessionId = "";
-    state.runActivityText = "";
-    state.canceling = false;
-    state.currentRunId = "";
-    state.currentRunStatus = "";
-    setAgentProcessing(state.liveMessage, false);
-    state.liveMessage = null;
-    state.runDraft = null;
-    state.pendingApproval = null;
-    state.pendingApprovalSessionId = "";
-    if ($("approvalDialog").open) $("approvalDialog").close();
-    syncSelectedRunUI();
-    $("newProject").disabled = !state.backendHealthy || !state.workspace;
-    $("newSchedule").disabled = !state.backendHealthy || !state.workspace;
-    $("newWorkspace").disabled = !state.backendHealthy;
-    $("newManagementWorkspace").disabled = !state.backendHealthy;
-    $("workspaceSelect").disabled = !state.backendHealthy;
-    renderNavigation();
+    await finishActiveRun(runState);
   }
 }
 
 async function runWithReconnect(task) {
   const sessionID = task.sessionId || state.runningSessionId;
+  const runState = task.runState || activeRunFor(sessionID);
+  if (!runState) throw new Error("找不到此 Session 的執行狀態");
   const progress = { runId: task.runId || "", lastSequence: Number(task.lastSequence || 0), terminal: false };
   let reconnects = 0;
-  while (!progress.terminal) {
+  while (!progress.terminal && !runState.terminal) {
     try {
       const response = await openRunStream(task, progress);
       progress.runId = response.headers.get("X-Run-ID") || progress.runId;
       if (!progress.runId) throw new Error("後端未回傳 Run ID，無法安全重連");
-      state.currentRunId = progress.runId;
+      runState.runId = progress.runId;
+      runState.runDraft.operationId = progress.runId;
       if (typeof task.onRunIdentified === "function") await task.onRunIdentified(progress.runId, progress.lastSequence);
-      if (!state.currentRunStatus) state.currentRunStatus = "running";
+      if (!runState.status) runState.status = "running";
+      syncRunStateAliases();
       syncRunActionButton();
-			setRunActivity("", sessionID);
+		  setRunActivity("", sessionID);
       await consumeEvents(response.body, progress, sessionID);
       if (typeof task.onSequence === "function") await task.onSequence(progress.lastSequence);
       if (progress.terminal) return;
@@ -3945,7 +4457,7 @@ async function runWithReconnect(task) {
       }
       throw new Error("事件連線提前結束");
     } catch (error) {
-      if (progress.terminal) return;
+      if (progress.terminal || runState.terminal || error.name === "AbortError") return;
       if (reconnects >= 3) throw new Error(`重連 3 次仍失敗，連線已中斷：${error.message}`);
       reconnects += 1;
       setRunActivity(`連線中斷，正在重連並補回事件（${reconnects}/3）`, sessionID);
@@ -3962,11 +4474,13 @@ async function openRunStream(task, progress) {
   const headers = reconnect
     ? { "Last-Event-ID": String(progress.lastSequence) }
     : { "Content-Type": "application/json", "Idempotency-Key": task.idempotencyKey };
-  const response = await fetch(path, reconnect ? { headers } : {
+  const options = reconnect ? { headers } : {
     method: "POST",
     headers,
     body: JSON.stringify({ input: task.input, attachment_ids: task.attachmentIds || [] }),
-  });
+  };
+  if (task.runState?.eventController) options.signal = task.runState.eventController.signal;
+  const response = await fetch(path, options);
   if (!response.ok) {
     let detail = response.statusText;
     try { detail = (await response.json()).detail || detail; } catch (_) {}
@@ -3996,12 +4510,27 @@ async function consumeEvents(stream, progress, sessionID) {
       const event = JSON.parse(data);
       if (Number.isInteger(event.sequence) && event.sequence > progress.lastSequence) progress.lastSequence = event.sequence;
       handleEvent(event, sessionID);
-      if (["run.completed", "run.failed", "run.canceled"].includes(event.type)) progress.terminal = true;
+      if (["run.completed", "run.failed", "run.canceled"].includes(event.type)) {
+        progress.terminal = true;
+        // 終止事件已經是完整結果，不應繼續等待 SSE 自己斷線；部分後端／
+        // 反向代理會保留連線，否則停止後 UI 永遠等不到 finishActiveRun。
+        await reader.cancel().catch(() => {});
+        return;
+      }
     }
   }
 }
 
 function handleTerminalRun(run, sessionID) {
+  const runState = activeRunFor(sessionID);
+  if (runState?.terminalHandled) return;
+  if (runState) {
+    runState.runId = run.id || runState.runId;
+    runState.status = run.status || runState.status;
+    runState.terminal = true;
+    runState.terminalHandled = true;
+    runState.canceling = false;
+  }
   const visible = state.session?.id === sessionID;
   const startedAt = Date.parse(run.started_at);
   const completedAt = Date.parse(run.completed_at);
@@ -4010,11 +4539,10 @@ function handleTerminalRun(run, sessionID) {
   }
   state.runStartedAt.delete(run.id);
   setContextCompactionState(sessionID, false);
-  if (visible) setAgentProcessing(state.liveMessage, false);
+  if (visible) setAgentProcessing(runState?.liveMessage || state.liveMessage, false);
   if (run.status === "failed" || run.status === "canceled") {
     if (run.error?.retryable) {
-      state.retryableRunId = run.id;
-      state.retryableSessionId = sessionID;
+      state.retryableRuns.set(sessionID, run);
     }
     if (visible) {
       appendRunOutcome({ id: run.id, status: run.status, error: run.error });
@@ -4022,11 +4550,17 @@ function handleTerminalRun(run, sessionID) {
     }
     toast(run.error?.message || `Run ${run.status}`);
   }
+  syncRunStateAliases();
 }
 
 function handleEvent(event, sessionID) {
   const payload = event.payload || {};
   const visible = state.session?.id === sessionID;
+
+  const runState = activeRunFor(sessionID);
+  // 停止已被本地確認後，串流中尚未送達的 late event 不得重新點亮處理動畫。
+  if (!runState || runState.terminalHandled) return;
+  if (event.run_id) runState.runId = String(event.run_id);
 	if (event.type === "context.compaction.started") {
 	  setContextCompactionState(sessionID, true);
 	} else if (["context.compacted", "context.compaction.failed"].includes(event.type)) {
@@ -4040,27 +4574,29 @@ function handleEvent(event, sessionID) {
 	  loadPlans(sessionID).catch(() => {});
 	}
 	if (visible && event.type === "plan.completion_check") loadPlans(sessionID).catch(() => {});
-	const operationID = String(event.run_id || state.currentRunId || "");
+	const operationID = String(event.run_id || runState.runId || "");
 	if (event.type === "run.started" && operationID && !state.runStartedAt.has(operationID)) {
-		state.currentRunStatus = "running";
+		runState.status = "running";
 	  const startedAt = Date.parse(event.created_at);
 	  state.runStartedAt.set(operationID, Number.isFinite(startedAt) ? startedAt : Date.now());
 	  const draft = ensureRunDraft(sessionID, operationID);
-	  draft.processing = true;
+	  if (draft) draft.processing = true;
+	  syncRunStateAliases();
 	  if (visible) renderSelectedRunDraft();
 	}
 	if (event.type === "run.paused") {
-		state.currentRunStatus = "paused";
+		runState.status = "paused";
 		setRunActivity("Run 已暫停", sessionID);
 		syncRunActionButton();
 	} else if (event.type === "run.resumed") {
-		state.currentRunStatus = "running";
+		runState.status = "running";
 		setRunActivity("", sessionID);
 		syncRunActionButton();
 	}
 	if (event.type === "message.start" && payload.message?.role === "assistant") {
     const message = normalizeAssistantThinking(payload.message);
     const draft = ensureRunDraft(sessionID, operationID, message.id);
+    if (!draft) return;
     draft.content = message.content || "";
     draft.reasoning = message.reasoning || "";
     draft.processing = !draft.content;
@@ -4070,6 +4606,7 @@ function handleEvent(event, sessionID) {
     }
   } else if (event.type === "message.delta") {
     const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
+    if (!draft) return;
     const delta = payload.delta || "";
     draft.content += delta;
     // 第一個回答字元出現後，文字串流本身就是進度，不再同時顯示思考動畫。
@@ -4080,7 +4617,8 @@ function handleEvent(event, sessionID) {
     }
   } else if (event.type === "message.thinking_delta") {
     const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
-    draft.reasoning += payload.delta || "";
+    if (!draft) return;
+    draft.reasoning = appendReasoningDelta(draft.reasoning, payload.delta || "");
     draft.processing = true;
     if (visible) {
       renderSelectedRunDraft();
@@ -4090,6 +4628,7 @@ function handleEvent(event, sessionID) {
     // 收到工具呼叫片段後，可以確定目前 Response 只是 Run 的中間階段。
     // 將先前已串流到主回答的文字即時移入處理過程，不等工具執行結束。
     const draft = ensureRunDraft(sessionID, operationID, payload.message_id);
+    if (!draft) return;
     draft.reasoning = joinReasoningParts(draft.reasoning, draft.content);
     draft.content = "";
     draft.internal = true;
@@ -4105,6 +4644,7 @@ function handleEvent(event, sessionID) {
       recordContextUsage(message.usage, sessionID, message.provider_id || identity.providerID, message.model || identity.model);
     }
     const draft = ensureRunDraft(sessionID, operationID, message.id);
+    if (!draft) return;
     const internal = message.metadata?.internal === true
       || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0);
     if (internal) {
@@ -4122,55 +4662,100 @@ function handleEvent(event, sessionID) {
       if (internal) continueRunProcessing(sessionID, operationID);
       return;
     }
-    state.liveMessage = renderSelectedRunDraft() || findMessage(message.id) || state.liveMessage;
-    if (state.liveMessage && operationID) state.liveMessage.dataset.operationId = operationID;
+    runState.liveMessage = renderSelectedRunDraft() || findMessage(message.id) || runState.liveMessage;
+    syncRunStateAliases();
+    if (runState.liveMessage && operationID) runState.liveMessage.dataset.operationId = operationID;
     if (internal) {
-      if (draft.reasoning && state.liveMessage) {
-        setMessageReasoning(state.liveMessage, draft.reasoning);
-        state.liveMessage.classList.add("reasoning-only");
-        renderRichContent(state.liveMessage.querySelector(".content"), "");
-        setAgentProcessing(state.liveMessage, false);
-        mergeReasoningIntoPrevious(state.liveMessage, operationID);
+      if (draft.reasoning && runState.liveMessage) {
+        setMessageReasoning(runState.liveMessage, draft.reasoning);
+        runState.liveMessage.classList.add("reasoning-only");
+        renderRichContent(runState.liveMessage.querySelector(".content"), "");
+        setAgentProcessing(runState.liveMessage, false);
+        mergeReasoningIntoPrevious(runState.liveMessage, operationID);
       } else {
-        state.liveMessage?.remove();
+        runState.liveMessage?.remove();
       }
-      state.liveMessage = null;
-      state.runDraft = null;
+      runState.liveMessage = null;
+      runState.runDraft = null;
+      syncRunStateAliases();
       continueRunProcessing(sessionID, operationID);
     } else {
-      if (state.liveMessage) {
-        const content = state.liveMessage.querySelector(".content");
+      if (runState.liveMessage) {
+        const content = runState.liveMessage.querySelector(".content");
         renderRichContent(content, message.content || richContentSource(content));
-        if (message.reasoning) setMessageReasoning(state.liveMessage, message.reasoning);
-        if (message.reasoning) mergeReasoningIntoPrevious(state.liveMessage, operationID);
+        if (message.reasoning) setMessageReasoning(runState.liveMessage, message.reasoning);
+        if (message.reasoning) mergeReasoningIntoPrevious(runState.liveMessage, operationID);
       }
-      setAgentProcessing(state.liveMessage, false);
+      setAgentProcessing(runState.liveMessage, false);
+    }
+	} else if (event.type === "tool.execution.start") {
+    // 工具呼叫本身就是執行過程的一部分：只註記呼叫了什麼，不展開參數。
+    const draft = ensureRunDraft(sessionID, operationID);
+    const toolName = String(payload.tool_name || "").trim();
+    if (draft && toolName) {
+      draft.reasoning = joinReasoningParts(draft.reasoning, `${translate("呼叫工具")}：\`${toolName}\``);
+      draft.processing = true;
+      if (visible) {
+        renderSelectedRunDraft();
+        scrollMessages();
+      }
+    }
+    setRunActivity("", sessionID);
+  } else if (event.type === "tool.execution.update") {
+    // 只把「還在等什麼」放到狀態列；工具自己的進度內容不展開成段落。
+    const phase = payload.update?.details?.phase;
+    if (phase === "mcp_waiting" || phase === "waiting_approval") {
+      setRunActivity(String(payload.update?.content || "").trim(), sessionID);
+    }
+  } else if (event.type === "tool.execution.end") {
+    setRunActivity("", sessionID);
+    const draft = ensureRunDraft(sessionID, operationID);
+    const failedTool = payload.result?.is_error ? String(payload.result?.tool_name || "").trim() : "";
+    if (draft && failedTool) {
+      draft.reasoning = joinReasoningParts(draft.reasoning, `${translate("工具失敗")}：\`${failedTool}\``);
+      if (visible) renderSelectedRunDraft();
     }
 	} else if (event.type === "run.approval_required" && payload.approval) {
-    if (visible) setAgentProcessing(state.liveMessage, false);
+    // 核准對話框可能因為切到別的對話而沒被看到；狀態列要說出它在等什麼。
+    setRunActivity(`${translate("等待人工核准")}：${String(payload.approval.tool_name || "").trim()}`, sessionID);
+    if (visible) setAgentProcessing(runState.liveMessage, false);
     showApproval(payload.approval, sessionID);
   } else if (event.type === "run.approval_resolved") {
-    state.pendingApproval = null;
-    state.pendingApprovalSessionId = "";
+    runState.pendingApproval = null;
+    syncRunStateAliases();
     if (visible && $("approvalDialog").open) $("approvalDialog").close();
 		setRunActivity("", sessionID);
 		continueRunProcessing(sessionID, operationID);
-	} else if (event.type === "run.completed") {
+		} else if (event.type === "run.completed") {
+    if (runState.terminalHandled) return;
+    runState.terminal = true;
+    runState.terminalHandled = true;
+    runState.canceling = false;
+    runState.status = "completed";
     setContextCompactionState(sessionID, false);
-    finalizeLiveReasoningDuration(event, operationID, visible);
-    if (visible) setAgentProcessing(state.liveMessage, false);
+    finalizeLiveReasoningDuration(event, operationID, visible, sessionID);
+    if (visible) setAgentProcessing(runState.liveMessage, false);
     if (visible) loadPlans(sessionID).catch(() => {});
-  } else if (event.type === "run.failed" || event.type === "run.canceled") {
+		} else if (event.type === "run.failed" || event.type === "run.canceled") {
+    if (runState.terminalHandled) return;
+    runState.terminal = true;
+    runState.terminalHandled = true;
+    runState.canceling = false;
+    runState.status = event.type === "run.canceled" ? "canceled" : "failed";
     setContextCompactionState(sessionID, false);
-    finalizeLiveReasoningDuration(event, operationID, visible);
-    if (visible) setAgentProcessing(state.liveMessage, false);
+    finalizeLiveReasoningDuration(event, operationID, visible, sessionID);
+    if (visible) setAgentProcessing(runState.liveMessage, false);
     if (payload.error?.retryable) {
-      state.retryableRunId = state.currentRunId;
-      state.retryableSessionId = sessionID;
+      state.retryableRuns.set(sessionID, {
+        id: runState.runId,
+        status: runState.status,
+        error: payload.error,
+        session_id: sessionID,
+      });
     }
     if (visible) {
       appendRunOutcome({
-        id: state.currentRunId,
+        id: runState.runId,
         status: event.type === "run.canceled" ? "canceled" : "failed",
         error: payload.error,
       });
@@ -4178,42 +4763,38 @@ function handleEvent(event, sessionID) {
     }
     toast(payload.error?.message || event.type);
   }
+  syncRunStateAliases();
 }
 
-function finalizeLiveReasoningDuration(event, operationID, visible) {
+function finalizeLiveReasoningDuration(event, operationID, visible, sessionID = "") {
   const startedAt = state.runStartedAt.get(operationID);
   const completedAt = Date.parse(event.created_at);
-  if (visible && Number.isFinite(startedAt) && Number.isFinite(completedAt)) {
-    finalizeReasoningGroup(operationID, completedAt - startedAt);
-    for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
-      if (node.dataset.operationId !== operationID) continue;
-      const block = node.querySelector(".message-reasoning");
-      if (block) block.open = false;
-    }
+  if (Number.isFinite(startedAt) && Number.isFinite(completedAt) && completedAt > startedAt) {
+    if (visible) finalizeReasoningGroup(operationID, completedAt - startedAt);
+    if (sessionID) state.lastRunDuration.set(sessionID, completedAt - startedAt);
   }
   state.runStartedAt.delete(operationID);
 }
 
+// runDurationText 是 Run 結束後留在狀態列的完成訊息。
+//
+// 等待秒數在結束的瞬間消失，使用者就沒機會知道這次到底等了多久——用本機模型時
+// 那個數字正是他們在評估的東西。
+function runDurationText(sessionID) {
+  const duration = state.lastRunDuration.get(sessionID);
+  if (!Number.isFinite(duration) || duration <= 0) return "";
+  return `${translate("本次回應共使用")} ${formatProcessingDuration(duration)}`;
+}
+
 async function retryCurrentRun() {
-  const sourceRunId = state.retryableRunId;
-  if (!sourceRunId || state.running) return;
-  const sessionID = state.retryableSessionId || state.session?.id;
+  const sessionID = state.session?.id;
+  const retryable = sessionID ? state.retryableRuns.get(sessionID) : null;
+  const sourceRunId = retryable?.id || state.retryableRunId;
+  if (!sourceRunId || !sessionID || activeRunFor(sessionID)) return;
+  const runState = addActiveRun(newRunState(sessionID));
+  state.retryableRuns.delete(sessionID);
+  syncRunStateAliases();
   if (!sessionID) return;
-  state.running = true;
-  state.runningSessionId = sessionID;
-	state.runActivityText = "";
-  state.canceling = false;
-  state.retryableRunId = "";
-  state.retryableSessionId = "";
-  state.runDraft = {
-    sessionId: sessionID,
-    operationId: "",
-    messageId: "",
-    content: "",
-    reasoning: "",
-    internal: false,
-    processing: true,
-  };
   syncSelectedRunUI();
   $("retryRun").disabled = true;
   renderSelectedRunDraft();
@@ -4224,42 +4805,29 @@ async function retryCurrentRun() {
       headers: { "Idempotency-Key": crypto.randomUUID() },
       body: "{}",
     });
-    state.currentRunId = run.id;
+    runState.runId = run.id;
+    runState.status = run.status || "queued";
+    runState.runDraft.operationId = run.id;
+    syncRunStateAliases();
     syncRunActionButton();
-		setRunActivity("", sessionID);
-    await runWithReconnect({ runId: run.id, sessionId: sessionID });
+	  setRunActivity("", sessionID);
+    await runWithReconnect({ runId: run.id, sessionId: sessionID, runState });
   } catch (error) {
-    state.retryableRunId = sourceRunId;
-    state.retryableSessionId = sessionID;
+    state.retryableRuns.set(sessionID, { id: sourceRunId, status: "failed", error, session_id: sessionID });
     toast(error.message);
   } finally {
-    if (state.currentRunId) state.runStartedAt.delete(state.currentRunId);
-    setContextCompactionState(sessionID, false);
-    state.running = false;
-    state.runningSessionId = "";
-    state.runActivityText = "";
-    state.canceling = false;
-    state.currentRunId = "";
-    state.currentRunStatus = "";
-    setAgentProcessing(state.liveMessage, false);
-    state.liveMessage = null;
-    state.runDraft = null;
+    await finishActiveRun(runState);
     $("retryRun").disabled = false;
-    syncSelectedRunUI();
-    renderNavigation();
-    if (state.promptQueue.length > 0) {
-      void drainPromptQueue();
-    } else {
-      if (state.session?.id === sessionID) await loadMessages().catch(() => {});
-      await loadSessions().catch(() => {});
-      refreshOpenProviderUsage();
-    }
+    refreshOpenProviderUsage();
   }
 }
 
 function showApproval(approval, sessionID = state.runningSessionId) {
-  state.pendingApproval = approval;
-  state.pendingApprovalSessionId = sessionID;
+  const runState = activeRunFor(sessionID);
+  if (!runState) return;
+  runState.pendingApproval = approval;
+  syncRunStateAliases();
+  if (state.session?.id !== sessionID) return;
   $("approvalToolName").textContent = approval.tool_name || "未知工具";
   $("approvalReasonText").textContent = approval.reason || "此工具需要人工確認。";
   const argumentsValue = approval.arguments || {};
@@ -4274,14 +4842,16 @@ function showApproval(approval, sessionID = state.runningSessionId) {
 }
 
 async function decideApproval(decision) {
-  const approval = state.pendingApproval;
-  if (!approval || !state.currentRunId) return;
+  const sessionID = state.session?.id;
+  const runState = activeRunFor(sessionID);
+  const approval = runState?.pendingApproval;
+  if (!approval || !runState?.runId) return;
   $("approveTool").disabled = true;
   $("denyTool").disabled = true;
   $("permanentApproval").disabled = true;
   const permanent = decision === "approve" && $("permanentApproval").checked;
   try {
-    await request(`/api/v1/runs/${encodeURIComponent(state.currentRunId)}/decision`, {
+    await request(`/api/v1/runs/${encodeURIComponent(runState.runId)}/decision`, {
       method: "POST",
       body: JSON.stringify({
         approval_id: approval.id,
@@ -4290,7 +4860,7 @@ async function decideApproval(decision) {
         permanent,
       }),
     });
-		setRunActivity("", state.pendingApprovalSessionId);
+	  setRunActivity("", sessionID);
   } catch (error) {
     toast(error.message);
     $("approveTool").disabled = false;
@@ -4300,31 +4870,61 @@ async function decideApproval(decision) {
 }
 
 async function cancelCurrentRun() {
-  if (!state.currentRunId || state.canceling) return;
-  state.canceling = true;
+  const sessionID = state.session?.id;
+  const runState = activeRunFor(sessionID);
+  if (!runState?.runId || runState.canceling) return;
+  runState.canceling = true;
+  setRunActivity(translate("正在停止…"), sessionID);
+  syncRunStateAliases();
   syncRunActionButton();
   try {
-    await request(`/api/v1/runs/${encodeURIComponent(state.currentRunId)}/cancel`, { method: "POST", body: "{}" });
+    const canceledRun = await request(`/api/v1/runs/${encodeURIComponent(runState.runId)}/cancel`, { method: "POST", body: "{}" });
+    if (activeRunFor(sessionID) !== runState) return;
+    if (canceledRun?.status && ["completed", "failed", "canceled"].includes(canceledRun.status)) {
+      handleTerminalRun(canceledRun, sessionID);
+    } else {
+      // 舊版或反向代理可能只回覆「已接受」而沒有帶回完整 Run；取消要求
+      // 已送達時仍須停止本地串流，避免 UI 一直顯示執行中。
+      runState.status = "canceled";
+      runState.terminal = true;
+      runState.terminalHandled = true;
+      runState.canceling = false;
+      setContextCompactionState(sessionID, false);
+      if (state.session?.id === sessionID) {
+        setAgentProcessing(runState.liveMessage, false);
+        appendRunOutcome({ id: runState.runId, status: "canceled" });
+      }
+      syncRunStateAliases();
+      syncSelectedRunUI();
+    }
+    runState.eventController?.abort();
+    await finishActiveRun(runState);
   } catch (error) {
-    state.canceling = false;
+    if (activeRunFor(sessionID) !== runState) return;
+    runState.canceling = false;
+    syncRunStateAliases();
     syncRunActionButton();
     toast(error.message);
   }
 }
 
 async function pauseCurrentRun() {
-  if (!state.currentRunId || state.currentRunStatus === "paused") return;
+  const sessionID = state.session?.id;
+  const runState = activeRunFor(sessionID);
+  if (!runState?.runId || runState.status === "paused") return;
   try {
-    await request("/api/v1/runs/" + encodeURIComponent(state.currentRunId) + "/pause", { method: "POST", body: "{}" });
-    state.currentRunStatus = "paused"; setRunActivity("Run 已暫停", state.runningSessionId); syncRunActionButton();
+    await request("/api/v1/runs/" + encodeURIComponent(runState.runId) + "/pause", { method: "POST", body: "{}" });
+    runState.status = "paused"; setRunActivity("Run 已暫停", sessionID); syncRunActionButton();
   } catch (error) { toast(error.message); }
 }
 
 async function resumeCurrentRun() {
-  if (!state.currentRunId || state.currentRunStatus !== "paused") return;
+  const sessionID = state.session?.id;
+  const runState = activeRunFor(sessionID);
+  if (!runState?.runId || runState.status !== "paused") return;
   try {
-    await request("/api/v1/runs/" + encodeURIComponent(state.currentRunId) + "/resume", { method: "POST", body: "{}" });
-    state.currentRunStatus = "running"; setRunActivity("", state.runningSessionId); syncRunActionButton();
+    await request("/api/v1/runs/" + encodeURIComponent(runState.runId) + "/resume", { method: "POST", body: "{}" });
+    runState.status = "running"; setRunActivity("", sessionID); syncRunActionButton();
   } catch (error) { toast(error.message); }
 }
 
@@ -4392,7 +4992,7 @@ async function setPinned(session, pinned) {
 }
 
 function openRenameSessionDialog(session) {
-  if (!session || state.running) return;
+  if (!session || sessionRunIsActive(session.id)) return;
   state.renamingSession = session;
   $("renameSessionTitle").value = session.title || "";
   $("renameSessionDialog").showModal();
@@ -4404,7 +5004,7 @@ async function renameSession(event) {
   event.preventDefault();
   const session = state.renamingSession;
   const title = $("renameSessionTitle").value.trim();
-  if (!session || !title || state.running) return;
+  if (!session || !title || sessionRunIsActive(session.id)) return;
   $("saveRenameSession").disabled = true;
   try {
     const updated = await request(`/api/v1/sessions/${encodeURIComponent(session.id)}`, {
@@ -4456,15 +5056,22 @@ async function openSessionContent(session) {
 function renderSessionContent(messages) {
   const list = $("sessionContentList");
   list.replaceChildren();
-  $("sessionContentMeta").textContent = `${state.inspectingSession?.id || ""} · ${messages.length} 則訊息`;
-  if (messages.length === 0) {
+  const visibleMessages = messages.filter((message) => {
+    if (!message || message.role !== "assistant") return true;
+    return Boolean(
+      String(message.content || "").trim()
+      || (Array.isArray(message.tool_calls) && message.tool_calls.length > 0),
+    );
+  });
+  $("sessionContentMeta").textContent = `${state.inspectingSession?.id || ""} · ${visibleMessages.length} 則訊息`;
+  if (visibleMessages.length === 0) {
     const empty = document.createElement("p");
     empty.className = "quiet session-content-state";
     empty.textContent = "這個對話目前沒有內容。";
     list.append(empty);
     return;
   }
-  list.append(...messages.map(sessionContentNode));
+  list.append(...visibleMessages.map(sessionContentNode));
 }
 
 function sessionContentNode(message) {
@@ -4516,7 +5123,7 @@ function sessionContentNode(message) {
 }
 
 function openDeleteSessionDialog(session) {
-  if (!session || state.running) return;
+  if (!session || sessionRunIsActive(session.id)) return;
   state.deletingSession = session;
   $("deleteSessionMessage").textContent = `確定要刪除對話「${session.title || "未命名"}」嗎？`;
   $("deleteSessionDialog").showModal();
@@ -4526,7 +5133,7 @@ function openDeleteSessionDialog(session) {
 async function deleteSession(event) {
   event.preventDefault();
   const session = state.deletingSession;
-  if (!session || state.running) return;
+  if (!session || sessionRunIsActive(session.id)) return;
   $("confirmDeleteSession").disabled = true;
   try {
     await request(`/api/v1/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
@@ -4643,7 +5250,7 @@ function openScheduleDialog(schedule) {
   $("scheduleEnabled").checked = schedule ? Boolean(schedule.enabled) : true;
   $("deleteSchedule").classList.toggle("hidden", !schedule);
   $("runScheduleNow").classList.toggle("hidden", !schedule);
-  $("runScheduleNow").disabled = state.running || !state.backendHealthy;
+  $("runScheduleNow").disabled = !state.backendHealthy;
   state.scheduleSandboxRoots = [...(schedule?.sandbox_roots || [])];
   renderProjectSandboxRoots("schedule");
   syncScheduleFrequencyFields();
@@ -4966,6 +5573,40 @@ async function saveWorkspaceSettings(event) {
   }
 }
 
+// saveToolSettings 只送工具相關欄位。更新 API 的欄位是指標，省略即保留原值，
+// 因此兩個設定頁各自儲存不會互相覆蓋；service_name 是必填，帶上目前值。
+async function saveToolSettings(event) {
+  event.preventDefault();
+  const serviceName = ($("settingServiceName").value || state.serviceSettings?.service_name || "").trim();
+  if (!serviceName) {
+    $("toolSettingsState").textContent = translate("儲存失敗");
+    toast(translate("尚未載入服務設定，請稍後再試"));
+    return;
+  }
+  $("saveToolSettings").disabled = true;
+  $("toolSettingsState").textContent = translate("儲存中…");
+  try {
+    const updated = await request("/api/v1/admin/service-settings", {
+      method: "PUT",
+      body: JSON.stringify({
+        service_name: serviceName,
+        extended_tools: $("settingExtendedTools").checked,
+        tool_call_mode: $("settingInstructionToolCalls").checked ? "instruction" : "native",
+        tool_retrieval: $("settingToolRetrieval").checked,
+        http_fetch_enabled: $("settingHTTPFetchEnabled").checked,
+        http_fetch_allow_private_networks: $("settingHTTPFetchPrivateNetworks").checked,
+      }),
+    });
+    applyServiceSettings(updated);
+    $("toolSettingsState").textContent = translate("已儲存");
+  } catch (error) {
+    $("toolSettingsState").textContent = translate("儲存失敗");
+    toast(error.message);
+  } finally {
+    $("saveToolSettings").disabled = false;
+  }
+}
+
 async function saveServiceSettings(event) {
   event.preventDefault();
   const serviceName = $("settingServiceName").value.trim();
@@ -4995,8 +5636,6 @@ async function saveServiceSettings(event) {
         max_wall_clock_seconds: wallClockMinutes * 60,
         max_tokens: maxTokens,
         max_tool_calls: maxToolCalls,
-        http_fetch_enabled: $("settingHTTPFetchEnabled").checked,
-        http_fetch_allow_private_networks: $("settingHTTPFetchPrivateNetworks").checked,
       }),
     });
     applyServiceSettings(updated);
@@ -5108,7 +5747,14 @@ async function saveSessionSettings(event) {
     await loadTools();
   } catch (error) {
     $("settingsState").textContent = "儲存失敗";
-    toast(error.message);
+    if (sessionBusyError(error)) {
+      const restored = await resyncActiveRun(state.session?.id);
+      toast(restored
+        ? translate("這個對話還有進行中的工作，完成或取消後才能調整設定")
+        : translate("後端仍在收尾上一個工作，稍待幾秒再試一次"));
+    } else {
+      toast(error.message);
+    }
   } finally {
     $("saveSessionSettings").disabled = false;
   }
@@ -5131,7 +5777,7 @@ async function activatePanel(name) {
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
   }
-  for (const value of ["overview", "workspace", "systemTools", "providers", "mcp", "reverseProxy", "tools", "permissions", "about", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
+  for (const value of ["overview", "workspace", "systemTools", "providers", "mcp", "reverseProxy", "toolSettings", "tools", "permissions", "about", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
   if (name === "workspace") {
     renderWorkspaceOptions();
     syncWorkspaceSettings();
@@ -5974,7 +6620,7 @@ function newMCPSetting() {
     url: "",
     startup_timeout_seconds: 20,
     call_timeout_seconds: 1800,
-    trust_annotations: false,
+    trust_annotations: true,
     status: "disconnected",
     tools: [],
   };
@@ -6000,6 +6646,498 @@ function renderMCPTransportFields(transport) {
   $("mcpHTTPFields").classList.toggle("hidden", stdio);
   $("mcpSettingCommand").required = stdio;
   $("mcpSettingURL").required = !stdio;
+}
+
+function isMCPImportObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mcpImportSensitiveName(value) {
+  return /(authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|credential|username|user_name|account)/i.test(String(value || ""));
+}
+
+function mcpImportVariable(value) {
+  return /\$\{[^}]+\}/.test(String(value || ""));
+}
+
+function mcpImportSourceValue(source, names) {
+  for (const name of names) {
+    if (source[name] !== undefined && source[name] !== null) return source[name];
+  }
+  return undefined;
+}
+
+function mcpImportStringMap(value, preserveSensitiveNames = false) {
+  const result = {};
+  let removedSensitive = false;
+  if (!isMCPImportObject(value)) return { value: result, removedSensitive };
+  for (const [key, raw] of Object.entries(value)) {
+    if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") continue;
+    const text = String(raw);
+    if (mcpImportSensitiveName(key) || mcpImportVariable(text) || /^(?:bearer|basic)\s+/i.test(text)) {
+      removedSensitive = true;
+      if (preserveSensitiveNames && String(key).trim()) result[key] = "";
+      continue;
+    }
+    result[key] = text;
+  }
+  return { value: result, removedSensitive };
+}
+
+function mcpTransportValue(value, fallback = "stdio") {
+  const transport = String(value || "").trim().toLowerCase();
+  if (transport === "stdio") return "stdio";
+  if (["sse", "server-sent-events", "server_sent_events"].includes(transport)) return "sse";
+  if (transport === "streamable-http" || transport === "streamable_http" || transport === "http") return "streamable-http";
+  return fallback;
+}
+
+function mcpImportAuthMethodValue(value) {
+  const method = String(value || "").trim().toLowerCase().replace(/[_\s]+/g, "-");
+  if (["none", "no-auth", "no-authentication", "anonymous", "unauthenticated"].includes(method)) return "none";
+  if (["bearer", "bearer-token", "token", "api-key", "oauth", "oauth2"].includes(method)) return "bearer";
+  if (["basic", "basic-auth", "password", "username-password"].includes(method)) return "basic";
+  if (["header", "headers", "custom-header", "custom-headers", "http-headers"].includes(method)) return "headers";
+  return "";
+}
+
+function mcpImportAuthMethods(source, rawAuth, rawHeaders, apiKey, authUsername, authPassword) {
+  const methods = new Set();
+  const add = (value) => {
+    const method = mcpImportAuthMethodValue(value);
+    if (method) methods.add(method);
+  };
+  const declared = mcpImportSourceValue(source, ["auth_methods", "authMethods", "authentication_methods", "authenticationMethods"])
+    ?? (isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["methods", "supported_methods", "supportedMethods"]) : undefined);
+  if (Array.isArray(declared)) declared.forEach(add);
+  else if (declared !== undefined) add(declared);
+  const rawAuthType = isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["type", "method"]) : rawAuth;
+  add(mcpImportSourceValue(source, ["auth_method", "authMethod", "authentication_type", "authenticationType"]));
+  add(rawAuthType);
+  if (typeof apiKey === "string" && apiKey.trim()) add("bearer");
+  if ((typeof authUsername === "string" && authUsername.trim()) || (typeof authPassword === "string" && authPassword)) add("basic");
+  if (isMCPImportObject(rawHeaders) && Object.keys(rawHeaders).length > 0) add("headers");
+  if (!methods.size) methods.add("none");
+  if (methods.size > 1) methods.delete("none");
+  return ["none", "bearer", "basic", "headers"].filter((method) => methods.has(method));
+}
+
+function mcpImportAuthOptions(methods = ["none", "bearer", "basic", "headers"]) {
+  const allowed = new Set(methods);
+  return [
+    { value: "none", label: "不使用驗證" },
+    { value: "bearer", label: "Bearer Token（金鑰）" },
+    { value: "basic", label: "Basic Auth（帳號密碼）" },
+    { value: "headers", label: "自訂 HTTP Headers" },
+  ].filter((option) => allowed.has(option.value));
+}
+
+function mcpImportID(value, fallback, used) {
+  let id = String(value || fallback || "mcp-server")
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  if (!id) id = "mcp-server";
+  const base = id;
+  let suffix = 2;
+  while (used.has(id)) {
+    id = `${base.slice(0, Math.max(1, 80 - String(suffix).length - 1))}-${suffix}`;
+    suffix += 1;
+  }
+  used.add(id);
+  return id;
+}
+
+function mcpImportEntries(root, fileName) {
+  if (Array.isArray(root)) return root.map((value, index) => [value?.id || value?.name || `mcp-server-${index + 1}`, value]);
+  if (!isMCPImportObject(root)) throw new Error(".mcp 檔案的根內容必須是 JSON 物件");
+  if (isMCPImportObject(root.mcpServers)) return Object.entries(root.mcpServers);
+  if (Array.isArray(root.servers)) return root.servers.map((value, index) => [value?.id || value?.name || `mcp-server-${index + 1}`, value]);
+  if (isMCPImportObject(root.servers)) return Object.entries(root.servers);
+  if (isMCPImportObject(root.server)) return [[root.server.id || root.server.name || "mcp-server", root.server]];
+  if (["command", "url", "server_url", "endpoint", "args"].some((key) => root[key] !== undefined)) {
+    const fallback = String(fileName || "mcp-server").replace(/\.[^.]+$/, "");
+    return [[root.id || root.name || fallback, root]];
+  }
+  throw new Error("找不到 MCP Server 設定；請使用 mcpServers、servers 或單一 Server JSON 格式");
+}
+
+function normalizeMCPImport(root, fileName) {
+  const entries = mcpImportEntries(root, fileName);
+  if (!entries.length) throw new Error(".mcp 檔案沒有可匯入的 MCP Server");
+  const usedIDs = new Set();
+  return entries.map(([entryID, raw], index) => {
+    const source = isMCPImportObject(raw) ? raw : {};
+    const id = mcpImportID(source.id || entryID, `mcp-server-${index + 1}`, usedIDs);
+    const displayName = String(source.display_name || source.displayName || source.name || entryID || id).trim().slice(0, 80);
+    const rawURL = mcpImportSourceValue(source, ["url", "server_url", "serverUrl", "endpoint", "base_url", "baseUrl"]);
+    const url = typeof rawURL === "string" && !mcpImportVariable(rawURL) ? rawURL.trim() : "";
+    const explicitTransport = String(source.transport || source.type || "").trim().toLowerCase();
+    const transport = explicitTransport === "stdio" || source.command || source.executable
+      ? "stdio"
+      : mcpTransportValue(explicitTransport, "streamable-http");
+    const rawEnvironment = mcpImportSourceValue(source, ["environment", "env"]);
+    const environment = mcpImportStringMap(rawEnvironment, true);
+    const rawHeaders = mcpImportSourceValue(source, ["headers", "http_headers", "httpHeaders"]);
+    const headers = mcpImportStringMap(rawHeaders, true);
+    let removedSensitive = environment.removedSensitive || headers.removedSensitive;
+    const apiKey = mcpImportSourceValue(source, ["api_key", "apiKey", "access_token", "accessToken", "bearer_token", "bearerToken", "token"]);
+    if (typeof apiKey === "string" && apiKey.trim()) removedSensitive = true;
+    const rawAuth = mcpImportSourceValue(source, ["basic_auth", "basicAuth", "authentication", "auth"]);
+    const authUsername = mcpImportSourceValue(source, ["username", "user_name", "account"])
+      ?? (isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["username", "user_name", "account"]) : undefined);
+    const authPassword = mcpImportSourceValue(source, ["password", "pass"])
+      ?? (isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["password", "pass"]) : undefined);
+    if ((typeof authUsername === "string" && authUsername.trim()) || (typeof authPassword === "string" && authPassword)) {
+      removedSensitive = true;
+    }
+    if (typeof rawURL === "string" && mcpImportVariable(rawURL)) removedSensitive = true;
+    const authMethods = transport === "stdio" ? ["none"] : mcpImportAuthMethods(source, rawAuth, rawHeaders, apiKey, authUsername, authPassword);
+    const rawArgs = mcpImportSourceValue(source, ["args", "arguments"]);
+    const args = Array.isArray(rawArgs) ? rawArgs.filter((value) => typeof value === "string") : [];
+    const timeout = Number(source.startup_timeout_seconds ?? source.startupTimeoutSeconds);
+    const callTimeout = Number(source.call_timeout_seconds ?? source.callTimeoutSeconds);
+    return {
+      id,
+      display_name: displayName || id,
+      enabled: source.enabled !== false,
+      transport,
+      command: String(source.command || source.executable || "").trim(),
+      args,
+      work_dir: String(source.work_dir || source.workDir || source.cwd || "").trim(),
+      url,
+      api_key: "",
+      auth_methods: authMethods,
+      auth_method: authMethods[0],
+      headers: headers.value,
+      environment: environment.value,
+      startup_timeout_seconds: Number.isFinite(timeout) && timeout > 0 ? Math.min(300, timeout) : 20,
+      call_timeout_seconds: Number.isFinite(callTimeout) && callTimeout > 0 ? Math.min(86400, callTimeout) : 1800,
+      // 匯入的設定沒有明確關閉時採預設值（信任）。
+      trust_annotations: source.trust_annotations !== false && source.trustAnnotations !== false,
+      removedSensitive,
+      missingURL: transport !== "stdio" && !url,
+    };
+  });
+}
+
+function mcpImportTextField(labelText, field, value, options = {}) {
+  const label = document.createElement("label");
+  if (options.full) label.classList.add("provider-field-full");
+  label.append(document.createTextNode(labelText));
+  const control = document.createElement(options.textarea ? "textarea" : "input");
+  control.dataset.importField = field;
+  if (options.textarea) {
+    control.rows = options.rows || 3;
+    control.spellcheck = false;
+  } else {
+    control.type = options.type || "text";
+  }
+  if (options.required) control.required = true;
+  if (options.pattern) control.pattern = options.pattern;
+  if (options.maxLength) control.maxLength = options.maxLength;
+  if (options.placeholder) control.placeholder = options.placeholder;
+  if (options.autocomplete) control.autocomplete = options.autocomplete;
+  control.value = value ?? "";
+  label.append(control);
+  if (options.hint) {
+    const hint = document.createElement("small");
+    hint.className = "hint";
+    hint.textContent = options.hint;
+    label.append(hint);
+  }
+  return label;
+}
+
+function mcpImportSelectField(labelText, field, value, options = {}) {
+  const label = document.createElement("label");
+  if (options.full) label.classList.add("provider-field-full");
+  label.append(document.createTextNode(labelText));
+  const select = document.createElement("select");
+  select.dataset.importField = field;
+  for (const option of options.options || []) {
+    const element = document.createElement("option");
+    element.value = option.value;
+    element.textContent = option.label;
+    select.append(element);
+  }
+  select.value = value || options.options?.[0]?.value || "";
+  label.append(select);
+  return label;
+}
+
+function mcpImportCheckField(labelText, field, checked, full = false) {
+  const label = document.createElement("label");
+  label.className = "check-label";
+  if (full) label.classList.add("provider-field-full");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = checked === true;
+  input.dataset.importField = field;
+  label.append(input, document.createTextNode(labelText));
+  return label;
+}
+
+function renderMCPImportTransportFields(serverElement, transport) {
+  const stdio = transport === "stdio";
+  const stdioFields = serverElement.querySelector("[data-import-stdio]");
+  const advancedDetails = serverElement.querySelector("[data-import-advanced-details]");
+  const httpFields = serverElement.querySelector("[data-import-http]");
+  const serverIndex = serverElement.dataset.importServer;
+  const authMethod = serverElement.querySelector('[data-import-field="auth_method"]')
+    || document.querySelector(`[data-import-server-field="${serverIndex}"][data-import-field="auth_method"]`);
+  stdioFields?.classList.toggle("hidden", !stdio);
+  advancedDetails?.classList.remove("hidden");
+  httpFields?.classList.toggle("hidden", stdio);
+  authMethod?.closest("label")?.classList.toggle("hidden", stdio);
+  if (authMethod?.closest("#mcpImportAuthMethodBar")) {
+    $("mcpImportAuthMethodBar").classList.toggle("hidden", stdio);
+  }
+  const command = serverElement.querySelector('[data-import-field="command"]');
+  const url = serverElement.querySelector('[data-import-field="url"]');
+  if (command) command.required = stdio;
+  if (url) url.required = !stdio;
+  renderMCPImportAuthFields(serverElement, authMethod?.value || "none");
+}
+
+function renderMCPImportAuthFields(serverElement, method) {
+  const fieldMap = {
+    bearer: ["api_key"],
+    basic: ["username", "password"],
+    headers: ["headers"],
+  };
+  const visibleFields = new Set(fieldMap[method] || []);
+  for (const field of ["api_key", "username", "password", "headers"]) {
+    const label = serverElement.querySelector(`[data-import-field="${field}"]`)?.closest("label");
+    label?.classList.toggle("hidden", !visibleFields.has(field));
+  }
+}
+
+function renderMCPImportDialog() {
+  const draft = state.mcpImportDraft;
+  if (!draft) return;
+  $("mcpImportFileName").textContent = `${draft.fileName} · ${draft.servers.length} 個 Server`;
+  $("mcpImportHint").textContent = draft.servers.some((server) => server.removedSensitive || server.missingURL)
+    ? "請補填必要連線資訊；檔案中的金鑰、Token、Authorization 與變數值已清空。"
+    : "請確認連線資訊；匯入只會在按下確認後安裝。";
+  $("mcpImportOverwrite").checked = false;
+  const list = $("mcpImportServerList");
+  const authMethodBar = $("mcpImportAuthMethodBar");
+  authMethodBar.replaceChildren();
+  authMethodBar.classList.toggle("hidden", draft.servers.length !== 1);
+  list.replaceChildren();
+  draft.servers.forEach((server, index) => {
+    const fieldset = document.createElement("fieldset");
+    fieldset.className = "mcp-import-server";
+    fieldset.dataset.importServer = String(index);
+    const legend = document.createElement("legend");
+    legend.textContent = server.display_name || server.id;
+    fieldset.append(legend);
+    if (server.removedSensitive || server.missingURL) {
+      const note = document.createElement("small");
+      note.className = "mcp-import-secret-note";
+      note.textContent = server.missingURL
+        ? "此 Server 尚未提供有效 URL，請填寫後才能安裝。"
+        : "檔案中的敏感值已清空，請在下方重新輸入。";
+      fieldset.append(note);
+    }
+    const grid = document.createElement("div");
+    grid.className = "provider-field-grid";
+    grid.append(
+      mcpImportTextField("MCP ID", "id", server.id, { required: true, maxLength: 80, pattern: "[A-Za-z0-9_-]+" }),
+      mcpImportTextField("顯示名稱", "display_name", server.display_name, { maxLength: 80 }),
+      mcpImportSelectField("傳輸方式", "transport", server.transport, { options: [
+        { value: "stdio", label: "Stdio" },
+        { value: "sse", label: "SSE（舊版）" },
+        { value: "streamable-http", label: "Streamable HTTP" },
+      ] }),
+      mcpImportCheckField("啟用這個 MCP Server", "enabled", server.enabled, true),
+    );
+    const transportSelect = grid.querySelector('[data-import-field="transport"]');
+    const stdioAdvanced = document.createElement("details");
+    stdioAdvanced.className = "provider-field-full mcp-import-advanced";
+    stdioAdvanced.dataset.importAdvancedDetails = "true";
+    stdioAdvanced.open = true;
+    const stdioSummary = document.createElement("summary");
+    stdioSummary.textContent = "進階設定";
+    stdioAdvanced.append(stdioSummary);
+    const stdioFields = document.createElement("div");
+    stdioFields.className = "provider-field-grid mcp-import-transport-fields";
+    stdioFields.dataset.importStdio = "true";
+    stdioFields.append(
+      mcpImportTextField("啟動命令", "command", server.command, { full: true, required: true, placeholder: "npx" }),
+      mcpImportTextField("參數（JSON 陣列）", "args", JSON.stringify(server.args, null, 2), { full: true, textarea: true, rows: 3 }),
+      mcpImportTextField("工作目錄", "work_dir", server.work_dir, { full: true, placeholder: "留空使用 APP 工作目錄" }),
+      mcpImportTextField("環境變數（JSON 物件）", "environment", JSON.stringify(server.environment, null, 2), { full: true, textarea: true, rows: 3, hint: "敏感環境變數的名稱會保留，但值已清空。" }),
+    );
+    stdioAdvanced.append(stdioFields);
+    const httpFields = document.createElement("div");
+    httpFields.className = "provider-field-full provider-field-grid mcp-import-transport-fields";
+    httpFields.dataset.importHttp = "true";
+    httpFields.append(
+      mcpImportTextField("Server URL", "url", server.url, { full: true, type: "url", required: true, placeholder: "https://example.com/mcp" }),
+      mcpImportTextField("金鑰（Bearer Token）", "api_key", "", { full: true, type: "password", placeholder: "輸入 MCP Server 金鑰", hint: "留空代表不使用 Bearer Token。" }),
+      mcpImportTextField("帳號", "username", "", { full: true, autocomplete: "username", placeholder: "輸入 MCP Server 帳號" }),
+      mcpImportTextField("密碼", "password", "", { full: true, type: "password", autocomplete: "current-password", placeholder: "輸入 MCP Server 密碼", hint: "留空代表不使用 Basic Auth。" }),
+      mcpImportTextField("HTTP Headers（JSON 物件）", "headers", JSON.stringify(server.headers, null, 2), { full: true, textarea: true, rows: 3, hint: "Authorization 等敏感標頭不會直接匯入。" }),
+    );
+    const authMethod = mcpImportSelectField("驗證方式", "auth_method", server.auth_method || "none", { options: mcpImportAuthOptions(server.auth_methods) });
+    authMethod.classList.add("mcp-import-auth-method");
+    authMethod.querySelector("select").dataset.importServerField = String(index);
+    stdioAdvanced.append(httpFields);
+    if (draft.servers.length === 1) {
+      authMethodBar.append(authMethod);
+    } else {
+      fieldset.insertBefore(authMethod, grid);
+    }
+    grid.append(stdioAdvanced);
+    fieldset.append(grid);
+    transportSelect?.addEventListener("change", (event) => renderMCPImportTransportFields(fieldset, event.target.value));
+    authMethod.querySelector("select")?.addEventListener("change", (event) => renderMCPImportAuthFields(fieldset, event.target.value));
+    renderMCPImportTransportFields(fieldset, server.transport);
+    list.append(fieldset);
+  });
+}
+
+function mcpImportFormValue() {
+  if (!state.mcpImportDraft) return null;
+  const form = $("mcpImportForm");
+  if (!form.checkValidity()) {
+    for (const invalid of form.querySelectorAll(":invalid")) invalid.closest("details")?.setAttribute("open", "");
+    form.reportValidity();
+    return null;
+  }
+  const values = [];
+  const ids = new Set();
+  try {
+    for (const fieldset of $("mcpImportServerList").querySelectorAll("[data-import-server]")) {
+      const read = (field) => fieldset.querySelector(`[data-import-field="${field}"]`)
+        || document.querySelector(`[data-import-server-field="${fieldset.dataset.importServer}"][data-import-field="${field}"]`);
+      const id = read("id").value.trim();
+      if (ids.has(id)) throw new Error(`MCP ID ${id} 在匯入檔中重複`);
+      ids.add(id);
+      const transport = mcpTransportValue(read("transport").value);
+      const server = {
+        id,
+        display_name: read("display_name").value.trim(),
+        enabled: read("enabled").checked,
+        transport,
+        startup_timeout_seconds: state.mcpImportDraft.servers[Number(fieldset.dataset.importServer)].startup_timeout_seconds,
+        call_timeout_seconds: state.mcpImportDraft.servers[Number(fieldset.dataset.importServer)].call_timeout_seconds,
+        trust_annotations: state.mcpImportDraft.servers[Number(fieldset.dataset.importServer)].trust_annotations,
+      };
+      if (transport === "stdio") {
+        server.command = read("command").value.trim();
+        server.args = parseMCPJSON(read("args").value, "參數", "array") || [];
+        server.work_dir = read("work_dir").value.trim();
+        server.environment = parseMCPJSON(read("environment").value, "環境變數", "object");
+      } else {
+        server.url = read("url").value.trim();
+        const authMethod = read("auth_method")?.value || "none";
+        if (authMethod === "bearer") {
+          const apiKey = read("api_key").value.trim();
+          if (apiKey) server.api_key = apiKey;
+        } else if (authMethod === "basic") {
+          const username = read("username").value.trim();
+          const password = read("password").value;
+          if (username) server.username = username;
+          if (password) server.password = password;
+        } else if (authMethod === "headers") {
+          server.headers = parseMCPJSON(read("headers").value, "HTTP Headers", "object");
+          if (server.headers) {
+            for (const [name, value] of Object.entries(server.headers)) {
+              if (!String(value).trim()) delete server.headers[name];
+            }
+          }
+        }
+      }
+      values.push(server);
+    }
+  } catch (error) {
+    toast(error.message);
+    return null;
+  }
+  return values;
+}
+
+async function installMCPImport(event) {
+  event.preventDefault();
+  const imported = mcpImportFormValue();
+  if (!imported || !state.mcpSettings) return;
+  const existing = state.mcpSettings.servers || [];
+  const existingIDs = new Set(existing.map((server) => server.id));
+  const conflicts = imported.filter((server) => existingIDs.has(server.id)).map((server) => server.id);
+  const overwrite = $("mcpImportOverwrite").checked;
+  if (conflicts.length && !overwrite) {
+    toast(`MCP ID 已存在：${conflicts.join("、")}；請勾選覆蓋既有設定`);
+    return;
+  }
+  const importedIDs = new Set(imported.map((server) => server.id));
+  const merged = [...(overwrite ? existing.filter((server) => !importedIDs.has(server.id)) : existing), ...imported];
+  $("installMCPImport").disabled = true;
+  try {
+    state.mcpSettings = await request("/api/v1/admin/mcp-settings", {
+      method: "PUT",
+      body: JSON.stringify(mcpSettingsPayload(merged)),
+    });
+    const selectedID = imported[0]?.id || "";
+    state.mcpImportDraft = null;
+    $("mcpImportDialog").close();
+    state.selectedMCPSettingsID = selectedID;
+    await loadMCPSettings(selectedID);
+    await loadTools();
+    toast(`已安裝 ${imported.length} 個 MCP Server`);
+  } catch (error) {
+    toast(`MCP 安裝失敗：${error.message}`);
+  } finally {
+    $("installMCPImport").disabled = false;
+  }
+}
+
+async function handleMCPImportContent(fileName, size, content) {
+  if (Number(size) > 2 * 1024 * 1024) {
+    toast(".mcp 檔案不得超過 2 MB");
+    return;
+  }
+  const root = JSON.parse(content);
+  const servers = normalizeMCPImport(root, fileName);
+  if (!state.mcpSettings) await loadMCPSettings();
+  if (!state.mcpSettings) throw new Error("MCP 設定尚未載入，請確認後端連線");
+  state.mcpImportDraft = { fileName, servers };
+  renderMCPImportDialog();
+  if (!$("mcpImportDialog").open) $("mcpImportDialog").showModal();
+}
+
+async function handleMCPImportFile(file) {
+  if (!file) return;
+  try {
+    await handleMCPImportContent(file.name, file.size, await file.text());
+  } catch (error) {
+    toast(`無法讀取 .mcp 檔案：${error.message}`);
+  }
+}
+
+function mcpImportDroppedFile(dataTransfer) {
+  return [...(dataTransfer?.files || [])].find((file) => /\.(?:mcp|json)$/i.test(file.name || ""));
+}
+
+async function handleMCPImportDrop(dataTransfer) {
+  const browserFile = mcpImportDroppedFile(dataTransfer);
+  if (browserFile) {
+    await handleMCPImportFile(browserFile);
+    return;
+  }
+  try {
+    const dropped = await desktop("mcp/files/dropped", { method: "POST", body: "{}" });
+    const file = Array.isArray(dropped) ? dropped[0] : null;
+    if (!file?.name || typeof file.content !== "string") {
+      throw new Error("系統沒有提供可讀取的 .mcp 檔案");
+    }
+    await handleMCPImportContent(file.name, file.size, file.content);
+  } catch (error) {
+    toast(`無法讀取系統拖入的 .mcp 檔案：${error.message}`);
+  }
 }
 
 function renderMCPSettings() {
@@ -6044,11 +7182,18 @@ function renderMCPSettings() {
   $("mcpSettingWorkDir").value = selected.work_dir || "";
   $("mcpSettingURL").value = selected.url || "";
   $("mcpSettingAPIKey").value = "";
-  $("mcpSettingClearKey").checked = false;
-  $("mcpSettingClearKeyRow").classList.toggle("hidden", !selected.has_api_key);
+  $("mcpSettingClearKey").setAttribute("aria-pressed", "false");
+  $("mcpSettingClearKey").classList.toggle("hidden", !selected.has_api_key);
   $("mcpAPIKeyState").textContent = selected.has_api_key
     ? "已儲存 MCP 金鑰；留空會保留，勾選下方選項可清除。"
     : "尚未儲存 MCP 金鑰；金鑰不會從後端讀回。";
+  $("mcpSettingUsername").value = "";
+  $("mcpSettingPassword").value = "";
+  $("mcpSettingClearBasicAuth").setAttribute("aria-pressed", "false");
+  $("mcpSettingClearBasicAuth").classList.toggle("hidden", !selected.has_basic_auth);
+  $("mcpBasicAuthState").textContent = selected.has_basic_auth
+    ? "已儲存帳號密碼；留空會保留，勾選下方選項可清除。"
+    : "尚未儲存帳號密碼；帳密不會從後端讀回。";
   $("mcpSettingEnvironment").value = "";
   $("mcpSettingHeaders").value = "";
   $("mcpEnvironmentState").textContent = selected.has_environment
@@ -6059,27 +7204,74 @@ function renderMCPSettings() {
     : "尚未儲存 HTTP Headers；敏感內容不會從後端讀回。";
   $("mcpSettingStartupTimeout").value = Number(selected.startup_timeout_seconds) || 20;
   $("mcpSettingCallTimeout").value = Number(selected.call_timeout_seconds) || 1800;
-  $("mcpSettingTrustAnnotations").checked = Boolean(selected.trust_annotations);
+  // 預設信任：唯讀查詢逐次核准只會讓使用者對核准對話框麻木；不信任的 Server 再手動關閉。
+  $("mcpSettingTrustAnnotations").checked = selected.trust_annotations !== false;
   $("mcpConnectionState").textContent = selected.enabled === false ? "已停用" : (selected.status || "未連線");
+  // 憑證明文不會回傳，因此直接顯示後端實際送出的驗證方式，讓「金鑰有沒有被使用」
+  // 不必靠猜。
+  $("mcpAuthModeState").textContent = selected.transport === "stdio"
+    ? ""
+    : `${translate("目前送出的驗證方式")}：${translate(mcpAuthModeLabels[selected.auth_mode] || "不使用驗證")}`;
   $("mcpConnectionError").textContent = selected.error || "";
   $("mcpSettingsState").textContent = "";
   $("mcpTestState").textContent = "";
   $("deleteMCPSetting").classList.toggle("hidden", isNew);
   const toolList = $("mcpToolList");
+  const exposed = Array.isArray(selected.tools) ? selected.tools : [];
+  const available = Array.isArray(selected.available_tools) && selected.available_tools.length
+    ? selected.available_tools
+    : exposed;
+  const enabled = Array.isArray(selected.enabled_tools) ? selected.enabled_tools : [];
+  $("mcpToolListCount").textContent = available.length === exposed.length
+    ? String(exposed.length)
+    : `${exposed.length}/${available.length}`;
+  toolList.classList.add("hidden");
   toolList.replaceChildren();
-  for (const tool of selected.tools || []) {
-    const code = document.createElement("code");
-    code.textContent = tool.name;
-    code.title = tool.display_name || tool.name;
-    toolList.append(code);
+  // 工具定義會整份進入每一次請求。外掛型 MCP Server 動輒數十上百個工具，
+  // 光是 schema 就可能佔掉數萬 token，因此這裡讓使用者只勾要用的。
+  for (const tool of available) {
+    const label = document.createElement("label");
+    label.className = "check-label mcp-tool-option";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.mcpTool = tool.name;
+    input.checked = enabled.length === 0 || enabled.includes(tool.name);
+    const name = document.createElement("code");
+    name.textContent = tool.name;
+    name.setAttribute("data-i18n-ignore", "");
+    label.append(input, name);
+    if (tool.display_name && tool.display_name !== tool.name) {
+      const title = document.createElement("small");
+      title.textContent = tool.display_name;
+      title.setAttribute("data-i18n-ignore", "");
+      label.append(title);
+    }
+    toolList.append(label);
   }
-  if (!(selected.tools || []).length) {
+  if (!available.length) {
     const small = document.createElement("small");
     small.className = "hint";
     small.textContent = "尚未載入工具清單。";
     toolList.append(small);
+  } else {
+    const hint = document.createElement("small");
+    hint.className = "hint";
+    hint.textContent = "只勾選需要的工具：工具定義每次請求都會整份送給模型，數量越多提示越長、模型越慢。全部勾選代表不限制。";
+    toolList.append(hint);
   }
+  syncMCPToolListToggle();
   renderMCPTransportFields(selected.transport || "stdio");
+}
+
+function syncMCPToolListToggle() {
+  const button = $("mcpToolListToggle");
+  const list = $("mcpToolList");
+  if (!button || !list) return;
+  const expanded = !list.classList.contains("hidden");
+  const label = expanded ? "收合功能表" : "展開功能表";
+  button.setAttribute("aria-expanded", String(expanded));
+  button.title = translate(label);
+  button.setAttribute("aria-label", translate(label));
 }
 
 function parseMCPJSON(value, label, expected) {
@@ -6102,7 +7294,7 @@ function parseMCPJSON(value, label, expected) {
 }
 
 function mcpSettingFormValue() {
-  const transport = $("mcpSettingTransport").value === "streamable-http" ? "streamable-http" : "stdio";
+  const transport = mcpTransportValue($("mcpSettingTransport").value);
   const server = {
     id: $("mcpSettingID").value.trim(),
     display_name: $("mcpSettingDisplayName").value.trim(),
@@ -6121,8 +7313,22 @@ function mcpSettingFormValue() {
     server.url = $("mcpSettingURL").value.trim();
     const apiKey = $("mcpSettingAPIKey").value.trim();
     if (apiKey) server.api_key = apiKey;
-    if ($("mcpSettingClearKey").checked) server.api_key = "";
+    if ($("mcpSettingClearKey").getAttribute("aria-pressed") === "true") server.api_key = "";
+    const username = $("mcpSettingUsername").value.trim();
+    const password = $("mcpSettingPassword").value;
+    if (username) server.username = username;
+    if (password) server.password = password;
+    if ($("mcpSettingClearBasicAuth").getAttribute("aria-pressed") === "true") {
+      server.username = "";
+      server.password = "";
+    }
     server.headers = parseMCPJSON($("mcpSettingHeaders").value, "HTTP Headers", "object");
+  }
+  const options = [...document.querySelectorAll("#mcpToolList input[data-mcp-tool]")];
+  if (options.length > 0) {
+    const checked = options.filter((input) => input.checked).map((input) => input.dataset.mcpTool);
+    // 全選代表不限制：日後 Server 新增工具時自動納入，而不是被凍結在目前這份清單。
+    server.enabled_tools = checked.length === options.length ? [] : checked;
   }
   return server;
 }
@@ -6131,7 +7337,9 @@ function mcpSettingsPayload(servers) {
   return { servers: servers.map((server) => {
     const value = JSON.parse(JSON.stringify(server));
     delete value.has_environment;
+    delete value.available_tools;
     delete value.has_api_key;
+    delete value.has_basic_auth;
     delete value.has_headers;
     delete value.status;
     delete value.error;
@@ -6486,6 +7694,7 @@ $("modelControlButton").addEventListener("click", (event) => {
 });
 $("openPlan").addEventListener("click", openPlanDialog);
 $("closePlan").addEventListener("click", () => $("planDialog").close());
+$("lockPlansSwitch").addEventListener("change", changePlanLock);
 $("activePlanTab").addEventListener("click", () => selectPlanTab("active"));
 $("completedPlanTab").addEventListener("click", () => selectPlanTab("completed"));
 for (const tab of [$("activePlanTab"), $("completedPlanTab")]) {
@@ -6521,6 +7730,7 @@ $("cancelWorkspace").addEventListener("click", () => $("workspaceDialog").close(
 $("workspaceForm").addEventListener("submit", createWorkspace);
 $("workspaceSettings").addEventListener("submit", saveWorkspaceSettings);
 $("serviceSettings").addEventListener("submit", saveServiceSettings);
+$("toolSettings").addEventListener("submit", saveToolSettings);
 $("settingHTTPFetchEnabled").addEventListener("change", syncHTTPFetchSettingFields);
 $("settingServiceName").addEventListener("input", (event) => {
   if (state.serviceSettings) {
@@ -6571,6 +7781,11 @@ $("pickEditProjectFolders").addEventListener("dragover", (event) => handleProjec
 $("pickEditProjectFolders").addEventListener("dragleave", () => $("pickEditProjectFolders").classList.remove("drag-over"));
 $("pickEditProjectFolders").addEventListener("drop", (event) => handleProjectFolderDrop(event, "settings"));
 $("cancelSession").addEventListener("click", () => $("sessionDialog").close());
+$("restoreRunsForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  $("restoreRunsDialog").close("confirm");
+});
+$("cancelRestoreRuns").addEventListener("click", () => $("restoreRunsDialog").close("cancel"));
 $("sessionForm").addEventListener("submit", createSession);
 $("openContextProjectDirectory").addEventListener("click", () => {
   const project = state.contextProject;
@@ -6639,6 +7854,7 @@ $("deleteSessionDialog").addEventListener("close", () => { state.deletingSession
 $("sessionSettings").addEventListener("submit", saveSessionSettings);
 $("sessionProviderSelect").addEventListener("change", changeSessionProvider);
 $("sessionModelSelect").addEventListener("change", changeSessionModel);
+$("sessionThinkingSelect").addEventListener("change", changeSessionThinking);
 $("newProvider").addEventListener("change", (event) => {
   const providerID = event.target.value || state.workspace?.default_provider_id || "";
   $("newModel").value = defaultModelForProvider(providerID);
@@ -6703,19 +7919,19 @@ $("send").addEventListener("click", activateRunAction);
 $("stopRun").addEventListener("click", () => { void cancelCurrentRun(); });
 $("messages").addEventListener("scroll", updateMessageAutoScroll, { passive: true });
 $("prompt").addEventListener("paste", (event) => {
-  if (!state.session || (state.running && !selectedSessionIsRunning())) return;
+  if (!state.session) return;
   const files = [...(event.clipboardData?.files || [])];
   if (files.length) addPendingAttachments(files);
 });
 const chatWorkspace = document.querySelector("main.workspace");
 chatWorkspace.addEventListener("dragenter", (event) => {
-  if (!dataTransferHasFiles(event.dataTransfer) || !state.session || (state.running && !selectedSessionIsRunning())) return;
+  if (!dataTransferHasFiles(event.dataTransfer) || !state.session) return;
   event.preventDefault();
   chatDragDepth += 1;
   chatWorkspace.classList.add("chat-drag-over");
 });
 chatWorkspace.addEventListener("dragover", (event) => {
-  if (!dataTransferHasFiles(event.dataTransfer) || !state.session || (state.running && !selectedSessionIsRunning())) return;
+  if (!dataTransferHasFiles(event.dataTransfer) || !state.session) return;
   event.preventDefault();
   event.dataTransfer.dropEffect = "copy";
   chatWorkspace.classList.add("chat-drag-over");
@@ -6729,7 +7945,7 @@ chatWorkspace.addEventListener("drop", (event) => {
   event.preventDefault();
   chatDragDepth = 0;
   chatWorkspace.classList.remove("chat-drag-over");
-  if (!state.session || (state.running && !selectedSessionIsRunning())) return;
+  if (!state.session) return;
   addPendingAttachments(event.dataTransfer.files);
   $("prompt").focus();
 });
@@ -6847,13 +8063,69 @@ $("addMCPSetting").addEventListener("click", () => {
 $("mcpSettingsForm").addEventListener("submit", saveMCPSetting);
 $("deleteMCPSetting").addEventListener("click", deleteMCPSetting);
 $("testMCPSetting").addEventListener("click", testMCPSetting);
+$("mcpToolListToggle").addEventListener("click", () => {
+  $("mcpToolList").classList.toggle("hidden");
+  syncMCPToolListToggle();
+});
 $("mcpSettingTransport").addEventListener("change", (event) => renderMCPTransportFields(event.target.value));
 $("mcpSettingAPIKey").addEventListener("input", (event) => {
-  if (event.target.value) $("mcpSettingClearKey").checked = false;
+  if (event.target.value) $("mcpSettingClearKey").setAttribute("aria-pressed", "false");
 });
-$("mcpSettingClearKey").addEventListener("change", (event) => {
-  if (event.target.checked) $("mcpSettingAPIKey").value = "";
+$("mcpSettingClearKey").addEventListener("click", (event) => {
+  const button = event.currentTarget;
+  const clear = button.getAttribute("aria-pressed") !== "true";
+  button.setAttribute("aria-pressed", String(clear));
+  if (clear) $("mcpSettingAPIKey").value = "";
 });
+for (const id of ["mcpSettingUsername", "mcpSettingPassword"]) {
+  $(id).addEventListener("input", (event) => {
+    if (event.target.value) $("mcpSettingClearBasicAuth").setAttribute("aria-pressed", "false");
+  });
+}
+$("mcpSettingClearBasicAuth").addEventListener("click", (event) => {
+  const button = event.currentTarget;
+  const clear = button.getAttribute("aria-pressed") !== "true";
+  button.setAttribute("aria-pressed", String(clear));
+  if (clear) {
+    $("mcpSettingUsername").value = "";
+    $("mcpSettingPassword").value = "";
+  }
+});
+$("mcpImportDropzone").addEventListener("click", () => $("mcpImportFile").click());
+$("mcpImportDropzone").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  $("mcpImportFile").click();
+});
+$("mcpImportDropzone").addEventListener("dragenter", (event) => {
+  if (!dataTransferHasFiles(event.dataTransfer)) return;
+  event.preventDefault();
+  $("mcpImportDropzone").classList.add("drag-over");
+});
+$("mcpImportDropzone").addEventListener("dragover", (event) => {
+  if (!dataTransferHasFiles(event.dataTransfer)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+  $("mcpImportDropzone").classList.add("drag-over");
+});
+$("mcpImportDropzone").addEventListener("dragleave", (event) => {
+  if (event.relatedTarget && $("mcpImportDropzone").contains(event.relatedTarget)) return;
+  $("mcpImportDropzone").classList.remove("drag-over");
+});
+$("mcpImportDropzone").addEventListener("drop", (event) => {
+  event.preventDefault();
+  $("mcpImportDropzone").classList.remove("drag-over");
+  void handleMCPImportDrop(event.dataTransfer);
+});
+$("mcpImportFile").addEventListener("change", (event) => {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (file) void handleMCPImportFile(file);
+});
+$("mcpImportForm").addEventListener("submit", (event) => { void installMCPImport(event); });
+$("closeMCPImport").addEventListener("click", () => $("mcpImportDialog").close());
+$("cancelMCPImport").addEventListener("click", () => $("mcpImportDialog").close());
+$("mcpImportDialog").addEventListener("close", () => { state.mcpImportDraft = null; });
 $("reverseProxySettingsForm").addEventListener("submit", saveReverseProxySettings);
 $("startReverseProxy").addEventListener("click", startReverseProxy);
 $("stopReverseProxy").addEventListener("click", stopReverseProxy);
@@ -7004,7 +8276,13 @@ window.addEventListener("blur", () => {
 window.addEventListener("nr-intern-language-change", () => {
   refreshOpenProviderUsage();
   renderContextUsage();
+  renderSessionUsage();
   renderSchedules();
+  if (state.restoreCandidates.length > 0) renderRestoreRunOptions({ preserveSelection: true });
+  syncMCPToolListToggle();
+  for (const block of document.querySelectorAll(".message-reasoning, .session-content-reasoning")) {
+    updateReasoningSummary(block);
+  }
 });
 
 setInterval(() => {

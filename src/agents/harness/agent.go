@@ -49,7 +49,28 @@ func (a *Agent) SetRunBudget(budget domain.RunBudget) {
 	a.runner.SetBudget(budget)
 }
 
+// SetToolCallMode 供管理介面即時切換工具呼叫協定。
+func (a *Agent) SetToolCallMode(mode harnesscore.ToolCallMode) {
+	if a == nil || a.runner == nil {
+		return
+	}
+	a.runner.SetToolCallMode(mode)
+}
+
+// SetToolRetrieval 供管理介面即時切換 MCP 工具目錄的檢索過濾。
+func (a *Agent) SetToolRetrieval(enabled bool) {
+	if a == nil || a.runner == nil {
+		return
+	}
+	a.runner.SetToolRetrieval(enabled)
+}
+
 func (a *Agent) CreateSession(ctx context.Context, input domain.CreateSessionInput) (domain.Session, error) {
+	thinkingMode, err := domain.NormalizeThinkingMode(input.ThinkingMode)
+	if err != nil {
+		return domain.Session{}, err
+	}
+	input.ThinkingMode = thinkingMode
 	return a.sessions.Create(ctx, a.descriptor.ID, input)
 }
 
@@ -76,7 +97,7 @@ func (a *Agent) DeleteSession(ctx context.Context, sessionID string) error {
 }
 
 func (a *Agent) UpdateSession(ctx context.Context, sessionID string, input domain.UpdateSessionInput) (domain.Session, error) {
-	if input.Title == nil && input.WorkspaceID == nil && input.ProjectID == nil && input.ProviderID == nil && input.Model == nil && input.PermissionProfile == nil && input.MemoryScope == nil && input.Pinned == nil && input.Position == nil {
+	if input.Title == nil && input.WorkspaceID == nil && input.ProjectID == nil && input.ProviderID == nil && input.Model == nil && input.ThinkingMode == nil && input.LockPlans == nil && input.PermissionProfile == nil && input.MemoryScope == nil && input.Pinned == nil && input.Position == nil {
 		return domain.Session{}, fmt.Errorf("%w: at least one session field is required", domain.ErrInvalidInput)
 	}
 	session, err := a.GetSession(ctx, sessionID)
@@ -100,6 +121,16 @@ func (a *Agent) UpdateSession(ctx context.Context, sessionID string, input domai
 	}
 	if input.Model != nil {
 		session.Model = strings.TrimSpace(*input.Model)
+	}
+	if input.ThinkingMode != nil {
+		thinkingMode, normalizeErr := domain.NormalizeThinkingMode(*input.ThinkingMode)
+		if normalizeErr != nil {
+			return domain.Session{}, normalizeErr
+		}
+		session.ThinkingMode = thinkingMode
+	}
+	if input.LockPlans != nil {
+		session.LockPlans = *input.LockPlans
 	}
 	if input.PermissionProfile != nil {
 		session.PermissionProfile = strings.ToLower(strings.TrimSpace(*input.PermissionProfile))
@@ -161,6 +192,49 @@ func (a *Agent) ListMessages(ctx context.Context, sessionID string) ([]domain.Me
 	return a.sessions.ListMessages(ctx, sessionID)
 }
 
+// RetractMessages 把 messageID 起的訊息移出對話，並回傳剩下的訊息。
+//
+// 只允許最後一則使用者訊息：重問中途的問題會讓後面所有回答失去依據，那不是
+// 「重來一次」而是改寫歷史。transcript 不會被刪除，只是追加一筆撤回記錄。
+func (a *Agent) RetractMessages(ctx context.Context, sessionID, messageID string) ([]domain.Message, error) {
+	if _, err := a.GetSession(ctx, sessionID); err != nil {
+		return nil, err
+	}
+	messageID = strings.TrimSpace(messageID)
+	if messageID == "" {
+		return nil, fmt.Errorf("%w: message id is required", domain.ErrInvalidInput)
+	}
+	messages, err := a.sessions.ListMessages(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	lastUserIndex := -1
+	target := -1
+	for index, message := range messages {
+		if strings.EqualFold(message.Role, "user") {
+			lastUserIndex = index
+		}
+		if message.ID == messageID {
+			target = index
+		}
+	}
+	if target < 0 {
+		return nil, fmt.Errorf("%w: message %q is not part of this session", domain.ErrNotFound, messageID)
+	}
+	if target != lastUserIndex {
+		return nil, fmt.Errorf("%w: only the last user message can be retracted", domain.ErrInvalidInput)
+	}
+	if _, err := a.sessions.AppendEntry(ctx, sessionID, domain.SessionEntry{
+		SessionID: sessionID,
+		Type:      domain.SessionEntryMessagesRetracted,
+		Data:      map[string]any{"from_message_id": messageID, "reason": "reask"},
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		return nil, err
+	}
+	return a.sessions.ListMessages(ctx, sessionID)
+}
+
 func (a *Agent) ListEntries(ctx context.Context, sessionID string) ([]domain.SessionEntry, error) {
 	if _, err := a.GetSession(ctx, sessionID); err != nil {
 		return nil, err
@@ -191,23 +265,31 @@ func (a *Agent) Run(ctx context.Context, input domain.RunInput, emit ports.Agent
 		}
 		session.Metadata["sandbox_roots"] = sandboxRoots
 	}
+	thinkingMode := strings.TrimSpace(input.ThinkingMode)
+	if thinkingMode == "" {
+		if value, exists := input.Metadata["thinking_mode"]; exists {
+			legacy, ok := value.(string)
+			if !ok && value != nil {
+				return domain.RunResult{}, fmt.Errorf("%w: thinking_mode must be a string", domain.ErrInvalidInput)
+			}
+			thinkingMode = legacy
+		} else {
+			thinkingMode = session.ThinkingMode
+		}
+	}
+	thinkingMode, err = domain.NormalizeThinkingMode(thinkingMode)
+	if err != nil {
+		return domain.RunResult{}, err
+	}
 	return a.runner.Run(ctx, harnesscore.Input{
 		RunID:        input.RunID,
 		Session:      session,
 		UserInput:    input.UserInput,
 		ProviderID:   input.ProviderID,
 		Model:        input.Model,
-		ThinkingMode: stringFromMap(input.Metadata, "thinking_mode"),
+		ThinkingMode: thinkingMode,
 		Metadata:     input.Metadata,
 	}, harnesscore.EventSink(emit))
-}
-
-func stringFromMap(values map[string]any, key string) string {
-	if values == nil {
-		return ""
-	}
-	value, _ := values[key].(string)
-	return strings.TrimSpace(value)
 }
 
 func stringSliceFromMap(values map[string]any, key string) []string {

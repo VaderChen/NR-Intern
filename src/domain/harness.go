@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const (
 	SessionEntryMessage             = "message"
@@ -14,6 +17,12 @@ const (
 	SessionEntryMemoryRecall        = "memory_recall"
 	SessionEntryCompletionCheck     = "completion_check"
 	SessionEntryPlanCompletionCheck = "plan_completion_check"
+	// SessionEntryMessagesRetracted 標記「從某則訊息起的內容不再屬於這個對話」。
+	//
+	// 重新提問要把上一次的回答與過程清掉，但 transcript 是 append-only 的稽核
+	// 記錄，刪檔案會讓「當時到底發生什麼」永遠查不回來。因此改成追加一筆撤回
+	// 記錄：組裝對話時略過被撤回的區段，原始內容仍完整留在 transcript 裡。
+	SessionEntryMessagesRetracted = "messages_retracted"
 )
 
 const (
@@ -29,6 +38,59 @@ type Usage struct {
 	TotalTokens  int `json:"total_tokens,omitempty"`
 }
 
+// Add 累加 Provider 回報的單輪用量；Provider 偶爾不提供 total_tokens，
+// 此時用 input 與 output 補足，讓預算與歷史統計都維持同一套計算方式。
+func (usage *Usage) Add(value Usage) {
+	if usage == nil {
+		return
+	}
+	usage.InputTokens += value.InputTokens
+	usage.OutputTokens += value.OutputTokens
+	if value.TotalTokens > 0 {
+		usage.TotalTokens += value.TotalTokens
+	} else {
+		usage.TotalTokens += value.InputTokens + value.OutputTokens
+	}
+}
+
+func (usage Usage) Total() int {
+	if usage.TotalTokens > 0 {
+		return usage.TotalTokens
+	}
+	return usage.InputTokens + usage.OutputTokens
+}
+
+// ModelPrice 是可由設定檔提供的模型單價，單位為每一百萬 token 的美元。
+// 價格不寫死在程式中，因為同一模型可能經由不同 Provider 或自架服務計價。
+type ModelPrice struct {
+	InputPerMillion  float64 `json:"input_per_million"`
+	OutputPerMillion float64 `json:"output_per_million"`
+	Currency         string  `json:"currency,omitempty"`
+}
+
+// RunUsage 是單一 Run 的最終用量快照。EstimatedCostUSD 使用指標區分
+// 「尚未設定價格」與確實算出的零成本；沒有價格時不應猜測金額。
+type RunUsage struct {
+	ProviderID       string   `json:"provider_id,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	InputTokens      int      `json:"input_tokens,omitempty"`
+	OutputTokens     int      `json:"output_tokens,omitempty"`
+	TotalTokens      int      `json:"total_tokens,omitempty"`
+	EstimatedCostUSD *float64 `json:"estimated_cost_usd,omitempty"`
+	Currency         string   `json:"currency,omitempty"`
+}
+
+// SessionUsage 是依 Session 所有 Run 即時彙總的統計，不作為 Session metadata
+// 落盤；ByModel 讓使用者能辨識不同 Provider／模型的用量來源。
+type SessionUsage struct {
+	InputTokens      int        `json:"input_tokens"`
+	OutputTokens     int        `json:"output_tokens"`
+	TotalTokens      int        `json:"total_tokens"`
+	EstimatedCostUSD *float64   `json:"estimated_cost_usd,omitempty"`
+	Currency         string     `json:"currency,omitempty"`
+	ByModel          []RunUsage `json:"by_model,omitempty"`
+}
+
 type ToolCall struct {
 	ID        string         `json:"id"`
 	Name      string         `json:"name"`
@@ -36,12 +98,17 @@ type ToolCall struct {
 }
 
 type ToolDefinition struct {
-	Name               string         `json:"name"`
-	Label              string         `json:"label,omitempty"`
-	Version            string         `json:"version,omitempty"`
-	Category           string         `json:"category,omitempty"`
-	Description        string         `json:"description"`
-	InputSchema        map[string]any `json:"input_schema,omitempty"`
+	Name        string         `json:"name"`
+	Label       string         `json:"label,omitempty"`
+	Version     string         `json:"version,omitempty"`
+	Category    string         `json:"category,omitempty"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"input_schema,omitempty"`
+	// OutputSchema 與 ServerInstructions 主要由 MCP 使用。OutputSchema 讓
+	// instruction tool protocol 能知道工具回傳的資料形狀；ServerInstructions
+	// 保留 MCP initialize 的使用提示，由 Harness 以「外部資料」邊界提供給模型。
+	OutputSchema       map[string]any `json:"output_schema,omitempty"`
+	ServerInstructions string         `json:"server_instructions,omitempty"`
 	Platforms          []string       `json:"platforms,omitempty"`
 	Capabilities       []string       `json:"capabilities,omitempty"`
 	ReadOnly           bool           `json:"read_only,omitempty"`
@@ -149,6 +216,16 @@ type UnresolvedToolFailure struct {
 type RunCompletion struct {
 	ChecksPerformed    int                     `json:"checks_performed"`
 	UnresolvedFailures []UnresolvedToolFailure `json:"unresolved_failures,omitempty"`
+}
+
+// RetractedFromMessageID 取出撤回記錄指向的起點訊息 ID；不是撤回記錄時回傳空字串。
+// 讀取 transcript 的每一端都要用同一套判讀，否則模型看到的對話會跟畫面不一致。
+func RetractedFromMessageID(entry SessionEntry) string {
+	if entry.Type != SessionEntryMessagesRetracted {
+		return ""
+	}
+	value, _ := entry.Data["from_message_id"].(string)
+	return strings.TrimSpace(value)
 }
 
 type SessionEntry struct {

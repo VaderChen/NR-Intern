@@ -142,14 +142,26 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - 檔案工具會解析最深既有父路徑與 symlink，限制在目前 Session 的沙箱根目錄集合內（見上節「工具沙箱範圍」）。
 - 文件工具同樣受 Sandbox 限制，並限制來源檔案、範本、結構化輸入、輸出文件、PDF 操作頁數／總量、渲染頁數／大小與 Open XML 解壓項目大小；不執行 PDF、DOCX、XLSX、PPTX 中的巨集、外部關聯或嵌入物件。`document_create`、`document_edit`、`document_convert`、`pdf_pages`、`document_render` 屬於 elevated tools；編輯與轉換必須另存新檔。模型指定的 TTF 必須位於 Sandbox；自動字型探索只讀固定的應用程式與作業系統字型目錄，回傳結果不揭露絕對路徑。LibreOffice／Poppler 只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受工具參數指定任意 executable，且子程序只繼承 PATH、HOME、暫存目錄、語系與必要的作業系統環境，不繼承 Provider API key 或後端 token。Approval 對外參數會隱藏 blocks、sheets、slides、replacements、cell_updates、annotations、sources 與 pages 的實際本文。
 - `http_fetch` 是唯一可由模型自行指定任意 URL 的內建工具，邊界見上節「網路邊界」；關閉後不會出現在模型的工具清單。
-- MCP 工具一律標記 `RequiresPermission=true`，和高風險內建工具一樣必須通過 elevated profile 與單次 Approval；Server 的 `readOnlyHint` 即使受信任，也只影響只讀並行排程，不會跳過權限或 Approval。
-- MCP stdio 子程序只繼承必要 OS 環境以及管理者明確設定的變數；Streamable HTTP 的 Bearer Token 與 headers 不會顯示於工具定義、Prompt 或管理 API 回應。
+- MCP 工具一律標記 `RequiresPermission=true`，必須通過 elevated profile；權限邊界不因唯讀而放寬。
+- **唯讀工具可免逐次 Approval，但不是無條件豁免。** MCP 工具的唯讀屬性來自 Server 自己宣告的 `readOnlyHint`，屬於外部不受信任資料，只有管理者對該 Server 開啟 `trust_annotations` 後才會被採信；未開啟時 MCP 工具不算唯讀，仍然逐次核准。跳過核准會發出 `run.approval_skipped`（`reason=read_only_tool`）留下紀錄。
+- `trust_annotations` **預設開啟**：MCP Server 由管理者自己加入，唯讀查詢逐次核准只會增加不必要的操作負擔。設定檔沒有這個欄位時採預設值；明確設為 `false` 時保存並沿用該決定，不會被預設值蓋掉。對不完全信任的 Server 應主動關閉——關閉後該 Server 的所有工具都逐次核准。
+- MCP stdio 子程序只繼承必要 OS 環境以及管理者明確設定的變數；SSE 與 Streamable HTTP 的 Bearer Token、Basic Auth 與 headers 不會顯示於工具定義、Prompt 或管理 API 回應。管理 API 只回傳 `auth_mode`（實際送出的驗證方式），讓使用者能確認憑證有被採用而不必顯示明文。
+- MCP 連線在伺服器 session 失效或重啟後會自動重連。只有「伺服器明確拒收」的錯誤（session not found／session 過期／連線未建立）才會自動重送工具呼叫，因為這種情況遠端不可能執行過；其餘連線錯誤仍只對宣告 idempotent 的工具重試，避免重複副作用。
 - MCP Server 回傳的工具描述、schema 與內容屬於外部不受信任資料。Harness 可用它來定義及執行工具，但不應把描述文字視為高於使用者要求、權限政策或 Host 指示的系統命令。
 - Shell 子程序只繼承必要 OS 環境，避免無條件洩漏 Provider API key 或後端 token；timeout/cancel 會終止程序樹。
 - SSH 憑證只存在後端 profile。正式環境應設定 known_hosts 或 SHA-256 host key；`insecure_ignore_host_key` 只供明確接受風險的隔離環境。
 - SSH 初始連線最多三次；遠端命令執行中斷線不自動重跑，避免重複副作用。
 - `ssh_wait` 只能用於 Agent 指定的唯讀、冪等檢查命令；它會重新建立 session 進行輪詢，且仍需要 elevated profile 與人工 Approval。上傳／部署命令不得放入輪詢 command，避免因重試造成重複副作用。
 - `wait_for` 不執行 Shell 命令，只在 Run context 與最大等待時間內暫停並發出進度；等待完成本身不構成遠端部署成功證據。
+
+## 用量與成本資料
+
+- Run 的 token 用量只採信後端 Provider adapter 回報的 usage；Application 在單一 Run 收尾時
+  保存快照，不從可被 Client 修改的事件或 transcript 反推，避免重播造成重複統計。
+- `model_prices` 是非秘密的後端設定，但只由設定檔載入，Run request 與模型輸出不能自行提供
+  價格。成本目前只接受 USD，沒有對應價格時 API 只回傳 token，不假造金額。
+- Session 用量依已保存的 Run 快照即時彙總，不落盤到 `session.json`；取消、失敗與重試都保留
+  各自的 Run 紀錄。成本估算不代表 Provider 的帳單，仍應以 Provider 官方帳務為準。
 
 ## 本機資料
 

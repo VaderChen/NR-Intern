@@ -597,12 +597,29 @@ func latestReportedInputTokens(messages []sequencedMessage, afterSequence int64)
 func messagesFromEntries(entries []domain.SessionEntry) []sequencedMessage {
 	messages := []sequencedMessage{}
 	for _, entry := range entries {
+		// 被撤回的訊息不再送給模型。判讀方式必須與 transcript 讀取端一致，
+		// 否則模型看到的對話會跟畫面上的不一樣。
+		if from := domain.RetractedFromMessageID(entry); from != "" {
+			if index := indexOfSequencedMessage(messages, from); index >= 0 {
+				messages = messages[:index]
+			}
+			continue
+		}
 		if entry.Type != domain.SessionEntryMessage || entry.Message == nil {
 			continue
 		}
 		messages = append(messages, sequencedMessage{Sequence: entry.Sequence, Message: cloneMessage(*entry.Message)})
 	}
 	return messages
+}
+
+func indexOfSequencedMessage(messages []sequencedMessage, messageID string) int {
+	for index, message := range messages {
+		if message.Message.ID == messageID {
+			return index
+		}
+	}
+	return -1
 }
 
 // repairToolCallPairs 保證送入模型的訊息序列符合 tool call 協定。
@@ -700,7 +717,17 @@ func shapeToolResults(messages []domain.Message, maxCharacters int) []domain.Mes
 	for index, message := range messages {
 		result[index] = cloneMessage(message)
 		if strings.EqualFold(message.Role, "tool") && utf8.RuneCountInString(message.Content) > maxCharacters {
-			result[index].Content = truncateMiddle(message.Content, maxCharacters) + "\n[tool result shortened for model context; full output remains in transcript]"
+			// 截斷本身不是答案，模型需要知道下一步該怎麼做，否則只能憑半份資料硬猜。
+			//
+			// 這段註記寫給模型看，措辭必須讓它不可能原樣轉交給使用者。先前寫成
+			// 「完整內容保留在 transcript」，模型就直接回「資料被截斷，請查看
+			// transcript 以確認生產進度」——把 Harness 的內部狀態當成答案交出去，
+			// 使用者拿到的是一句無法行動的話。
+			result[index].Content = truncateMiddle(message.Content, maxCharacters) +
+				"\n[Harness 內部狀態，不是可以交給使用者的內容：這次的工具結果過長，只保留了前後兩段。" +
+				"不要告訴使用者資料被截斷，也不要請使用者自己去查記錄或 transcript。" +
+				"需要完整資料時縮小查詢範圍或加上篩選條件重新呼叫工具，取得完整結果後再回答；" +
+				"不要憑截斷內容推測整體數量或結論。]"
 		}
 	}
 	return result

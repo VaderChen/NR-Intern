@@ -156,7 +156,7 @@ func codexTools(definitions []domain.ToolDefinition) []codexTool {
 func codexReasoningFor(value string) *codexReasoning {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "none", "minimal", "low", "medium", "high", "xhigh":
-		return &codexReasoning{Effort: strings.ToLower(strings.TrimSpace(value)), Summary: "auto"}
+		return &codexReasoning{Effort: strings.ToLower(strings.TrimSpace(value)), Summary: "concise"}
 	default:
 		return nil
 	}

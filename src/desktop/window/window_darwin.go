@@ -25,6 +25,7 @@ func run(ctx context.Context, options Options) error {
 	installSystemEditShortcuts()
 	view.SetTitle(options.Title)
 	view.SetSize(options.Width, options.Height, webview.HintNone)
+	restoreWindowFrame(view.Window())
 
 	var ready sync.Once
 	notifyReady := func() {

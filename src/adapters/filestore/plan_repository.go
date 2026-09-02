@@ -61,6 +61,36 @@ func (r *PlanRepository) List(ctx context.Context, sessionID string) ([]domain.P
 	return values, nil
 }
 
+// Reconcile 讓計畫狀態跟 Session 的鎖定設定保持一致。舊版資料在讀取時
+// 仍可維持原本的佇列格式，但一旦知道目前 Session 設定，就在這裡明確整理。
+func (r *PlanRepository) Reconcile(ctx context.Context, sessionID string, locked bool) ([]domain.Plan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path, err := r.path(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	values, err := r.read(path, sessionID)
+	if errors.Is(err, os.ErrNotExist) {
+		return []domain.Plan{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if locked {
+		values = normalizePlanQueue(values)
+	} else {
+		values = normalizeParallelPlans(values)
+	}
+	if err := r.write(path, sessionID, values); err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
 func (r *PlanRepository) Get(ctx context.Context, sessionID, planID string) (domain.Plan, error) {
 	values, err := r.List(ctx, sessionID)
 	if err != nil {
@@ -192,6 +222,12 @@ func (r *PlanRepository) DeleteSession(ctx context.Context, sessionID string) er
 }
 
 func (r *PlanRepository) Reorder(ctx context.Context, sessionID string, planIDs []string) ([]domain.Plan, error) {
+	return r.ReorderWithPolicy(ctx, sessionID, planIDs, true)
+}
+
+// ReorderWithPolicy 依 Session 的計畫鎖定設定排序。保留 Reorder 的鎖定預設，
+// 維持既有 Repository 呼叫端的相容行為。
+func (r *PlanRepository) ReorderWithPolicy(ctx context.Context, sessionID string, planIDs []string, locked bool) ([]domain.Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -207,6 +243,9 @@ func (r *PlanRepository) Reorder(ctx context.Context, sessionID string, planIDs 
 	}
 	if err != nil {
 		return nil, err
+	}
+	if !locked {
+		values = normalizeParallelPlans(values)
 	}
 	if len(planIDs) != len(values) {
 		return nil, fmt.Errorf("%w: plan order must contain every plan exactly once", domain.ErrInvalidInput)
@@ -231,10 +270,14 @@ func (r *PlanRepository) Reorder(ctx context.Context, sessionID string, planIDs 
 	}
 	active := currentActivePlan(values)
 	first := firstUnfinishedPlan(reordered)
-	if active != nil && first != nil && active.ID != first.ID && domain.PlanHasProgress(*active) {
+	if locked && active != nil && first != nil && active.ID != first.ID && domain.PlanHasProgress(*active) {
 		return nil, fmt.Errorf("%w: plan %q has already started and must remain before queued plans", domain.ErrConflict, active.Title)
 	}
-	reordered = normalizePlanQueue(reordered)
+	if locked {
+		reordered = normalizePlanQueue(reordered)
+	} else {
+		reordered = normalizeParallelPlans(reordered)
+	}
 	if err := r.write(path, sessionID, reordered); err != nil {
 		return nil, err
 	}
@@ -280,7 +323,7 @@ func (r *PlanRepository) read(path, sessionID string) ([]domain.Plan, error) {
 			return nil, fmt.Errorf("decode plans: %w", err)
 		}
 	}
-	return normalizePlanQueue(values), nil
+	return values, nil
 }
 
 func (r *PlanRepository) write(path, sessionID string, values []domain.Plan) error {
@@ -329,6 +372,17 @@ func normalizePlanQueue(values []domain.Plan) []domain.Plan {
 			activeAssigned = true
 		} else {
 			normalized[index].Status = domain.PlanStatusQueued
+		}
+	}
+	return normalized
+}
+
+func normalizeParallelPlans(values []domain.Plan) []domain.Plan {
+	normalized := append([]domain.Plan(nil), values...)
+	for index := range normalized {
+		normalized[index].Position = index
+		if !domain.PlanIsTerminal(normalized[index]) {
+			normalized[index].Status = domain.PlanStatusActive
 		}
 	}
 	return normalized

@@ -265,12 +265,14 @@ func TestRunBlocksRepeatedFailedMutationStrategyButAllowsCorrectedStrategy(t *te
 	}
 }
 
-func TestRunStartsWithSystemShellToolOnly(t *testing.T) {
+// 唯讀工具在系統工具優先階段就會公開；只有寫入型內建工具要等 Shell 實際失敗。
+func TestRunStartsWithReadOnlyToolsAndSystemShell(t *testing.T) {
 	sessions := newMemorySessions(testSession())
 	model := &scriptedModel{responses: []domain.ModelResponse{{Content: "完成了"}}}
 	definitions := []domain.ToolDefinition{
 		{Name: "file_read", Description: "讀取 Sandbox 內的檔案。", ReadOnly: true},
 		{Name: "directory_list", Description: "列出 Sandbox 內的目錄。", ReadOnly: true},
+		{Name: "file_write", Description: "寫入 Sandbox 內的檔案。", RequiresPermission: true},
 		{Name: "shell_exec", Description: "執行主機命令。"},
 	}
 	runner := newTestRunner(sessions, model, &fakeTools{definitions: definitions})
@@ -287,15 +289,23 @@ func TestRunStartsWithSystemShellToolOnly(t *testing.T) {
 	if request.SystemPrompt != "system" || request.UserPrompt != "請讀取檔案" || len(request.History) != 0 {
 		t.Fatalf("prompt sections were not separated: system=%q user=%q history=%+v", request.SystemPrompt, request.UserPrompt, request.History)
 	}
-	for _, expected := range []string{"本輪已透過 OpenAI-compatible tools 欄位提供", "shell_exec", "不可要求使用者執行指令", "ＨＥＬＬＯ．ＭＤ 應使用 HELLO.MD"} {
+	// 工具清單本身走 OpenAI-compatible 的 tools 欄位；文字提示只補「怎麼用」的規則，
+	// 不再重列一次工具名稱。
+	for _, expected := range []string{"本輪已透過 OpenAI-compatible tools 欄位提供", "不可要求使用者代為執行", "ＨＥＬＬＯ．ＭＤ 應使用 HELLO.MD"} {
 		if !strings.Contains(request.ToolPrompt, expected) {
 			t.Errorf("tools prompt does not contain %q: %s", expected, request.ToolPrompt)
 		}
 	}
-	for _, hidden := range []string{"file_read", "directory_list"} {
-		if strings.Contains(request.ToolPrompt, hidden) {
-			t.Errorf("built-in tool %q was exposed before Shell failure: %s", hidden, request.ToolPrompt)
+	// 唯讀工具沒有副作用，第一輪就要能用，否則每個讀取需求都得先跑一個註定失敗的
+	// Shell 命令，多花一輪卻沒有任何產出。
+	exposedNames := strings.Join(availableToolNamesSorted(request.Tools), ",")
+	for _, exposed := range []string{"file_read", "directory_list", "shell_exec"} {
+		if !strings.Contains(exposedNames, exposed) {
+			t.Errorf("read-only tool %q must be available in the system-first stage: %s", exposed, exposedNames)
 		}
+	}
+	if strings.Contains(exposedNames, "file_write") {
+		t.Errorf("write tool was exposed before Shell failure: %s", exposedNames)
 	}
 	for _, expected := range []string{"Host 執行環境", "GOOS=" + runtime.GOOS, runtime.GOARCH, "shell_exec 本輪可呼叫：true", "必須透過 shell_exec 實際執行", "direct mode", "shell mode"} {
 		if !strings.Contains(request.HostPrompt, expected) {
@@ -305,16 +315,19 @@ func TestRunStartsWithSystemShellToolOnly(t *testing.T) {
 	if !strings.Contains(request.PhasePrompt, "大型目錄") || !strings.Contains(request.PhasePrompt, "深度 1–2") {
 		t.Fatalf("large-scope exploration policy missing: %s", request.PhasePrompt)
 	}
-	if !strings.Contains(request.PhasePrompt, "OS 系統工具優先階段") || !strings.Contains(request.PhasePrompt, "內建工具尚未公開") {
+	if !strings.Contains(request.PhasePrompt, "OS 系統工具優先階段") || !strings.Contains(request.PhasePrompt, "寫入型內建工具") {
 		t.Fatalf("system-first tool policy missing: %s", request.PhasePrompt)
+	}
+	if !strings.Contains(request.PhasePrompt, "唯讀內建工具") || !strings.Contains(request.PhasePrompt, "不必先用 shell_exec 試探") {
+		t.Fatalf("read-only availability is not stated in the phase prompt: %s", request.PhasePrompt)
 	}
 	for _, expected := range []string{"使用者可見的工作進度", "我打算分三個步驟完成", "語言與語系", "不得固定綁定", "Awaiting tool execution results"} {
 		if !strings.Contains(request.PhasePrompt, expected) {
 			t.Errorf("progress presentation prompt does not contain %q: %s", expected, request.PhasePrompt)
 		}
 	}
-	if len(request.Tools) != 1 || request.Tools[0].Name != "shell_exec" {
-		t.Fatalf("request tools = %+v, want shell_exec only", request.Tools)
+	if names := strings.Join(availableToolNamesSorted(request.Tools), ","); names != "directory_list,file_read,shell_exec" {
+		t.Fatalf("request tools = %s, want the read-only tools plus shell_exec", names)
 	}
 	for _, event := range events {
 		if event.Type != "turn.start" {
@@ -324,8 +337,8 @@ func TestRunStartsWithSystemShellToolOnly(t *testing.T) {
 		if !ok {
 			t.Fatalf("available_tools = %#v, want []string", event.Payload["available_tools"])
 		}
-		if strings.Join(names, ",") != "shell_exec" {
-			t.Fatalf("available_tools = %v, want shell_exec only", names)
+		if strings.Join(names, ",") != "directory_list,file_read,shell_exec" {
+			t.Fatalf("available_tools = %v, want the read-only tools plus shell_exec", names)
 		}
 		if event.Payload["tool_stage"] != toolStageSystemShell {
 			t.Fatalf("tool_stage = %v, want %s", event.Payload["tool_stage"], toolStageSystemShell)
@@ -345,6 +358,7 @@ func TestRunUnlocksBuiltinToolsAfterShellExecutionFailure(t *testing.T) {
 	definitions := []domain.ToolDefinition{
 		{Name: "file_read", Description: "讀取檔案", ReadOnly: true},
 		{Name: "directory_list", Description: "列出目錄", ReadOnly: true},
+		{Name: "file_write", Description: "寫入檔案", RequiresPermission: true},
 		{Name: "shell_exec", Description: "執行主機命令"},
 	}
 	executed := []string{}
@@ -374,11 +388,13 @@ func TestRunUnlocksBuiltinToolsAfterShellExecutionFailure(t *testing.T) {
 	if len(model.requests) != 3 {
 		t.Fatalf("requests = %d, want 3", len(model.requests))
 	}
-	if len(model.requests[0].Tools) != 1 || model.requests[0].Tools[0].Name != "shell_exec" {
-		t.Fatalf("first request tools = %+v", model.requests[0].Tools)
+	// 第一輪已包含唯讀工具，但寫入型工具仍要等 Shell 實際失敗才解鎖。
+	firstNames := strings.Join(availableToolNamesSorted(model.requests[0].Tools), ",")
+	if firstNames != "directory_list,file_read,shell_exec" {
+		t.Fatalf("first request tools = %s, want read-only tools plus shell_exec", firstNames)
 	}
 	secondNames := strings.Join(availableToolNamesSorted(model.requests[1].Tools), ",")
-	if secondNames != "directory_list,file_read,shell_exec" {
+	if secondNames != "directory_list,file_read,file_write,shell_exec" {
 		t.Fatalf("second request tools = %s, want full catalog", secondNames)
 	}
 	if !strings.Contains(model.requests[1].PhasePrompt, "內建工具備援階段") {
@@ -458,12 +474,14 @@ func TestRunExecutesToolsAndFeedsResultsBack(t *testing.T) {
 }
 
 func TestRunForcesFinalizationAfterAutonomousToolTurnLimitWithoutPlanLoop(t *testing.T) {
-	sessions := newMemorySessions(testSession())
+	session := testSession()
+	session.LockPlans = true
+	sessions := newMemorySessions(session)
 	plans, err := filestore.NewPlanRepository(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewPlanRepository: %v", err)
 	}
-	plan, err := domain.NewPlan(testSession().ID, domain.CreatePlanInput{
+	plan, err := domain.NewPlan(session.ID, domain.CreatePlanInput{
 		Title: "長任務", Steps: []domain.CreatePlanStepInput{{Title: "分析目錄", Verification: "摘要完成"}},
 	}, time.Now())
 	if err != nil {
@@ -490,7 +508,7 @@ func TestRunForcesFinalizationAfterAutonomousToolTurnLimitWithoutPlanLoop(t *tes
 	runner.Plans = plans
 	runner.MaxAutonomousToolTurns = 2
 
-	result, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "分析目前目錄"}, nil)
+	result, err := runner.Run(context.Background(), Input{Session: session, UserInput: "分析目前目錄"}, nil)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -1138,4 +1156,70 @@ func hasEngineEvent(events []domain.EngineEvent, eventType string) bool {
 		}
 	}
 	return false
+}
+
+// 本機模型常見的收尾失敗：只吐了思考（<think> 或 harmony 的 analysis 頻道）
+// 就停住，回答是空的。直接讓整個 Run 失敗，使用者就是白等一輪。
+func TestRunRetriesWhenTheModelOnlyProducesReasoning(t *testing.T) {
+	sessions := newMemorySessions(testSession())
+	model := &scriptedModel{responses: []domain.ModelResponse{
+		{Reasoning: "使用者說 HELLO，我要回招呼。"},
+		{Content: "你好，有什麼需要協助的嗎？"},
+	}}
+	runner := newTestRunner(sessions, model, &fakeTools{})
+
+	events := []domain.EngineEvent{}
+	result, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "HELLO"}, func(event domain.EngineEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if result.Message.Content != "你好，有什麼需要協助的嗎？" {
+		t.Fatalf("content = %q", result.Message.Content)
+	}
+	if len(model.requests) != 2 {
+		t.Fatalf("model was called %d times, want 2", len(model.requests))
+	}
+	var retried bool
+	for _, event := range events {
+		if event.Type == "run.empty_answer_retry" {
+			retried = true
+		}
+	}
+	if !retried {
+		t.Fatal("no run.empty_answer_retry event was emitted")
+	}
+	// 空回答留在 transcript 供稽核，但不能當成使用者可見的回覆。
+	stored, err := sessions.ListMessages(context.Background(), testSession().ID)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	for _, message := range stored {
+		if message.Role != "assistant" || strings.TrimSpace(message.Content) != "" {
+			continue
+		}
+		if internal, _ := message.Metadata["internal"].(bool); !internal {
+			t.Fatalf("empty assistant message was not marked internal: %+v", message.Metadata)
+		}
+	}
+}
+
+// 明確要求之後還是只有思考，就必須誠實失敗，而不是無限重試。
+func TestRunFailsClearlyWhenTheModelNeverAnswers(t *testing.T) {
+	sessions := newMemorySessions(testSession())
+	model := &scriptedModel{responses: []domain.ModelResponse{{Reasoning: "想了很久"}}}
+	runner := newTestRunner(sessions, model, &fakeTools{})
+
+	_, err := runner.Run(context.Background(), Input{Session: testSession(), UserInput: "HELLO"}, nil)
+	if err == nil {
+		t.Fatal("Run should have failed")
+	}
+	if !strings.Contains(err.Error(), "沒有產生回答") {
+		t.Fatalf("error = %v", err)
+	}
+	if len(model.requests) != 1+maxEmptyAnswerRetries {
+		t.Fatalf("model was called %d times, want %d", len(model.requests), 1+maxEmptyAnswerRetries)
+	}
 }

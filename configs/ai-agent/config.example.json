@@ -40,7 +40,7 @@
     "memory_forget"
   ],
   "allow_elevated_tools": true,
-  "tool_call_mode": "instruction",
+  "tool_call_mode": "native",
   "permissions": {
     "default_profile": "default",
     "elevated_profiles": [
@@ -73,6 +73,15 @@
     "allow_writes": true
   },
   "default_provider_id": "openai-compatible",
+  "model_prices": {
+    "openai-compatible": {
+      "gpt-4o-mini": {
+        "input_per_million": 0.15,
+        "output_per_million": 0.6,
+        "currency": "USD"
+      }
+    }
+  },
   "providers": {
     "openai-compatible": {
       "type": "openai-compatible",
@@ -120,5 +129,7 @@
     "max_redirects": 5,
     "allowed_hosts": [],
     "blocked_hosts": []
-  }
+  },
+  "extended_tools": false,
+  "tool_retrieval": true
 }

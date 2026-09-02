@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -91,6 +93,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /desktop/api/restart", s.restart)
 	s.mux.HandleFunc("POST /desktop/api/folders/pick", s.pickFolders)
 	s.mux.HandleFunc("POST /desktop/api/folders/dropped", s.droppedFolders)
+	s.mux.HandleFunc("POST /desktop/api/mcp/files/dropped", s.droppedMCPFiles)
 	s.mux.HandleFunc("POST /desktop/api/screen-capture", s.captureScreen)
 	s.mux.HandleFunc("POST /desktop/api/clipboard/image", s.copyImageToClipboard)
 	s.mux.HandleFunc("POST /desktop/api/resources/open", s.openResource)
@@ -184,6 +187,44 @@ func (s *Server) droppedFolders(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	writeData(writer, values)
+}
+
+func (s *Server) droppedMCPFiles(writer http.ResponseWriter, request *http.Request) {
+	paths, err := folderpicker.DroppedFiles(request.Context())
+	if errors.Is(err, folderpicker.ErrUnavailable) {
+		writeJSON(writer, http.StatusNotImplemented, map[string]any{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]any{"error": "read dropped MCP files: " + err.Error()})
+		return
+	}
+	files := make([]map[string]any, 0, len(paths))
+	for _, path := range paths {
+		extension := strings.ToLower(filepath.Ext(path))
+		if extension != ".mcp" && extension != ".json" {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if info.Size() > 2*1024*1024 {
+			writeJSON(writer, http.StatusRequestEntityTooLarge, map[string]any{"error": ".mcp 檔案不得超過 2 MB"})
+			return
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			writeJSON(writer, http.StatusInternalServerError, map[string]any{"error": "read dropped MCP file: " + readErr.Error()})
+			return
+		}
+		files = append(files, map[string]any{"name": filepath.Base(path), "size": info.Size(), "content": string(data)})
+	}
+	if len(files) == 0 {
+		writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeData(writer, files)
 }
 
 func (s *Server) serveStatic(writer http.ResponseWriter, request *http.Request) {

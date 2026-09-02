@@ -7,6 +7,7 @@ package folderpicker
 #include <stdlib.h>
 
 char* nr_dropped_folders_json(void);
+char* nr_dropped_files_json(void);
 */
 import "C"
 
@@ -29,6 +30,22 @@ func dropped(ctx context.Context) ([]string, error) {
 	values := []string{}
 	if err := json.Unmarshal([]byte(C.GoString(value)), &values); err != nil {
 		return nil, fmt.Errorf("decode dropped folders: %w", err)
+	}
+	return values, nil
+}
+
+func droppedFiles(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	value := C.nr_dropped_files_json()
+	if value == nil {
+		return nil, nil
+	}
+	defer C.free(unsafe.Pointer(value))
+	values := []string{}
+	if err := json.Unmarshal([]byte(C.GoString(value)), &values); err != nil {
+		return nil, fmt.Errorf("decode dropped files: %w", err)
 	}
 	return values, nil
 }

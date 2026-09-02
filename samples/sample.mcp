@@ -1,0 +1,32 @@
+{
+  "mcpServers": {
+    "local-example": {
+      "display_name": "Local MCP Example",
+      "command": "npx",
+      "args": ["-y", "@example/mcp-server"],
+      "env": {
+        "MCP_API_TOKEN": ""
+      }
+    },
+    "remote-bearer-example": {
+      "display_name": "Remote Bearer Example",
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "X-API-Key": "${MCP_API_KEY}"
+      }
+    },
+    "legacy-sse-example": {
+      "display_name": "Legacy SSE Example",
+      "type": "sse",
+      "url": "https://example.com/sse"
+    },
+    "remote-basic-example": {
+      "display_name": "Remote Basic Auth Example",
+      "transport": "streamable-http",
+      "url": "https://example.com/private-mcp",
+      "username": "${MCP_USERNAME}",
+      "password": "${MCP_PASSWORD}"
+    }
+  }
+}
