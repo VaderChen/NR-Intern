@@ -326,6 +326,13 @@ func TestRunStartsWithReadOnlyToolsAndSystemShell(t *testing.T) {
 			t.Errorf("progress presentation prompt does not contain %q: %s", expected, request.PhasePrompt)
 		}
 	}
+	// 工具目錄每一輪都在提示裡，答案照抄工具名稱的規則也必須每一輪都在，
+	// 不能只在收斂階段——沒有呼叫工具就直接回答時一樣會抄。
+	for _, expected := range []string{"使用者看得到什麼", "業務語言"} {
+		if !strings.Contains(request.PhasePrompt, expected) {
+			t.Errorf("answer audience prompt does not contain %q: %s", expected, request.PhasePrompt)
+		}
+	}
 	if names := strings.Join(availableToolNamesSorted(request.Tools), ","); names != "directory_list,file_read,shell_exec" {
 		t.Fatalf("request tools = %s, want the read-only tools plus shell_exec", names)
 	}
@@ -1221,5 +1228,29 @@ func TestRunFailsClearlyWhenTheModelNeverAnswers(t *testing.T) {
 	}
 	if len(model.requests) != 1+maxEmptyAnswerRetries {
 		t.Fatalf("model was called %d times, want %d", len(model.requests), 1+maxEmptyAnswerRetries)
+	}
+}
+
+// 工具目錄每一輪都在提示裡，模型會把識別名稱當成可以引用的詞彙寫進答案。
+// 這一段必須每一輪都在：沒有呼叫任何工具就直接回答時也會照著目錄抄。
+func TestAnswerAudiencePromptPresentEveryTurn(t *testing.T) {
+	prompt := answerAudiencePrompt()
+	for _, expected := range []string{"使用者看得到什麼", "業務語言", "reporter_workstation_select"} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("answer audience prompt does not contain %q: %s", expected, prompt)
+		}
+	}
+}
+
+// 「說明依據」不能被讀成「列出工具名稱」——那正是這條規則造成的實際問題。
+func TestAnswerEvidenceRulesDoNotAskForToolNames(t *testing.T) {
+	rules := answerEvidenceRules()
+	if strings.Contains(rules, "使用的服務或工具") {
+		t.Fatal("evidence rules must not ask the model to name the tool it used")
+	}
+	for _, expected := range []string{"資料來源", "不要出現內部工具識別名稱"} {
+		if !strings.Contains(rules, expected) {
+			t.Fatalf("evidence rules do not contain %q: %s", expected, rules)
+		}
 	}
 }

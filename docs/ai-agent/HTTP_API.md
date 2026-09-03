@@ -417,7 +417,11 @@ curl -X PUT http://127.0.0.1:8787/api/v1/admin/service-settings \
 | `extended_tools` | `false` | 精簡集合已含文件檢視、讀取、建立、轉換；開啟後增加編輯、SSH、記憶等工具，仍受 allowlist 限制 |
 | `tool_retrieval` | `true` | 依需求縮小模型工具目錄，其餘已啟用工具可由 `find_tools` 找回 |
 | `tool_call_mode` | `native` | 使用原生 `tool_calls`；不支援的 Provider 可切換 `instruction` |
-| `memory_space` | `false` | 實驗性開關，目前只保存值，不改變既有長期記憶行為 |
+| `memory_space` | `false` | 即時套用 Agent 記憶准入、去重、Project 優先 scope、較小自動召回視窗與超量整理；仍受既有 memory 設定限制 |
+
+自動召回預設最多 6 筆，注入預算為 1200 UTF-8 bytes（雖然設定名為
+`max_injected_characters`），另有綜合排序門檻。策略參數由 JSON 的 `memory.space` 提供，
+service-settings 端點只切換是否啟用；完整條件見 [回憶空間](MEMORY_SPACE.md)。
 
 ### 設定包下載
 
@@ -442,6 +446,9 @@ Project、Session、Run、事件、計畫、附件、記憶、通知或 OAuth to
 ## Harness 稽核 Entries
 
 `GET /api/v1/sessions/{session_id}/entries` 讀取包含 operation、turn 與 tool call 生命週期的完整稽核資料。使用 `after_sequence` 與 `limit` 分頁，`limit` 預設 200、最大 1000；回應會附上 `next_after_sequence` 與 `has_more`。
+
+分頁現在由儲存層的記憶體位置索引定位，避免每頁載入整份 transcript；API 路徑、游標與回應
+形狀不變。索引不落盤，第一次讀取會建立；不能建立索引時退回掃描，真正的資料損毀仍回報錯誤。
 
 ## 建立非同步 Run
 
@@ -513,6 +520,18 @@ UI 重開時會查詢目前 Workspace 的 queued、running、paused、waiting ap
 
 ## 管理與復原
 
+### Run 與事件的保留範圍
+
+Run metadata 在啟動／Save 時以 500 筆為整理基準，只淘汰最舊範圍的終態 Run，未終態不刪；
+因此總數可能超過 500。啟動後與每 30 分鐘的維護只保留最新 50 筆 Run 與所有未終態 Run 的
+事件檔，其餘及孤兒事件檔會清除。舊 Run 被淘汰後查詢可能回傳 404；事件檔被清理後也不能
+要求完整歷史重播。`entries` 仍讀取獨立的 Session transcript，不因事件清理而刪除。
+
+Session 用量、`by_model` 與 export 的 `runs` 只彙總仍存在的 Run，不保證終身累計。
+需要長期成本或稽核資料時，應在整理前另行匯出與備份。
+
+### 狀態恢復
+
 後端重啟會把 queued、running、paused 與 waiting approval 的未完成 Run 標記為 `failed`、錯誤碼 `server_restarted` 並保留可重試狀態；原 Run
 不會被覆寫。`pause` 只在目前 Provider request 或工具回合結束後生效，等待人工核准的 Run
 不能一般暫停；`cancel-all` 則對所有尚未 terminal 的 Run 送出取消要求，並立即反映為
@@ -577,8 +596,19 @@ curl 'http://127.0.0.1:8787/api/v1/memories?q=繁體&kinds=preference&limit=20'
 curl -X DELETE 'http://127.0.0.1:8787/api/v1/memories/<id>?reason=不再適用'
 ```
 
-`scope` 留空時使用後端預設 scope，與 Harness 對 Session 的預設一致。
+`scope` 留空時使用後端管理預設 scope，不會依 Session 的 Project 自動切換；回憶空間開啟後，
+若要管理特定 Project 記憶，請明確提供 `scope=project:<id>`。
 後端設定 `memory.enabled=false` 時，這組端點回傳 409 而不是假裝成功。
+
+手動記憶 API 直接呼叫 Repository，不套用 Agent 記憶工具的准入與超量策略。DELETE 先標記
+為 `forgotten`；非 active 且 UpdatedAt 早於 30 天前的紀錄會由背景維護永久清理，清理後 GET
+可能回傳 404，取代鏈中的舊 ID 也可能不再可查。
+
+### 記憶引用事件
+
+自動召回命中會發出 `memory.recalled`，payload 含 `count`、`memory_ids`、`truncated`；
+工具失敗後補召回另有 `trigger=tool_failure`。它表示模型將參考這些記憶，不表示記憶內容
+已經被驗證。Console 顯示筆數與觸發原因，事件不包含完整記憶本文。
 
 ## 依狀態列出 Run
 

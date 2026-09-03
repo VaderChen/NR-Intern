@@ -84,6 +84,17 @@ func (r *memorySessions) ListEntriesAfter(ctx context.Context, sessionID string,
 	return result, nil
 }
 
+func (r *memorySessions) ListEntriesPage(ctx context.Context, sessionID string, afterSequence int64, limit int) ([]domain.SessionEntry, bool, error) {
+	entries, err := r.ListEntriesAfter(ctx, sessionID, afterSequence)
+	if err != nil {
+		return nil, false, err
+	}
+	if limit > 0 && len(entries) > limit {
+		return entries[:limit], true, nil
+	}
+	return entries, false, nil
+}
+
 func (r *memorySessions) LatestEntryOfType(ctx context.Context, sessionID, entryType string) (domain.SessionEntry, error) {
 	entries, err := r.ListEntries(ctx, sessionID)
 	if err != nil {

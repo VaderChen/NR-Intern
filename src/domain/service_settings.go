@@ -22,8 +22,9 @@ type ServiceSettings struct {
 	// 工具與 MCP 工具都適用；其餘工具仍可由模型以 find_tools 取回後呼叫，沒有
 	// 任何工具被停用。關閉後整份目錄會進入每一次請求。
 	ToolRetrieval bool `json:"tool_retrieval"`
-	// MemorySpace 是實驗性功能：跨對話的共同記憶。目前只保存開關狀態，
-	// 機制設計見 docs/ai-agent/MEMORY_SPACE.md。
+	// MemorySpace 是實驗性功能：跨對話的共同記憶。開啟後套用准入過濾、去重、
+	// 專案 scope、召回視窗與淘汰；關閉時維持既有長期記憶行為。
+	// 機制說明見 docs/ai-agent/MEMORY_SPACE.md。
 	MemorySpace bool `json:"memory_space"`
 }
 

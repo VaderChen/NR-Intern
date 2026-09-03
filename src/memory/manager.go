@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
+	"time"
 )
 
 type Config struct {
@@ -14,11 +16,40 @@ type Config struct {
 	RecallLimit           int  `json:"recall_limit"`
 	MaxInjectedCharacters int  `json:"max_injected_characters"`
 	AllowWrites           bool `json:"allow_writes"`
+	// Space 是「回憶空間」：跨對話共用記憶時的准入、視窗與淘汰規則。
+	// 關閉時維持原本的長期記憶行為。
+	Space SpaceConfig `json:"space"`
 }
 
 type Manager struct {
 	Repository ports.MemoryRepository
 	Config     Config
+
+	// spaceEnabled 與 Config.Space.Enabled 分開存放，因為回憶空間是設定頁上
+	// 隨時可切換的開關，而 Run 是在別的 goroutine 讀它的。
+	spaceEnabled atomic.Bool
+}
+
+// NewManager 建立記憶管理器，並把回憶空間的初始開關同步進去。
+func NewManager(repository ports.MemoryRepository, config Config) *Manager {
+	manager := &Manager{Repository: repository, Config: config}
+	manager.spaceEnabled.Store(config.Space.Enabled)
+	return manager
+}
+
+// SetSpaceEnabled 讓設定頁的切換立刻生效，不必重啟服務。
+func (m *Manager) SetSpaceEnabled(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.spaceEnabled.Store(enabled)
+}
+
+// space 回傳套用預設值後的回憶空間設定。
+func (m *Manager) space() SpaceConfig {
+	config := m.Config.Space.normalized()
+	config.Enabled = m.spaceEnabled.Load()
+	return config
 }
 
 type RecallResult struct {
@@ -35,17 +66,28 @@ func (m *Manager) Recall(ctx context.Context, session domain.Session, query stri
 	if query == "" {
 		return RecallResult{}, nil
 	}
+	space := m.space()
 	limit := m.Config.RecallLimit
 	if limit <= 0 {
 		limit = 8
 	}
+	searchLimit := limit
+	if space.Enabled {
+		// 先取較寬的候選，再由 rankMemories 依相關度挑進視窗。
+		searchLimit = space.RecallLimit * 4
+	}
 	values, err := m.Repository.Search(ctx, domain.MemoryQuery{
-		Scope: ScopeForSession(session),
+		Scope: ScopeForSessionWithSpace(session, space.Enabled),
 		Text:  query,
-		Limit: limit,
+		Limit: searchLimit,
 	})
 	if err != nil {
 		return RecallResult{}, fmt.Errorf("recall long-term memory: %w", err)
+	}
+	if space.Enabled {
+		// 低於相關度門檻就完全不注入：寧可空手，也不要把不相關的舊決策
+		// 塞進提示——那比沒有記憶更容易把模型帶偏。
+		values = rankMemories(values, query, space, time.Now().UTC())
 	}
 	if len(values) == 0 {
 		return RecallResult{}, nil
@@ -54,6 +96,9 @@ func (m *Manager) Recall(ctx context.Context, session domain.Session, query stri
 	maximum := m.Config.MaxInjectedCharacters
 	if maximum <= 0 {
 		maximum = 8_000
+	}
+	if space.Enabled {
+		maximum = space.MaxInjectedCharacters
 	}
 	var content strings.Builder
 	content.WriteString("\n\n<recalled_memories>\n")

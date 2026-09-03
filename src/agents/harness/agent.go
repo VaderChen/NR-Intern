@@ -242,6 +242,14 @@ func (a *Agent) ListEntries(ctx context.Context, sessionID string) ([]domain.Ses
 	return a.sessions.ListEntries(ctx, sessionID)
 }
 
+// ListEntriesPage 讓分頁在儲存層生效，而不是全部載入後再切一頁。
+func (a *Agent) ListEntriesPage(ctx context.Context, sessionID string, afterSequence int64, limit int) ([]domain.SessionEntry, bool, error) {
+	if _, err := a.GetSession(ctx, sessionID); err != nil {
+		return nil, false, err
+	}
+	return a.sessions.ListEntriesPage(ctx, sessionID, afterSequence, limit)
+}
+
 func (a *Agent) Run(ctx context.Context, input domain.RunInput, emit ports.AgentEventSink) (domain.RunResult, error) {
 	session, err := a.GetSession(ctx, input.SessionID)
 	if err != nil {

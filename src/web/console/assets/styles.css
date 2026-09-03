@@ -780,11 +780,10 @@ dialog label { display: grid; gap: 5px; margin: 13px 0; color: var(--muted); }
 .sandbox-fieldset legend { padding: 0 6px; color: var(--text); font-weight: 750; }
 /* 實驗性功能卡片：說明比開關本身重要，開關只是「之後會怎麼運作」的入口。 */
 .experimental-badge { margin-left: 7px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 10px; font-weight: 600; vertical-align: middle; }
-.experimental-detail { margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--line); }
-.experimental-detail h3 { margin: 0 0 5px; color: var(--text); font-size: 11px; font-weight: 700; letter-spacing: .02em; }
-.experimental-detail h3:not(:first-child) { margin-top: 12px; }
-.experimental-detail ul { margin: 0; padding-left: 17px; color: var(--muted); font-size: 11px; line-height: 1.65; }
-.experimental-detail strong { color: var(--text); font-weight: 650; }
+/* 開關對齊卡片右上：標題與開關同一列，說明另起一行佔滿寬度。 */
+.experimental-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.experimental-title { color: var(--text); font-size: 13px; font-weight: 750; }
+.experimental-card .hint { margin: 6px 0 0; }
 .sandbox-fieldset .hint { margin: 0 0 10px; }
 .folder-picker { display: flex; min-height: 72px; align-items: center; justify-content: center; gap: 10px; border-style: dashed; }
 .folder-picker > span:last-child { display: grid; text-align: left; }

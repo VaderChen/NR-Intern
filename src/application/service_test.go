@@ -116,6 +116,10 @@ func (e *fakeEngine) ListEntries(context.Context, string) ([]domain.SessionEntry
 	return nil, nil
 }
 
+func (e *fakeEngine) ListEntriesPage(context.Context, string, int64, int) ([]domain.SessionEntry, bool, error) {
+	return nil, false, nil
+}
+
 func (e *fakeEngine) RetractMessages(_ context.Context, _, messageID string) ([]domain.Message, error) {
 	e.retractedMessageID = messageID
 	return nil, nil

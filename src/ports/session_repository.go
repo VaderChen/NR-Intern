@@ -21,4 +21,9 @@ type SessionRepository interface {
 	ListEntriesAfter(context.Context, string, int64) ([]domain.SessionEntry, error)
 	// LatestEntryOfType 回傳指定型別中序號最大的 entry，找不到時回傳 ErrNotFound。
 	LatestEntryOfType(context.Context, string, string) (domain.SessionEntry, error)
+	// ListEntriesPage 從 afterSequence 之後最多取 limit 筆，並回報後面是否還有。
+	//
+	// 與 ListEntries 分開是因為分頁必須在儲存層生效：先全部載入再切一頁，
+	// 等於每翻一頁就把整份 transcript 重讀一次，頁數與單頁成本都隨長度成長。
+	ListEntriesPage(context.Context, string, int64, int) ([]domain.SessionEntry, bool, error)
 }

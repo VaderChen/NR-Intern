@@ -52,7 +52,11 @@ type Runtime struct {
 	InstanceID   string
 	Model        *modelrouter.Router
 	Memory       ports.MemoryRepository
-	Events       ports.RunEventRepository
+	// MemoryManager 保留參考，讓回憶空間開關不必重啟後端就能生效。
+	MemoryManager *memory.Manager
+	Events        ports.RunEventRepository
+	// Runs 保留參考，讓背景清理能把只增不減的 run 紀錄與事件檔壓回上限。
+	Runs         ports.RunRepository
 	Plans        ports.PlanRepository
 	Agent        *harnessagent.Agent
 	ProviderAuth *providerauth.Manager
@@ -65,6 +69,8 @@ type Runtime struct {
 	providerUsageRefreshMu sync.Mutex
 	updateCheckContext     context.Context
 	updateCheckCancel      context.CancelFunc
+	maintenanceContext     context.Context
+	maintenanceCancel      context.CancelFunc
 	updateCheckMu          sync.Mutex
 	updateStatusMu         sync.RWMutex
 	updateStatus           domain.UpdateStatus
@@ -269,12 +275,14 @@ func Build(config Config) (*Runtime, error) {
 		if err != nil {
 			return nil, err
 		}
-		memoryManager = &memory.Manager{Repository: memoryRepository, Config: config.Memory}
-		nativeToolValues = append(nativeToolValues, nativememories.NewSearchTool(memoryRepository))
+		memoryConfig := config.Memory
+		memoryConfig.Space.Enabled = config.MemorySpace
+		memoryManager = memory.NewManager(memoryRepository, memoryConfig)
+		nativeToolValues = append(nativeToolValues, nativememories.NewSearchTool(memoryManager))
 		if config.Memory.AllowWrites {
 			nativeToolValues = append(nativeToolValues,
-				nativememories.NewRememberTool(memoryRepository),
-				nativememories.NewForgetTool(memoryRepository),
+				nativememories.NewRememberTool(memoryManager),
+				nativememories.NewForgetTool(memoryManager),
 			)
 		}
 	}
@@ -382,22 +390,24 @@ func Build(config Config) (*Runtime, error) {
 		return nil, err
 	}
 	runtime := &Runtime{
-		Config:       config,
-		Application:  service,
-		NativeTools:  nativeTools,
-		Tools:        toolRuntime,
-		MCP:          mcpManager,
-		ReverseProxy: reverseProxy,
-		StartedAt:    time.Now().UTC(),
-		InstanceID:   domain.NewID("instance"),
-		Model:        model,
-		Memory:       memoryRepository,
-		Events:       events,
-		Plans:        plans,
-		Agent:        agent,
-		ProviderAuth: providerAuth,
-		HTTPFetch:    httpFetch,
-		logger:       logger,
+		Config:        config,
+		Application:   service,
+		NativeTools:   nativeTools,
+		Tools:         toolRuntime,
+		MCP:           mcpManager,
+		ReverseProxy:  reverseProxy,
+		StartedAt:     time.Now().UTC(),
+		InstanceID:    domain.NewID("instance"),
+		Model:         model,
+		Memory:        memoryRepository,
+		MemoryManager: memoryManager,
+		Events:        events,
+		Runs:          runs,
+		Plans:         plans,
+		Agent:         agent,
+		ProviderAuth:  providerAuth,
+		HTTPFetch:     httpFetch,
+		logger:        logger,
 	}
 	handler, err := httpapi.New(service, httpapi.Config{
 		APIToken:                config.APIToken,
@@ -438,6 +448,7 @@ func Build(config Config) (*Runtime, error) {
 	runtime.HTTPHandler = handler
 	runtime.startProviderUsageRefresher()
 	runtime.startUpdateChecker()
+	runtime.startStorageMaintenance()
 	runtime.startModelLimitDiscovery()
 	mcpManager.Warm(context.Background())
 	return runtime, nil
@@ -545,6 +556,9 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if r.Agent != nil {
 		r.Agent.SetToolCallMode(harness.NormalizeToolCallMode(updatedConfig.ToolCallMode))
 		r.Agent.SetToolRetrieval(updatedConfig.ToolRetrieval)
+	}
+	if r.MemoryManager != nil {
+		r.MemoryManager.SetSpaceEnabled(updatedConfig.MemorySpace)
 	}
 	return settings, nil
 }
@@ -1389,6 +1403,7 @@ func (r *Runtime) Close(ctx context.Context) error {
 	if r.updateCheckCancel != nil {
 		r.updateCheckCancel()
 	}
+	r.stopStorageMaintenance()
 	if r.ProviderAuth != nil {
 		result = r.ProviderAuth.Close(ctx)
 	}

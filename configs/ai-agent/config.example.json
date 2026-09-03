@@ -71,7 +71,14 @@
     "auto_recall": true,
     "recall_limit": 8,
     "max_injected_characters": 8000,
-    "allow_writes": true
+    "allow_writes": true,
+    "space": {
+      "recall_limit": 6,
+      "max_injected_characters": 1200,
+      "min_relevance": 0.15,
+      "scope_cap": 500,
+      "stale_days": 90
+    }
   },
   "default_provider_id": "openai-compatible",
   "model_prices": {

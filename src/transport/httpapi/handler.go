@@ -1039,22 +1039,13 @@ func (h *Handler) listEntries(writer http.ResponseWriter, request *http.Request)
 		writeProblem(writer, request, fmt.Errorf("%w: limit cannot exceed 1000", domain.ErrInvalidInput))
 		return
 	}
-	values, err := h.service.ListEntries(request.Context(), request.PathValue("session_id"))
+	// 分頁必須在儲存層完成。原本是先 ListEntries 載入整份 transcript 再切一頁，
+	// 於是前端翻 N 頁就把整個檔案完整解碼 N 次——頁數與單頁成本都隨 session 長度
+	// 成長，開一個長對話變成平方成本。
+	filtered, hasMore, err := h.service.ListEntriesPage(request.Context(), request.PathValue("session_id"), after, int(limit))
 	if err != nil {
 		writeProblem(writer, request, err)
 		return
-	}
-	filtered := make([]domain.SessionEntry, 0, min(int(limit), len(values)))
-	hasMore := false
-	for _, value := range values {
-		if value.Sequence <= after {
-			continue
-		}
-		if len(filtered) >= int(limit) {
-			hasMore = true
-			break
-		}
-		filtered = append(filtered, value)
 	}
 	next := after
 	if len(filtered) > 0 {

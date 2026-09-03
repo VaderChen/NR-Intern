@@ -3663,8 +3663,7 @@ function mergeReasoningIntoPrevious(messageNode, operationID = "") {
 
 function finalizeReasoningGroup(operationID, durationMilliseconds) {
   if (!operationID || !Number.isFinite(durationMilliseconds) || durationMilliseconds < 0) return;
-  for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
-    if (node.dataset.operationId !== operationID) continue;
+  for (const node of assistantNodesForOperation(operationID)) {
     const block = node.querySelector(".message-reasoning");
     if (block) {
       block.dataset.durationMilliseconds = String(Math.round(durationMilliseconds));
@@ -3676,11 +3675,19 @@ function finalizeReasoningGroup(operationID, durationMilliseconds) {
 function updateLiveReasoningDuration(operationID, now = Date.now()) {
   const startedAt = state.runStartedAt.get(operationID);
   if (!operationID || !Number.isFinite(startedAt) || !Number.isFinite(now) || now < startedAt) return;
-  for (const node of $("messages").querySelectorAll(".message.assistant[data-operation-id]")) {
-    if (node.dataset.operationId !== operationID) continue;
+  for (const node of assistantNodesForOperation(operationID)) {
     const block = node.querySelector(".message-reasoning:not(.hidden)");
     if (block) updateReasoningSummary(block, now - startedAt);
   }
+}
+
+// assistantNodesForOperation 只取屬於這個 operation 的節點。
+//
+// 這兩個呼叫端一個在每秒的計時器上、一個在訊息完成時，原本都是掃過全部
+// assistant 節點再用 JS 過濾——長對話裡每秒要走訪上千個節點，卻只為了改其中一個。
+function assistantNodesForOperation(operationID) {
+  if (!operationID) return [];
+  return $("messages").querySelectorAll(`.message.assistant[data-operation-id="${CSS.escape(operationID)}"]`);
 }
 
 function updateReasoningSummary(block, durationMilliseconds = null) {
@@ -4820,6 +4827,16 @@ function handleEvent(event, sessionID) {
       draft.reasoning = joinReasoningParts(draft.reasoning, `${translate("工具失敗")}：\`${failedTool}\``);
       if (visible) renderSelectedRunDraft();
     }
+  } else if (event.type === "memory.recalled") {
+    // 回憶空間讓這次的答案取決於使用者看不見的狀態。至少要讓人知道「這次有用到
+    // 記憶、用了幾條」，否則出錯時完全無從判斷答案為什麼變了。
+    const draft = ensureRunDraft(sessionID, operationID);
+    const count = Number(payload.count || 0);
+    if (draft && count > 0) {
+      const label = payload.trigger === "tool_failure" ? translate("工具失敗後查詢記憶") : translate("引用長期記憶");
+      draft.reasoning = joinReasoningParts(draft.reasoning, `${label}：${count}`);
+      if (visible) renderSelectedRunDraft();
+    }
   } else if (event.type === "turn.start") {
     // 新的一輪開始 = 又要等模型。上一輪的文字已經留在畫面上，若不重新標記處理中，
     // 接下來的等待（本機模型可能好幾分鐘）畫面完全靜止，跟當機無法區分。
@@ -5053,9 +5070,14 @@ async function resumeCurrentRun() {
   } catch (error) { toast(error.message); }
 }
 
+// findMessage 用屬性選擇器直接命中，不展開整份訊息清單。
+//
+// 原本是把所有 .message 節點收成陣列再線性比對。它同時在 SSE 熱路徑與
+// syncMilestoneActive 的每個捲動 frame 上（每個里程碑各呼叫一次），
+// 於是捲動成本是「提問數 × 訊息數」——對話越長越卡，而且是平方成長。
 function findMessage(id) {
   if (!id) return null;
-  return [...$("messages").querySelectorAll(".message")].find((element) => element.dataset.messageId === id) || null;
+  return $("messages").querySelector(`.message[data-message-id="${CSS.escape(id)}"]`);
 }
 
 function messageDistanceFromBottom(container = $("messages")) {
@@ -5100,6 +5122,9 @@ function renderMessageMilestones() {
     tick.type = "button";
     tick.className = "message-milestone";
     tick.dataset.messageId = question.dataset.messageId || "";
+    // 捲動時每個 frame 都要量這個節點的位置，直接把參照掛上來，
+    // 免得每次都重新到訊息清單裡找一遍。
+    tick.milestoneTarget = question;
     tick.dataset.label = label;
     tick.dataset.text = text;
     tick.setAttribute("aria-label", `${label}：${text.slice(0, 60)}`);
@@ -5151,14 +5176,18 @@ function hideMilestoneCard() {
 // 並在捲到底時直接指向最後一段：最新的提問就在眼前，沒有別的答案。
 function syncMilestoneActive() {
   const container = $("messages");
-  const ticks = [...document.querySelectorAll(".message-milestone")];
+  const rail = $("messageMilestones");
+  const ticks = rail ? [...rail.children] : [];
   if (!container || ticks.length === 0) return;
   const bounds = container.getBoundingClientRect();
   const threshold = bounds.top + Math.min(bounds.height * 0.6, 360);
   let activeIndex = 0;
+  // 訊息節點在 renderMessageMilestones 時就掛在 tick 上，這裡不再重新查找。
+  // 每個 frame 仍要讀 rect（位置會隨捲動改變），但已經是每個里程碑一次，
+  // 而不是每個里程碑掃一遍整份訊息清單。
   ticks.forEach((tick, index) => {
-    const target = tick.dataset.messageId ? findMessage(tick.dataset.messageId) : null;
-    if (target && target.getBoundingClientRect().top <= threshold) activeIndex = index;
+    const target = tick.milestoneTarget;
+    if (target && target.isConnected && target.getBoundingClientRect().top <= threshold) activeIndex = index;
   });
   // 兩端各自對稱：捲到底就是最後一段，捲到頂就是第一段。
   // 短對話時多個提問會同時落在判定線以上，沒有這兩條規則，兩端都會標錯。

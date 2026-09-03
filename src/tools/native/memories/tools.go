@@ -13,27 +13,29 @@ import (
 )
 
 type SearchTool struct {
-	Repository ports.MemoryRepository
+	Memory *memory.Manager
 }
 
 type RememberTool struct {
-	Repository ports.MemoryRepository
+	Memory *memory.Manager
 }
 
 type ForgetTool struct {
-	Repository ports.MemoryRepository
+	Memory *memory.Manager
 }
 
-func NewSearchTool(repository ports.MemoryRepository) *SearchTool {
-	return &SearchTool{Repository: repository}
+// 工具一律經過 Manager：准入、去重、淘汰與 scope 解析都集中在那裡，
+// 直接打 Repository 會繞過全部策略。
+func NewSearchTool(manager *memory.Manager) *SearchTool {
+	return &SearchTool{Memory: manager}
 }
 
-func NewRememberTool(repository ports.MemoryRepository) *RememberTool {
-	return &RememberTool{Repository: repository}
+func NewRememberTool(manager *memory.Manager) *RememberTool {
+	return &RememberTool{Memory: manager}
 }
 
-func NewForgetTool(repository ports.MemoryRepository) *ForgetTool {
-	return &ForgetTool{Repository: repository}
+func NewForgetTool(manager *memory.Manager) *ForgetTool {
+	return &ForgetTool{Memory: manager}
 }
 
 func (t *SearchTool) Definition() domain.ToolDefinition {
@@ -59,15 +61,16 @@ func (t *SearchTool) Definition() domain.ToolDefinition {
 }
 
 func (t *SearchTool) Execute(ctx context.Context, invocation tools.Invocation, _ ports.ToolUpdateSink) (domain.ToolExecution, error) {
-	if t == nil || t.Repository == nil {
+	if t == nil || t.Memory == nil {
 		return failure(invocation.Call, "memory repository is unavailable"), nil
 	}
 	kinds, err := parseKinds(toolutil.StringSlice(invocation.Call.Arguments, "kinds"))
 	if err != nil {
 		return failure(invocation.Call, err.Error()), nil
 	}
-	values, err := t.Repository.Search(ctx, domain.MemoryQuery{
-		Scope: memory.ScopeForSession(invocation.Session),
+	// scope 交給 Manager 解析：回憶空間開啟時寫入會收斂到專案，這裡若自己帶
+	// 舊的 Agent scope，模型就找不到自己剛寫進去的記憶。
+	values, err := t.Memory.Search(ctx, invocation.Session, domain.MemoryQuery{
 		Text:  toolutil.String(invocation.Call.Arguments, "query"),
 		Kinds: kinds,
 		Tags:  toolutil.StringSlice(invocation.Call.Arguments, "tags"),
@@ -85,7 +88,7 @@ func (t *RememberTool) Definition() domain.ToolDefinition {
 		Label:        "寫入長期記憶",
 		Version:      "1.0.0",
 		Category:     "memory",
-		Description:  "保存跨 session 仍有價值的事實、偏好、決策、程序或限制。不要保存暫時資訊、憑證、金鑰、密碼或其他敏感資料。",
+		Description:  rememberDescription(t != nil && t.Memory.SpaceEnabled()),
 		Platforms:    []string{"darwin", "linux", "windows"},
 		Capabilities: []string{"remember", "deduplicate", "supersede", "scope-isolation"},
 		InputSchema: map[string]any{
@@ -102,8 +105,21 @@ func (t *RememberTool) Definition() domain.ToolDefinition {
 	}
 }
 
+// rememberDescription 在回憶空間開啟時先講清楚准入條件。
+//
+// 不講的話模型只會寫進來、被擋下、再換句話說寫一次——三次工具呼叫換不到任何東西。
+func rememberDescription(spaceEnabled bool) string {
+	if !spaceEnabled {
+		return "保存跨 session 仍有價值的事實、偏好、決策、程序或限制。不要保存暫時資訊、憑證、金鑰、密碼或其他敏感資料。"
+	}
+	return "保存跨對話仍有價值的偏好、決策、限制或作法。回憶空間已開啟，只收 preference、decision、constraint、procedure 四類；" +
+		"fact 會被拒絕——會過期，需要時重新查詢即可。內容必須換一個對話、換一天仍然成立；" +
+		"只對這次任務成立的路徑、錯誤訊息與暫時狀態，以及倉庫裡查得到的程式結構或 git 記錄都不要寫。" +
+		"憑證、金鑰、密碼一律擋下。改變既有決策時用 supersedes 指定被取代的記憶 ID，不要只是再寫一則。"
+}
+
 func (t *RememberTool) Execute(ctx context.Context, invocation tools.Invocation, _ ports.ToolUpdateSink) (domain.ToolExecution, error) {
-	if t == nil || t.Repository == nil {
+	if t == nil || t.Memory == nil {
 		return failure(invocation.Call, "memory repository is unavailable"), nil
 	}
 	content := toolutil.String(invocation.Call.Arguments, "content")
@@ -117,8 +133,7 @@ func (t *RememberTool) Execute(ctx context.Context, invocation tools.Invocation,
 		}
 		return failure(invocation.Call, err.Error()), nil
 	}
-	value, err := t.Repository.Remember(ctx, domain.RememberMemoryInput{
-		Scope:           memory.ScopeForSession(invocation.Session),
+	value, err := t.Memory.Remember(ctx, invocation.Session, domain.RememberMemoryInput{
 		Kind:            kinds[0],
 		Content:         content,
 		Tags:            toolutil.StringSlice(invocation.Call.Arguments, "tags"),
@@ -154,7 +169,7 @@ func (t *ForgetTool) Definition() domain.ToolDefinition {
 }
 
 func (t *ForgetTool) Execute(ctx context.Context, invocation tools.Invocation, _ ports.ToolUpdateSink) (domain.ToolExecution, error) {
-	if t == nil || t.Repository == nil {
+	if t == nil || t.Memory == nil {
 		return failure(invocation.Call, "memory repository is unavailable"), nil
 	}
 	id := toolutil.String(invocation.Call.Arguments, "id")
@@ -162,7 +177,7 @@ func (t *ForgetTool) Execute(ctx context.Context, invocation tools.Invocation, _
 	if id == "" || reason == "" {
 		return failure(invocation.Call, "id and reason are required"), nil
 	}
-	value, err := t.Repository.Forget(ctx, memory.ScopeForSession(invocation.Session), id, reason)
+	value, err := t.Memory.Forget(ctx, invocation.Session, id, reason)
 	if err != nil {
 		return failure(invocation.Call, err.Error()), nil
 	}

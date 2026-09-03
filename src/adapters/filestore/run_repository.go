@@ -14,10 +14,20 @@ import (
 	"time"
 )
 
+// defaultRunRetention 是 runs.json 保留的 run 筆數上限。
+//
+// 這個檔案每次 Save 都整份重寫，而一次 run 會 Save 好幾次（啟動、狀態轉換、完成）。
+// 沒有上限時，寫入成本正比於「這台機器跑過的 run 總數」，只會越來越慢也永遠不會
+// 回落。500 筆足夠涵蓋任何實際的回顧需求，完整紀錄仍在各 session 的 transcript 裡。
+const defaultRunRetention = 500
+
 type RunRepository struct {
-	mu       sync.RWMutex
-	filePath string
-	runs     map[string]domain.Run
+	mu        sync.RWMutex
+	filePath  string
+	runs      map[string]domain.Run
+	retention int
+	// pruned 記下被淘汰的 run，讓呼叫端有機會清掉對應的事件檔。
+	pruned []string
 }
 
 type runFile struct {
@@ -35,18 +45,70 @@ func NewRunRepository(dataDir string) (*RunRepository, error) {
 		return nil, fmt.Errorf("create run store: %w", err)
 	}
 	repository := &RunRepository{
-		filePath: filepath.Join(root, "runs.json"),
-		runs:     map[string]domain.Run{},
+		filePath:  filepath.Join(root, "runs.json"),
+		runs:      map[string]domain.Run{},
+		retention: defaultRunRetention,
 	}
 	if err := repository.load(); err != nil {
 		return nil, err
 	}
-	if repository.markInterruptedRuns() {
+	changed := repository.markInterruptedRuns()
+	if repository.pruneLocked() {
+		changed = true
+	}
+	if changed {
 		if err := repository.persistLocked(); err != nil {
 			return nil, err
 		}
 	}
 	return repository, nil
+}
+
+// TakePrunedRunIDs 取出並清空自上次呼叫以來被淘汰的 run ID。
+//
+// RunRepository 不知道事件檔放在哪裡，所以不自己刪；由同時握有兩個 store 的
+// 呼叫端接手。回傳後就從清單移除，避免重複處理。
+func (r *RunRepository) TakePrunedRunIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pruned) == 0 {
+		return nil
+	}
+	values := r.pruned
+	r.pruned = nil
+	return values
+}
+
+// terminalRunStatus 判斷 run 是否已經結束、不會再被寫入。
+func terminalRunStatus(status domain.RunStatus) bool {
+	switch status {
+	case domain.RunStatusCompleted, domain.RunStatusFailed, domain.RunStatusCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+// pruneLocked 把 run 數量壓回上限，最舊的先淘汰。回傳是否有變動。
+func (r *RunRepository) pruneLocked() bool {
+	if r.retention <= 0 || len(r.runs) <= r.retention {
+		return false
+	}
+	ordered := make([]domain.Run, 0, len(r.runs))
+	for _, run := range r.runs {
+		ordered = append(ordered, run)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt.Before(ordered[j].CreatedAt) })
+	for index := 0; index < len(ordered)-r.retention; index++ {
+		// 只淘汰已經結束的 run。paused 與 waiting_approval 看起來像停住了，
+		// 其實都還會寫回狀態——用「是否為終態」判斷才不會漏掉。
+		if !terminalRunStatus(ordered[index].Status) {
+			continue
+		}
+		delete(r.runs, ordered[index].ID)
+		r.pruned = append(r.pruned, ordered[index].ID)
+	}
+	return len(r.pruned) > 0
 }
 
 func (r *RunRepository) Save(_ context.Context, run domain.Run) error {
@@ -57,6 +119,7 @@ func (r *RunRepository) Save(_ context.Context, run domain.Run) error {
 	defer r.mu.Unlock()
 	previous, existed := r.runs[run.ID]
 	r.runs[run.ID] = cloneRun(run)
+	r.pruneLocked()
 	if err := r.persistLocked(); err != nil {
 		if existed {
 			r.runs[run.ID] = previous

@@ -177,6 +177,9 @@ Provider／Model 提供 `by_model` 明細。`model_prices` 設定以 Provider ID
 Console 標題列顯示 Session 累計 token，以 K／M 縮寫並在 tooltip 提供精確值；沒有成本時隱藏
 金額與分隔符號。重新提問不退還已消耗的 token，不能用累計用量推算當前上下文占比。
 
+Session 彙總只涵蓋仍保留的 Run。RunRepository 整理掉舊紀錄後，對應用量也會從查詢與匯出
+消失；這不是永久帳務總帳，長期統計應另行保存匯出。
+
 ### Human-in-the-loop Approval
 
 `RequiresPermission` 的原生工具在實際執行前會建立 durable approval request，Run 狀態改為
@@ -623,8 +626,36 @@ MCP 呼叫前則只對 schema 指定的物件／陣列做標準 JSON 字串解�
 ## 實驗性回憶空間
 
 `memory_space` 預設關閉，透過 Config、service settings 與 Console「實驗性功能」頁保存，
-目前沒有共享／召回／淘汰實作。它不控制既有 `memory.*` 或 scope 規則；詳細設計與預定限制
-見 [回憶空間提案](MEMORY_SPACE.md)，不可當成已完成的資料保護機制。
+Runtime 以原子開關即時套用至 `memory.Manager`。Agent 的記憶工具統一經過 Manager，啟用時
+套用種類／秘密樣式檢查、近似去重、Project → Workspace 的預設 scope 與召回排序。
+明確的 `memory_scope` 優先；仍遵守既有 `memory.enabled`、`auto_recall` 與 `allow_writes`。
+
+自動召回預設最多 6 筆、1200 UTF-8 bytes（包含包裝說明），依文字相關度、新鮮度與 confidence
+排序；初始召回留在後續 context，符合工具重複失敗條件時另補一次、只注入下一輪。
+`memory.recalled` 帶引用 ID、筆數與截斷狀態，失敗觸發另有 `trigger=tool_failure`，Console
+以筆數與原因顯示。模型主動查詢不受這個自動注入窗口限制。
+
+同 scope active 記憶以 500 筆為整理目標，超量時軟性淘汰較低價值內容。種類與憑證樣式可由
+程式檢查，可重用性、可推導性與矛盾則不能完全自動判斷；明確取代使用 `supersedes`。
+實作、參數、限制與 30 天失效記憶保留規則見 [回憶空間](MEMORY_SPACE.md)。
+
+## 長對話索引與儲存保留
+
+`SessionRepository` 的記憶體索引只存每筆 entry 的 sequence、type 與 byte offset，首次掃描
+header，後續以二分搜尋及 seek 讀取指定頁。append 同步更新索引；大小不符可重建，無法建立
+索引時退回掃描，不掩蓋真正的 JSON 損毀。`ListEntriesPage` 從 HTTP 經 application、agent
+一路傳到 Repository，避免每翻一頁都完整解碼 transcript；既有游標契約不變。
+
+前端訊息查找直接使用 ID 屬性選擇器，處理計時只查當前 operation 的節點；段落刻度保存目標
+節點參照，減少長對話捲動時的重複查找。
+
+RunRepository 在啟動與 Save 時，以總數 500 為整理基準，依建立時間淘汰最舊範圍中已結束的
+Run，未終態一律保留，所以不是硬性上限。Runtime 啟動後及每 30 分鐘另清理事件檔：保留最新
+50 筆 Run 與所有未終態 Run 的事件，其餘及孤兒事件檔移除。非 active 且 UpdatedAt 早於
+30 天前的記憶也會永久移除，與回憶空間開關無關。
+
+這些固定保留值目前不接受配置。Session transcript 不因維護而刪除，但舊 Run API、用量
+快照、事件重播與失效記憶稽核資料可能不再可用；升級前須備份，長期稽核另存匯出。
 
 ## 完成度判定
 
@@ -659,7 +690,10 @@ System prompt 另外約束回答格式：多筆項目、逐項清單或每筆有
 表格（Console 已支援表格渲染與橫向捲動），並說明是否還有未列出的項目；只有一兩筆或每筆只有
 單一值時不必硬做表格。
 
-收斂階段的提示另外要求答案交代依據：實際查了哪個服務或工具、查詢範圍與過濾條件、
+每輪提示要求以使用者熟悉的業務語言描述能力與來源，不直接列出內部工具識別字、函式名或
+API 端點；只有使用者明確詢問工具或整合方式時才揭露。這是表達規則，不是機密過濾機制。
+
+收斂階段的提示另外要求答案交代依據：實際查了哪些資料、查詢範圍與過濾條件、
 支撐結論的關鍵數據，以及取樣、時間點等會影響判讀的限制。只回一句結論（例如
 「目前共有 264 筆製令。」）數字就算正確，使用者也無法判斷可信度。同一段規則明確要求
 長度與問題複雜度相稱，避免反向變成覆述工作過程；這段規則只在工具結果已進入 history 的
@@ -676,11 +710,16 @@ System prompt 另外約束回答格式：多筆項目、逐項清單或每筆有
 - 工作記憶：由 operation、turn、tool records 與 session workspace 保存本次工作的實際狀態。
 - 長期記憶：保存跨 session 仍有效的 `fact`、`preference`、`decision`、`procedure`、`constraint`。
 
-長期記憶經 `ports.MemoryRepository` 隔離儲存技術。目前使用本機 JSON store 與可解釋的詞彙／雙字元召回；日後可加入向量索引 adapter，不需修改 Harness 或工具介面。預設 scope 是 Agent ID，建立 session 時可用 metadata 的 `memory_scope` 改成使用者、專案或租戶識別，避免不同 scope 互相讀取。
+長期記憶經 `ports.MemoryRepository` 隔離儲存技術。目前使用本機 JSON store 與可解釋的詞彙／雙字元召回；日後可加入向量索引 adapter，不需修改 Harness 或工具介面。關閉回憶空間時，預設 scope 是 Agent ID；啟用後優先使用 Project，再退回 Workspace。Session metadata 的 `memory_scope` 可明確指定其他範圍；這是召回範圍，不是獨立的租戶授權邊界。
 
-每次 operation 只自動召回一次，再於所有後續 turn 重用同一份結果。召回資料以明確邊界注入 system prompt，並標示為「可能過時的資料而非新指令」，降低記憶內容造成提示注入的風險；`memory_recall` entry 只記錄記憶 ID 與 scope，供追蹤模型當時使用過哪些資料。
+每次 operation 初始召回一次，再於後續 turn 重用；回憶空間啟用時，工具重複失敗另可補召回。
+召回資料以明確邊界注入 system prompt，並標示為「可能過時的資料而非新指令」，降低提示注入
+風險；`memory_recall` entry 記錄記憶 ID 與 scope，供追蹤使用來源。
 
 寫入具備種類、標籤、信心值、來源 session、去重與 `supersedes` 關係。`memory_forget` 採 soft forget，資料保留稽核資訊但不再被召回；Agent 只有在使用者明確要求時才能執行。設定 `memory.allow_writes=false` 可只保留自動召回與 `memory_search`。
+
+啟用回憶空間後 Agent 寫入不收 `fact`，且預設 scope 依 Project／Workspace 選擇。非 active
+記憶的稽核資料只保留至清理期限，並非永久保留；詳細規則見前述儲存保留與回憶空間章節。
 
 ## 原生工具與 OS 差異
 

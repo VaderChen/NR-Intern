@@ -225,6 +225,30 @@ func (r *MemoryRepository) Search(ctx context.Context, query domain.MemoryQuery)
 	return result, nil
 }
 
+// ListScope 回傳 scope 內所有仍生效的記憶，依建立時間排序。
+func (r *MemoryRepository) ListScope(ctx context.Context, scope string) ([]domain.Memory, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	scope = strings.TrimSpace(scope)
+	if scope == "" {
+		return nil, fmt.Errorf("%w: memory scope is required", domain.ErrInvalidInput)
+	}
+	r.mu.RLock()
+	result := make([]domain.Memory, 0, len(r.items))
+	for _, value := range r.items {
+		if value.Scope != scope || value.Status != domain.MemoryStatusActive {
+			continue
+		}
+		result = append(result, cloneMemory(value))
+	}
+	r.mu.RUnlock()
+	sort.SliceStable(result, func(first, second int) bool {
+		return result[first].CreatedAt.Before(result[second].CreatedAt)
+	})
+	return result, nil
+}
+
 func (r *MemoryRepository) Forget(ctx context.Context, scope, id, reason string) (domain.Memory, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Memory{}, err
@@ -250,6 +274,36 @@ func (r *MemoryRepository) Forget(ctx context.Context, scope, id, reason string)
 		return domain.Memory{}, err
 	}
 	return cloneMemory(value), nil
+}
+
+// PurgeInactive 永久移除在 before 之前就已失效的記憶，回傳移除筆數。
+//
+// forgotten 與 superseded 不會被召回，也不佔 scope 上限，但它們留在檔案裡，而這個
+// 檔案每次寫入都整份重寫——留越久，每次寫記憶就越慢。保留一段時間是為了稽核
+// 「當時到底記了什麼」，過了那段時間就沒有理由再扛著。
+func (r *MemoryRepository) PurgeInactive(ctx context.Context, before time.Time) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := cloneMemories(r.items)
+	removed := 0
+	for id, value := range r.items {
+		if value.Status == domain.MemoryStatusActive || !value.UpdatedAt.Before(before) {
+			continue
+		}
+		delete(r.items, id)
+		removed++
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	if err := r.persistLocked(); err != nil {
+		r.items = previous
+		return 0, err
+	}
+	return removed, nil
 }
 
 func (r *MemoryRepository) load() error {

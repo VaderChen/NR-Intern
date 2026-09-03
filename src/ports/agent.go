@@ -21,5 +21,7 @@ type AgentEngine interface {
 	// RetractMessages 讓「重新提問」把某一則使用者訊息之後的內容移出對話。
 	RetractMessages(context.Context, string, string) ([]domain.Message, error)
 	ListEntries(context.Context, string) ([]domain.SessionEntry, error)
+	// ListEntriesPage 讓分頁在儲存層生效，不必為了一頁載入整份 transcript。
+	ListEntriesPage(context.Context, string, int64, int) ([]domain.SessionEntry, bool, error)
 	Run(context.Context, domain.RunInput, AgentEventSink) (domain.RunResult, error)
 }

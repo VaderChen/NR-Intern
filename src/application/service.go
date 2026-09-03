@@ -615,6 +615,15 @@ func (s *Service) ListEntries(ctx context.Context, sessionID string) ([]domain.S
 	return engine.ListEntries(ctx, sessionID)
 }
 
+// ListEntriesPage 把分頁一路傳到儲存層：只讀這一頁需要的位元組。
+func (s *Service) ListEntriesPage(ctx context.Context, sessionID string, afterSequence int64, limit int) ([]domain.SessionEntry, bool, error) {
+	engine, _, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	return engine.ListEntriesPage(ctx, sessionID, afterSequence, limit)
+}
+
 func (s *Service) ListRuns(ctx context.Context, sessionID string) ([]domain.Run, error) {
 	return s.runs.List(ctx, strings.TrimSpace(sessionID))
 }

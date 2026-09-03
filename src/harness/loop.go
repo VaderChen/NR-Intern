@@ -261,7 +261,8 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	}
 	// 檢索是工具目錄的第一層過濾：只有與這次需求相關的工具進入模型目錄，
 	// 其餘工具仍可經 find_tools 取回並直接呼叫。
-	retriever := newToolRetriever(definitions, r.retrievalQuery(ctx, input), r.toolRetrievalSnapshot())
+	retrievalQuery := r.retrievalQuery(ctx, input)
+	retriever := newToolRetriever(definitions, retrievalQuery, r.toolRetrievalSnapshot())
 	if retriever.enabled() {
 		logger.Debug("mcp tool retrieval active",
 			"catalog", len(retriever.known),
@@ -281,7 +282,13 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	// 每個 Run 都從系統 Shell 階段開始。只有 shell_exec 的實際執行結果為失敗，
 	// 才在下一輪公開檔案、搜尋、比較、SSH 等內建工具。
 	builtinFallbackEnabled := !definitionNamed(definitions, systemShellToolName)
-	recalled, err := r.recallMemory(ctx, input.Session, input.UserInput, operationID)
+	// 回憶空間與工具檢索共用查詢字串：跟進提問常常只剩代名詞（「那再改一下」），
+	// 單看這一句什麼都檢索不到。
+	memoryQuery := input.UserInput
+	if r.Memory.SpaceEnabled() {
+		memoryQuery = retrievalQuery
+	}
+	recalled, err := r.recallMemory(ctx, input.Session, memoryQuery, operationID)
 	if err != nil {
 		return domain.RunResult{}, err
 	}
@@ -306,6 +313,10 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	// completionDirective 只作用於下一輪的 system prompt，不寫進 transcript 的訊息串，
 	// 避免把 Harness 的內部追問偽裝成使用者發言。
 	completionDirective := ""
+	// failureRecall 承載「同一個工具連續失敗兩次」時補檢索到的記憶，
+	// 與 completionDirective 一樣只作用於下一輪。
+	failureRecall := ""
+	failureRecallTracker := &memory.FailureRecallTracker{}
 	planCompletionChecks := 0
 	lastPlanCompletionKey := ""
 	toolProtocolRepairAttempts := 0
@@ -389,7 +400,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			_ = r.finishTurn(context.WithoutCancel(ctx), input.Session.ID, operationID, turnID, turn, turnStartedAt, "failed", 0, domain.ModelResponse{}, planErr)
 			return domain.RunResult{}, planErr
 		}
-		phasePrompt := joinPromptSections(toolSelectionPhasePrompt(builtinFallbackEnabled, activeDefinitions), retrievalPhasePrompt(activeDefinitions), planningPhasePrompt(input.Session.LockPlans, planCount > 0), explorationPhasePrompt(builtinFallbackEnabled, activeDefinitions), progressPresentationPrompt(input.ThinkingMode))
+		phasePrompt := joinPromptSections(toolSelectionPhasePrompt(builtinFallbackEnabled, activeDefinitions), retrievalPhasePrompt(activeDefinitions), planningPhasePrompt(input.Session.LockPlans, planCount > 0), explorationPhasePrompt(builtinFallbackEnabled, activeDefinitions), answerAudiencePrompt(), progressPresentationPrompt(input.ThinkingMode))
 		if toolResultsObserved {
 			phasePrompt = joinPromptSections(phasePrompt, finalizationPhasePrompt(toolTurns, maxAutonomousToolTurns, forceFinalization, loopGuardReason, successfulMutationSummary))
 		}
@@ -398,9 +409,11 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			attachmentContextPrompt(input.Metadata),
 			planPrompt,
 			recalled.SystemPrompt,
+			failureRecall,
 			completionDirective,
 		)
 		completionDirective = ""
+		failureRecall = ""
 		contextBudgetPrompt := joinPromptSections(systemPrompt, hostPrompt, toolPrompt, phasePrompt, contextPrompt)
 		modelSystemPrompt := systemPrompt
 		modelHostPrompt := hostPrompt
@@ -987,6 +1000,24 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				if persistErr != nil {
 					return domain.RunResult{}, persistErr
 				}
+				if failureRecallTracker.Observe(call.Name, result.IsError) && r.Memory.SpaceEnabled() {
+					// 「這個錯以前遇過」是記憶最有價值的時刻，值得為它多打一次檢索。
+					retry, recallErr := r.recallMemory(ctx, input.Session, memory.FailureRecallQuery(call.Name, result.Content), operationID)
+					if recallErr != nil {
+						logger.Warn("failure-triggered memory recall failed", "tool_name", call.Name, "error", recallErr)
+					} else if len(retry.Memories) > 0 {
+						failureRecall = retry.SystemPrompt
+						logger.Debug("failure-triggered memory recall", "tool_name", call.Name, "count", len(retry.Memories))
+						if err := sink.emitEvent("memory.recalled", map[string]any{
+							"count":      len(retry.Memories),
+							"memory_ids": memoryIDs(retry.Memories),
+							"truncated":  retry.Truncated,
+							"trigger":    "tool_failure",
+						}); err != nil {
+							return domain.RunResult{}, err
+						}
+					}
+				}
 				toolStatus := toolExecutionStatus(result)
 				// 只記錄名稱、狀態、耗時與輸出大小：工具參數與輸出可能含憑證或使用者資料。
 				logger.Info("tool execution finished",
@@ -1247,7 +1278,7 @@ func (r *Runner) recallMemory(ctx context.Context, session domain.Session, query
 	}
 	_, err = appendRecord(ctx, r.Sessions, session.ID, domain.SessionEntryMemoryRecall, map[string]any{
 		"operation_id": operationID,
-		"scope":        memory.ScopeForSession(session),
+		"scope":        memory.ScopeForSessionWithSpace(session, r.Memory.SpaceEnabled()),
 		"memory_ids":   memoryIDs(result.Memories),
 		"truncated":    result.Truncated,
 	})
@@ -1872,6 +1903,11 @@ func progressPresentationPrompt(thinkingMode string) string {
 // 數字是對的，但使用者看不出查了哪個服務、用什麼條件查、資料是什麼時候的，
 // 也就無法判斷這個結論可不可信。這裡要求答案帶上依據，同時明確限制長度要與問題
 // 相稱，避免反過來變成為了湊字數的長篇覆述。
+//
+// 但「說明依據」不等於「列出工具名稱」。要求帶依據之後，模型開始在答案裡整理出
+// 以 reporter_workstation_select、dispatchstatus_query 為欄位的功能對照表——對使用者
+// 完全沒有意義，還把內部整合細節攤開來。依據要用資料來源與查詢條件表達，
+// 工具識別名稱是實作細節。
 // emptyAnswerDirective 用在模型只輸出思考、沒有輸出回答的下一輪。
 func emptyAnswerDirective() string {
 	return `## 上一輪沒有產生回答
@@ -1881,10 +1917,30 @@ func emptyAnswerDirective() string {
 需要資料就直接呼叫工具；已經有足夠資料就直接給結論。`
 }
 
+// answerAudiencePrompt 說明使用者看的是什麼。
+//
+// 工具目錄每一輪都在提示裡，模型很自然會把它當成可以引用的詞彙，於是答案裡出現
+// 「透過 reporter_workstation_select 查詢特定派工單的細節」這種句子。對現場人員來說
+// 那是一串沒有意義的識別字，還把內部整合細節攤在使用者面前。
+//
+// 這一段刻意放在每一輪而不是只放收斂階段：沒有呼叫任何工具就直接回答時
+// （「你能幫我做什麼」），一樣會照著目錄把工具名稱抄出來。
+func answerAudiencePrompt() string {
+	return `## 使用者看得到什麼
+
+工具目錄、工具名稱與參數 schema 都是內部實作，使用者看不到也不需要知道。
+給使用者的文字一律用業務語言描述能力與資料來源（「查詢派工單明細」而不是「呼叫 reporter_workstation_select」）；
+只有使用者明確在問工具本身或系統整合方式時，才可以直接寫出工具名稱。`
+}
+
 func answerEvidenceRules() string {
 	return `
 最終答案必須讓使用者不必追問就知道結論從哪裡來：
-- 說明實際查了什麼：使用的服務或工具、查詢範圍與過濾條件，以及支撐結論的關鍵數據。
+- 說明實際查了什麼：資料來源、查詢範圍與過濾條件，以及支撐結論的關鍵數據。
+- 用使用者看得懂的說法描述來源（例如「派工單系統的 CNC 部門派工紀錄」「2026-09-01 的生產批號」），
+  不要出現內部工具識別名稱、函式名稱或 API 端點；使用者要的是「查了哪些資料」，不是「呼叫了哪個程式」。
+  只有使用者明確在問工具本身或系統整合方式時，才可以直接寫出工具名稱。
+- 建議下一步時同樣用行為描述（「建立一份通知單」），不要寫成內部工具的操作指示。
 - 若資料有取樣、過濾、時間點或權限範圍等會影響判讀的限制，一併說明。
 - 使用者提出後續動作或決策時，補上據此可以採取的下一步。
 - 長度與問題複雜度相稱：單一數據的問題補上一兩句依據即可，不要為了湊字數擴寫、

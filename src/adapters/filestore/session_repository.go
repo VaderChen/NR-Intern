@@ -29,6 +29,8 @@ type SessionRepository struct {
 	mu        sync.Mutex
 	locks     map[string]*sync.Mutex
 	sequences map[string]int64
+	// indexes 是各 session transcript 的位置索引，見 session_index.go。
+	indexes map[string]*entryIndex
 }
 
 func NewSessionRepository(dataDir string) (*SessionRepository, error) {
@@ -44,6 +46,7 @@ func NewSessionRepository(dataDir string) (*SessionRepository, error) {
 		root:      root,
 		locks:     map[string]*sync.Mutex{},
 		sequences: map[string]int64{},
+		indexes:   map[string]*entryIndex{},
 	}, nil
 }
 
@@ -227,6 +230,7 @@ func (r *SessionRepository) Delete(ctx context.Context, sessionID string) error 
 	r.mu.Lock()
 	delete(r.sequences, sessionID)
 	delete(r.locks, sessionID)
+	delete(r.indexes, sessionID)
 	r.mu.Unlock()
 	return nil
 }
@@ -269,7 +273,13 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 	if err != nil {
 		return domain.SessionEntry{}, fmt.Errorf("encode session entry: %w", err)
 	}
-	file, err := os.OpenFile(filepath.Join(directory, sessionEntriesFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	entriesPath := filepath.Join(directory, sessionEntriesFile)
+	// 先取寫入前的檔案大小：那就是這一筆在索引裡的位移。
+	offset, err := transcriptSize(entriesPath)
+	if err != nil {
+		return domain.SessionEntry{}, err
+	}
+	file, err := os.OpenFile(entriesPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
 	if err != nil {
 		return domain.SessionEntry{}, fmt.Errorf("open session transcript: %w", err)
 	}
@@ -287,6 +297,8 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 	r.mu.Lock()
 	r.sequences[sessionID] = sequence
 	r.mu.Unlock()
+	// 索引就地延長，不必為了下一次讀取重掃整個檔案。
+	r.noteAppendedEntry(sessionID, sequence, entry.Type, offset, len(data)+1)
 	// 這裡刻意不重寫 session.json。一次 run 會 append 十幾筆 entry，
 	// 每筆都做一次完整 marshal + 暫存檔 + rename 只為了更新 UpdatedAt，
 	// 是長 session 變慢的主因之一。UpdatedAt 改由讀取時併入 transcript 的 mtime。
@@ -392,28 +404,144 @@ func (r *SessionRepository) scanEntries(ctx context.Context, sessionID string, a
 	return nil
 }
 
+// ListEntriesAfter 只讀取序號大於 afterSequence 的部分。
+//
+// 用索引直接 seek 到起點，不從檔頭掃起：壓縮後每個 turn 需要的通常只是最後幾筆，
+// 但檔案本身不會因為壓縮而變小，從頭掃的成本會隨 session 長度無上限成長。
 func (r *SessionRepository) ListEntriesAfter(ctx context.Context, sessionID string, afterSequence int64) ([]domain.SessionEntry, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	entries := []domain.SessionEntry{}
-	err := r.scanEntries(ctx, sessionID,
-		func(header entryHeader) bool { return header.Sequence > afterSequence },
-		func(entry domain.SessionEntry) error {
-			entries = append(entries, entry)
-			return nil
-		})
-	if err != nil {
-		return nil, err
-	}
-	return entries, nil
+	entries, _, err := r.entriesPage(ctx, sessionID, afterSequence, 0)
+	return entries, err
 }
 
+// ListEntriesPage 從 afterSequence 之後最多讀取 limit 筆，並回報後面是否還有。
+//
+// limit <= 0 表示不限筆數。剩餘筆數由索引直接得出，不需要為了 has_more 多讀一次檔案。
+func (r *SessionRepository) ListEntriesPage(ctx context.Context, sessionID string, afterSequence int64, limit int) ([]domain.SessionEntry, bool, error) {
+	return r.entriesPage(ctx, sessionID, afterSequence, limit)
+}
+
+func (r *SessionRepository) entriesPage(ctx context.Context, sessionID string, afterSequence int64, limit int) ([]domain.SessionEntry, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	directory, err := r.sessionDir(sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := r.Get(ctx, sessionID); err != nil {
+		return nil, false, err
+	}
+	path := filepath.Join(directory, sessionEntriesFile)
+	index, indexErr := r.entryIndexFor(ctx, sessionID, path)
+	if indexErr != nil {
+		// 索引建不起來（序號不遞增、檔案損毀）時退回全檔掃描，功能不受影響。
+		entries := []domain.SessionEntry{}
+		scanErr := r.scanEntries(ctx, sessionID,
+			func(header entryHeader) bool { return header.Sequence > afterSequence },
+			func(entry domain.SessionEntry) error {
+				entries = append(entries, entry)
+				return nil
+			})
+		if scanErr != nil {
+			return nil, false, scanErr
+		}
+		if limit > 0 && len(entries) > limit {
+			return entries[:limit], true, nil
+		}
+		return entries, false, nil
+	}
+	r.mu.Lock()
+	offset, remaining := index.offsetAfter(afterSequence)
+	r.mu.Unlock()
+	if remaining == 0 {
+		return []domain.SessionEntry{}, false, nil
+	}
+	wanted := remaining
+	hasMore := false
+	if limit > 0 && limit < remaining {
+		wanted = limit
+		hasMore = true
+	}
+	entries := make([]domain.SessionEntry, 0, wanted)
+	if err := r.readEntriesAt(ctx, path, offset, wanted, func(entry domain.SessionEntry) {
+		entries = append(entries, entry)
+	}); err != nil {
+		return nil, false, err
+	}
+	return entries, hasMore, nil
+}
+
+// readEntriesAt 從指定位移解碼最多 count 筆 entry。
+func (r *SessionRepository) readEntriesAt(ctx context.Context, path string, offset int64, count int, visit func(domain.SessionEntry)) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("open session transcript: %w", err)
+	}
+	defer file.Close()
+	read := 0
+	err = readJSONLinesAt(ctx, file, offset, func(_ int64, line []byte) error {
+		if read >= count {
+			return errStopReading
+		}
+		var entry domain.SessionEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return fmt.Errorf("decode session entry: %w", err)
+		}
+		visit(withoutPersistedReasoning(entry))
+		read++
+		if read >= count {
+			return errStopReading
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errStopReading) {
+		return fmt.Errorf("read session transcript: %w", err)
+	}
+	return nil
+}
+
+// errStopReading 讓 readJSONLinesAt 在取滿筆數後立刻停止，不再讀剩下的檔案。
+var errStopReading = errors.New("stop reading session transcript")
+
+// LatestEntryOfType 回傳指定型別中序號最大的 entry。
+//
+// 型別存在索引裡，因此不必掃描檔案就能算出位置，只讀那一行。
 func (r *SessionRepository) LatestEntryOfType(ctx context.Context, sessionID, entryType string) (domain.SessionEntry, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.SessionEntry{}, err
 	}
 	entryType = strings.TrimSpace(entryType)
+	directory, dirErr := r.sessionDir(sessionID)
+	if dirErr != nil {
+		return domain.SessionEntry{}, dirErr
+	}
+	if _, err := r.Get(ctx, sessionID); err != nil {
+		return domain.SessionEntry{}, err
+	}
+	path := filepath.Join(directory, sessionEntriesFile)
+	if index, indexErr := r.entryIndexFor(ctx, sessionID, path); indexErr == nil {
+		r.mu.Lock()
+		offset, ok := index.latestOffsetOfType(entryType)
+		r.mu.Unlock()
+		if !ok {
+			return domain.SessionEntry{}, fmt.Errorf("%w: %s entry in session %q", domain.ErrNotFound, entryType, sessionID)
+		}
+		var latest domain.SessionEntry
+		found := false
+		if err := r.readEntriesAt(ctx, path, offset, 1, func(entry domain.SessionEntry) {
+			latest = entry
+			found = true
+		}); err != nil {
+			return domain.SessionEntry{}, err
+		}
+		if !found {
+			return domain.SessionEntry{}, fmt.Errorf("%w: %s entry in session %q", domain.ErrNotFound, entryType, sessionID)
+		}
+		return latest, nil
+	}
 	found := false
 	var latest domain.SessionEntry
 	err := r.scanEntries(ctx, sessionID,
@@ -541,6 +669,16 @@ func (r *SessionRepository) nextSequenceLocked(sessionID string, entriesPath str
 	r.mu.Unlock()
 	if exists {
 		return sequence + 1, nil
+	}
+	// 快取沒命中（程序剛啟動後第一次 append）時用索引取號。
+	//
+	// 原本是把每一行完整 unmarshal 一次來找最大序號：那是整份 transcript 最貴的
+	// 一種讀法（21 MB 約 74 ms），而需要的只是最後一筆的序號。
+	if index, indexErr := r.entryIndexFor(context.Background(), sessionID, entriesPath); indexErr == nil {
+		r.mu.Lock()
+		last := index.lastSequence()
+		r.mu.Unlock()
+		return last + 1, nil
 	}
 	file, err := os.Open(entriesPath)
 	if err != nil {

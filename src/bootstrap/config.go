@@ -73,6 +73,7 @@ type Config struct {
 	// 解碼，欄位直接改名會讓既有設定檔開不起來，因此保留讀取。
 	LegacyMCPToolRetrieval *bool `json:"mcp_tool_retrieval,omitempty"`
 	// MemorySpace 是實驗性的跨對話共同記憶開關，預設關閉。
+	// 開啟後由 memory.Manager 套用准入、去重、專案 scope、召回視窗與淘汰。
 	MemorySpace bool `json:"memory_space"`
 }
 

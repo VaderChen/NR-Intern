@@ -4,6 +4,8 @@
 
 NR-Intern is a desktop AI agent written in Go. It keeps working from the current conversation, verified tool results, and persisted state. Simple requests are handled directly, while longer tasks can be planned, executed step by step, and verified.
 
+![NR-Intern conversation interface](images/cap0001.jpg)
+
 ## Highlights
 
 - Extensible provider routing for OpenAI-compatible Chat Completions and OpenAI Codex Responses authenticated through ChatGPT/Codex OAuth.
@@ -19,10 +21,11 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - Version information and update checks in the About page.
 - You can keep typing while a conversation is running; later messages are stored in the browser's IndexedDB Durable Outbox and submitted in order after the active run ends. Network retries reuse the same Idempotency-Key.
 - Automatic context compaction with a history character limit, persistent memory, and configurable memory scopes.
-- Per-run and per-session input, output, and total token usage, with estimated cost from configurable model prices; token totals remain available when no price is configured.
+- Optional experimental Memory Space reuses preferences, decisions, and procedures with near-duplicate handling, project-first scopes, compact recall, and failure-triggered memory lookup.
+- Per-run input, output, and total token usage, with session totals across retained runs and estimated cost from configurable model prices. No price means tokens only.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
 - The compact tool set includes document reading, creation, and conversion; extended tools, tool retrieval, and native or instruction tool-call modes are also available.
-- Preview questions and jump between sections in long conversations. Cumulative usage uses K/M notation with exact values on hover.
+- Indexed paging for long conversations, question previews, and section navigation. Cumulative usage uses K/M notation with exact values on hover.
 - Bounded, cancellable waiting with `wait_for`, plus `ssh_wait` polling for read-only remote checks so deployments are confirmed by bytes, SHA-256, or service readiness instead of an early upload return.
 - `http_fetch` reads external resources: HTML becomes plain text, localhost and private addresses are allowed by default, and the whole tool can be switched off from system settings.
 - A built-in MCP client connects to local stdio, legacy SSE, or remote Streamable HTTP servers and places their tools under the same permission and approval flow.
@@ -47,6 +50,8 @@ Runtime configuration, generated data, and credentials must remain outside versi
 
 Conversations, work status, and settings are stored by the backend. Notifications are off by default and can be enabled in general settings.
 Configuration bundles exclude conversations and attachments and are not full backups. Review URLs, account names, and paths before sharing.
+
+Back up before upgrading. Older runs, event files, and inactive memories beyond the retention period are automatically cleaned up; session transcripts remain. Export usage and audit data separately for long-term records. See the [retention rules](docs/ai-agent/DEVELOPMENT.md#長對話讀取與儲存維護).
 
 ## Documentation
 

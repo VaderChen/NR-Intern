@@ -4,6 +4,8 @@
 
 NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工具結果與持久化狀態持續工作；簡單任務直接處理，長任務則可建立計畫、逐步執行並驗證結果。
 
+![NR-Intern 對話介面](images/cap0001.jpg)
+
 ## 主要能力
 
 - 可擴充的 Provider Router，支援 OpenAI-compatible Chat Completions，以及使用 ChatGPT／Codex OAuth 的 OpenAI Codex Responses。
@@ -19,10 +21,11 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 - 「關於」頁提供版本資訊與更新檢查。
 - 對話執行中仍可繼續輸入，後續訊息會寫入 Browser IndexedDB 的 Durable Outbox，上一輪結束後依序送出；網路中斷時保留固定 Idempotency-Key 供安全重試。
 - Context 自動整理搭配歷史字元上限，並支援長期記憶與記憶範圍控制。
-- 每個 Run 與 Session 的 input／output／total token 統計，並可透過設定的模型單價顯示估算成本；未設定價格時只顯示 token。
+- 可選的實驗性回憶空間：重用偏好、決策與作法，提供近似去重、Project 優先的記憶範圍與精簡召回；工具失敗時可參考過往記憶。
+- 每個 Run 的 input／output／total token 統計，Session 彙總仍保留的 Run，並可透過模型單價顯示估算成本；未設定價格時只顯示 token。
 - 原生檔案、文件、Shell、SSH 與計畫工具，搭配 Sandbox 及執行審核。
 - 精簡工具集即支援文件讀取、建立與轉換；可切換擴充工具集、工具檢索與 native／instruction 呼叫模式。
-- 長對話提供提問段落預覽與快速跳轉；累計用量以 K／M 顯示，滑過可看精確值。
+- 長對話採索引分頁，提供提問段落預覽與快速跳轉；累計用量以 K／M 顯示，滑過可看精確值。
 - 非同步工作可使用 `wait_for` 進行可取消等待，遠端部署可用 `ssh_wait` 輪詢唯讀檢查，確認檔案大小、SHA-256 或服務就緒後才算完成。
 - `http_fetch` 對外讀取網路資源：HTML 自動轉純文字，localhost 與私有網段預設允許，並可從管理介面直接關閉。
 - 內建 MCP Client，可連接本機 stdio、舊版 SSE 或遠端 Streamable HTTP Server，將外部工具納入相同的權限與審核流程。
@@ -47,6 +50,9 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 對話、工作狀態與設定由後端保存；通知中心預設關閉，可在一般設定開啟。
 設定包不含對話與附件，也不是完整備份；URL、帳號與路徑等內容分享前仍需人工檢查。
+
+升級前請先備份。較舊的 Run、事件檔與超過保留期限的失效記憶會自動整理，Session 對話紀錄
+不因此刪除；長期用量與稽核資料請另存匯出，詳見[保留規則](docs/ai-agent/DEVELOPMENT.md#長對話讀取與儲存維護)。
 
 ## 文件
 

@@ -182,12 +182,28 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
   價格。成本目前只接受 USD，沒有對應價格時 API 只回傳 token，不假造金額。
 - Session 用量依已保存的 Run 快照即時彙總，不落盤到 `session.json`；取消、失敗與重試都保留
   各自的 Run 紀錄。成本估算不代表 Provider 的帳單，仍應以 Provider 官方帳務為準。
+- Run metadata 受保留規則整理後，Session 用量與匯出僅涵蓋尚存 Run，可能低於曾經顯示的累計值。
+  不得視為不可刪除的帳務或稽核總帳。
 
 ## 本機資料
 
-`memory_space` 目前只持久化實驗性開關；[回憶空間設計](MEMORY_SPACE.md) 中的准入過濾、專案
-共享、召回門檻與淘汰機制尚未實作，不能當成現有資料隔離或秘密過濾保證。既有 `memory.*`
-設定與記憶 scope 規則仍獨立生效。
+啟用 `memory_space` 時，Agent 記憶工具透過 Manager 檢查種類與常見憑證樣式，預設 scope
+收斂到 Project，沒有 Project 時退回 Workspace；明確 `memory_scope` 優先。此為檢索範圍
+約定，不是多租戶存取控制。本文樣式檢查不涵蓋所有憑證、個資或任意欄位，可重用性也仍由模型
+判斷，不能宣稱敏感內容一定不會寫入。詳見 [回憶空間](MEMORY_SPACE.md)。
+
+已認證的記憶管理 API 仍直接使用 Repository，包含手動寫入；它不套用 Agent 的 Manager
+准入／去重／scope 淘汰規則，應只提供給同等受信任的管理者。
+
+### 儲存保留與永久移除
+
+目前保留值固定在程式內，沒有設定開關。RunRepository 啟動與 Save 時以 500 筆為整理基準，
+只淘汰最舊範圍中的已結束 Run，未終態保留。Runtime 啟動後及每 30 分鐘只保留最新 50 筆 Run
+與所有未終態 Run 的事件檔；孤兒與較舊事件檔永久刪除。非 active 且 UpdatedAt 早於 30 天前
+的記憶也會永久清理，不受回憶空間開關影響。
+
+Session transcript 不因上述維護而刪除，但不能從對話文字完整還原 Run metadata、用量快照
+或 SSE 事件序列。升級前應備份，長期稽核需另存匯出；沒有備份的清理資料無法恢復。
 
 上下文字元限制只縮減模型所見的歷史，不會清除持久化 transcript，也不是資料保留／刪除政策。
 新 `model request` 日誌只記工具名稱、訊息數與字元數，不記錄提示或參數本文。

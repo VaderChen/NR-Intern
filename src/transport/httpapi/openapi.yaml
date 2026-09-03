@@ -870,6 +870,7 @@ paths:
         schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
     get:
       summary: 分頁取得完整 Session 稽核 entries
+      description: 依 after_sequence 與 limit 在儲存層定位讀取，回應含 next_after_sequence 與 has_more。位置索引只存在記憶體；讀取來源為 transcript，不受 Run 事件檔保留期限影響。
       responses:
         "200": { $ref: "#/components/responses/JSONData" }
         default: { $ref: "#/components/responses/Problem" }
@@ -1036,6 +1037,10 @@ paths:
         schema: { type: integer, format: int64, minimum: 0 }
     get:
       summary: 重播並持續訂閱 Run SSE events
+      description: >-
+        重播僅適用於仍保留的事件檔。啟動後與每 30 分鐘維護時，保留最新 50 筆 Run 與全部未終態 Run 的事件，
+        其餘及孤兒事件檔會清理。Run metadata 也以 500 筆為整理基準，僅淘汰最舊範圍中的終態 Run；淘汰後可能回傳 404。
+        memory.recalled 事件含 count、memory_ids、truncated，工具失敗後補召回另有 trigger=tool_failure，不回傳記憶本文。
       responses:
         "200":
           description: Last-Event-ID 之後的 durable event stream
@@ -1498,7 +1503,7 @@ components:
         extended_tools: { type: boolean, description: 預設 false。精簡集合已含文件檢視、讀取、建立與轉換；編輯、SSH、記憶等工具需擴充集合，仍受 allowlist 限制。工具檢索另由 tool_retrieval 控制。 }
         tool_call_mode: { type: string, enum: [native, instruction], description: native 使用 Provider 的 tool_calls 欄位；Provider 不支援時才用 instruction。 }
         tool_retrieval: { type: boolean, description: 預設 true。工具目錄先經檢索，只有與本次需求相關的工具進入提示（內建工具與 MCP 工具都適用）；其餘工具仍可由模型以 find_tools 取回後直接呼叫。關閉後整份目錄會進入每一次請求。 }
-        memory_space: { type: boolean, default: false, description: 實驗性功能，目前只保存開關，不改變既有長期記憶行為。共享與淘汰機制尚未實作，設計見 docs/ai-agent/MEMORY_SPACE.md。 }
+        memory_space: { type: boolean, default: false, description: 實驗性功能。Agent 記憶工具套用種類／憑證樣式檢查及近似去重，預設 scope 優先 Project、其次 Workspace，明確 memory_scope 優先。自動召回預設最多 6 筆與 1200 UTF-8 bytes 注入預算及綜合排序門檻；scope 超量時軟性淘汰。仍受既有 memory 設定限制，手動記憶 API 不套用此策略。切換不搬移既有資料，30 天失效記憶清理則獨立執行。 }
     HTTPFetchSettings:
       type: object
       required: [enabled, allow_private_networks]
@@ -1521,7 +1526,7 @@ components:
         extended_tools: { type: boolean, description: 省略時保留目前設定。 }
         tool_call_mode: { type: string, enum: [native, instruction], description: 省略時保留目前設定。 }
         tool_retrieval: { type: boolean, description: 省略時保留目前設定。 }
-        memory_space: { type: boolean, description: 省略時保留目前設定；只保存開關，尚未啟用共享記憶機制。 }
+        memory_space: { type: boolean, description: 省略時保留目前設定；切換立即生效，不必重啟後端。 }
     ProviderSettings:
       type: object
       required: [default_provider_id, providers]
@@ -1704,6 +1709,7 @@ components:
         currency: { type: string, enum: [USD] }
     SessionUsage:
       type: object
+      description: 由目前保留的 Run 用量快照彙總，非終身帳務紀錄；舊 Run 被清理後不再計入。
       required: [input_tokens, output_tokens, total_tokens]
       properties:
         input_tokens: { type: integer, minimum: 0 }
