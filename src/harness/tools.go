@@ -139,9 +139,10 @@ func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback 
 	result := make([]domain.ToolDefinition, 0, len(definitions))
 	for _, definition := range definitions {
 		name := strings.ToLower(strings.TrimSpace(definition.Name))
-		staged := (definition.ReadOnly && !deferredFirstStageCategory(definition.Category)) ||
+		staged := definition.ReadOnly ||
 			name == systemShellToolName || name == waitToolName || name == sshWaitToolName ||
-			strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__")
+			strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__") ||
+			documentAuthoringTool(name)
 		if staged {
 			result = append(result, definition)
 		}
@@ -149,14 +150,22 @@ func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback 
 	return result
 }
 
-// deferredFirstStageCategory 把體積大又少用的工具家族留到備援階段。
+// documentAuthoringTool 是「產出辦公文件」的工具，不受第一階段的 Shell 優先政策限制。
 //
-// 第一階段的工具目錄會整份進入每一次請求的提示，instruction 模式更是直接以文字列出
-// schema。辦公文件家族有十個工具、schema 也最長，但只有處理 PDF／DOCX／XLSX／PPTX 時
-// 才用得到；把它們留在備援階段，能讓「讀檔案、查目錄、呼叫 MCP」這些常見需求維持
-// 一輪完成，又不必為每次對話都付整份文件工具的提示成本。
-func deferredFirstStageCategory(category string) bool {
-	return strings.EqualFold(strings.TrimSpace(category), "documents")
+// Shell 優先的用意是讓副作用交給 OS 既有程式處理，但產生 XLSX／DOCX 正是 Shell 做不到
+// 的事：實測使用者說「把結果轉成 Excel」，模型照政策先用 shell_exec 找 python 的
+// openpyxl，四分四十秒後失敗，最後退而求其次寫了一個 CSV——而機器上一直有能直接
+// 產出 XLSX 的內建工具，只是那一輪的目錄裡沒有它。
+//
+// 辦公文件家族原本整個被延後到備援階段，理由是 schema 很長、會撐大第一階段的目錄。
+// 那個理由已經由工具檢索處理（目錄只帶進這一輪相關的工具），不需要再用「拿掉能力」來換。
+func documentAuthoringTool(name string) bool {
+	switch name {
+	case "document_create", "document_convert", "document_edit":
+		return true
+	default:
+		return false
+	}
 }
 
 func containsNonPlanningTool(calls []domain.ToolCall) bool {

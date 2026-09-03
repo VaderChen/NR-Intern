@@ -133,6 +133,9 @@ const scheduleWeekdayNames = ["週日", "週一", "週二", "週三", "週四", 
 const scheduleRefreshIntervalMilliseconds = 30_000;
 const activeRunStatuses = new Set(["queued", "running", "paused", "waiting_approval"]);
 const waitingForModelPrefix = "等待模型回應";
+// stalledRunIndicatorDelayMilliseconds 是「文字停了多久算又在等」。
+// 太短會在串流的字與字之間閃動，太長則讓靜止期無法辨識。
+const stalledRunIndicatorDelayMilliseconds = 2_000;
 // 前幾秒不顯示等待訊息：正常速度的回答不需要被提醒「還在等」。
 const waitingForModelDelayMilliseconds = 5000;
 const mcpAuthModeLabels = Object.freeze({
@@ -263,23 +266,34 @@ function normalizedServiceSettings(value = {}) {
     tool_call_mode: (value.tool_call_mode ?? current.tool_call_mode) === "instruction" ? "instruction" : "native",
     // 預設 true：舊的後端沒有這個欄位時，畫面要顯示實際生效的行為。
     tool_retrieval: Boolean(value.tool_retrieval ?? current.tool_retrieval ?? true),
+    // 實驗性功能一律預設關閉。
+    memory_space: Boolean(value.memory_space ?? current.memory_space ?? false),
   };
 }
 
-function applyServiceSettings(value) {
+// applyServiceSettings 把後端設定套回畫面。
+//
+// fields=false 用在開關的即時儲存：只更新開關與狀態，不動數值欄位——使用者
+// 可能正在輸入時間或 Token 上限，切換一個開關不該把他打到一半的內容洗掉。
+function applyServiceSettings(value, { fields = true } = {}) {
   const settings = normalizedServiceSettings(value);
   state.serviceSettings = settings;
   applyUILanguage(settings.ui_language);
   applyServiceName(settings.service_name_is_default ? localizedDefaultServiceName() : settings.service_name);
   if ($("settingNotificationsEnabled")) $("settingNotificationsEnabled").checked = settings.notifications_enabled;
   syncNotificationUIAvailability();
-  if ($("settingMaxWallClockMinutes")) $("settingMaxWallClockMinutes").value = String(Math.ceil(settings.max_wall_clock_seconds / 60));
-  if ($("settingMaxTokens")) $("settingMaxTokens").value = String(settings.max_tokens);
-  if ($("settingMaxToolCalls")) $("settingMaxToolCalls").value = String(settings.max_tool_calls);
+  if (fields) {
+    if ($("settingMaxWallClockMinutes")) $("settingMaxWallClockMinutes").value = String(Math.ceil(settings.max_wall_clock_seconds / 60));
+    if ($("settingMaxTokens")) $("settingMaxTokens").value = String(settings.max_tokens);
+    if ($("settingMaxToolCalls")) $("settingMaxToolCalls").value = String(settings.max_tool_calls);
+  }
   if ($("settingExtendedTools")) {
     $("settingExtendedTools").checked = settings.extended_tools;
     $("settingInstructionToolCalls").checked = settings.tool_call_mode === "instruction";
     $("settingToolRetrieval").checked = settings.tool_retrieval;
+  }
+  if ($("settingMemorySpace")) {
+    $("settingMemorySpace").checked = settings.memory_space;
   }
   if ($("settingHTTPFetchEnabled")) {
     $("settingHTTPFetchEnabled").checked = settings.http_fetch.enabled;
@@ -924,7 +938,7 @@ function resetWorkspace() {
   state.contextCapabilitiesRequest += 1;
   state.contextCapabilityCache = {};
   $("sessionTitle").textContent = "選擇或建立對話";
-  $("agentLabel").textContent = "後端目前離線";
+  setAgentLabel("後端目前離線");
   $("prompt").disabled = true;
   syncRunActionButton();
   $("workspaceSelect").replaceChildren();
@@ -962,7 +976,7 @@ async function loadApplicationState() {
   state.workspaces = workspaces;
   state.permissions = diagnostics.config?.permissions || null;
   void loadUpdateStatus();
-  $("agentLabel").textContent = state.agent?.name || "尚無 Agent";
+  setAgentLabel(state.agent?.name || "尚無 Agent");
   renderProviderOptions();
   renderPermissionOptions();
   renderWorkspaceOptions();
@@ -1185,7 +1199,6 @@ function sessionNode(session, pinnedContext) {
   runIndicator.setAttribute("role", "status");
   runIndicator.setAttribute("aria-label", "此對話正在背景執行");
   runIndicator.title = "此對話正在背景執行";
-  for (let index = 0; index < 3; index += 1) runIndicator.append(document.createElement("i"));
   const pin = iconButton(session.pinned ? "◆" : "◇", session.pinned ? "取消釘選" : "釘選", () => setPinned(session, !session.pinned));
   pin.classList.add("pin-button");
   pin.disabled = sessionRunIsActive(session.id);
@@ -1691,10 +1704,30 @@ function activeContextIdentity(session = state.session) {
   };
 }
 
+// formatContextTokenCount 以量級顯示 token 數：1,024 以上用 K，接近百萬改用 M。
+//
+// 「1,885,311 tokens」要逐位數才知道是多少，但這個位置要的是量級不是精確值。
+// 精確數字仍以 title 提供（滑過即可看到），診斷時不會因此少掉資訊。
 function formatContextTokenCount(value) {
-  if (value === null || value === undefined || value === "") return "-";
+  const number = tokenCountValue(value);
+  if (number === null) return "-";
+  const thousands = Math.round(number / 1000);
+  if (thousands >= 1000) return `${(number / 1000000).toFixed(1)}M`;
+  if (number >= 1024) return `${thousands}K`;
+  return exactTokenCount(number);
+}
+
+function tokenCountValue(value) {
+  if (value === null || value === undefined || value === "") return null;
   const number = Number(value);
-  if (!Number.isFinite(number) || number < 0) return "-";
+  if (!Number.isFinite(number) || number < 0) return null;
+  return number;
+}
+
+// exactTokenCount 是完整位數的寫法，給 title 與小數值使用。
+function exactTokenCount(value) {
+  const number = tokenCountValue(value);
+  if (number === null) return "-";
   const language = window.NRInternI18n?.language || "zh-TW";
   return new Intl.NumberFormat(language, { maximumFractionDigits: 0 }).format(number);
 }
@@ -1711,6 +1744,15 @@ function formatSessionUsageCost(value) {
   }).format(number);
 }
 
+// setAgentLabel 設定標題下方那一行；空字串會把整行隱藏，不留空白高度。
+function setAgentLabel(text) {
+  const element = $("agentLabel");
+  if (!element) return;
+  const value = String(text || "").trim();
+  element.textContent = value;
+  element.hidden = value === "";
+}
+
 function renderSessionUsage() {
   const control = $("sessionUsage");
   if (!control) return;
@@ -1723,14 +1765,39 @@ function renderSessionUsage() {
     : `— ${translate("tokens")}`;
   $("sessionUsageTokens").textContent = tokenText;
   const hasCost = usage.estimated_cost_usd !== undefined && usage.estimated_cost_usd !== null;
-  $("sessionUsageCost").textContent = hasCost
-    ? formatSessionUsageCost(usage.estimated_cost_usd)
-    : "—";
+  // 沒有設定模型價格時就不顯示成本，連同分隔點一起收起來——一個「—」不帶任何資訊，
+  // 只會讓人以為是壞掉的欄位。
+  $("sessionUsageCost").textContent = hasCost ? formatSessionUsageCost(usage.estimated_cost_usd) : "";
+  $("sessionUsageCost").hidden = !hasCost;
+  const separator = control.querySelector('[aria-hidden="true"]');
+  if (separator) separator.hidden = !hasCost;
+  const exact = Number.isFinite(total) && total >= 0 ? `${exactTokenCount(total)} ${translate("tokens")}` : "";
+  // 這是累計用量，不是目前對話的大小。重新提問會移除舊回應，但那些 token 已經
+  // 實際處理並計費過，不會退回去；想看「現在送出多少」要看上下文百分比。
+  const scope = translate("此對話所有工作的累計用量；重新提問不會扣回已用量。目前送出的大小請看上下文百分比。");
   const title = hasCost
-    ? `${translate("Session 用量")} · ${translate("估算成本")}`
-    : `${translate("Session 用量")} · ${translate("尚未設定模型價格")}`;
-  control.title = title;
-  control.setAttribute("aria-label", `${tokenText} · ${$("sessionUsageCost").textContent}`);
+    ? `${translate("Session 累計用量")} · ${translate("估算成本")}\n${scope}`
+    : `${translate("Session 累計用量")} · ${translate("尚未設定模型價格")}\n${scope}`;
+  control.title = exact ? `${exact} · ${title}` : title;
+  control.setAttribute("aria-label", hasCost ? `${tokenText} · ${$("sessionUsageCost").textContent}` : tokenText);
+}
+
+// runIsProcessing 回報目前選取的對話是不是正在等 Agent 動作。
+// 動畫的唯一判斷來源，訊息區與狀態列都看它。
+function runIsProcessing() {
+  const runState = activeRunFor(state.session?.id);
+  if (!runState || runState.terminalHandled || runState.pendingApproval) return false;
+  return Boolean(runState.runDraft?.processing);
+}
+
+// setTokenField 顯示精簡量級，並把精確位數放進 title。
+function setTokenField(elementID, value, suffix = "") {
+  const element = $(elementID);
+  if (!element) return;
+  element.textContent = `${formatContextTokenCount(value)}${suffix}`;
+  const exact = exactTokenCount(value);
+  if (exact === "-") element.removeAttribute("title");
+  else element.title = `${exact} tokens`;
 }
 
 function contextUsageSnapshot() {
@@ -1741,11 +1808,11 @@ function contextUsageSnapshot() {
     && usage?.providerID === identity.providerID
     && usage?.model === identity.model;
   const inputTokens = usageMatches && Number.isFinite(Number(usage.inputTokens)) ? Number(usage.inputTokens) : null;
-  // 相容服務與 Codex 模型不一定提供 Context Window；未提供時以 256K
-  // 作為 UI 的保守上限，避免百分比與剩餘空間永遠無法計算。
-  const contextWindow = Number(capabilities?.context_window) > 0
-    ? Number(capabilities.context_window)
-    : fallbackContextWindowTokens;
+  // 相容服務與 Codex 模型不一定提供 Context Window；未提供時以 256K 估算，
+  // 讓百分比仍算得出來。但這個假設要標示出來——實測有一台本機 Provider 沒宣告
+  // window，畫面顯示「31.5%」看起來很空，實際已經吃掉模型 64% 的容量。
+  const declaredWindow = Number(capabilities?.context_window) > 0;
+  const contextWindow = declaredWindow ? Number(capabilities.context_window) : fallbackContextWindowTokens;
   const maxOutputTokens = Number(capabilities?.max_output_tokens) > 0 ? Number(capabilities.max_output_tokens) : null;
   const percent = inputTokens !== null && contextWindow
     ? Math.max(0, Math.min(100, (inputTokens / contextWindow) * 100))
@@ -1754,6 +1821,7 @@ function contextUsageSnapshot() {
     ...identity,
     inputTokens,
     contextWindow,
+    declaredWindow,
     maxOutputTokens,
     remainingTokens: inputTokens !== null && contextWindow ? Math.max(0, contextWindow - inputTokens) : null,
     percent,
@@ -1771,14 +1839,17 @@ function renderContextUsage() {
   }
   const snapshot = contextUsageSnapshot();
   const percentText = snapshot.percent === null ? "-" : `${formatProviderUsagePercent(snapshot.percent)}%`;
-  $("contextUsagePercent").textContent = percentText;
-  $("contextUsageDetailPercent").textContent = percentText;
+  // 未宣告 window 時整個百分比都是假設出來的，要讓使用者看得出來。
+  const estimated = snapshot.percent !== null && !snapshot.declaredWindow;
+  $("contextUsagePercent").textContent = estimated ? `${percentText}*` : percentText;
+  $("contextUsageDetailPercent").textContent = estimated ? `${percentText}*` : percentText;
   $("contextUsageProvider").textContent = providerDisplayName(snapshot.providerID) || snapshot.providerID || "-";
   $("contextUsageModel").textContent = snapshot.model || "-";
-  $("contextUsageInput").textContent = formatContextTokenCount(snapshot.inputTokens);
-  $("contextUsageLimit").textContent = formatContextTokenCount(snapshot.contextWindow);
-  $("contextUsageOutputLimit").textContent = formatContextTokenCount(snapshot.maxOutputTokens);
-  $("contextUsageRemaining").textContent = formatContextTokenCount(snapshot.remainingTokens);
+  setTokenField("contextUsageInput", snapshot.inputTokens);
+  setTokenField("contextUsageLimit", snapshot.contextWindow,
+    snapshot.declaredWindow ? "" : `（${translate("未宣告，估算值")}）`);
+  setTokenField("contextUsageOutputLimit", snapshot.maxOutputTokens);
+  setTokenField("contextUsageRemaining", snapshot.remainingTokens);
   const track = $("contextUsageTrack");
   const bar = $("contextUsageBar");
   if (snapshot.percent === null) {
@@ -2347,9 +2418,9 @@ function clearSessionUI() {
   $("sessionUsageTokens").textContent = "";
   $("sessionUsageCost").textContent = "";
   const workspaceModel = displayedModelForProvider(state.workspace?.default_provider_id, state.workspace?.model);
-  $("agentLabel").textContent = state.workspace
+  setAgentLabel(state.workspace
     ? `${providerDisplayName(state.workspace.default_provider_id) || state.workspace.default_provider_id}${workspaceModel ? ` · ${workspaceModel}` : ""}`
-    : state.agent?.name || "General Harness Agent";
+    : state.agent?.name || "General Harness Agent");
   syncSessionRuntimeControls({ loadModels: false });
   syncPlanButton();
   renderContextUsage();
@@ -2566,7 +2637,9 @@ function syncSessionUI() {
   const providerID = session.provider_id || state.workspace?.default_provider_id || "";
   // 只留 Provider：模型名稱右上角的膠囊已經顯示，重複列在這裡只會把標題列撐長，
   // 長模型名（本機模型動輒三四十個字元）會直接壓到搜尋框上。
-  $("agentLabel").textContent = providerDisplayName(providerID) || providerID;
+  // 對話標題下不重複顯示 Provider：模型與 Provider 都在右上角的模型膠囊裡，
+  // 這一行只是把標題列撐長。沒有選對話時仍會顯示（那時右上角是空的）。
+  setAgentLabel("");
   renderSessionUsage();
   syncSessionRuntimeControls();
   syncPlanButton();
@@ -3224,6 +3297,7 @@ async function loadMessages() {
   container.classList.toggle("hidden", visibleEntries === 0);
   renderContextUsage();
   syncReaskButton();
+  renderMessageMilestones();
   scrollMessages({ force: true });
 }
 
@@ -3446,6 +3520,8 @@ function appendMessage(message, options = {}) {
     reask.classList.add("message-action-button", "message-action-reask", "hidden");
     actions.append(reask);
     article.append(bubble, actions);
+    // 新的提問出現就多一個段落刻度。
+    queueMicrotask(renderMessageMilestones);
   } else if (message.role === "assistant") {
     const reasoning = createReasoningBlock(message.reasoning || "");
     if (internalAssistant) {
@@ -3633,10 +3709,29 @@ function updateReasoningSummary(block, durationMilliseconds = null) {
 }
 
 function updateLiveReasoningDurations() {
+  restoreStalledRunIndicator();
   updateWaitingForModelActivity();
   if (state.runStartedAt.size === 0) return;
   const now = Date.now();
   for (const operationID of state.runStartedAt.keys()) updateLiveReasoningDuration(operationID, now);
+}
+
+// restoreStalledRunIndicator 是進度指示的自我修復。
+//
+// 「文字開始串流就關掉動畫」這條規則配上事件驅動的復原，只要漏接任何一個事件
+// （斷線重連、內部訊息、工具回合之間），畫面就會靜止在上一輪的文字上——本機模型
+// 一停就是好幾分鐘，跟當機無法區分。實測修過一次仍然重現，所以改成不依賴特定事件：
+// 只要 Run 還活著、又超過兩秒沒有新文字，就把處理中狀態補回去。
+function restoreStalledRunIndicator() {
+  const sessionID = state.session?.id;
+  const runState = activeRunFor(sessionID);
+  if (!runState || runState.terminalHandled || runState.pendingApproval) return;
+  const draft = runState.runDraft;
+  if (!draft || draft.processing) return;
+  const quietFor = Date.now() - (draft.lastDeltaAt || 0);
+  if (quietFor < stalledRunIndicatorDelayMilliseconds) return;
+  draft.processing = true;
+  renderSelectedRunDraft();
 }
 
 // updateWaitingForModelActivity 在模型還沒吐出任何文字或工具指令時交代「還在等模型」。
@@ -3652,7 +3747,9 @@ function updateWaitingForModelActivity() {
   const started = state.runStartedAt.get(draft?.operationId || runState.runId || "");
   const current = runState.activityText || "";
   if (current && !current.startsWith(waitingForModelPrefix)) return;
-  if (!started || (draft && (draft.content || draft.reasoning))) {
+  // 依據是「這一刻在不在等模型」，不是「畫面上有沒有文字」。上一輪的文字留在
+  // 畫面上時，下一輪的等待同樣要看得見。
+  if (!started || (draft && !draft.processing)) {
     if (current.startsWith(waitingForModelPrefix)) setRunActivity("", sessionID);
     return;
   }
@@ -3751,7 +3848,10 @@ function setAgentProcessing(messageElement, active) {
 
 function showActivity(text) {
   $("activityText").textContent = text;
-  $("activity").classList.toggle("hidden", !text);
+  // 進度動畫在這一列，因此有動畫時整列就要顯示，即使還沒有任何狀態文字。
+  const processing = runIsProcessing();
+  $("activity").classList.toggle("processing", processing);
+  $("activity").classList.toggle("hidden", !text && !processing);
   const retryVisible = Boolean(state.retryableRunId)
     && Boolean(text)
     && !selectedSessionIsRunning()
@@ -3837,6 +3937,8 @@ function renderSelectedRunDraft() {
   }
   messageNode.classList.toggle("reasoning-only", Boolean(draft.internal));
   setAgentProcessing(messageNode, draft.processing);
+  // 動畫在狀態列，草稿狀態一變就要同步那一列。
+  showActivity(state.runActivityText || "");
   runState.liveMessage = messageNode;
   state.liveMessage = messageNode;
   $("emptyState").classList.add("hidden");
@@ -4610,7 +4712,10 @@ function handleEvent(event, sessionID) {
     const delta = payload.delta || "";
     draft.content += delta;
     // 第一個回答字元出現後，文字串流本身就是進度，不再同時顯示思考動畫。
-    if (delta.length > 0) draft.processing = false;
+    if (delta.length > 0) {
+      draft.processing = false;
+      draft.lastDeltaAt = Date.now();
+    }
     if (visible) {
       renderSelectedRunDraft();
       scrollMessages();
@@ -4714,6 +4819,26 @@ function handleEvent(event, sessionID) {
     if (draft && failedTool) {
       draft.reasoning = joinReasoningParts(draft.reasoning, `${translate("工具失敗")}：\`${failedTool}\``);
       if (visible) renderSelectedRunDraft();
+    }
+  } else if (event.type === "turn.start") {
+    // 新的一輪開始 = 又要等模型。上一輪的文字已經留在畫面上，若不重新標記處理中，
+    // 接下來的等待（本機模型可能好幾分鐘）畫面完全靜止，跟當機無法區分。
+    //
+    // 一律重畫，不能只在旗標翻轉時才畫：重新連線後 runDraft 是全新的（processing
+    // 本來就是 true），只看旗標會整個跳過繪製，畫面上仍然什麼都沒有。
+    const draft = ensureRunDraft(sessionID, operationID);
+    if (draft) {
+      draft.processing = true;
+      // 斷線重連時不會再收到 run.started，計時起點會缺；補上才有秒數可顯示。
+      if (operationID && !state.runStartedAt.has(operationID)) {
+        const startedAt = Date.parse(event.created_at);
+        state.runStartedAt.set(operationID, Number.isFinite(startedAt) ? startedAt : Date.now());
+      }
+      if (visible) {
+        renderSelectedRunDraft();
+        updateWaitingForModelActivity();
+        scrollMessages();
+      }
     }
 	} else if (event.type === "run.approval_required" && payload.approval) {
     // 核准對話框可能因為切到別的對話而沒被看到；狀態列要說出它在等什麼。
@@ -4951,6 +5076,122 @@ function moveMessagesToBottom(container) {
   const previousBehavior = container.style.scrollBehavior;
   container.style.scrollBehavior = "auto";
   container.scrollTop = container.scrollHeight;
+  container.style.scrollBehavior = previousBehavior;
+}
+
+// renderMessageMilestones 依提問建立左側的段落刻度。
+//
+// 長對話捲起來很慢，而使用者要找的通常是「我上一次問什麼」。一則提問一個刻度，
+// 滑過看內容、點下跳過去；只有一則提問時整條軌隱藏，因為沒有東西可跳。
+function renderMessageMilestones() {
+  const rail = $("messageMilestones");
+  if (!rail) return;
+  const questions = [...document.querySelectorAll("#messages .message.user")];
+  rail.replaceChildren();
+  rail.classList.toggle("hidden", questions.length < 2);
+  if (questions.length < 2) {
+    hideMilestoneCard();
+    return;
+  }
+  questions.forEach((question, index) => {
+    const text = (question.querySelector(".content")?.textContent || "").trim();
+    const label = `${translate("提問")} ${index + 1}`;
+    const tick = document.createElement("button");
+    tick.type = "button";
+    tick.className = "message-milestone";
+    tick.dataset.messageId = question.dataset.messageId || "";
+    tick.dataset.label = label;
+    tick.dataset.text = text;
+    tick.setAttribute("aria-label", `${label}：${text.slice(0, 60)}`);
+    tick.addEventListener("click", () => {
+      // 手動跳轉之後不要再被自動捲動拉回底部。
+      state.messageAutoScroll = false;
+      scrollMessageIntoView(question);
+      syncMilestoneActive();
+    });
+    tick.addEventListener("mouseenter", () => showMilestoneCard(tick));
+    tick.addEventListener("focus", () => showMilestoneCard(tick));
+    tick.addEventListener("mouseleave", hideMilestoneCard);
+    tick.addEventListener("blur", hideMilestoneCard);
+    rail.append(tick);
+  });
+  syncMilestoneActive();
+}
+
+function showMilestoneCard(tick) {
+  const card = $("messageMilestoneCard");
+  const rail = $("messageMilestones");
+  if (!card || !rail) return;
+  card.replaceChildren();
+  const title = document.createElement("strong");
+  title.textContent = tick.dataset.label || "";
+  const body = document.createElement("span");
+  body.textContent = tick.dataset.text || "";
+  card.append(title, body);
+  card.classList.remove("hidden");
+  card.setAttribute("aria-hidden", "false");
+  const workspace = rail.offsetParent || rail.parentElement;
+  const bounds = tick.getBoundingClientRect();
+  const origin = workspace.getBoundingClientRect();
+  const top = Math.max(8, Math.min(bounds.top - origin.top - 12, origin.height - card.offsetHeight - 8));
+  card.style.top = `${top}px`;
+}
+
+function hideMilestoneCard() {
+  const card = $("messageMilestoneCard");
+  if (!card) return;
+  card.classList.add("hidden");
+  card.setAttribute("aria-hidden", "true");
+}
+
+// syncMilestoneActive 標出目前看到的是哪一段。
+//
+// 判定線一度設在容器頂端 +96px，結果剛送出的提問還在畫面中段時不算數，
+// 導覽軌仍停在上一段——使用者明明正在看第六個提問。改成以容器的六成高度為界，
+// 並在捲到底時直接指向最後一段：最新的提問就在眼前，沒有別的答案。
+function syncMilestoneActive() {
+  const container = $("messages");
+  const ticks = [...document.querySelectorAll(".message-milestone")];
+  if (!container || ticks.length === 0) return;
+  const bounds = container.getBoundingClientRect();
+  const threshold = bounds.top + Math.min(bounds.height * 0.6, 360);
+  let activeIndex = 0;
+  ticks.forEach((tick, index) => {
+    const target = tick.dataset.messageId ? findMessage(tick.dataset.messageId) : null;
+    if (target && target.getBoundingClientRect().top <= threshold) activeIndex = index;
+  });
+  // 兩端各自對稱：捲到底就是最後一段，捲到頂就是第一段。
+  // 短對話時多個提問會同時落在判定線以上，沒有這兩條規則，兩端都會標錯。
+  if (container.scrollHeight - container.scrollTop - container.clientHeight <= 8) {
+    activeIndex = ticks.length - 1;
+  } else if (container.scrollTop <= 8) {
+    activeIndex = 0;
+  }
+  ticks.forEach((tick, index) => tick.classList.toggle("active", index === activeIndex));
+}
+
+// scrollMessagesTo 捲到指定位置。
+//
+// 這個容器的 CSS 是 scroll-behavior: smooth，而部分引擎會忽略 scrollTo 的 behavior
+// 選項、只認 CSS，導致程式化捲動完全不動（既有的 moveMessagesToBottom 也是為此
+// 暫時改成 auto）。跳段落要求「按了就到」，因此沿用同一招。
+// scrollMessageIntoView 把指定訊息捲到對話區頂端。
+//
+// 不能用 offsetTop：訊息的 offsetParent 是 .workspace（有 position: relative），
+// 不是捲動容器，算出來會固定差一個標題列的高度。用 bounding rect 的相對位置才準。
+function scrollMessageIntoView(element) {
+  const container = $("messages");
+  if (!container || !element) return;
+  const offset = element.getBoundingClientRect().top - container.getBoundingClientRect().top;
+  scrollMessagesTo(container.scrollTop + offset - 24);
+}
+
+function scrollMessagesTo(top) {
+  const container = $("messages");
+  if (!container) return;
+  const previousBehavior = container.style.scrollBehavior;
+  container.style.scrollBehavior = "auto";
+  container.scrollTop = Math.max(0, top);
   container.style.scrollBehavior = previousBehavior;
 }
 
@@ -5573,38 +5814,45 @@ async function saveWorkspaceSettings(event) {
   }
 }
 
-// saveToolSettings 只送工具相關欄位。更新 API 的欄位是指標，省略即保留原值，
-// 因此兩個設定頁各自儲存不會互相覆蓋；service_name 是必填，帶上目前值。
-async function saveToolSettings(event) {
-  event.preventDefault();
-  const serviceName = ($("settingServiceName").value || state.serviceSettings?.service_name || "").trim();
+// saveServiceSettingPatch 只送指定欄位。更新 API 的欄位是指標，省略即保留原值，
+// 因此一個開關的即時儲存不會動到別的設定，也不會把使用者還在輸入的名稱或數值
+// 一起存進去——service_name 是必填，刻意取已儲存的值而不是輸入框的當下內容。
+async function saveServiceSettingPatch(patch, stateElementID) {
+  const serviceName = (state.serviceSettings?.service_name || $("settingServiceName")?.value || "").trim();
+  const stateElement = stateElementID ? $(stateElementID) : null;
   if (!serviceName) {
-    $("toolSettingsState").textContent = translate("儲存失敗");
+    if (stateElement) stateElement.textContent = translate("儲存失敗");
     toast(translate("尚未載入服務設定，請稍後再試"));
-    return;
+    return false;
   }
-  $("saveToolSettings").disabled = true;
-  $("toolSettingsState").textContent = translate("儲存中…");
+  if (stateElement) stateElement.textContent = translate("儲存中…");
   try {
     const updated = await request("/api/v1/admin/service-settings", {
       method: "PUT",
-      body: JSON.stringify({
-        service_name: serviceName,
-        extended_tools: $("settingExtendedTools").checked,
-        tool_call_mode: $("settingInstructionToolCalls").checked ? "instruction" : "native",
-        tool_retrieval: $("settingToolRetrieval").checked,
-        http_fetch_enabled: $("settingHTTPFetchEnabled").checked,
-        http_fetch_allow_private_networks: $("settingHTTPFetchPrivateNetworks").checked,
-      }),
+      body: JSON.stringify({ service_name: serviceName, ...patch }),
     });
-    applyServiceSettings(updated);
-    $("toolSettingsState").textContent = translate("已儲存");
+    applyServiceSettings(updated, { fields: false });
+    if (stateElement) stateElement.textContent = translate("已儲存");
+    return true;
   } catch (error) {
-    $("toolSettingsState").textContent = translate("儲存失敗");
+    if (stateElement) stateElement.textContent = translate("儲存失敗");
     toast(error.message);
-  } finally {
-    $("saveToolSettings").disabled = false;
+    return false;
   }
+}
+
+// bindSettingSwitch 讓開關改變就直接生效。
+//
+// 儲存失敗時把開關撥回原位：畫面顯示「開著」但後端是關著，比多按一次儲存嚴重得多。
+function bindSettingSwitch(elementID, stateElementID, patchFor) {
+  const input = $(elementID);
+  if (!input) return;
+  input.addEventListener("change", async () => {
+    input.disabled = true;
+    const saved = await saveServiceSettingPatch(patchFor(input.checked), stateElementID);
+    input.disabled = false;
+    if (!saved) input.checked = !input.checked;
+  });
 }
 
 async function saveServiceSettings(event) {
@@ -5632,7 +5880,6 @@ async function saveServiceSettings(event) {
       body: JSON.stringify({
         service_name: serviceName,
         ui_language: uiLanguage,
-        notifications_enabled: $("settingNotificationsEnabled").checked,
         max_wall_clock_seconds: wallClockMinutes * 60,
         max_tokens: maxTokens,
         max_tool_calls: maxToolCalls,
@@ -5720,6 +5967,36 @@ async function deleteProject(project, { closeSettings = false } = {}) {
   }
 }
 
+// 釘選是獨立的布林狀態，切換就直接生效；同一個表單裡的名稱、模型等欄位
+// 可能還在編輯，因此只送 pinned 這一個欄位。
+async function savePinnedSetting(checked) {
+  if (!state.session) return false;
+  $("settingsState").textContent = translate("儲存中…");
+  try {
+    const updated = await request(`/api/v1/sessions/${encodeURIComponent(state.session.id)}`, {
+      method: "PATCH",
+      reconnects: 3,
+      body: JSON.stringify({ pinned: checked }),
+    });
+    state.session = updated;
+    state.sessions = state.sessions.map((item) => item.id === updated.id ? updated : item);
+    renderNavigation();
+    $("settingsState").textContent = translate("已儲存");
+    return true;
+  } catch (error) {
+    $("settingsState").textContent = translate("儲存失敗");
+    if (sessionBusyError(error)) {
+      const restored = await resyncActiveRun(state.session?.id);
+      toast(restored
+        ? translate("這個對話還有進行中的工作，完成或取消後才能調整設定")
+        : translate("後端仍在收尾上一個工作，稍待幾秒再試一次"));
+    } else {
+      toast(error.message);
+    }
+    return false;
+  }
+}
+
 async function saveSessionSettings(event) {
   event.preventDefault();
   if (!state.session) return;
@@ -5736,7 +6013,6 @@ async function saveSessionSettings(event) {
         model: $("settingModel").value.trim(),
         permission_profile: $("settingPermission").value,
         memory_scope: $("settingMemoryScope").value.trim(),
-        pinned: $("settingPinned").checked,
       }),
     });
     state.session = updated;
@@ -5777,7 +6053,7 @@ async function activatePanel(name) {
     button.classList.toggle("active", selected);
     button.setAttribute("aria-selected", String(selected));
   }
-  for (const value of ["overview", "workspace", "systemTools", "providers", "mcp", "reverseProxy", "toolSettings", "tools", "permissions", "about", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
+  for (const value of ["overview", "workspace", "systemTools", "providers", "mcp", "reverseProxy", "toolSettings", "tools", "experimental", "permissions", "about", "audit"]) $(`${value}Panel`).classList.toggle("hidden", value !== name);
   if (name === "workspace") {
     renderWorkspaceOptions();
     syncWorkspaceSettings();
@@ -6198,8 +6474,40 @@ function renderProviderSettings() {
   $("providerSettingHeaderTimeout").value = settings.response_header_timeout_seconds || 120;
   $("providerSettingContextWindow").value = settings.context_window || 0;
   $("providerSettingMaxOutputTokens").value = settings.max_output_tokens || 0;
+  // 這兩欄是「人工覆寫」，不是實際生效的值。只顯示 0 會讓人以為什麼都沒讀到，
+  // 但 Provider 自己回報的限制其實已經在用了——把它顯示出來。
+  void renderProviderLimitsHint(isNew ? "" : selected.id, settings.model || "");
   $("deleteProviderSetting").classList.toggle("hidden", isNew);
 	renderProviderTypeFields(providerType, settings, isNew, selected.id || "");
+}
+
+// renderProviderLimitsHint 顯示 Provider 實際回報的模型限制。
+//
+// Context window 是 Harness 決定何時壓縮的依據。表單欄位存的是人工覆寫值，
+// 未覆寫時是 0——使用者看到 0 會以為「沒讀到」，但實際上 Provider 回報的值早就
+// 在用了（實測 Codex 回報 272,000）。兩者的差別必須看得見。
+async function renderProviderLimitsHint(providerID, model) {
+	const hint = $("providerSettingLimitsHint");
+	if (!hint) return;
+	const fallback = translate("填 0 表示採用 Provider 自己回報的值。");
+	hint.textContent = fallback;
+	if (!providerID) return;
+	try {
+		const query = model ? `?model=${encodeURIComponent(model)}` : "";
+		const value = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/capabilities${query}`);
+		const window = Number(value?.context_window) || 0;
+		const output = Number(value?.max_output_tokens) || 0;
+		if (window <= 0 && output <= 0) {
+			hint.textContent = `${fallback} ${translate("這個 Provider 沒有回報限制，需要自行填寫，否則壓縮會以後備預算估算。")}`;
+			return;
+		}
+		const parts = [];
+		if (window > 0) parts.push(`Context window ${window.toLocaleString("en-US")}`);
+		if (output > 0) parts.push(`${translate("最大輸出")} ${output.toLocaleString("en-US")}`);
+		hint.textContent = `${fallback} ${translate("目前 Provider 回報")}：${parts.join("／")}。`;
+	} catch (_) {
+		hint.textContent = fallback;
+	}
 }
 
 function renderProviderTypeFields(providerType, settings, isNew, providerID) {
@@ -7231,7 +7539,7 @@ function renderMCPSettings() {
   // 光是 schema 就可能佔掉數萬 token，因此這裡讓使用者只勾要用的。
   for (const tool of available) {
     const label = document.createElement("label");
-    label.className = "check-label mcp-tool-option";
+    label.className = "check-label plain-check mcp-tool-option";
     const input = document.createElement("input");
     input.type = "checkbox";
     input.dataset.mcpTool = tool.name;
@@ -7730,7 +8038,23 @@ $("cancelWorkspace").addEventListener("click", () => $("workspaceDialog").close(
 $("workspaceForm").addEventListener("submit", createWorkspace);
 $("workspaceSettings").addEventListener("submit", saveWorkspaceSettings);
 $("serviceSettings").addEventListener("submit", saveServiceSettings);
-$("toolSettings").addEventListener("submit", saveToolSettings);
+// 設定頁的開關一律即時儲存，不再需要按「儲存」。
+bindSettingSwitch("settingNotificationsEnabled", "serviceSettingsState", (checked) => ({ notifications_enabled: checked }));
+bindSettingSwitch("settingExtendedTools", "toolSettingsState", (checked) => ({ extended_tools: checked }));
+bindSettingSwitch("settingInstructionToolCalls", "toolSettingsState", (checked) => ({ tool_call_mode: checked ? "instruction" : "native" }));
+bindSettingSwitch("settingToolRetrieval", "toolSettingsState", (checked) => ({ tool_retrieval: checked }));
+bindSettingSwitch("settingHTTPFetchEnabled", "toolSettingsState", (checked) => ({ http_fetch_enabled: checked }));
+bindSettingSwitch("settingHTTPFetchPrivateNetworks", "toolSettingsState", (checked) => ({ http_fetch_allow_private_networks: checked }));
+bindSettingSwitch("settingMemorySpace", "experimentalSettingsState", (checked) => ({ memory_space: checked }));
+$("settingPinned").addEventListener("change", async (event) => {
+  const input = event.currentTarget;
+  input.disabled = true;
+  const saved = await savePinnedSetting(input.checked);
+  input.disabled = false;
+  if (!saved) input.checked = !input.checked;
+});
+$("toolSettings").addEventListener("submit", (event) => event.preventDefault());
+$("experimentalSettings").addEventListener("submit", (event) => event.preventDefault());
 $("settingHTTPFetchEnabled").addEventListener("change", syncHTTPFetchSettingFields);
 $("settingServiceName").addEventListener("input", (event) => {
   if (state.serviceSettings) {
@@ -7918,6 +8242,15 @@ window.addEventListener("resize", fitImageEditorCanvas);
 $("send").addEventListener("click", activateRunAction);
 $("stopRun").addEventListener("click", () => { void cancelCurrentRun(); });
 $("messages").addEventListener("scroll", updateMessageAutoScroll, { passive: true });
+// 捲動時同步標出目前所在段落。用 rAF 節流，長對話捲動不會因此掉幀。
+let milestoneFrame = 0;
+$("messages").addEventListener("scroll", () => {
+  if (milestoneFrame) return;
+  milestoneFrame = requestAnimationFrame(() => {
+    milestoneFrame = 0;
+    syncMilestoneActive();
+  });
+}, { passive: true });
 $("prompt").addEventListener("paste", (event) => {
   if (!state.session) return;
   const files = [...(event.clipboardData?.files || [])];
@@ -8028,6 +8361,7 @@ $("closeManagement").addEventListener("click", closeManagement);
 for (const button of document.querySelectorAll(".panel-tab")) button.addEventListener("click", () => activatePanel(button.dataset.panel));
 $("refreshDiagnostics").addEventListener("click", loadDiagnostics);
 $("exportDiagnostics").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/diagnostics/export", "nr-intern-diagnostics.json"));
+$("downloadConfigBundle").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/config-bundle", "nr-intern-config.zip"));
 $("downloadBackup").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/backup", "nr-intern-backup.zip"));
 $("checkForUpdates").addEventListener("click", () => void checkForUpdates());
 $("openLatestRelease").addEventListener("click", () => {

@@ -177,9 +177,14 @@ fi
 typeset -a mac_apps
 mac_apps=("$DIST_OUTPUT_DIR"/*/macos-arm64/NR-Intern.app(N/om))
 if (( ${#mac_apps[@]} > 0 )); then
-	# 舊版 App 執行中時，build.command 會保留舊目錄；必須使用排序後
-	# 最新的 Bundle，否則重啟仍會載入舊版而看不到修正。
-	MAC_APP="${mac_apps[-1]}"
+	# 舊版 App 執行中時，build.command 會保留舊目錄；必須使用最新的 Bundle，
+	# 否則重啟仍會載入舊版而看不到修正。
+	#
+	# glob qualifier om 是「修改時間新的在前」，因此最新的是 [1]，不是 [-1]。
+	# 這裡原本取 [-1]，也就是最舊的那一個：只要有舊版 App 還在執行（build.command
+	# 會保留它的目錄），重新建置後啟動的仍是舊版，修正看起來完全沒生效——
+	# 必須先跑 clean.command 把舊目錄清掉才會正常。
+	MAC_APP="${mac_apps[1]}"
 	if /usr/bin/open -n -F -i /dev/null -o "$DESKTOP_LOG" --stderr "$DESKTOP_LOG" "$MAC_APP" --args \
 		-config "$CONFIG_PATH" -working-dir "$PROJECT_ROOT" -open=false "$@" "${startup_signal_arguments[@]}"; then
 		STARTUP_SIGNAL_HANDED_OFF=1

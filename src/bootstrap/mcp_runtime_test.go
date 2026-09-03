@@ -34,7 +34,7 @@ func newMCPTestRuntime(t *testing.T, servers ...mcpclient.ServerConfig) *Runtime
 // 否則使用者每次調整任何設定都會把金鑰洗掉。
 func TestUpdateMCPSettingsKeepsStoredCredentials(t *testing.T) {
 	runtime := newMCPTestRuntime(t, mcpclient.ServerConfig{
-	ID: "mars", Enabled: true, Transport: mcpclient.TransportStreamableHTTP,
+		ID: "mars", Enabled: true, Transport: mcpclient.TransportStreamableHTTP,
 		URL: "https://mcp.example.com/mcp", Username: "fixture-user", Password: "fixture-password",
 		Headers: map[string]string{"X-Site": "factory"},
 	})

@@ -100,7 +100,8 @@ Console 建立多份計畫、收合步驟與拖曳排序，Agent 遇到多步驟
 
 `lock_plans=true` 時，每個 Session 最多只有第一份未完成計畫為 `active`，後續均為 `queued`；
 active 完成或刪除後，Repository 會自動啟用下一份。`lock_plans=false`（預設）時，未完成計畫
-可以同時為 `active`，不同計畫可由不同 Run 平行執行。兩種模式都要求排序列表完整且不重複；
+可以同時為 `active`，Agent 可在不同計畫間切換；這不會取消同一 Session 的 Run single-writer
+限制，跨 Session 才能平行執行 Run。兩種模式都要求排序列表完整且不重複；
 已有步驟進度的 active 計畫不能被移到其他未完成計畫後面，避免 UI 顯示順序與 Agent 實際執行
 順序分裂。
 
@@ -115,17 +116,17 @@ Harness 就會攔截模型過早產生的 final answer，要求繼續執行與�
 Session 有 `shell_exec` 時，每個 Run 從「系統工具優先階段」開始，本輪公開：
 
 - **唯讀工具**（`file_read`、`directory_list`、`file_search`、`file_compare`、
-  `memory_search`、`wait_for`、`ssh_wait`），但不含辦公文件家族。
+  `memory_search` 與文件檢視等），仍受工具集設定與檢索結果限制。
 - `shell_exec`，以及 Harness 計畫控制工具與已連線的 MCP 工具。
+- `document_create`、`document_convert`；擴充工具集允許時也包含 `document_edit`。
+- `wait_for`／`ssh_wait` 只有已啟用且由檢索帶入時才公開，不屬於固定核心工具。
 
-寫入型內建工具（建立目錄、寫檔、編輯、文件產出）與 `ssh_exec` 仍維持 Shell 優先：需要這類
+其他寫入型內建工具（建立目錄、寫檔、文字編輯）與 `ssh_exec` 仍維持 Shell 優先：需要這類
 副作用時先用 `shell_exec` 實際執行，Shell 真正執行失敗後才由備援階段公開完整目錄。人工拒絕、
 Approval 中斷或 loop guard 都不算 Shell 失敗，不能藉此解鎖。
 
-辦公文件家族（`documents` 類別，共十個工具）留到備援階段：第一階段的工具目錄會整份進入
-每一次請求的提示，instruction 模式更是直接以文字列出 schema，而這個家族工具最多、schema
-最長，卻只有處理 PDF／DOCX／XLSX／PPTX 時才用得到。把它留在備援階段，常見的「讀檔案、
-查目錄、呼叫 MCP」維持一輪完成，又不必為每次對話都付整份文件工具的提示成本。
+文件產出、轉換與編輯可直接使用專門工具，避免先尋找 Shell 套件或自行改用不符需求的格式。
+較大的文件 schema 由工具檢索控制；其他文件副作用工具仍依原有階段規則供應。
 
 唯讀工具提前公開是刻意的取捨：先前它們要等一次 Shell 失敗才解鎖，等於每個「讀檔案、盤點目錄」
 的需求都固定多花一輪跑一個註定失敗的命令卻沒有任何產出。唯讀工具沒有副作用，提前公開不會
@@ -140,6 +141,11 @@ turn 配額，但仍受整體 `max_turns` 與已啟用的 `max_tool_calls` 限�
 Harness 另有結構化重複操作防護：已成功的相同副作用工具呼叫不會執行第二次；具
 `atomic-replace` 能力的工具對同一資源成功改寫三次後，下一輪會停用工具並強制整理
 目前結果。判定只使用工具定義、參數與執行結果，不分析模型自然語言。
+
+失敗防護區分操作策略與內容修正：一般錯誤以工具、目標與控制參數辨識；錯誤指向
+`cell_updates`、`blocks` 等內容欄位時，另把內容摘要加入 attempt key，避免把真正修正後的
+輸入誤判成同一次失敗。同一工具對同一資源累計四次相同錯誤時仍會攔截後續嘗試，要求改變做法；
+這不是繞過工具驗證、強制完成計畫或自動重做已成功的副作用。
 
 ### Run budget
 
@@ -167,6 +173,9 @@ Session 的 `Usage` 不寫入 `session.json`，而是每次由既有 Run 清單�
 Provider／Model 提供 `by_model` 明細。`model_prices` 設定以 Provider ID 與模型名稱索引，
 單價單位為每百萬 token 的 USD；沒有對應價格時只回傳 token，不提供估算金額。歷史 Run 的
 估算成本在收尾時保存，日後調整價格表不會改寫既有紀錄。
+
+Console 標題列顯示 Session 累計 token，以 K／M 縮寫並在 tooltip 提供精確值；沒有成本時隱藏
+金額與分隔符號。重新提問不退還已消耗的 token，不能用累計用量推算當前上下文占比。
 
 ### Human-in-the-loop Approval
 
@@ -213,11 +222,14 @@ Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。這�
 以 Session single-writer gate 最後保護，因此其他 Client 同時送入同一 Session 時也不會交錯寫入
 transcript。
 
-UI 啟動時先讀取目前 Workspace 的 queued／running／paused／waiting approval Run，依 Session
-重新掛接 durable SSE；若後端已將中斷 Run 標記為 retryable failure，也會顯示可重試狀態。恢復
+UI 啟動時先讀取目前 Workspace 的 queued／running／paused／waiting approval Run，透過恢復
+視窗讓使用者勾選，確認後才掛接所選 Run 的 durable SSE；中斷且可重試的 Run 保留重試入口。恢復
 視窗按下取消時只停止該 Session 的 UI 恢復，不取消後端背景 Run，並在目前 UI 生命週期內記住
-這個 Session 的排除狀態，避免後續查詢再次自動掛回。這讓隱藏視窗、背景執行、瀏覽器重整與
-桌面程式重開都不會遺失工作生命週期。
+這個 Session 的排除狀態。之後主動開啟該 Session 時會重新查詢並連線，讓使用者能看見真實
+狀態及操作停止；真正停止執行仍須 Run cancel。取消恢復不等於取消後端工作。
+
+長對話左側以提問建立段落刻度，可預覽與跳轉，少於兩則提問時隱藏。串流文字本身表示進度，
+沒有新文字超過兩秒且 Run 仍在處理時，狀態列重新顯示處理動畫；等待人工核准時不套用此動畫。
 
 ## 工作管理與系統能力
 
@@ -251,6 +263,12 @@ plans、attachments、memories、schedules、notifications 與非秘密的 servi
 排除 Provider、OAuth、MCP 與 NetPass 憑證檔。還原前先保存 `backups/pre-restore-*.zip`，
 只接受白名單資料目錄、拒絕絕對路徑、`..`、符號連結及超過 512 MiB 的解壓內容，完成後回傳
 `restart_required=true`。
+
+設定包是獨立的管理匯出，不是安全備份。`Runtime.ConfigBundle` 只讀取 `data_dir` 中已存在的
+`providers.json`、`mcp-servers.json`、`netpass.json`、`service-settings.json`，依欄位名稱
+遮蔽秘密，再加上 `manifest.json` 產生 ZIP。HTTP 層只提供 `GET /api/v1/admin/config-bundle`，
+Console 從系統工具下載；不包含對話、附件、OAuth token 或環境變數，也沒有設定包專用匯入。
+URL、帳號與命令列參數不是通用匿名化的對象，分享限制見 [安全設計](SECURITY.md)。
 
 全域搜尋由後端掃描 Workspace、Project、Session、Message、Plan 與 Schedule，限制查詢 200
 字元、最多 100 筆，只回傳 bounded snippet，不把完整訊息或檔案內容交給前端。唯讀權限中心
@@ -425,9 +443,14 @@ Workspace、Session 與 Run 三層都能覆寫 model，而不同模型的 contex
 budget = context_window − max(context.reserved_output_tokens, model 的 max_output_tokens)
 ```
 
-`context_window` 未宣告（0）時退回 `context.max_estimated_tokens`，預設為 262,144（256K budget）。相容端點無法可靠探測，
-用模型名稱字串比對又太脆弱，因此限制由設定提供：Provider 層級的 `context_window` /
-`max_output_tokens`，以及覆寫個別模型的 `model_limits`。
+`context_window` 未宣告（0）時退回 `context.max_estimated_tokens`，預設為 262,144（256K budget）。
+啟動時透過 Router 在背景探索模型清單與限制，共用 20 秒期限；探索失敗不阻擋啟動。各 adapter
+依其能力來源、Provider 的 `context_window`／`max_output_tokens` 與個別 `model_limits` 合成
+有效限制，不以模型名稱猜測容量。未宣告時 Run 日誌警告使用後備預算，Console 百分比加星號
+並標示估算；Provider 表單另外顯示能力查詢值，不把人工欄位的 0 當成有效容量。
+
+OpenAI-compatible adapter 的非零目錄回報值優先於人工設定；只有缺少相應回報欄位時才依
+個別 `model_limits`、Provider 層級設定與 Context 後備預算決定。
 
 ### Token 估算
 
@@ -518,9 +541,15 @@ output_schema、read_only、requires_permission）。`platforms` 與 `capabiliti
 可在管理介面即時切換、不需重啟後端的開關：
 
 - **擴充工具集**（`extended_tools`，預設關閉）：關閉時只公開精簡集合——`shell_exec`、
-  `file_read`、`directory_list`、`file_search` 與三個計畫控制工具，取設定檔 `allowed_tools`
-  的交集，不會放大原本的授權範圍。需要文件處理、寫入、SSH 或記憶工具時再打開。
+  `file_read`、`directory_list`、`file_search`、四個文件工具（`document_inspect`、
+  `document_read`、`document_create`、`document_convert`）與三個計畫控制工具，取設定檔
+  `allowed_tools` 的交集，不會放大原本的授權範圍。需要寫入、編輯、SSH 或記憶工具時再打開。
   檢索（下一項）會在這個結果之上再過濾一次。
+
+  文件工具原本不在精簡集合裡。實際後果是使用者說「把結果轉成 Excel」時，Agent 只剩
+  `shell_exec` 可用，於是寫了一個沒有 UTF-8 BOM 的 CSV——Excel 打開全是亂碼，而且那也
+  不是使用者要的格式。精簡集合當初是為了壓低提示大小，這件事現在由工具檢索處理，
+  沒有必要再用「拿掉能力」來換。
 - **工具檢索**（`tool_retrieval`，預設開啟）：見下一節。內建工具與 MCP 工具都適用。
 - **工具呼叫協定**（`tool_call_mode`，預設 `native`）：多數推論引擎會以 grammar 約束
   `tool_calls` 輸出，比要求模型自行輸出 JSON 指令可靠得多；Provider 不支援原生工具呼叫時
@@ -538,8 +567,13 @@ output_schema、read_only、requires_permission）。`platforms` 與 `capabiliti
 問題也不是「哪些工具用不到」——使用者通常全部都要用——而是「這一輪用得到哪些」。
 因此 `harness.toolRetriever` 在每個 Run 開始時對工具目錄做一次檢索。內建工具同樣納入：
 擴充工具集打開後有近二十個內建工具，`document_*`、`ssh_*` 的 schema 都不小，而任何一次需求
-通常只會用到其中一兩個。核心工具（`coreToolNames`：Shell、讀檔、列目錄、搜尋、計畫控制與
-等待）不參與檢索——階段提示直接點名它們，少了任何一個模型會先卡一輪。
+通常只會用到其中一兩個。核心工具（`coreToolNames`：Shell、讀檔、列目錄、搜尋與計畫控制）不參與檢索——
+階段提示直接點名它們，少了任何一個模型會先卡一輪。
+
+`wait_for` 與 `ssh_wait` 刻意**不是**核心工具。它們一度被列入，理由只是「階段提示提到
+它們」——那是錯的理由：這兩個工具會實際阻塞（`wait_for` 單次最長 30 分鐘），而且是唯讀
+工具、不需要人工核准。永遠掛在目錄裡的結果是小模型隨手呼叫一次，整個 Run 就安靜停住，
+畫面上與當機無法區分。需要等待時由檢索帶出來即可。
 
 1. **第一層過濾**：以這次的使用者輸入、加上同一個 session 最近幾則使用者訊息為查詢，
    取相關度最高的工具（上限 `mcpRetrievalLimit`）
@@ -556,6 +590,41 @@ output_schema、read_only、requires_permission）。`platforms` 與 `capabiliti
    呼叫過與取回過的工具會留在該 Run 的目錄裡，連續使用同一個工具不會每輪重找。
 
 實測（`tool_retrieval_smoke_test.go`）：67 個工具的目錄，工具負載從 30,210 字降到 1,399 字。
+
+## 對話歷史的字元上限
+
+歷史整理有兩個獨立觸發條件：token 使用量達到輸入預算的 90%，或整形後的歷史字元數超過
+`context.max_history_characters`（預設 60,000）。後者用來補足 JSON、代碼與識別碼等內容的
+token 估算誤差；單則工具結果會先套用 `max_tool_result_characters`，避免單一超大結果誤觸發。
+
+字元條件超量時會縮小保留訊息數，再依既有摘要流程壓縮。組合 prompt 前的
+`Runner.enforceHistoryCharacterLimit` 再檢查一次，必要時由舊而新移除模型可見的歷史，
+並修補 tool call／result 配對。它不刪除持久化 transcript，也不改變 Run 的累計 token、
+工具呼叫或 wall-clock 預算。
+
+這不是整份模型請求的硬性上限：至少保留最新一則，且 system prompt、工具 schema、當前輸入
+與配對修補仍可能增加大小。因此仍需依 Provider 能力設定預算，不應把字元上限當成容量保證。
+
+每輪送出前的 `model request` 日誌提供 `tools`、`tool_chars`、`steering_chars`、
+`history_messages`、`history_chars`、`user_chars` 與工具名稱，不記錄本文。歷史被最後防線
+裁切時另有 WARN，供區分模型回應慢與請求負載過大。
+
+## 工具呼叫相容性
+
+原生模式沒有 `tool_calls`、卻在回答中輸出疑似工具參數時，Harness 會依可呼叫工具的 schema
+比對 JSON 物件或陣列，進入有限次數的協定修正，要求模型改用工具呼叫欄位。修正耗盡會以
+部分完成收尾；JSON 文字本身不代表檔案已建立或工具已執行。這是啟發式偵測，不是語意理解保證。
+
+`tools.Registry` 依頂層參數 schema 還原字串化的物件、陣列、數字與布林值；對部分非標準
+JSON 嘗試格式修復，失敗則保留原值，交由工具驗證。純文字欄位不因看起來像 JSON 而轉型。
+MCP 呼叫前則只對 schema 指定的物件／陣列做標準 JSON 字串解碼，不沿用原生工具的寬鬆修復。
+兩者都不改變 allowlist、權限、Sandbox 與輸入大小限制。
+
+## 實驗性回憶空間
+
+`memory_space` 預設關閉，透過 Config、service settings 與 Console「實驗性功能」頁保存，
+目前沒有共享／召回／淘汰實作。它不控制既有 `memory.*` 或 scope 規則；詳細設計與預定限制
+見 [回憶空間提案](MEMORY_SPACE.md)，不可當成已完成的資料保護機制。
 
 ## 完成度判定
 

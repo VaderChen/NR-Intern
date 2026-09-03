@@ -26,6 +26,7 @@ type storedServiceSettings struct {
 	ToolRetrieval                 *bool   `json:"tool_retrieval,omitempty"`
 	// LegacyMCPToolRetrieval 是 ToolRetrieval 的舊名稱，只讀不寫。
 	LegacyMCPToolRetrieval *bool `json:"mcp_tool_retrieval,omitempty"`
+	MemorySpace            *bool `json:"memory_space,omitempty"`
 }
 
 func loadPersistedServiceSettings(config *Config) error {
@@ -89,6 +90,9 @@ func loadPersistedServiceSettings(config *Config) error {
 	if stored.ToolRetrieval != nil {
 		config.ToolRetrieval = *stored.ToolRetrieval
 	}
+	if stored.MemorySpace != nil {
+		config.MemorySpace = *stored.MemorySpace
+	}
 	return nil
 }
 
@@ -109,6 +113,7 @@ func persistServiceSettings(dataDir string, settings domain.ServiceSettings) err
 		ExtendedTools:                 boolPointer(settings.ExtendedTools),
 		ToolCallMode:                  stringPointer(settings.ToolCallMode),
 		ToolRetrieval:                 boolPointer(settings.ToolRetrieval),
+		MemorySpace:                   boolPointer(settings.MemorySpace),
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode service settings: %w", err)

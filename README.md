@@ -10,17 +10,19 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 - `Workspace → Project → Session` 管理結構，以及每個對話獨立的 Provider 與模型選擇。
 - Workspace 與 Project 的職務說明：常駐工作規則只寫一次，之後每次對話與排程都自動帶入。
 - 多份有序工作計畫、拖曳排序、步驟狀態與工具驗證證據。
-- 可選的 Thinking 思考程度；Session 可鎖定計畫依序執行，也可讓未完成計畫平行運作。
+- 可選的 Thinking 思考程度；Session 可鎖定計畫依序執行，或解除鎖定以切換未完成計畫；不同 Session 可同時工作。
 - 獨立的排程區塊：可自訂週期與 Sandbox，到點自動建立新對話並開工。
-- Durable Run、可重播 SSE、串流回答與斷線續接；UI 重開後會自動恢復仍在執行或可重試的 Run。
+- Durable Run、可重播 SSE、串流回答與斷線續接；UI 重開後可勾選要重新連線的對話，中斷的工作保留重試入口。
 - 異常恢復、可選的持久化通知中心、Run 暫停／恢復／取消全部控制，以及脫敏診斷包。
 - 全域搜尋、安全備份／還原與唯讀權限中心；還原前會自動保留可復原快照。
-- 官方 GitHub Release 版本更新檢查；啟用通知中心後新版本會進入通知中心，同一版本不重複通知。
+- 可下載遮蔽憑證欄位的設定包，供換機時參考 Provider、MCP、反向代理與服務設定。
+- 「關於」頁提供版本資訊與更新檢查。
 - 對話執行中仍可繼續輸入，後續訊息會寫入 Browser IndexedDB 的 Durable Outbox，上一輪結束後依序送出；網路中斷時保留固定 Idempotency-Key 供安全重試。
-- Context 自動整理、跨 Session 長期記憶與記憶範圍控制。
+- Context 自動整理搭配歷史字元上限，並支援長期記憶與記憶範圍控制。
 - 每個 Run 與 Session 的 input／output／total token 統計，並可透過設定的模型單價顯示估算成本；未設定價格時只顯示 token。
 - 原生檔案、文件、Shell、SSH 與計畫工具，搭配 Sandbox 及執行審核。
-- 精簡／擴充工具集、工具檢索，以及 native／instruction 兩種工具呼叫模式，依模型能力調整。
+- 精簡工具集即支援文件讀取、建立與轉換；可切換擴充工具集、工具檢索與 native／instruction 呼叫模式。
+- 長對話提供提問段落預覽與快速跳轉；累計用量以 K／M 顯示，滑過可看精確值。
 - 非同步工作可使用 `wait_for` 進行可取消等待，遠端部署可用 `ssh_wait` 輪詢唯讀檢查，確認檔案大小、SHA-256 或服務就緒後才算完成。
 - `http_fetch` 對外讀取網路資源：HTML 自動轉純文字，localhost 與私有網段預設允許，並可從管理介面直接關閉。
 - 內建 MCP Client，可連接本機 stdio、舊版 SSE 或遠端 Streamable HTTP Server，將外部工具納入相同的權限與審核流程。
@@ -43,8 +45,8 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 實際設定檔、執行資料與憑證不應提交到版本庫。完整架構、API 與安全設計請參考下方文件。
 
-對話、工作狀態與設定均由後端持久化保存；UI 重開或後端重啟後，可恢復仍在執行或可重試的工作。
-通知中心可在一般設定關閉，並只保存工作狀態摘要。
+對話、工作狀態與設定由後端保存；通知中心預設關閉，可在一般設定開啟。
+設定包不含對話與附件，也不是完整備份；URL、帳號與路徑等內容分享前仍需人工檢查。
 
 ## 文件
 
@@ -56,8 +58,6 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 - [HTTP API](https://vaderchen.github.io/NR-Intern/http-api.html)
 - [安全設計](https://vaderchen.github.io/NR-Intern/security.html)
 - [OpenAPI 契約](https://vaderchen.github.io/NR-Intern/openapi.html)
-
-發行封裝與簽章由維護者的內部流程處理；README 不提供封裝命令、參數或簽章設定。
 
 ## 資料安全
 

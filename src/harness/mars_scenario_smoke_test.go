@@ -444,3 +444,46 @@ func TestSmokeOversizedToolResultIsBoundedForTheModel(t *testing.T) {
 		t.Fatalf("截斷後沒有告訴模型下一步該怎麼做：%s", toolContent[len(toolContent)-200:])
 	}
 }
+
+// 使用者實測卡住的那次請求：工具目錄 772 字、提示 4,806 字，
+// 但對話歷史 131,861 字——佔整個請求的 96%，而且壓縮從未觸發。
+//
+// 原因是 token 估算失準：那份歷史幾乎都是 JSON 與設備代碼，ASCII 權重（每 4 字元
+// 1 token）把 13 萬字估成約 3.5 萬 token、只佔預算 31%，遠低於 90% 的壓縮門檻。
+// 本機模型卻要為此 prefill 二十分鐘。字元上限就是為了這種情況存在的。
+func TestSmokeLargeAsciiHistoryStillGetsCompacted(t *testing.T) {
+	session := smokeSession(t)
+	sessions := newMemorySessions(session)
+	ctx := context.Background()
+
+	// 模擬 43 則訊息、13 萬字的機器資料歷史（JSON 與代碼，全部 ASCII）。
+	row := `{"equipment_code":"CNC01_01","department":"CNC","status":1,"mo":"TST-BOMCA-0001"},`
+	block := strings.Repeat(row, 40)
+	for index := 0; index < 42; index++ {
+		role := "assistant"
+		if index%2 == 0 {
+			role = "user"
+		}
+		if _, err := sessions.AppendEntry(ctx, session.ID, domain.SessionEntry{
+			SessionID: session.ID,
+			Type:      domain.SessionEntryMessage,
+			Message:   &domain.Message{ID: fmt.Sprintf("msg_%d", index), SessionID: session.ID, Role: role, Content: block},
+		}); err != nil {
+			t.Fatalf("AppendEntry: %v", err)
+		}
+	}
+
+	model := &scriptedModel{responses: []domain.ModelResponse{{Content: "好的。"}}}
+	runner := smokeRunner(sessions, model, newSmokeToolRuntime(t, newSmokeMCPServer(t)))
+	if _, err := runner.Run(ctx, Input{RunID: "run_big_history", Session: session, UserInput: "請把上述結果轉成 EXCEL 檔案"}, func(domain.EngineEvent) error { return nil }); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// 壓縮本身會先向模型要一份摘要，因此第一個請求是摘要用的；真正的工作回合是最後一個。
+	turn := model.requests[len(model.requests)-1]
+	_, history := requestSize(turn)
+	t.Logf("13 萬字歷史經壓縮後送出 = %d 字／%d 則（共 %d 次模型請求）", history, len(turn.History), len(model.requests))
+	if history > DefaultMaxHistoryCharacters {
+		t.Fatalf("history %d 字超過上限 %d：字元閘門沒有攔下來", history, DefaultMaxHistoryCharacters)
+	}
+}

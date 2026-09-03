@@ -28,7 +28,7 @@ func (t *ConvertTool) Definition() domain.ToolDefinition {
 		Label:              "轉換辦公文件",
 		Version:            "1.0.0",
 		Category:           "documents",
-		Description:        "透過固定探索的 LibreOffice 後端，將 DOCX、XLSX、PPTX 與相容的舊式 Office／OpenDocument 文件轉成 PDF，或將 DOC、XLS、PPT、ODT、ODS、ODP、RTF 遷移到對應 Open XML 格式。來源與輸出都必須位於 Sandbox。",
+		Description:        "透過固定探索的 LibreOffice 後端，將 Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）與相容的舊式 Office／OpenDocument 文件轉成 PDF，或將 DOC、XLS、PPT、ODT、ODS、ODP、RTF 遷移到對應 Open XML 格式。來源與輸出都必須位於 Sandbox。",
 		Platforms:          []string{"darwin", "linux", "windows"},
 		Capabilities:       []string{"document-convert", "office-to-pdf", "legacy-office-migration", "docx", "xlsx", "pptx", "pdf", "workspace-sandbox", "atomic-write"},
 		RequiresPermission: true,

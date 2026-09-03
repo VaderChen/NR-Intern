@@ -24,18 +24,29 @@ type ContextConfig struct {
 	MaxEstimatedTokens int `json:"max_estimated_tokens"`
 	// ReservedOutputTokens 是為模型輸出保留的最低額度；Provider 宣告的
 	// max_output_tokens 較大時以較大者為準。
-	ReservedOutputTokens    int    `json:"reserved_output_tokens"`
-	RetainMessages          int    `json:"retain_messages"`
-	MaxToolResultCharacters int    `json:"max_tool_result_characters"`
-	MaxSummaryInputChars    int    `json:"max_summary_input_characters"`
-	MaxSummaryCharacters    int    `json:"max_summary_characters"`
-	SummaryProviderID       string `json:"summary_provider_id,omitempty"`
-	SummaryModel            string `json:"summary_model,omitempty"`
+	ReservedOutputTokens    int `json:"reserved_output_tokens"`
+	RetainMessages          int `json:"retain_messages"`
+	MaxToolResultCharacters int `json:"max_tool_result_characters"`
+	MaxSummaryInputChars    int `json:"max_summary_input_characters"`
+	MaxSummaryCharacters    int `json:"max_summary_characters"`
+	// MaxHistoryCharacters 是送進模型的對話歷史字元上限，超過就強制壓縮。
+	//
+	// token 估算會失準：工具結果多半是 JSON、代碼與識別碼，ASCII 權重（每 4 字元
+	// 1 token）對這種內容大約低估一半以上。實測一次卡住的請求帶了 131,861 字歷史，
+	// 估算只有約 3.5 萬 token、佔預算 31%，因此永遠不會觸發壓縮，而本機模型光是
+	// prefill 就要二十分鐘。字元上限不依賴估算，是估算失準時的最後一道防線。
+	MaxHistoryCharacters int    `json:"max_history_characters"`
+	SummaryProviderID    string `json:"summary_provider_id,omitempty"`
+	SummaryModel         string `json:"summary_model,omitempty"`
 }
 
 const (
-	softCompactionRatio       = 0.9
-	DefaultMaxEstimatedTokens = 256 * 1024
+	softCompactionRatio = 0.9
+	// DefaultMaxHistoryCharacters 是歷史字元的預設上限。約當中文六萬 token、
+	// 英文一萬五千 token，本機模型仍能在可接受時間內 prefill；雲端模型要更大
+	// 的視窗可在設定檔調高。
+	DefaultMaxHistoryCharacters = 60_000
+	DefaultMaxEstimatedTokens   = 256 * 1024
 )
 
 type ContextCompactionStatus struct {
@@ -150,6 +161,17 @@ func (m *ContextManager) BuildObserved(
 	compactionConfig := config
 	thresholdReached := triggerTokens >= int(float64(budget)*softCompactionRatio)
 	older, _ := splitForCompaction(messages, compactionConfig.RetainMessages)
+	// 字元上限與 token 估算是兩道獨立的閘門。估算低估時（工具結果的 JSON 與代碼
+	// 最容易低估），這一道仍會把歷史壓下來，並把保留則數收到真的裝得下的數量。
+	// 以「整形後」的字數判斷：單一超大工具結果會先被 shapeToolResults 截到上限，
+	// 用原始長度判斷會把只有一則大結果的正常情況也判成需要壓縮。
+	if historyCharacters := shapedCharacters(messages, config.MaxToolResultCharacters); historyCharacters > config.MaxHistoryCharacters {
+		thresholdReached = true
+		if fitted := retainCountWithinCharacters(messages, config.MaxHistoryCharacters); fitted < compactionConfig.RetainMessages {
+			compactionConfig.RetainMessages = fitted
+			older, _ = splitForCompaction(messages, compactionConfig.RetainMessages)
+		}
+	}
 	if thresholdReached && len(older) == 0 && len(messages) > 1 {
 		// 少量但極大的訊息也可能吃滿 context。固定保留 16 則會讓這類 Session
 		// 永遠無法壓縮，因此超過門檻時至少整理較舊的一半，保留最新工作狀態。
@@ -852,6 +874,65 @@ func int64Value(value any) int64 {
 	}
 }
 
+// BudgetDiagnostics 回報這次會用的預算，以及 context window 是不是 Provider
+// 真的宣告過的。
+//
+// 未宣告時預算會退回設定檔的 max_estimated_tokens（預設 256K）——對本機模型
+// 而言那是一個天文數字，壓縮門檻因此永遠碰不到。實測有一台 Provider 沒宣告
+// window，模型每輪吃 82,318 tokens、prefill 二十分鐘，而 Harness 認為只用了 35%。
+// 這個資訊必須寫進日誌，否則現場完全看不出問題在哪。
+func (m *ContextManager) BudgetDiagnostics(session domain.Session) (budgetTokens int, declared bool) {
+	if m == nil {
+		return 0, false
+	}
+	config := normalizeContextConfig(m.Config)
+	if m.Capabilities != nil {
+		if capabilities := m.Capabilities.Capabilities(session.ProviderID, session.Model); capabilities.ContextWindow > 0 {
+			return m.budget(config, session), true
+		}
+	}
+	return config.MaxEstimatedTokens, false
+}
+
+// HistoryCharacterLimit 公開字元上限，讓送出前的最後一道檢查用同一個數字。
+func (m *ContextManager) HistoryCharacterLimit() int {
+	if m == nil {
+		return 0
+	}
+	return normalizeContextConfig(m.Config).MaxHistoryCharacters
+}
+
+// shapedCharacters 回報這批訊息實際會送出的字數：工具結果已套用單則上限。
+func shapedCharacters(messages []sequencedMessage, maxToolResultCharacters int) int {
+	total := 0
+	for _, message := range messages {
+		length := utf8.RuneCountInString(message.Message.Content)
+		if strings.EqualFold(message.Message.Role, "tool") && length > maxToolResultCharacters {
+			length = maxToolResultCharacters
+		}
+		total += length
+	}
+	return total
+}
+
+// retainCountWithinCharacters 由最新往回累加，回報字元上限內裝得下的訊息數。
+// 至少保留一則：完全不留會讓模型失去當下的工作狀態。
+func retainCountWithinCharacters(messages []sequencedMessage, limit int) int {
+	total := 0
+	count := 0
+	for index := len(messages) - 1; index >= 0; index-- {
+		total += utf8.RuneCountInString(messages[index].Message.Content)
+		if total > limit && count > 0 {
+			break
+		}
+		count++
+	}
+	if count < 1 {
+		count = 1
+	}
+	return count
+}
+
 func normalizeContextConfig(config ContextConfig) ContextConfig {
 	if config.MaxEstimatedTokens <= 0 {
 		config.MaxEstimatedTokens = DefaultMaxEstimatedTokens
@@ -870,6 +951,9 @@ func normalizeContextConfig(config ContextConfig) ContextConfig {
 	}
 	if config.MaxSummaryCharacters <= 0 {
 		config.MaxSummaryCharacters = 16_000
+	}
+	if config.MaxHistoryCharacters <= 0 {
+		config.MaxHistoryCharacters = DefaultMaxHistoryCharacters
 	}
 	config.SummaryProviderID = strings.TrimSpace(config.SummaryProviderID)
 	config.SummaryModel = strings.TrimSpace(config.SummaryModel)

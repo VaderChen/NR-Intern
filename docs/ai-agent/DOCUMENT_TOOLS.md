@@ -17,6 +17,11 @@ NR-Intern 以十個原生工具處理 PDF、DOCX、XLSX 與 PPTX。讀取、建�
 
 ## 建立文件
 
+精簡工具集已提供 `document_inspect`、`document_read`、`document_create`、`document_convert`；
+其餘工具需啟用擴充集合並列於 allowlist。文件建立與轉換可在第一階段直接呼叫，不需先嘗試
+Shell。使用者要求 Excel、Word 或簡報時，應交付對應 XLSX、DOCX、PPTX，不應自行改成交付
+CSV、Markdown 或工具參數 JSON；只有明確要求或同意時才改用 CSV，並注意 Excel 的 UTF-8 BOM。
+
 DOCX 與 PDF 使用 `blocks`。區塊類型為 `heading`、`paragraph`、`bullet`、`numbered`、`table`、`page_break`：
 
 ```json
@@ -51,6 +56,28 @@ XLSX 使用 `sheets`；JSON 數字與布林值會保留為試算表型別，公�
   }]
 }
 ```
+
+新建 XLSX 若沒有 `sheets`，也接受 `cell_updates`，會依工作表名稱組成新檔：
+
+```json
+{
+  "path": "output/metrics.xlsx",
+  "create_parent": true,
+  "cell_updates": [
+    {"sheet": "Summary", "cell": "A1", "value": "項目"},
+    {"sheet": "Summary", "cell": "B1", "value": "數量"},
+    {"sheet": "Summary", "row": 2, "column": 1, "value": "範例"},
+    {"sheet": "Summary", "row": 2, "column": 2, "value": 42}
+  ]
+}
+```
+
+此相容路徑另接受 `Sheet!A1`、`rows` 矩陣與 `value` 內的 A1 儲存格映射；`row`／`column`
+由 1 起算。建議新呼叫仍採標準 `sheets` 結構，並明確提供工作表名稱。這些替代寫法只適用於
+沒有範本的新建 XLSX，不代表既有文件編輯或範本更新也接受所有替代形式。
+
+Registry 依工具 schema 還原被模型字串化的陣列／物件、數字與布林值，並嘗試修復部分 JSON
+格式錯誤；無法解讀時保留原值，交由工具回報驗證錯誤。這不替代文件結構驗證或資料正確性檢查。
 
 PPTX 使用 `slides`，輸出為 16:9 且文字框可在 PowerPoint、Keynote 或 LibreOffice Impress 中繼續編輯：
 

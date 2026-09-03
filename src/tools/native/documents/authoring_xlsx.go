@@ -11,9 +11,211 @@ import (
 
 var spreadsheetCellReferencePattern = regexp.MustCompile(`(?i)^([A-Z]{1,3})([1-9][0-9]{0,6})$`)
 
+// sheetsFromCellUpdates 把儲存格清單攤成工作表的列陣列。
+//
+// 工作表順序依第一次出現的先後，欄列大小由最大的儲存格參照決定；沒有被指定的
+// 位置留空。公式（formula）沿用既有的 formulas 對照表。
+func sheetsFromCellUpdates(updates []cellUpdate) ([]spreadsheetSheet, error) {
+	order := []string{}
+	grids := map[string]map[int]map[int]any{}
+	formulas := map[string]map[string]string{}
+	for index, update := range updates {
+		name := strings.TrimSpace(update.Sheet)
+		if name == "" {
+			name = "Sheet1"
+		}
+		// 允許 Excel 的完整寫法 Sheet1!A1 與 '工作表 1'!A1：工作表名稱就寫在那裡，
+		// 沒有理由因為格式不同就拒絕。sheet 欄位缺席時就用參照裡的名稱。
+		// rows 直接給整張表：這是 sheets 的形狀被放進 cell_updates，內容不用改。
+		if len(update.Rows) > 0 {
+			if _, exists := grids[name]; !exists {
+				grids[name] = map[int]map[int]any{}
+				formulas[name] = map[string]string{}
+				order = append(order, name)
+			}
+			base := 0
+			for row := range grids[name] {
+				if row > base {
+					base = row
+				}
+			}
+			for rowIndex, values := range update.Rows {
+				row := base + rowIndex + 1
+				if _, exists := grids[name][row]; !exists {
+					grids[name][row] = map[int]any{}
+				}
+				for columnIndex, value := range values {
+					grids[name][row][columnIndex+1] = value
+				}
+			}
+			continue
+		}
+		// value 是「儲存格對照表」時，一筆就描述整張表：{"A1": "部門", "B1": "數量"}。
+		//
+		// 實測 20 次呼叫裡，模型反覆用這種寫法——對一份 23 列的表，要它吐出上百筆
+		// 單格項目本來就不合理，它的表達方式比較接近人的想法。形狀沒有歧義，收下。
+		if cells, ok := cellReferenceMap(update.Value); ok {
+			if _, exists := grids[name]; !exists {
+				grids[name] = map[int]map[int]any{}
+				formulas[name] = map[string]string{}
+				order = append(order, name)
+			}
+			for reference, value := range cells {
+				match := spreadsheetCellReferencePattern.FindStringSubmatch(strings.ToUpper(reference))
+				row, _ := strconv.Atoi(match[2])
+				column := columnIndexFromLetters(match[1])
+				if _, exists := grids[name][row]; !exists {
+					grids[name][row] = map[int]any{}
+				}
+				grids[name][row][column] = value
+			}
+			continue
+		}
+		// 數字定址優先：row/column 明確，不需要解析任何字串格式。
+		if update.Row > 0 && update.Column > 0 {
+			if _, exists := grids[name]; !exists {
+				grids[name] = map[int]map[int]any{}
+				formulas[name] = map[string]string{}
+				order = append(order, name)
+			}
+			if strings.TrimSpace(update.Formula) != "" {
+				formulas[name][cellReferenceFromIndexes(update.Row, update.Column)] = update.Formula
+				continue
+			}
+			if _, exists := grids[name][update.Row]; !exists {
+				grids[name][update.Row] = map[int]any{}
+			}
+			grids[name][update.Row][update.Column] = update.Value
+			continue
+		}
+		reference := strings.TrimSpace(update.Cell)
+		// 有些模型會自創「工作表/列/欄」這種寫法（實測看過 "sheet0/1/1"）。
+		// 這個形狀沒有歧義，直接支援比讓它反覆重試划算。
+		if parts := strings.Split(reference, "/"); len(parts) == 3 {
+			row, rowErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+			column, columnErr := strconv.Atoi(strings.TrimSpace(parts[2]))
+			if rowErr == nil && columnErr == nil && row > 0 && column > 0 {
+				if qualifier := strings.TrimSpace(parts[0]); qualifier != "" && strings.TrimSpace(update.Sheet) == "" {
+					name = qualifier
+				}
+				reference = cellReferenceFromIndexes(row, column)
+			}
+		}
+		if separator := strings.LastIndex(reference, "!"); separator >= 0 {
+			qualifier := strings.Trim(strings.TrimSpace(reference[:separator]), "'")
+			reference = strings.TrimSpace(reference[separator+1:])
+			if strings.TrimSpace(update.Sheet) == "" && qualifier != "" {
+				name = qualifier
+			}
+		}
+		reference = strings.ToUpper(reference)
+		match := spreadsheetCellReferencePattern.FindStringSubmatch(reference)
+		if match == nil {
+			// 錯誤訊息要把可用的寫法講完，模型才修得回來。
+			return nil, fmt.Errorf(`cell_updates[%d]: 位置無法解析（cell=%q）。可用寫法：cell 為 "A1" 或 "Sheet1!A1"；或用 row 與 column（皆為 1 起算的整數）；或 value 直接給儲存格對照表 {"A1": "部門", "B1": "數量"}`, index, update.Cell)
+		}
+		column := columnIndexFromLetters(match[1])
+		row, err := strconv.Atoi(match[2])
+		if err != nil || row < 1 {
+			return nil, fmt.Errorf("cell_updates[%d]: cell %q is not a valid reference such as A1", index, update.Cell)
+		}
+		if _, exists := grids[name]; !exists {
+			grids[name] = map[int]map[int]any{}
+			formulas[name] = map[string]string{}
+			order = append(order, name)
+		}
+		if strings.TrimSpace(update.Formula) != "" {
+			formulas[name][reference] = update.Formula
+			continue
+		}
+		if _, exists := grids[name][row]; !exists {
+			grids[name][row] = map[int]any{}
+		}
+		grids[name][row][column] = update.Value
+	}
+	sheets := make([]spreadsheetSheet, 0, len(order))
+	for _, name := range order {
+		grid := grids[name]
+		maxRow, maxColumn := 0, 0
+		for row, columns := range grid {
+			if row > maxRow {
+				maxRow = row
+			}
+			for column := range columns {
+				if column > maxColumn {
+					maxColumn = column
+				}
+			}
+		}
+		rows := make([][]any, 0, maxRow)
+		for row := 1; row <= maxRow; row++ {
+			values := make([]any, maxColumn)
+			for column := 1; column <= maxColumn; column++ {
+				if cell, exists := grid[row][column]; exists {
+					values[column-1] = cell
+				}
+			}
+			rows = append(rows, values)
+		}
+		sheet := spreadsheetSheet{Name: name, Rows: rows}
+		if len(formulas[name]) > 0 {
+			sheet.Formulas = formulas[name]
+		}
+		sheets = append(sheets, sheet)
+	}
+	return sheets, nil
+}
+
+// cellReferenceMap 判斷 value 是不是「儲存格參照 → 內容」的對照表。
+// 必須每一個鍵都是合法的儲存格參照，才不會把一般的巢狀資料誤判成表格。
+func cellReferenceMap(value any) (map[string]any, bool) {
+	cells, ok := value.(map[string]any)
+	if !ok || len(cells) == 0 {
+		return nil, false
+	}
+	for reference := range cells {
+		if !spreadsheetCellReferencePattern.MatchString(strings.ToUpper(strings.TrimSpace(reference))) {
+			return nil, false
+		}
+	}
+	return cells, true
+}
+
+// cellReferenceFromIndexes 把 1 起算的列欄號轉回 A1 標記。
+func cellReferenceFromIndexes(row, column int) string {
+	letters := ""
+	for value := column; value > 0; value = (value - 1) / 26 {
+		letters = string(rune('A'+(value-1)%26)) + letters
+	}
+	return fmt.Sprintf("%s%d", letters, row)
+}
+
+// columnIndexFromLetters 把 A、B…Z、AA 轉成 1 起算的欄號。
+func columnIndexFromLetters(letters string) int {
+	index := 0
+	for _, value := range strings.ToUpper(letters) {
+		index = index*26 + int(value-'A') + 1
+	}
+	return index
+}
+
 func createXLSX(ctx context.Context, request documentCreateRequest) (authoredDocument, error) {
+	// 沒有 sheets 但有 cell_updates 時，用儲存格內容組出工作表。
+	//
+	// cell_updates 原本是給「編輯既有活頁簿」用的，但模型很自然會用儲存格的語言
+	// 描述一份新表（{"sheet":"設備清單","cell":"A1","value":"總覽"}）。意圖完全明確：
+	// 工作表名稱、位置、內容都給齊了。因為欄位名稱不同就拒絕，只會讓它一直重試——
+	// 實測連續失敗到被 loop guard 擋下，最後回使用者「XLSX 工具呼叫失敗」。
+	if len(request.Sheets) == 0 && len(request.CellUpdates) > 0 {
+		sheets, err := sheetsFromCellUpdates(request.CellUpdates)
+		if err != nil {
+			return authoredDocument{}, err
+		}
+		request.Sheets = sheets
+		request.CellUpdates = nil
+	}
 	if len(request.Sheets) == 0 {
-		return authoredDocument{}, fmt.Errorf("XLSX requires at least one sheet")
+		return authoredDocument{}, fmt.Errorf("XLSX requires at least one sheet: provide sheets (name plus rows), or cell_updates with sheet, cell and value")
 	}
 	entries := map[string][]byte{
 		"_rels/.rels":       rootRelationships("xl/workbook.xml"),

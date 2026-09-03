@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -478,4 +479,224 @@ func decodeJSONObject(content string) (map[string]any, error) {
 		return nil, fmt.Errorf("input must contain exactly one JSON object")
 	}
 	return result, nil
+}
+
+// toolArgumentsLeak 判斷模型是不是把工具「參數」當成回答輸出，而不是實際呼叫工具。
+//
+// 原生工具呼叫模式下，Harness 只認 tool_calls 欄位；模型若把參數寫進 content，
+// 這一輪就會被當成最終回答，使用者畫面上出現的是一整片 JSON。實測就是這樣：
+// 使用者要一份 Excel，收到的是幾百個 {"cell":"A1","sheet":"設備清單","value":...}。
+//
+// 判定刻意保守——內容必須是合法 JSON，而且形狀要對得上某個可用工具的 schema
+// （物件對上工具參數、陣列對上某個 array 參數的 items），並且要涵蓋該處的必填欄位。
+// 使用者本來就要求輸出 JSON 的情況不該被誤判成協定錯誤。
+func toolArgumentsLeak(content string, definitions []domain.ToolDefinition) string {
+	trimmed := stripJSONFence(strings.TrimSpace(content))
+	if trimmed == "" {
+		return ""
+	}
+	for _, candidate := range leakCandidates(trimmed) {
+		if name := matchToolArgumentShape(candidate, definitions); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+// leakCandidates 取出內容裡可能是工具參數的 JSON 片段。
+//
+// 模型不一定只吐 JSON：實測看過「[] AI Agent [{"text":"設備狀況總覽表",...}]」，
+// 前面帶著雜訊。整段解析必然失敗，那一大片參數就當成答案顯示出來了。
+// 因此除了整段之外，也掃出內嵌的平衡括號片段逐一比對。
+func leakCandidates(trimmed string) []string {
+	candidates := []string{trimmed}
+	for _, opener := range []byte{'[', '{'} {
+		for offset := 0; offset < len(trimmed); {
+			index := strings.IndexByte(trimmed[offset:], opener)
+			if index < 0 {
+				break
+			}
+			start := offset + index
+			span := balancedJSONSpan(trimmed[start:])
+			if span == "" {
+				offset = start + 1
+				continue
+			}
+			// 太短的片段（例如空陣列）只會製造誤判。
+			if len(span) >= 40 {
+				candidates = append(candidates, span)
+			}
+			offset = start + len(span)
+		}
+	}
+	return candidates
+}
+
+// balancedJSONSpan 從開頭的 [ 或 { 取出平衡的 JSON 片段。
+func balancedJSONSpan(content string) string {
+	if content == "" || (content[0] != '[' && content[0] != '{') {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for index := 0; index < len(content); index++ {
+		character := content[index]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case character == '\\':
+				escaped = true
+			case character == '"':
+				inString = false
+			}
+			continue
+		}
+		switch character {
+		case '"':
+			inString = true
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+			if depth == 0 {
+				return content[:index+1]
+			}
+		}
+	}
+	return ""
+}
+
+func matchToolArgumentShape(candidate string, definitions []domain.ToolDefinition) string {
+	var decoded any
+	if err := json.Unmarshal([]byte(candidate), &decoded); err != nil {
+		return ""
+	}
+	switch value := decoded.(type) {
+	case map[string]any:
+		for _, definition := range definitions {
+			if schemaCoversKeys(definition.InputSchema, objectKeys(value)) {
+				return definition.Name
+			}
+		}
+	case []any:
+		keys := arrayElementKeys(value)
+		if len(keys) == 0 {
+			return ""
+		}
+		for _, definition := range definitions {
+			properties, ok := definition.InputSchema["properties"].(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, property := range properties {
+				item, ok := property.(map[string]any)
+				if !ok || !strings.EqualFold(schemaTypeName(item), "array") {
+					continue
+				}
+				if items, ok := item["items"].(map[string]any); ok && schemaCoversKeys(items, keys) {
+					return definition.Name
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// schemaCoversKeys 回報這組鍵是否正好落在 schema 宣告的欄位內，且涵蓋必填欄位。
+func schemaCoversKeys(schema map[string]any, keys []string) bool {
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok || len(properties) == 0 || len(keys) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if _, exists := properties[key]; !exists {
+			return false
+		}
+	}
+	// 必填欄位只要對上一個就算數，不要求全到齊。
+	//
+	// 一度要求全部必填欄位都出現，結果實測漏掉了真實案例：模型印出的是
+	// {"cell":"sheet0/1/1","value":"設備狀況報告"}，少了 schema 標為必填的 sheet，
+	// 於是判定不成立，那一大片 JSON 就當成答案顯示給使用者。參數不完整仍然是參數。
+	required := schemaRequiredNames(schema)
+	if len(required) > 0 {
+		for _, name := range required {
+			if schemaKeyPresent(keys, name) {
+				return true
+			}
+		}
+		return false
+	}
+	// 沒有必填欄位的 schema 太容易被任意 JSON 命中，要求至少對上兩個欄位。
+	return len(keys) >= 2
+}
+
+func schemaRequiredNames(schema map[string]any) []string {
+	switch declared := schema["required"].(type) {
+	case []string:
+		return declared
+	case []any:
+		names := make([]string, 0, len(declared))
+		for _, item := range declared {
+			if text, ok := item.(string); ok {
+				names = append(names, text)
+			}
+		}
+		return names
+	}
+	return nil
+}
+
+func schemaTypeName(schema map[string]any) string {
+	switch declared := schema["type"].(type) {
+	case string:
+		return declared
+	case []any:
+		for _, item := range declared {
+			if text, ok := item.(string); ok && !strings.EqualFold(text, "null") {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func schemaKeyPresent(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func objectKeys(value map[string]any) []string {
+	keys := make([]string, 0, len(value))
+	for key := range value {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// arrayElementKeys 取陣列元素的鍵集合；元素必須全部是物件，否則不算工具參數。
+func arrayElementKeys(values []any) []string {
+	seen := map[string]bool{}
+	for _, item := range values {
+		object, ok := item.(map[string]any)
+		if !ok {
+			return nil
+		}
+		for key := range object {
+			seen[key] = true
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

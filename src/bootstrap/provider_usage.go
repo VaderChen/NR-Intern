@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -11,6 +12,23 @@ const (
 	providerUsageRefreshTimeout     = 30 * time.Second
 	providerUsageRefreshConcurrency = 4
 )
+
+// startModelLimitDiscovery 在啟動後向各 Provider 問一次模型限制。
+//
+// context window 是 Harness 決定何時壓縮的依據，未宣告時會退回 256K 的後備預算，
+// 對本機模型等於永遠不壓縮。多數相容服務會在模型目錄回報這個值，開機問一次就好，
+// 不必要求使用者自己去進階設定裡填。問不到只記一行 WARN，不影響啟動。
+func (r *Runtime) startModelLimitDiscovery() {
+	if r == nil || r.Model == nil {
+		return
+	}
+	logger := slog.Default().With("service", r.Config.ServiceName)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		r.Model.DiscoverModelLimits(ctx, logger)
+	}()
+}
 
 // startProviderUsageRefresher 在後端啟動後立即查詢一次，之後固定在背景更新。
 func (r *Runtime) startProviderUsageRefresher() {

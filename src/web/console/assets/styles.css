@@ -256,11 +256,9 @@ small { color: var(--muted); }
 .session:hover { border-color: transparent; background: transparent; }
 .session span, .session small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session small { font-size: 10px; opacity: .75; }
-.session-run-indicator { display: none; flex: none; align-items: center; gap: 3px; margin-right: 7px; color: var(--accent); }
-.session-row.running .session-run-indicator { display: flex; }
-.session-run-indicator i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: .25; animation: session-running-wave 1.15s ease-in-out infinite; }
-.session-run-indicator i:nth-child(2) { animation-delay: .14s; }
-.session-run-indicator i:nth-child(3) { animation-delay: .28s; }
+/* 側欄用轉圈：它跟狀態列的三點同時出現在畫面上，兩個一樣的動畫分不出誰在說什麼。 */
+.session-run-indicator { display: none; width: 11px; height: 11px; flex: none; box-sizing: border-box; margin-right: 7px; border: 1.5px solid var(--accent-soft); border-top-color: var(--accent); border-radius: 50%; animation: session-running-spin .8s linear infinite; }
+.session-row.running .session-run-indicator { display: block; }
 .pin-button { visibility: hidden; margin-right: 3px; color: var(--muted); }
 .session-row:hover .pin-button, .pin-button.pinned { visibility: visible; }
 .pin-button.pinned { color: var(--accent); }
@@ -361,7 +359,19 @@ small { color: var(--muted); }
 .empty-state p { margin: 0; color: var(--muted); }
 .empty-icon { display: grid; width: 58px; height: 58px; place-items: center; margin: auto; border: 1px solid var(--empty-border); border-radius: 18px; color: var(--accent); background: var(--empty-background); font-size: 30px; }
 /* 底部留白比上方多：最後一則訊息貼著輸入框時很難閱讀，捲到底也看不出「已經到底了」。 */
-.messages { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 28px max(24px, calc((100% - 820px) / 2)) 72px; scroll-behavior: smooth; }
+/* 左側 padding 要讓得出導覽軌的寬度：視窗窄的時候原本的 24px 會讓刻度壓到文字上。 */
+.messages { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 28px max(24px, calc((100% - 820px) / 2)) 72px; padding-left: max(40px, calc((100% - 820px) / 2)); scroll-behavior: smooth; }
+/* 段落導覽軌：一則提問一個刻度，長對話可以直接跳回某一次的問題。
+   位置貼在對話區左緣，不佔訊息欄寬度。 */
+.message-milestones { position: absolute; z-index: 20; top: 50%; left: 12px; display: flex; max-height: min(60vh, 420px); flex-direction: column; gap: 5px; overflow: hidden auto; padding: 4px 3px; transform: translateY(-50%); scrollbar-width: none; }
+.message-milestones::-webkit-scrollbar { display: none; }
+.message-milestone { width: 7px; height: 2px; flex: none; padding: 0; border: 0; border-radius: 99px; background: var(--line-strong); cursor: pointer; opacity: .38; transition: width .14s ease, opacity .14s ease, background .14s ease; }
+.message-milestone:hover, .message-milestone:focus-visible { width: 11px; opacity: .9; outline: none; }
+.message-milestone.active { width: 12px; background: var(--accent); opacity: 1; }
+.message-milestone-card { position: absolute; z-index: 21; left: 40px; width: min(300px, 40vw); padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-overlay); box-shadow: 0 12px 32px var(--panel-shadow); color: var(--text); font-size: 11px; line-height: 1.6; pointer-events: none; backdrop-filter: blur(12px); }
+.message-milestone-card strong { display: block; margin-bottom: 3px; color: var(--muted); font-size: 10px; font-weight: 600; }
+.message-milestone-card span { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; }
+@media (max-width: 900px) { .message-milestones { display: none; } }
 .context-compaction-indicator { position: absolute; z-index: 25; top: 50%; left: 50%; display: inline-flex; min-height: 42px; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid var(--accent); border-radius: 999px; color: var(--text); background: var(--panel-overlay); box-shadow: 0 12px 34px var(--panel-shadow), 0 0 18px var(--focus-ring); backdrop-filter: blur(14px); pointer-events: none; transform: translate(-50%, -50%); }
 .context-compaction-spinner { width: 18px; height: 18px; flex: none; border: 2px solid var(--accent-soft); border-top-color: var(--accent); border-radius: 50%; animation: context-compaction-spin .85s linear infinite; }
 .context-compaction-indicator strong { font-size: 12px; white-space: nowrap; }
@@ -369,7 +379,7 @@ small { color: var(--muted); }
 .context-compaction-dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--accent); opacity: .25; animation: context-compaction-dot 1.05s ease-in-out infinite; }
 .context-compaction-dots i:nth-child(2) { animation-delay: .14s; }
 .context-compaction-dots i:nth-child(3) { animation-delay: .28s; }
-.message { margin: 0 0 22px; }
+.message { margin: 0 0 26px; }
 .message .content, .reasoning-content { min-width: 0; overflow-wrap: anywhere; line-height: 1.65; }
 .message .content > :first-child, .reasoning-content > :first-child { margin-top: 0; }
 .message .content > :last-child, .reasoning-content > :last-child { margin-bottom: 0; }
@@ -434,7 +444,18 @@ details[open] > .reasoning-summary::after { transform: rotate(45deg); }
 .message.tool { padding: 10px 12px; border-left: 2px solid var(--tool-border); background: var(--tool-background); color: var(--tool-text); font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
 /* 等待狀態與上下文／計畫按鈕同一列：它只是一行狀態，不需要獨佔一條橫幅。 */
 .activity { display: flex; min-width: 0; margin-right: auto; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
-.activity > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 省略號只給文字用：動畫也是 span，overflow: hidden 會把上跳的那一格裁掉。 */
+.activity > span:not(.activity-dots) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 進度動畫改放在這一列的固定位置：跟在訊息文字後面時，會像句子的一部分，
+   而且每次文字長度不同、位置就跳來跳去。 */
+/* 動畫會往上位移 5px，容器要留得下，而且不能裁切。 */
+.activity-dots { display: none; height: 16px; flex: none; align-items: flex-end; gap: 5px; overflow: visible; padding-bottom: 3px; }
+.activity.processing .activity-dots { display: flex; }
+.activity-dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .24; animation: agent-processing-wave 1.15s ease-in-out infinite; }
+.activity-dots i:nth-child(2) { animation-delay: .14s; }
+.activity-dots i:nth-child(3) { animation-delay: .28s; }
+/* 訊息內的動畫改由上面那組取代，保留 class 供狀態判斷使用。 */
+.message.assistant.processing .agent-processing { display: none; }
 .composer { display: flex; flex: none; flex-direction: column; gap: 7px; width: min(820px, calc(100% - 48px)); margin: 0 auto 20px; padding: 10px; border: 1px solid var(--line-strong); border-radius: 16px; background: var(--panel-2); box-shadow: 0 12px 40px var(--composer-shadow); transition: border-color .14s ease, box-shadow .14s ease, background .14s ease; }
 .workspace.chat-drag-over .composer { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 3px var(--focus-ring), 0 12px 40px var(--composer-shadow); }
 .composer-input-row { display: flex; min-width: 0; gap: 10px; }
@@ -500,18 +521,18 @@ details[open] > .reasoning-summary::after { transform: rotate(45deg); }
   30% { opacity: 1; transform: translateY(-3px); }
 }
 
-@keyframes session-running-wave {
-  0%, 60%, 100% { opacity: .25; transform: translateY(0); }
-  30% { opacity: 1; transform: translateY(-2px); }
+@keyframes session-running-spin {
+  to { transform: rotate(360deg); }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .agent-processing span { animation: none; opacity: .55; }
   .agent-processing span:nth-child(2) { opacity: .75; }
   .agent-processing span:nth-child(3) { opacity: 1; }
-  .session-run-indicator i { animation: none; opacity: .55; }
-  .session-run-indicator i:nth-child(2) { opacity: .75; }
-  .session-run-indicator i:nth-child(3) { opacity: 1; }
+  .activity-dots i { animation: none; opacity: .55; }
+  .activity-dots i:nth-child(2) { opacity: .75; }
+  .activity-dots i:nth-child(3) { opacity: 1; }
+  .session-run-indicator { animation: none; border-color: var(--accent); }
   .context-usage-trigger.is-compacting, .context-compaction-spinner, .context-compaction-dots i { animation: none; }
   .context-compaction-spinner { border-color: var(--accent); }
 }
@@ -574,6 +595,22 @@ summary { cursor: pointer; color: var(--muted); }
 .save-state { color: var(--accent); font-size: 11px; }
 .check-label { display: flex !important; grid-template-columns: none; flex-direction: row; align-items: center; gap: 8px !important; }
 .check-label input { width: auto; }
+/* 開關：設定是「開著還是關著」，勾選框要多看一眼才知道，開關一眼就知道。 */
+/* 尺寸與配色刻意與 .switch-track 完全一致：畫面上不該出現兩種長得不一樣的開關。 */
+.check-label input[type="checkbox"] { position: relative; flex: none; width: 34px; height: 20px; margin: 0; border: 1px solid var(--line-strong); border-radius: 99px; background: var(--panel-3); appearance: none; -webkit-appearance: none; cursor: pointer; transition: border-color .16s ease, background .16s ease; }
+.check-label input[type="checkbox"]::after { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--panel); box-shadow: 0 1px 3px rgb(0 0 0 / .24); content: ""; transition: transform .16s ease; }
+.check-label input[type="checkbox"]:checked { border-color: var(--accent); background: var(--accent); }
+.check-label input[type="checkbox"]:checked::after { transform: translateX(14px); }
+.check-label input[type="checkbox"]:disabled { cursor: not-allowed; opacity: .5; }
+.check-label input[type="checkbox"]:focus-visible { box-shadow: 0 0 0 3px var(--focus-ring); }
+/* 複選清單與一次性確認維持勾選框：開關表達「開著或關著的模式」，
+   挑選項目或確認一次動作都不是模式，畫成開關反而讀錯。 */
+.check-label.plain-check input[type="checkbox"] { width: auto; height: auto; border: 0; border-radius: 0; background: none; appearance: auto; -webkit-appearance: auto; }
+.check-label.plain-check input[type="checkbox"]::after { content: none; }
+/* 設定列：說明在左、開關靠右，一整欄的開關才會對齊在同一條垂直線上，
+   掃一眼就知道哪些開著。DOM 順序維持 input 在前，點標籤切換與朗讀順序都不變，
+   只用 row-reverse 調整視覺位置。複選清單不適用：那是挑項目，不是設定列。 */
+.check-label:not(.plain-check) { width: 100%; flex-direction: row-reverse; justify-content: space-between; }
 .tool-list, .audit-list { display: grid; gap: 8px; }
 .tool-item, .audit-item { padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
 .tool-item > div, .audit-item > div { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -607,6 +644,12 @@ summary { cursor: pointer; color: var(--muted); }
 .switch-label input:focus-visible + .switch-track { box-shadow: 0 0 0 3px var(--focus-ring); }
 .switch-label input:disabled + .switch-track { opacity: .5; }
 .switch-label.switch-disabled { cursor: not-allowed; }
+/* 開關一律是那一列最右邊的元素。這兩個標題列的 DOM 是「軌道在前、文字在後」，
+   用 order 調整視覺順序即可，不必改標記，點擊與朗讀順序都不變。 */
+.switch-label.switch-trailing .switch-track { order: 2; }
+/* 擷取選單只有一列，同樣是說明在左、開關靠右。 */
+.screen-capture-toggle { width: 100%; justify-content: space-between; }
+.screen-capture-toggle .toggle-switch { order: 2; }
 .provider-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; }
 .provider-field-grid > label { display: grid; gap: 5px; margin: 8px 0; color: var(--muted); }
 .provider-field-grid input:not([type="checkbox"]), .provider-field-grid select { height: 42px; min-height: 42px; padding: 9px 10px; border-radius: 9px; font-size: 14px; line-height: 1.4; }
@@ -735,6 +778,13 @@ dialog label { display: grid; gap: 5px; margin: 13px 0; color: var(--muted); }
 .settings-fieldset .check-label { margin-bottom: 8px; }
 .settings-fieldset .hint { margin: 0; }
 .sandbox-fieldset legend { padding: 0 6px; color: var(--text); font-weight: 750; }
+/* 實驗性功能卡片：說明比開關本身重要，開關只是「之後會怎麼運作」的入口。 */
+.experimental-badge { margin-left: 7px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 10px; font-weight: 600; vertical-align: middle; }
+.experimental-detail { margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--line); }
+.experimental-detail h3 { margin: 0 0 5px; color: var(--text); font-size: 11px; font-weight: 700; letter-spacing: .02em; }
+.experimental-detail h3:not(:first-child) { margin-top: 12px; }
+.experimental-detail ul { margin: 0; padding-left: 17px; color: var(--muted); font-size: 11px; line-height: 1.65; }
+.experimental-detail strong { color: var(--text); font-weight: 650; }
 .sandbox-fieldset .hint { margin: 0 0 10px; }
 .folder-picker { display: flex; min-height: 72px; align-items: center; justify-content: center; gap: 10px; border-style: dashed; }
 .folder-picker > span:last-child { display: grid; text-align: left; }

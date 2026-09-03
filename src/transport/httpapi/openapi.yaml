@@ -67,6 +67,26 @@ paths:
           content:
             application/zip: { schema: { type: string, format: binary } }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/config-bundle:
+    get:
+      summary: 下載設定包（Provider、MCP、反向代理與服務設定）
+      description: >-
+        只收錄 data_dir 已存在的 providers.json、mcp-servers.json、netpass.json、service-settings.json
+        與產生的 manifest.json，不含對話、附件、OAuth token 檔或環境變數。
+        依秘密欄位名稱清除字串或字串陣列，Header／environment／env 物件的值清為空字串；
+        manifest.json 列出被遮蔽的欄位。URL、帳號、路徑與命令列參數仍可能含敏感資料，分享前須人工檢查。
+        此端點只有匯出，不可交給安全備份還原端點匯入。
+      responses:
+        "200":
+          description: 設定 ZIP 壓縮檔；即使沒有設定檔仍含 manifest.json。
+          headers:
+            Content-Disposition:
+              description: 建議下載檔名。
+              schema: { type: string, example: 'attachment; filename="nr-intern-config.zip"' }
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/admin/restore:
     post:
       summary: 還原安全備份
@@ -1475,9 +1495,10 @@ components:
           maximum: 10000
           description: 單次工作工具呼叫上限；0 表示不限制。
         http_fetch: { $ref: "#/components/schemas/HTTPFetchSettings" }
-        extended_tools: { type: boolean, description: 關閉時只公開精簡工具集；工具目錄的檢索另由 tool_retrieval 控制。 }
+        extended_tools: { type: boolean, description: 預設 false。精簡集合已含文件檢視、讀取、建立與轉換；編輯、SSH、記憶等工具需擴充集合，仍受 allowlist 限制。工具檢索另由 tool_retrieval 控制。 }
         tool_call_mode: { type: string, enum: [native, instruction], description: native 使用 Provider 的 tool_calls 欄位；Provider 不支援時才用 instruction。 }
         tool_retrieval: { type: boolean, description: 預設 true。工具目錄先經檢索，只有與本次需求相關的工具進入提示（內建工具與 MCP 工具都適用）；其餘工具仍可由模型以 find_tools 取回後直接呼叫。關閉後整份目錄會進入每一次請求。 }
+        memory_space: { type: boolean, default: false, description: 實驗性功能，目前只保存開關，不改變既有長期記憶行為。共享與淘汰機制尚未實作，設計見 docs/ai-agent/MEMORY_SPACE.md。 }
     HTTPFetchSettings:
       type: object
       required: [enabled, allow_private_networks]
@@ -1500,6 +1521,7 @@ components:
         extended_tools: { type: boolean, description: 省略時保留目前設定。 }
         tool_call_mode: { type: string, enum: [native, instruction], description: 省略時保留目前設定。 }
         tool_retrieval: { type: boolean, description: 省略時保留目前設定。 }
+        memory_space: { type: boolean, description: 省略時保留目前設定；只保存開關，尚未啟用共享記憶機制。 }
     ProviderSettings:
       type: object
       required: [default_provider_id, providers]

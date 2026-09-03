@@ -2,6 +2,7 @@ package documents
 
 import (
 	"AgenticService/src/domain"
+	"AgenticService/src/internal/logging"
 	"AgenticService/src/tools"
 	"archive/zip"
 	"bytes"
@@ -180,5 +181,306 @@ func writeMinimalPDF(t *testing.T, filePath, text string) {
 	fmt.Fprintf(&output, "trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, xref)
 	if err := os.WriteFile(filePath, output.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// 使用者說「轉成 Excel」時，產出必須是真的能打開、而且中文正確的 .xlsx。
+// 這條路徑先前不在預設工具集裡，Agent 只能用 shell 寫 CSV，Excel 打開是亂碼。
+func TestDocumentCreateWritesReadableChineseXLSX(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path":   "設備狀況.xlsx",
+		"format": "xlsx",
+		"title":  "設備狀況",
+		"sheets": []any{map[string]any{
+			"name":        "設備",
+			"header_rows": 1,
+			"rows": []any{
+				[]any{"部門", "設備代碼", "設備名稱", "稼動"},
+				[]any{"雷雕部門", "MA-01", "雷雕機一號", 1},
+				[]any{"組裝區", "CNC01_01", "銑床", 1},
+			},
+		}},
+	})
+	if create.IsError {
+		t.Fatalf("document_create failed: %s", create.Content)
+	}
+
+	filePath := filepath.Join(root, "設備狀況.xlsx")
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat created workbook: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("created workbook is empty")
+	}
+	// 真的是 OpenXML 容器，不是改了副檔名的 CSV。
+	archive, err := zip.OpenReader(filePath)
+	if err != nil {
+		t.Fatalf("created file is not a valid xlsx container: %v", err)
+	}
+	_ = archive.Close()
+
+	// 讀回來確認中文沒有壞掉。
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備狀況.xlsx", "section": "設備", "start_row": 1, "end_row": 3,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"部門", "設備代碼", "雷雕機一號", "MA-01"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing from the workbook: %s", want, read.Content)
+		}
+	}
+}
+
+// 端對端：模型把 sheets 整個字串化送進來時，document_create 仍要能產出檔案。
+// 這是實測 transcript 裡連續失敗的形狀。
+func TestDocumentCreateAcceptsStringifiedSheets(t *testing.T) {
+	root := t.TempDir()
+	registry, err := tools.NewRegistry(tools.RegistryConfig{
+		AllowElevated: true,
+		Permissions:   domain.PermissionPolicy{DefaultProfile: domain.DefaultPermissionProfile, ElevatedProfiles: []string{domain.DefaultPermissionProfile}},
+		Logger:        logging.Discard(),
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	if err := registry.Register(NewCreateTool(2*1024*1024, 8*1024*1024)); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	session := domain.Session{ID: "session_test", PermissionProfile: domain.DefaultPermissionProfile,
+		Metadata: map[string]any{"workspace_root": root}}
+
+	result, err := registry.Execute(context.Background(), session, domain.ToolCall{
+		ID:   "call_1",
+		Name: "document_create",
+		Arguments: map[string]any{
+			"path":   "設備狀況.xlsx",
+			"format": "xlsx",
+			"sheets": `[{"name":"設備","rows":[["部門","代碼"],["CNC","MC0002"]]}]`,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("document_create rejected stringified sheets: %s", result.Content)
+	}
+	if _, err := os.Stat(filepath.Join(root, "設備狀況.xlsx")); err != nil {
+		t.Fatalf("workbook was not written: %v", err)
+	}
+}
+
+// 模型描述新表格時很自然會用儲存格的語言，而不是 sheets/rows。
+// 實測就是這樣連續失敗到被 loop guard 擋下，最後回使用者「XLSX 工具呼叫失敗」。
+func TestDocumentCreateBuildsSheetsFromCellUpdates(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path":   "設備狀況.xlsx",
+		"format": "xlsx",
+		"cell_updates": []any{
+			map[string]any{"sheet": "設備清單", "cell": "A1", "value": "設備狀況總覽表"},
+			map[string]any{"sheet": "設備清單", "cell": "A2", "value": "部門"},
+			map[string]any{"sheet": "設備清單", "cell": "B2", "value": "設備代碼"},
+			map[string]any{"sheet": "設備清單", "cell": "A3", "value": "CNC"},
+			map[string]any{"sheet": "設備清單", "cell": "B3", "value": "MC0002"},
+			map[string]any{"sheet": "統計", "cell": "A1", "value": "總計"},
+			map[string]any{"sheet": "統計", "cell": "B1", "value": 23},
+		},
+	})
+	if create.IsError {
+		t.Fatalf("document_create rejected cell_updates: %s", create.Content)
+	}
+
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備狀況.xlsx", "section": "設備清單", "start_row": 1, "end_row": 3,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"設備狀況總覽表", "設備代碼", "MC0002"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing from the first sheet: %s", want, read.Content)
+		}
+	}
+	// 第二張工作表也要建出來。
+	second := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備狀況.xlsx", "section": "統計", "start_row": 1, "end_row": 1,
+	})
+	if second.IsError || !strings.Contains(second.Content, "總計") {
+		t.Fatalf("the second sheet was not created: error=%v content=%s", second.IsError, second.Content)
+	}
+}
+
+// 模型會用 Excel 的完整寫法 Sheet1!A1。實測因為只接受 A1 而被拒絕，
+// 模型改對之後又被 loop guard 擋下，最後用 shell 寫出一個空殼檔案交差。
+func TestDocumentCreateAcceptsQualifiedCellReferences(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path": "設備狀況.xlsx", "format": "xlsx",
+		"cell_updates": []any{
+			map[string]any{"cell": "設備清單!A1", "value": "設備狀況總覽"},
+			map[string]any{"cell": "'設備清單'!B1", "value": "部門"},
+			map[string]any{"cell": "A2", "sheet": "設備清單", "value": "CNC"},
+		},
+	})
+	if create.IsError {
+		t.Fatalf("qualified references were rejected: %s", create.Content)
+	}
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備狀況.xlsx", "section": "設備清單", "start_row": 1, "end_row": 2,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"設備狀況總覽", "部門", "CNC"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing: %s", want, read.Content)
+		}
+	}
+}
+
+// 儲存格參照錯誤要明確回報，不能默默產出一份空表。
+func TestDocumentCreateRejectsBadCellReference(t *testing.T) {
+	root := t.TempDir()
+	result := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path": "壞的.xlsx", "format": "xlsx",
+		"cell_updates": []any{map[string]any{"sheet": "S", "cell": "第一格", "value": 1}},
+	})
+	if !result.IsError || !strings.Contains(result.Content, "A1") {
+		t.Fatalf("a bad cell reference was not reported clearly: error=%v content=%s", result.IsError, result.Content)
+	}
+}
+
+// 模型不一定用 A1 標記法。實測看過自創的 "sheet0/1/1"，也可能改用數字欄位。
+// 兩種都要能建出正確的表，否則就是又一輪重試到被擋下。
+func TestDocumentCreateAcceptsNumericAndSlashCellAddressing(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path": "設備.xlsx", "format": "xlsx",
+		"cell_updates": []any{
+			map[string]any{"cell": "設備清單/1/1", "value": "設備狀況報告"},
+			map[string]any{"cell": "設備清單/1/2", "value": "設備分佈總覽"},
+			map[string]any{"sheet": "設備清單", "row": 2, "column": 1, "value": "CNC"},
+			map[string]any{"sheet": "設備清單", "row": 2, "column": 2, "value": "MC0002"},
+		},
+	})
+	if create.IsError {
+		t.Fatalf("numeric or slash addressing was rejected: %s", create.Content)
+	}
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備.xlsx", "section": "設備清單", "start_row": 1, "end_row": 2,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"設備狀況報告", "設備分佈總覽", "CNC", "MC0002"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing: %s", want, read.Content)
+		}
+	}
+}
+
+// 實測 20 次 document_create 呼叫裡反覆出現的寫法：一筆描述一整張表，
+// value 是「儲存格參照 → 內容」的對照表。對 23 列的表要求上百筆單格項目並不合理。
+func TestDocumentCreateAcceptsCellReferenceMap(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path": "設備總覽.xlsx", "format": "xlsx", "title": "設備狀況",
+		"cell_updates": []any{
+			map[string]any{"sheet": "設備總覽", "value": map[string]any{
+				"A1": "部門", "B1": "設備數量", "C1": "設備代碼",
+				"A2": "BOM 整合測試部", "B2": 4, "C2": "TST-BOMCASE-MC-PACK",
+				"A3": "CNC", "B3": 6, "C3": "MC0002",
+			}},
+		},
+	})
+	if create.IsError {
+		t.Fatalf("the cell-reference map was rejected: %s", create.Content)
+	}
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備總覽.xlsx", "section": "設備總覽", "start_row": 1, "end_row": 3,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"部門", "設備數量", "BOM 整合測試部", "MC0002"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing from the workbook: %s", want, read.Content)
+		}
+	}
+}
+
+// 一般的巢狀資料不能被誤判成儲存格對照表。
+func TestDocumentCreateRejectsNonCellMaps(t *testing.T) {
+	root := t.TempDir()
+	result := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "壞的.xlsx", map[string]any{
+		"path": "壞的.xlsx", "format": "xlsx",
+		"cell_updates": []any{map[string]any{"sheet": "S", "value": map[string]any{"columns": []any{"部門"}}}},
+	})
+	if !result.IsError {
+		t.Fatal("a nested data structure was silently treated as a cell map")
+	}
+	if !strings.Contains(result.Content, "A1") {
+		t.Fatalf("the error must teach the accepted shapes: %s", result.Content)
+	}
+}
+
+// 四種位置寫法混在同一次呼叫裡也要各走各的路：逐筆偵測形狀，不是全域二選一。
+func TestDocumentCreateRoutesMixedCellShapes(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path": "混用.xlsx", "format": "xlsx",
+		"cell_updates": []any{
+			map[string]any{"sheet": "設備", "value": map[string]any{"A1": "部門", "B1": "數量"}}, // 儲存格對照表
+			map[string]any{"sheet": "設備", "cell": "A2", "value": "CNC"},                    // A1
+			map[string]any{"cell": "設備!B2", "value": 6},                                    // Sheet!A1
+			map[string]any{"sheet": "設備", "row": 3, "column": 1, "value": "雷雕"},            // row/column
+			map[string]any{"cell": "設備/3/2", "value": 3},                                   // 工作表/列/欄
+		},
+	})
+	if create.IsError {
+		t.Fatalf("mixed cell shapes were rejected: %s", create.Content)
+	}
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "混用.xlsx", "section": "設備", "start_row": 1, "end_row": 3,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"部門", "數量", "CNC", "雷雕"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing; a shape was not routed correctly: %s", want, read.Content)
+		}
+	}
+}
+
+// 實測：模型把整張表的 rows 放進了 cell_updates。內容完全正確，只是放錯欄位。
+func TestDocumentCreateAcceptsSheetRowsInsideCellUpdates(t *testing.T) {
+	root := t.TempDir()
+	create := executeDocumentTool(t, NewCreateTool(2*1024*1024, 8*1024*1024), root, "document_create", map[string]any{
+		"path": "設備.xlsx", "format": "xlsx",
+		"cell_updates": []any{
+			map[string]any{"sheet": "設備分佈總覽", "rows": []any{
+				[]any{"設備名稱", "設備代碼", "部門"},
+				[]any{"BOM 測試包裝設備", "TST-BOMCASE-MC-PACK", "BOM 整合測試部"},
+			}},
+		},
+	})
+	if create.IsError {
+		t.Fatalf("sheet rows inside cell_updates were rejected: %s", create.Content)
+	}
+	read := executeDocumentTool(t, NewReadTool(2*1024*1024, 64*1024), root, "document_read", map[string]any{
+		"path": "設備.xlsx", "section": "設備分佈總覽", "start_row": 1, "end_row": 2,
+	})
+	if read.IsError {
+		t.Fatalf("document_read failed: %s", read.Content)
+	}
+	for _, want := range []string{"設備名稱", "TST-BOMCASE-MC-PACK", "BOM 整合測試部"} {
+		if !strings.Contains(read.Content, want) {
+			t.Fatalf("%q missing: %s", want, read.Content)
+		}
 	}
 }

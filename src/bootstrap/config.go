@@ -72,6 +72,8 @@ type Config struct {
 	// LegacyMCPToolRetrieval 是這個開關的舊名稱。設定檔以 DisallowUnknownFields
 	// 解碼，欄位直接改名會讓既有設定檔開不起來，因此保留讀取。
 	LegacyMCPToolRetrieval *bool `json:"mcp_tool_retrieval,omitempty"`
+	// MemorySpace 是實驗性的跨對話共同記憶開關，預設關閉。
+	MemorySpace bool `json:"memory_space"`
 }
 
 type HTTPFetchConfig struct {
@@ -526,14 +528,23 @@ func validateConfig(config *Config) error {
 	return nil
 }
 
-// LeanToolNames 是精簡工具集：一個通用主機工具、最基本的讀取能力與計畫控制。
-// 其餘工具（文件處理、寫入、SSH、記憶、比較等）在管理介面打開「擴充工具集」後才公開。
-// MCP 工具由各自的 Server 設定控制，不受這個清單限制。
+// LeanToolNames 是精簡工具集：一個通用主機工具、最基本的讀取能力、辦公文件
+// 產出與計畫控制。其餘工具（寫入、編輯、SSH、記憶、比較等）在管理介面打開
+// 「擴充工具集」後才公開。MCP 工具由各自的 Server 設定控制，不受這個清單限制。
+//
+// 文件工具原本不在精簡集合裡，結果是使用者要一份 Excel，Agent 只剩 shell 可用，
+// 就寫了一個沒有 BOM 的 CSV 交差——Excel 打開是亂碼，而且那根本不是使用者要的
+// 格式。精簡集合當初是為了控制提示大小，這件事現在由工具檢索處理（目錄只帶進
+// 這一輪相關的工具），沒有必要再用「拿掉能力」來換。
 var LeanToolNames = []string{
 	"shell_exec",
 	"file_read",
 	"directory_list",
 	"file_search",
+	"document_inspect",
+	"document_read",
+	"document_create",
+	"document_convert",
 	"plan_get",
 	"plan_create",
 	"plan_step_update",

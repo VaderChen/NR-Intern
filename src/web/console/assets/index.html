@@ -180,6 +180,8 @@
         <h2>從實際行動開始</h2>
         <p>Agent 不會先固定拆解問題，而會依目前狀態、記憶與原生工具結果持續運作。</p>
       </section>
+      <nav id="messageMilestones" class="message-milestones hidden" aria-label="對話段落"></nav>
+      <div id="messageMilestoneCard" class="message-milestone-card hidden" role="tooltip" aria-hidden="true"></div>
       <section id="messages" class="messages hidden" aria-live="polite"></section>
       <section id="contextCompactionIndicator" class="context-compaction-indicator hidden" role="status" aria-live="assertive">
         <span class="context-compaction-spinner" aria-hidden="true"></span>
@@ -189,6 +191,7 @@
 
       <div class="conversation-actions">
         <section id="activity" class="activity hidden" aria-live="polite">
+          <span id="activityDots" class="activity-dots" aria-hidden="true"><i></i><i></i><i></i></span>
           <span id="activityText"></span>
           <button id="retryRun" class="small hidden" type="button">重試 Run</button>
         </section>
@@ -266,11 +269,12 @@
         <button id="overviewManagementTab" class="panel-tab active" data-panel="overview" role="tab" aria-selected="true" aria-controls="overviewPanel">一般設定</button>
         <button id="workspaceManagementTab" class="panel-tab" data-panel="workspace" role="tab" aria-selected="false" aria-controls="workspacePanel">Workspace 設定</button>
         <button id="providersManagementTab" class="panel-tab" data-panel="providers" role="tab" aria-selected="false" aria-controls="providersPanel">Provider 設定</button>
-        <button id="systemToolsManagementTab" class="panel-tab" data-panel="systemTools" role="tab" aria-selected="false" aria-controls="systemToolsPanel">系統工具</button>
         <button id="mcpManagementTab" class="panel-tab" data-panel="mcp" role="tab" aria-selected="false" aria-controls="mcpPanel">使用 MCP</button>
         <button id="reverseProxyManagementTab" class="panel-tab" data-panel="reverseProxy" role="tab" aria-selected="false" aria-controls="reverseProxyPanel">反向代理</button>
         <button id="toolSettingsManagementTab" class="panel-tab" data-panel="toolSettings" role="tab" aria-selected="false" aria-controls="toolSettingsPanel">工具設定</button>
         <button id="toolsManagementTab" class="panel-tab" data-panel="tools" role="tab" aria-selected="false" aria-controls="toolsPanel">工具列表</button>
+        <button id="experimentalManagementTab" class="panel-tab" data-panel="experimental" role="tab" aria-selected="false" aria-controls="experimentalPanel">實驗性功能</button>
+        <button id="systemToolsManagementTab" class="panel-tab" data-panel="systemTools" role="tab" aria-selected="false" aria-controls="systemToolsPanel">系統工具</button>
         <button id="permissionsManagementTab" class="panel-tab" data-panel="permissions" role="tab" aria-selected="false" aria-controls="permissionsPanel">權限中心</button>
         <button id="aboutManagementTab" class="panel-tab" data-panel="about" role="tab" aria-selected="false" aria-controls="aboutPanel">關於</button>
         <button id="auditManagementTab" class="panel-tab hidden" data-panel="audit" role="tab" aria-selected="false" aria-controls="auditPanel">稽核</button>
@@ -350,6 +354,40 @@
         <section id="noWorkspaceSettings" class="management-section quiet hidden">目前沒有可設定的 Workspace。</section>
       </div>
 
+      <div id="experimentalPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="experimentalManagementTab">
+        <form id="experimentalSettings" class="management-section">
+          <div class="section-head"><h2>實驗性功能</h2><span id="experimentalSettingsState" class="save-state"></span></div>
+          <p class="hint">這裡的功能還在設計或開發中，預設關閉。開啟後行為可能改變或被移除，正式工作請先評估風險。</p>
+          <fieldset class="settings-fieldset experimental-card">
+            <legend>回憶空間<span class="experimental-badge">尚未實作</span></legend>
+            <label class="check-label"><input id="settingMemorySpace" type="checkbox">啟用回憶空間</label>
+            <p class="hint">讓 Agent 跨對話存取共同記憶：在別的對話裡確認過的偏好、決策與作法，下一次不必重講。目前只保存開關狀態，機制尚未實作。</p>
+            <div class="experimental-detail">
+              <h3>保存與共享的條件</h3>
+              <ul>
+                <li>只收 <strong>偏好、決策、限制、作法</strong> 四類；「這個檔案有 300 行」這種事實不收，會過期而且下次查得到。</li>
+                <li>必須<strong>換一個對話、換一天仍然成立</strong>；只對這次任務成立的路徑、錯誤訊息與暫時狀態不收。</li>
+                <li>倉庫裡查得到的（程式結構、git 記錄、專案說明）不收：查一次比記一輩子便宜，而且不會過時。</li>
+                <li>密碼、金鑰、權杖與個人資料一律排除。</li>
+                <li>寫入前先比對既有記憶：重複的更新原本那筆，矛盾的建立取代關係，不會越積越多份。</li>
+              </ul>
+              <h3>調用時機</h3>
+              <ul>
+                <li>每個工作開始時檢索一次，用你這次的需求當關鍵字。</li>
+                <li>同一個工具連續失敗兩次時再檢索一次——「這個錯以前遇過」正是記憶最有價值的時候。</li>
+                <li>其餘回合不注入；Agent 仍可自行呼叫記憶查詢工具。</li>
+              </ul>
+              <h3>窗口大小與成長上限</h3>
+              <ul>
+                <li>單次注入最多 <strong>6 條、1,200 字</strong>，低於相關度門檻就完全不注入——寧可空手，不要塞雜訊。</li>
+                <li>每個共享範圍最多保留 <strong>500 條</strong>；超過時淘汰最久沒被召回、也沒被引用過的。</li>
+                <li>共享範圍預設是<strong>專案</strong>，可升級到 Workspace；不會把某個專案的內容講給另一個專案。</li>
+              </ul>
+            </div>
+          </fieldset>
+        </form>
+      </div>
+
       <div id="systemToolsPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="systemToolsManagementTab">
         <section class="management-section backend-card">
           <div class="section-head"><h2>後端程序</h2><span class="status-line"><span id="managementStatusDot" class="dot"></span><strong id="managementBackendState">檢查中</strong></span></div>
@@ -374,9 +412,10 @@
         </section>
         <section class="management-section">
           <div class="section-head"><h2>系統工具</h2><span id="adminDataState" class="save-state"></span></div>
-          <p class="hint">診斷包與備份不包含 Provider、MCP、OAuth 或 NetPass 金鑰。還原使用者資料後需要重新啟動後端。</p>
+          <p class="hint">診斷包與備份不包含 Provider、MCP、OAuth 或 NetPass 金鑰。還原使用者資料後需要重新啟動後端。設定包只含 Provider、MCP、反向代理與服務設定，不含 Workspace、專案與對話紀錄；金鑰同樣不會匯出，換一台機器後要重新輸入。</p>
           <div class="management-form-actions admin-data-actions">
             <button id="exportDiagnostics" class="ghost" type="button">下載診斷包</button>
+            <button id="downloadConfigBundle" class="ghost" type="button">下載設定包</button>
             <button id="downloadBackup" class="ghost" type="button">下載安全備份</button>
             <button id="restoreBackup" class="danger ghost" type="button">還原備份</button>
             <input id="restoreBackupFile" class="hidden" type="file" accept=".zip,application/zip">
@@ -398,7 +437,7 @@
             <div class="section-head">
               <div><h2 id="providerSettingsEditorTitle">Provider 設定</h2><p class="hint">設定儲存後會直接套用到新的模型請求。</p></div>
               <div class="provider-editor-head-actions">
-                <label id="providerSettingEnabledLabel" class="switch-label">
+                <label id="providerSettingEnabledLabel" class="switch-label switch-trailing">
                   <input id="providerSettingEnabled" type="checkbox" role="switch" aria-label="啟用 Provider">
                   <span class="switch-track" aria-hidden="true"></span>
                   <span>啟用</span>
@@ -419,7 +458,7 @@
                   <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
                   <small id="providerSettingAPIKeyState"></small>
                 </label>
-                <label id="providerSettingClearKeyRow" class="check-label hidden"><input id="providerSettingClearKey" type="checkbox">清除目前已儲存的 API Key</label>
+                <label id="providerSettingClearKeyRow" class="check-label plain-check hidden"><input id="providerSettingClearKey" type="checkbox">清除目前已儲存的 API Key</label>
               </div>
               <div id="providerOAuthFields" class="provider-field-full provider-auth-fields hidden">
                 <small>將開啟 ChatGPT 登入頁，登入與帳號選擇都在瀏覽器中完成。</small>
@@ -459,6 +498,7 @@
                 <label>Context window<input id="providerSettingContextWindow" type="number" min="0"></label>
                 <label>最大輸出 Tokens<input id="providerSettingMaxOutputTokens" type="number" min="0"></label>
               </div>
+              <p id="providerSettingLimitsHint" class="hint">填 0 表示採用 Provider 自己回報的值。</p>
             </details>
             <div class="provider-editor-actions">
               <button id="deleteProviderSetting" class="danger ghost" type="button">刪除 Provider</button>
@@ -493,7 +533,7 @@
             <div class="section-head">
               <div><h2 id="mcpSettingsEditorTitle">MCP Server 設定</h2><p class="hint">支援本機 stdio、舊版 SSE 與遠端 Streamable HTTP；儲存後會在背景建立連線。</p></div>
               <div class="provider-editor-head-actions">
-                <label class="switch-label">
+                <label class="switch-label switch-trailing">
                   <input id="mcpSettingEnabled" type="checkbox" role="switch" aria-label="啟用 MCP Server">
                   <span class="switch-track" aria-hidden="true"></span>
                   <span>啟用</span>
@@ -585,7 +625,7 @@
             <div id="mcpImportAuthMethodBar" class="mcp-import-auth-method-bar"></div>
           </div>
           <div id="mcpImportServerList" class="mcp-import-server-list"></div>
-          <label class="check-label mcp-import-overwrite"><input id="mcpImportOverwrite" type="checkbox">覆蓋相同 MCP ID 的既有設定</label>
+          <label class="check-label plain-check mcp-import-overwrite"><input id="mcpImportOverwrite" type="checkbox">覆蓋相同 MCP ID 的既有設定</label>
           <div class="dialog-actions">
             <button id="cancelMCPImport" class="ghost" type="button">取消</button>
             <button id="installMCPImport" class="primary" type="submit">確認並安裝</button>
@@ -612,7 +652,7 @@
                 <input id="reverseProxyAPIKey" type="password" autocomplete="new-password" placeholder="輸入 NetPass API Key">
                 <small id="reverseProxyAPIKeyState">API Key 不會從後端讀回；留空會保留目前設定。</small>
               </label>
-              <label id="reverseProxyClearKeyRow" class="check-label hidden"><input id="reverseProxyClearKey" type="checkbox">清除目前已儲存的 NetPass API Key</label>
+              <label id="reverseProxyClearKeyRow" class="check-label plain-check hidden"><input id="reverseProxyClearKey" type="checkbox">清除目前已儲存的 NetPass API Key</label>
             </div>
             <label>裝置名稱（選填）
               <input id="reverseProxyName" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,62}[A-Za-z0-9]" autocomplete="off" placeholder="nr-intern">
@@ -661,7 +701,7 @@
             <label class="check-label"><input id="settingExtendedTools" type="checkbox">擴充工具集</label>
             <label class="check-label"><input id="settingInstructionToolCalls" type="checkbox">改用指令模式工具呼叫</label>
             <label class="check-label"><input id="settingToolRetrieval" type="checkbox" checked>工具目錄先經檢索再進入提示</label>
-            <p class="hint">工具目錄每一輪都會整份送進提示。預設只公開精簡工具集（Shell、讀檔、列目錄、搜尋與計畫控制）；需要文件處理、寫入、SSH 或記憶工具時再開啟擴充工具集。檢索會再過濾一次：可選工具超過 12 個時，只有與這次需求相關的工具進入提示，內建工具與 MCP 工具都適用，其餘工具 Agent 仍可用 find_tools 找回來直接呼叫，沒有任何工具被停用；關閉檢索會讓整份目錄進入每一次請求，大型 MCP Server 可能讓單次請求膨脹到數萬 tokens。工具呼叫預設使用 Provider 的原生 tool_calls 欄位；Provider 不支援時才改用指令模式，由模型自行輸出 JSON 指令。</p>
+            <p class="hint">工具目錄每一輪都會整份送進提示。預設只公開精簡工具集（Shell、讀檔、列目錄、搜尋、辦公文件產出與計畫控制）；需要寫入、編輯、SSH 或記憶工具時再開啟擴充工具集。檢索會再過濾一次：可選工具超過 12 個時，只有與這次需求相關的工具進入提示，內建工具與 MCP 工具都適用，其餘工具 Agent 仍可用 find_tools 找回來直接呼叫，沒有任何工具被停用；關閉檢索會讓整份目錄進入每一次請求，大型 MCP Server 可能讓單次請求膨脹到數萬 tokens。工具呼叫預設使用 Provider 的原生 tool_calls 欄位；Provider 不支援時才改用指令模式，由模型自行輸出 JSON 指令。</p>
           </fieldset>
           <fieldset class="settings-fieldset">
             <legend>對外網路</legend>
@@ -669,9 +709,6 @@
             <label class="check-label"><input id="settingHTTPFetchPrivateNetworks" type="checkbox" checked>允許連線到 localhost 與私有網段</label>
             <p class="hint">關閉第一項後 http_fetch 會從 Agent 可用的工具清單消失，不需要重啟後端。第二項預設允許連線到 localhost、內網與雲端 metadata 位址；若不需要存取私有服務，建議關閉。</p>
           </fieldset>
-          <div class="management-form-actions">
-            <button id="saveToolSettings" class="primary" type="submit">儲存工具設定</button>
-          </div>
         </form>
       </div>
 
@@ -907,13 +944,13 @@
       <fieldset id="scheduleWeekdayField" class="schedule-weekdays hidden">
         <legend>星期</legend>
         <div class="schedule-weekday-list">
-          <label class="check-label"><input type="checkbox" data-weekday="1">週一</label>
-          <label class="check-label"><input type="checkbox" data-weekday="2">週二</label>
-          <label class="check-label"><input type="checkbox" data-weekday="3">週三</label>
-          <label class="check-label"><input type="checkbox" data-weekday="4">週四</label>
-          <label class="check-label"><input type="checkbox" data-weekday="5">週五</label>
-          <label class="check-label"><input type="checkbox" data-weekday="6">週六</label>
-          <label class="check-label"><input type="checkbox" data-weekday="0">週日</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="1">週一</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="2">週二</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="3">週三</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="4">週四</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="5">週五</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="6">週六</label>
+          <label class="check-label plain-check"><input type="checkbox" data-weekday="0">週日</label>
         </div>
       </fieldset>
       <fieldset class="sandbox-fieldset">

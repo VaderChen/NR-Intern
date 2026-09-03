@@ -107,6 +107,23 @@ Session 不屬於任何 Project，沙箱只來自該排程；路徑經 `RunInput
 
 ## Provider 與秘密
 
+### 設定包的分享邊界
+
+`GET /api/v1/admin/config-bundle` 與其他管理 API 共用 Bearer 認證，權限等同受信任的管理者。
+匯出僅讀取 `data_dir` 四種設定檔與產生的 manifest，不遍歷對話資料，也不讀 OAuth token 檔。
+這與安全備份不同：安全備份保留使用者資料；設定包保留 Provider、MCP、NetPass 與服務設定結構。
+
+秘密名稱比對會清除 API Key、token、password 等字串值與字串陣列；Header／environment／env
+物件保留鍵但清空值。數字與布林值不清除，避免誤傷 `max_tokens` 等上限。
+`manifest.json` 只記錄被遮蔽的欄位名稱，不保存其原值。
+
+**設定包不是匿名資料包，也不是任意文字的秘密掃描器。** URL 中的 userinfo／query、帳號、
+本機絕對路徑、command／args、非標準名稱的文字欄位都可能保留。金鑰應使用專用秘密欄位，
+不要嵌入 URL 或命令列；匯出檔僅供受信任管理者參考，分享前仍須人工檢查，不應直接公開。
+目前沒有設定包專用匯入流程，不能當成完整備份還原。
+
+### 憑證管理
+
 - Provider adapter 只由後端設定註冊，模型不能新增 endpoint。Workspace 只能引用已註冊 Provider ID。
 - Workspace 保存自己的 `provider_ids` 集合與其中一個 `default_provider_id`，用來提供新對話及未指定 override 時的預設值；Session／Run override 可選擇任一全域已啟用 Provider。仍被 Workspace 或 Session 引用的 Provider 不可停用或刪除。
 - Provider 管理 API 只以 `has_api_key`／`has_oauth_token` 表示憑證狀態；Diagnostics 只回傳 endpoint、協定、預設模型、串流能力與是否已設定憑證，不回傳 API Key、額外 header、access token 或 refresh token。
@@ -134,6 +151,9 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 ## 內建與 MCP 工具
 
 - 工具必須同時通過後端 allowlist 與 Session permission profile；profile 本身由上述後端策略指派。
+- 精簡工具集已包含文件建立與轉換；進入目錄或被 `find_tools` 找到不代表核准，仍須通過原有
+  Sandbox、elevated policy、輸入大小與 Approval 檢查。Schema 導向參數正規化只處理型別／格式，
+  不授予額外工具或路徑權限；MCP 參數與結果仍視為外部不受信任資料。
 - 寫檔、Shell 與 SSH 是 elevated tools；還需要 `allow_elevated_tools=true`。
 - elevated tool 在實際執行前還要經過單次人工 Approval；permission profile 是資格邊界，Approval 是本次具體參數的副作用確認，兩者不能互相取代。
 - Approval decision 必須攜帶目前 `approval_id`；後端拒絕過期或不相符的決策，避免舊 UI 操作誤套到下一個工具呼叫。
@@ -164,6 +184,13 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
   各自的 Run 紀錄。成本估算不代表 Provider 的帳單，仍應以 Provider 官方帳務為準。
 
 ## 本機資料
+
+`memory_space` 目前只持久化實驗性開關；[回憶空間設計](MEMORY_SPACE.md) 中的准入過濾、專案
+共享、召回門檻與淘汰機制尚未實作，不能當成現有資料隔離或秘密過濾保證。既有 `memory.*`
+設定與記憶 scope 規則仍獨立生效。
+
+上下文字元限制只縮減模型所見的歷史，不會清除持久化 transcript，也不是資料保留／刪除政策。
+新 `model request` 日誌只記工具名稱、訊息數與字元數，不記錄提示或參數本文。
 
 Filestore 目錄預設使用 owner/group 受限權限，記憶、Workspace 與 Project snapshot 使用 `0600`。
 Provider、OAuth、MCP 與 NetPass 的持久化秘密同樣使用權限限制檔案，且管理 API 只回傳脫敏狀態。

@@ -13,7 +13,8 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 	config := Config{AllowedTools: []string{
 		"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create",
 		"file_read", "file_search", "file_compare", "file_write", "file_edit",
-		"document_inspect", "document_read", "http_fetch", "shell_exec", "ssh_exec",
+		"document_inspect", "document_read", "document_create", "document_convert",
+		"document_edit", "http_fetch", "shell_exec", "ssh_exec",
 		"memory_search", "memory_remember", "memory_forget",
 	}}
 
@@ -22,7 +23,12 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 	if len(lean) != len(LeanToolNames) {
 		t.Fatalf("lean set = %v, want %v", lean, LeanToolNames)
 	}
-	for _, name := range []string{"file_write", "ssh_exec", "document_read", "memory_remember", "http_fetch"} {
+	// 文件產出留在精簡集合裡：使用者說「給我 Excel」時，沒有這些工具就只能用
+	// shell 寫一個沒有 BOM 的 CSV 交差。寫入、編輯、SSH 與記憶仍然要擴充工具集。
+	if !strings.Contains(strings.Join(lean, ","), "document_create") {
+		t.Fatalf("document_create must stay in the lean set: %v", lean)
+	}
+	for _, name := range []string{"file_write", "file_edit", "ssh_exec", "document_edit", "memory_remember", "http_fetch"} {
 		if strings.Contains(strings.Join(lean, ","), name) {
 			t.Fatalf("%q must not be in the lean set: %v", name, lean)
 		}

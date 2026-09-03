@@ -152,7 +152,7 @@ func (r *Registry) Execute(ctx context.Context, session domain.Session, call dom
 	}
 	result, err := value.Execute(ctx, Invocation{
 		Session:        session,
-		Call:           cloneCall(call),
+		Call:           normalizeCallArguments(cloneCall(call), definition),
 		WorkspaceRoot:  workspaceRoots[0],
 		WorkspaceRoots: workspaceRoots,
 	}, sink)

@@ -10,17 +10,19 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - A `Workspace → Project → Session` hierarchy with per-conversation provider and model selection.
 - Standing instructions on workspaces and projects: write the working rules once and every conversation and schedule carries them.
 - Multiple ordered work plans with drag-and-drop ordering, step states, and tool-backed evidence.
-- Configurable Thinking levels; Session plans can be locked for sequential execution or run in parallel when unlocked.
+- Configurable Thinking levels; lock plans for sequential work or unlock them to switch between unfinished plans. Different sessions can work concurrently.
 - A standalone schedule section: each schedule carries its own recurrence and sandbox, and starts a new conversation on time.
-- Durable runs, replayable SSE, streamed responses, reconnection support, and automatic recovery of active or retryable runs after the UI restarts.
+- Durable runs, replayable SSE, streamed responses, and reconnection support. After a UI restart, choose which conversations to reconnect; interrupted work retains a retry option.
 - Recovery controls, an optional persistent notification center, pause/resume/cancel-all for runs, and redacted diagnostic exports.
 - Global search, safe backup/restore, and a read-only permissions center with pre-restore snapshots.
-- Official GitHub Release update checks; when notifications are enabled, new versions appear in the notification center and the same release is never notified twice.
+- Download a configuration bundle with credential fields redacted to reference provider, MCP, reverse-proxy, and service settings on another machine.
+- Version information and update checks in the About page.
 - You can keep typing while a conversation is running; later messages are stored in the browser's IndexedDB Durable Outbox and submitted in order after the active run ends. Network retries reuse the same Idempotency-Key.
-- Automatic context compaction, cross-session memory, and configurable memory scopes.
+- Automatic context compaction with a history character limit, persistent memory, and configurable memory scopes.
 - Per-run and per-session input, output, and total token usage, with estimated cost from configurable model prices; token totals remain available when no price is configured.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
-- Compact or extended tool sets, tool retrieval, and native or instruction tool-call modes can be selected for the model in use.
+- The compact tool set includes document reading, creation, and conversion; extended tools, tool retrieval, and native or instruction tool-call modes are also available.
+- Preview questions and jump between sections in long conversations. Cumulative usage uses K/M notation with exact values on hover.
 - Bounded, cancellable waiting with `wait_for`, plus `ssh_wait` polling for read-only remote checks so deployments are confirmed by bytes, SHA-256, or service readiness instead of an early upload return.
 - `http_fetch` reads external resources: HTML becomes plain text, localhost and private addresses are allowed by default, and the whole tool can be switched off from system settings.
 - A built-in MCP client connects to local stdio, legacy SSE, or remote Streamable HTTP servers and places their tools under the same permission and approval flow.
@@ -43,7 +45,8 @@ The interface language controls only the UI and an uncustomized default name. Th
 
 Runtime configuration, generated data, and credentials must remain outside version control. See the documents below for the architecture, API, and security design.
 
-The frontend checks `/api/v1/admin/status` at startup for the API major version, event schema, and required capabilities. If the same Idempotency-Key is replayed with different input, the backend returns Conflict instead of creating a second run.
+Conversations, work status, and settings are stored by the backend. Notifications are off by default and can be enabled in general settings.
+Configuration bundles exclude conversations and attachments and are not full backups. Review URLs, account names, and paths before sharing.
 
 ## Documentation
 
@@ -55,8 +58,6 @@ The frontend checks `/api/v1/admin/status` at startup for the API major version,
 - [HTTP API](https://vaderchen.github.io/NR-Intern/http-api.html)
 - [Security](https://vaderchen.github.io/NR-Intern/security.html)
 - [OpenAPI contract](https://vaderchen.github.io/NR-Intern/openapi.html)
-
-Release packaging and signing are handled through a maintainer-only workflow. This README does not publish packaging commands, parameters, or signing configuration.
 
 ## Data security
 

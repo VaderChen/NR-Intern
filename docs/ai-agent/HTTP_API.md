@@ -27,6 +27,7 @@ Authorization: Bearer <token>
 | DELETE | `/api/v1/notifications/read` | 清除已讀通知 |
 | GET | `/api/v1/search` | 搜尋 Workspace、Project、Session、Message、Plan 與 Schedule 的短摘要 |
 | GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、通知中心、Run 上限、工具供應方式與 `http_fetch` 開關 |
+| GET | `/api/v1/admin/config-bundle` | 下載遮蔽秘密欄位的設定 ZIP；不包含對話與附件 |
 | GET／PUT | `/api/v1/admin/provider-settings` | 讀取或完整取代脫敏 Provider 設定 |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/models` | 重新取得模型目錄；沒有目錄時回傳空陣列 |
 | POST | `/api/v1/admin/provider-settings/{provider_id}/test` | 送出最小模型請求並測試工具呼叫 |
@@ -406,6 +407,38 @@ curl -X PUT http://127.0.0.1:8787/api/v1/admin/service-settings \
 
 完整機器可讀契約位於 [`src/transport/httpapi/openapi.yaml`](../../src/transport/httpapi/openapi.yaml)，執行中的後端也會由 `/api/v1/openapi.yaml` 提供相同內容。
 
+### 工具供應與實驗性設定
+
+`GET／PUT /api/v1/admin/service-settings` 另提供以下欄位。PUT 仍須提供 `service_name`，其他欄位
+省略即保留；Console 的開關只送出本次變更，數值表單則另行儲存。
+
+| 欄位 | 預設 | 語意 |
+|---|---|---|
+| `extended_tools` | `false` | 精簡集合已含文件檢視、讀取、建立、轉換；開啟後增加編輯、SSH、記憶等工具，仍受 allowlist 限制 |
+| `tool_retrieval` | `true` | 依需求縮小模型工具目錄，其餘已啟用工具可由 `find_tools` 找回 |
+| `tool_call_mode` | `native` | 使用原生 `tool_calls`；不支援的 Provider 可切換 `instruction` |
+| `memory_space` | `false` | 實驗性開關，目前只保存值，不改變既有長期記憶行為 |
+
+### 設定包下載
+
+`GET /api/v1/admin/config-bundle` 沿用管理 API 認證，直接回傳 `application/zip`，不包在 JSON
+envelope；`Content-Disposition` 建議檔名為 `nr-intern-config.zip`。
+
+只從 `data_dir` 讀取已存在的 `providers.json`、`mcp-servers.json`、`netpass.json`、
+`service-settings.json`。缺少的檔案略過，沒有設定檔時仍產生 manifest；不包含 Workspace、
+Project、Session、Run、事件、計畫、附件、記憶、通知或 OAuth token 檔，也不補入環境變數。
+
+`manifest.json` 的 `format` 為 `nr-intern-config-bundle`、`version` 為 `1`，並提供
+`created_at`、`included`、`excluded`、`redacted`、`note`。`redacted` 使用 `檔名:欄位名`
+表示被遮蔽的欄位，不是每個 JSON 節點的完整路徑。
+
+遮蔽依欄位名稱比對 `api_key`、`apikey`、`token`、`secret`、`password`、`passphrase`、
+`authorization`、`credential`、`private_key`、`client_secret`；字串變為空字串，字串陣列
+變為空陣列，數字與布林值保留。`headers`、`environment`、`env` 物件的每個值均清為空字串。
+其他值不會自動匿名化，尤其 URL、帳號、路徑或命令列參數，分享前應人工檢查。
+
+目前僅提供設定包匯出，沒有對應的匯入 API，亦不能以安全備份還原端點匯入。
+
 ## Harness 稽核 Entries
 
 `GET /api/v1/sessions/{session_id}/entries` 讀取包含 operation、turn 與 tool call 生命週期的完整稽核資料。使用 `after_sequence` 與 `limit` 分頁，`limit` 預設 200、最大 1000；回應會附上 `next_after_sequence` 與 `has_more`。
@@ -471,10 +504,12 @@ Browser Console 會在載入 Workspace 前檢查 API major version 與必要 cap
 major version 不同或缺少必要功能時，UI 會顯示版本不相容提示；Client 不應把單一新端點的 404
 當成唯一相容性判斷。
 
-UI 重開時會查詢目前 Workspace 的 queued、running、paused、waiting approval Run，重新連接其
-SSE；若後端重啟已將 Run 標記為 `server_restarted` 且 `retryable=true`，UI 會保留重試入口。
+UI 重開時會查詢目前 Workspace 的 queued、running、paused、waiting approval Run，先顯示
+恢復視窗，確認後才重新連接勾選的 Run。若後端重啟已將 Run 標記為 `server_restarted` 且
+`retryable=true`，UI 會保留重試入口，不會自動重做工具副作用。
 恢復對話視窗按下「取消」只會停止該 Session 的 UI 恢復與 SSE 重連，不會取消後端仍在背景
-執行的 Run；之後同一個 UI 生命週期內也不會因 Session 狀態查詢再次自動掛回。
+執行的 Run。使用者之後主動開啟該 Session 時，會重新讀取真實狀態並連線，供查看或停止工作。
+要取消後端執行，須使用停止按鈕或 Run cancel API。
 
 ## 管理與復原
 

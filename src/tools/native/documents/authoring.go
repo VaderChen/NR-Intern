@@ -91,6 +91,15 @@ type cellUpdate struct {
 	Cell    string `json:"cell"`
 	Value   any    `json:"value"`
 	Formula string `json:"formula"`
+	// Rows 是「整張表」的寫法被放進 cell_updates 時的容納欄位。
+	// 實測模型送過 {"sheet":"設備","rows":[[...],[...]]}——那是 sheets 的形狀，
+	// 內容完全正確，只是放錯欄位。認得就好，不必讓它重試。
+	Rows [][]any `json:"rows"`
+	// Row 與 Column 是 1 起算的數字定址，作為 cell 的替代寫法。
+	// 模型不一定會用 A1 標記法（實測看過自創的 "sheet0/1/1"），與其猜字串格式，
+	// 不如在 schema 裡直接提供數字欄位讓它挑。
+	Row    int `json:"row"`
+	Column int `json:"column"`
 }
 
 type pdfAnnotation struct {
@@ -124,10 +133,10 @@ func NewEditTool(maxInputBytes int, maxDocumentBytes int64) *EditTool {
 func (t *CreateTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
 		Name:               "document_create",
-		Label:              "建立辦公文件",
+		Label:              "建立辦公文件（Word／Excel／PowerPoint／PDF）",
 		Version:            "1.0.0",
 		Category:           "documents",
-		Description:        "在 Project／Session Sandbox 內以結構化內容建立 DOCX、XLSX、PPTX 或 PDF。可用 template_path 保留既有文件樣式，再以 replacements、cell_updates 或 annotations 填入內容。預設不覆寫既有檔案；Unicode PDF 會優先使用指定字型，否則自動探索完整覆蓋的系統字型。",
+		Description:        "在 Project／Session Sandbox 內以結構化內容建立 Word 文件（DOCX）、Excel 試算表（XLSX）、PowerPoint 簡報（PPTX）或 PDF。使用者說「轉成 Excel」「做一份 Word」「產生簡報」時就是用這個工具，不要改用 Shell 或 CSV 代替。XLSX 用 sheets（每張表給 name 與 rows）；只給 cell_updates（sheet／cell／value）時會自動組成工作表。可用 template_path 保留既有文件樣式，再以 replacements、cell_updates 或 annotations 填入內容。預設不覆寫既有檔案；Unicode PDF 會優先使用指定字型，否則自動探索完整覆蓋的系統字型。",
 		Platforms:          []string{"darwin", "linux", "windows"},
 		Capabilities:       []string{"document-create", "template-preservation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "workspace-sandbox", "atomic-write", "atomic-replace", "bounded-input"},
 		RequiresPermission: true,
@@ -141,7 +150,7 @@ func (t *EditTool) Definition() domain.ToolDefinition {
 		Label:              "編輯辦公文件",
 		Version:            "1.0.0",
 		Category:           "documents",
-		Description:        "保留來源文件，將局部編輯結果另存到 output_path。DOCX/PPTX 使用 replacements 精確替換文字；XLSX 使用 cell_updates 更新儲存格，也可 replacements；PDF 使用 annotations 疊加文字、線段或方框，Unicode 標註可自動探索完整覆蓋的系統 TTF。",
+		Description:        "保留來源文件，將局部編輯結果另存到 output_path。Word（DOCX）與 PowerPoint（PPTX）使用 replacements 精確替換文字；Excel（XLSX）使用 cell_updates 更新儲存格，也可 replacements；PDF 使用 annotations 疊加文字、線段或方框，Unicode 標註可自動探索完整覆蓋的系統 TTF。",
 		Platforms:          []string{"darwin", "linux", "windows"},
 		Capabilities:       []string{"document-edit", "exact-replace", "spreadsheet-cell-update", "pdf-annotation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "workspace-sandbox", "atomic-write", "atomic-replace"},
 		RequiresPermission: true,
@@ -478,9 +487,13 @@ func cellUpdateSchema() map[string]any {
 	return map[string]any{
 		"type": "array",
 		"items": map[string]any{
-			"type": "object", "required": []string{"sheet", "cell"}, "properties": map[string]any{
-				"sheet": map[string]any{"type": "string"}, "cell": map[string]any{"type": "string"},
-				"value": map[string]any{}, "formula": map[string]any{"type": "string"},
+			"type": "object", "required": []string{"sheet"}, "properties": map[string]any{
+				"sheet":  map[string]any{"type": "string", "description": "工作表名稱"},
+				"cell":   map[string]any{"type": "string", "description": "儲存格參照，A1 或 Sheet1!A1；也可改用 row 與 column"},
+				"rows":   map[string]any{"type": "array", "items": map[string]any{"type": "array"}, "description": "整張表的列陣列，等同 sheets[].rows"},
+				"row":    map[string]any{"type": "integer", "minimum": 1, "description": "1 起算的列號，cell 的替代寫法"},
+				"column": map[string]any{"type": "integer", "minimum": 1, "description": "1 起算的欄號，cell 的替代寫法"},
+				"value":  map[string]any{}, "formula": map[string]any{"type": "string"},
 			},
 		},
 	}

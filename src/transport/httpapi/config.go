@@ -17,6 +17,7 @@ type Config struct {
 	Diagnostics             func(context.Context) (any, error)
 	DiagnosticsExport       func(context.Context) ([]byte, error)
 	Backup                  func(context.Context) ([]byte, error)
+	ConfigBundle            func(context.Context) ([]byte, error)
 	Restore                 func(context.Context, []byte) (domain.RestoreResult, error)
 	Permissions             func(context.Context) (domain.PermissionCenter, error)
 	UpdateStatus            func(context.Context) (domain.UpdateStatus, error)

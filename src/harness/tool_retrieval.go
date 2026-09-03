@@ -37,10 +37,13 @@ const (
 // 這些是 Harness 自己的階段控制與最基本的探索能力：階段提示直接點名它們，
 // 少了任何一個，模型會在「該用什麼」這件事上先卡一輪。它們數量固定且 schema
 // 很小，留著的成本遠低於檢索失準的代價。
+//
+// wait_for 與 ssh_wait 刻意不在這裡。它們一度被列為核心，只因為階段提示提到
+// 它們——那是錯的理由：這兩個工具會實際阻塞，wait_for 單次最長 30 分鐘，而且
+// 是唯讀工具、不需要人工核准。永遠掛在目錄裡的結果是小模型隨手呼叫一次，整個
+// Run 就安靜地停在那裡，畫面上跟當機一模一樣。要等待時由檢索帶出來就好。
 var coreToolNames = map[string]bool{
 	systemShellToolName: true,
-	waitToolName:        true,
-	sshWaitToolName:     true,
 	"file_read":         true,
 	"directory_list":    true,
 	"file_search":       true,

@@ -5,6 +5,7 @@ import (
 	"AgenticService/src/ports"
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -173,6 +174,51 @@ func (r *Router) ListProviderModels(ctx context.Context, providerID string) ([]s
 }
 
 // Capabilities 回報實際會被使用的模型限制。ContextWindow 為 0 代表未宣告。
+// DiscoverModelLimits 在背景向每個 Provider 的模型目錄問一次限制。
+//
+// context window 未宣告時，Harness 會退回設定檔的後備預算（預設 256K）——對本機
+// 模型那是天文數字，壓縮門檻因此永遠碰不到，實測造成每輪 8 萬 token、prefill 二十
+// 分鐘。多數 OpenAI-compatible 服務（LM Studio、vLLM、llama.cpp）會在 /v1/models
+// 回報 context_length 或 max_model_len，問一次就能省去人工宣告。
+//
+// 問不到不是錯誤：OpenAI 本身與部分本機服務（例如 mlx-server）不回報這個欄位，
+// 那些情況仍然需要在 Provider 設定裡填寫。因此這裡只記錄結果，不影響啟動。
+func (r *Router) DiscoverModelLimits(ctx context.Context, logger *slog.Logger) {
+	r.mu.RLock()
+	ids := make([]string, 0, len(r.providers))
+	for id := range r.providers {
+		ids = append(ids, id)
+	}
+	r.mu.RUnlock()
+	sort.Strings(ids)
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		if _, err := r.ListProviderModels(ctx, id); err != nil {
+			if logger != nil {
+				logger.Debug("model catalog probe failed", "provider_id", id, "error", err)
+			}
+			continue
+		}
+		if logger == nil {
+			continue
+		}
+		capabilities := r.Capabilities(id, "")
+		if capabilities.ContextWindow > 0 {
+			logger.Info("model limits discovered from the provider",
+				"provider_id", id,
+				"context_window", capabilities.ContextWindow,
+				"max_output_tokens", capabilities.MaxOutputTokens,
+			)
+			continue
+		}
+		logger.Warn("provider does not report a context window; declare it in the provider settings",
+			"provider_id", id,
+		)
+	}
+}
+
 func (r *Router) Capabilities(providerID, model string) domain.ModelCapabilities {
 	if r == nil {
 		return domain.ModelCapabilities{}

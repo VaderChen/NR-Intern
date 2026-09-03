@@ -120,6 +120,7 @@ type RedactedConfig struct {
 	ExtendedTools     bool                                    `json:"extended_tools"`
 	ToolCallMode      string                                  `json:"tool_call_mode"`
 	ToolRetrieval     bool                                    `json:"tool_retrieval"`
+	MemorySpace       bool                                    `json:"memory_space"`
 	Context           harness.ContextConfig                   `json:"context"`
 	Memory            memory.Config                           `json:"memory"`
 	DefaultProviderID string                                  `json:"default_provider_id"`
@@ -408,6 +409,7 @@ func Build(config Config) (*Runtime, error) {
 		Diagnostics:             runtime.Diagnostics,
 		DiagnosticsExport:       runtime.DiagnosticsExport,
 		Backup:                  runtime.Backup,
+		ConfigBundle:            runtime.ConfigBundle,
 		Restore:                 runtime.Restore,
 		Permissions:             runtime.Permissions,
 		UpdateStatus:            runtime.UpdateStatus,
@@ -436,6 +438,7 @@ func Build(config Config) (*Runtime, error) {
 	runtime.HTTPHandler = handler
 	runtime.startProviderUsageRefresher()
 	runtime.startUpdateChecker()
+	runtime.startModelLimitDiscovery()
 	mcpManager.Warm(context.Background())
 	return runtime, nil
 }
@@ -508,6 +511,9 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if input.ToolRetrieval != nil {
 		updatedConfig.ToolRetrieval = *input.ToolRetrieval
 	}
+	if input.MemorySpace != nil {
+		updatedConfig.MemorySpace = *input.MemorySpace
+	}
 	if input.ToolCallMode != nil {
 		if !harness.ValidToolCallMode(*input.ToolCallMode) {
 			return domain.ServiceSettings{}, fmt.Errorf("%w: tool_call_mode must be native or instruction", domain.ErrInvalidInput)
@@ -559,6 +565,7 @@ func serviceSettingsFromConfig(config Config) domain.ServiceSettings {
 		ExtendedTools:        config.ExtendedTools,
 		ToolCallMode:         string(harness.NormalizeToolCallMode(config.ToolCallMode)),
 		ToolRetrieval:        config.ToolRetrieval,
+		MemorySpace:          config.MemorySpace,
 	}
 }
 
@@ -1354,6 +1361,7 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 			ExtendedTools:        config.ExtendedTools,
 			ToolCallMode:         string(harness.NormalizeToolCallMode(config.ToolCallMode)),
 			ToolRetrieval:        config.ToolRetrieval,
+			MemorySpace:          config.MemorySpace,
 			Context:              config.Context,
 			Memory:               config.Memory,
 			DefaultProviderID:    r.Model.DefaultProviderID(),
@@ -1436,6 +1444,12 @@ func systemPrompt() string {
 回答包含多筆項目、逐項清單，或每筆有多個可比較欄位時，優先用 Markdown 表格呈現；欄位以使用者關心的識別碼、狀態與數量為主，不要為了湊欄位塞入無關資訊。資料筆數多時先呈現與問題直接相關的部分，並說明是否還有未列出的項目。只有一兩筆、或每筆只有單一值時用一句話說明即可，不必硬做表格。
 
 不要把所有問題都先拆成固定計畫：簡單任務直接執行。遇到多個相依動作、預期需要多輪工具、跨多個檔案，或 Session 已有計畫的長任務時，使用 Harness 提供的結構化計畫並依序執行、驗證。需要資訊時直接使用合適工具；工具結果不足或失敗時，依新狀態調整。
+
+## 產出檔案
+
+使用者指定了檔案格式就產出那個格式，不要換一種格式交差：說「Excel」「試算表」就用 document_create 產出 .xlsx，不是 CSV；說「Word」就是 .docx。真的做不到時直接說明缺什麼工具或權限，讓使用者決定，不要自行降級後宣稱完成。
+只有在使用者明確要 CSV，或已說明並取得同意時才輸出 CSV；輸出 CSV 一律以 UTF-8 BOM 開頭，否則 Excel 打開中文會是亂碼。
+交付檔案時附上完整路徑與內容摘要（筆數、欄位），並確認檔案確實寫入成功。
 
 ## 何時才算完成
 

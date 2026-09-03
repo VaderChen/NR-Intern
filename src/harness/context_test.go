@@ -2,8 +2,10 @@ package harness
 
 import (
 	"AgenticService/src/domain"
+	"AgenticService/src/internal/logging"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -403,5 +405,44 @@ func TestCompactionUsesLatestProviderInputUsage(t *testing.T) {
 	}
 	if !started || !window.Compacted {
 		t.Fatal("provider-reported input above 90% did not trigger compaction")
+	}
+}
+
+// 組合 prompt 之前的最後一道檢查：壓縮沒把歷史降下來時，仍然不能把超量的
+// 內容送出去。這裡刻意繞過壓縮（沒有 Context.Model 可做摘要）驗證守門本身。
+func TestEnforceHistoryCharacterLimitTrimsOldestFirst(t *testing.T) {
+	runner := &Runner{Context: &ContextManager{Config: ContextConfig{MaxHistoryCharacters: 1_000}}}
+	messages := []domain.Message{}
+	for index := 0; index < 20; index++ {
+		messages = append(messages, domain.Message{
+			ID:      fmt.Sprintf("msg_%02d", index),
+			Role:    map[bool]string{true: "user", false: "assistant"}[index%2 == 0],
+			Content: strings.Repeat("a", 200),
+		})
+	}
+
+	trimmed := runner.enforceHistoryCharacterLimit(messages, logging.Discard(), 1)
+
+	if got := historyCharacters(trimmed); got > 1_000 {
+		t.Fatalf("history stayed at %d characters, over the %d limit", got, 1_000)
+	}
+	if len(trimmed) == 0 {
+		t.Fatal("the guard must keep at least the most recent message")
+	}
+	// 保留的必須是最新的那幾則。
+	if trimmed[len(trimmed)-1].ID != "msg_19" {
+		t.Fatalf("the newest message was dropped: %s", trimmed[len(trimmed)-1].ID)
+	}
+}
+
+// 正常情況下這道檢查什麼都不做。
+func TestEnforceHistoryCharacterLimitLeavesNormalHistoryAlone(t *testing.T) {
+	runner := &Runner{Context: &ContextManager{Config: ContextConfig{MaxHistoryCharacters: 60_000}}}
+	messages := []domain.Message{
+		{ID: "msg_1", Role: "user", Content: "查一下製令"},
+		{ID: "msg_2", Role: "assistant", Content: "共有 42 筆。"},
+	}
+	if got := runner.enforceHistoryCharacterLimit(messages, logging.Discard(), 1); len(got) != len(messages) {
+		t.Fatalf("normal history was trimmed: %d of %d messages kept", len(got), len(messages))
 	}
 }

@@ -162,6 +162,14 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		"run_id", strings.TrimSpace(input.RunID),
 		"session_id", input.Session.ID,
 	)
+	if budgetTokens, declared := r.Context.BudgetDiagnostics(input.Session); !declared && budgetTokens > 0 {
+		// 沒有這行，現場只會看到「很慢」，看不到「Harness 以為還有 26 萬 token 可用」。
+		logger.Warn("provider did not declare a context window; compaction uses the configured fallback",
+			"provider_id", providerID,
+			"model", modelID,
+			"fallback_budget_tokens", budgetTokens,
+		)
+	}
 	logger.Info("harness run started",
 		"provider_id", providerID,
 		"model", modelID,
@@ -466,6 +474,13 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			messages = repairMessages(messages)
 		}
 		history, userPrompt := splitCurrentUserMessage(messages, userMessage)
+		// 組合 prompt 之前的最後一道檢查：以實際字數再驗一次。
+		//
+		// 前面的壓縮是依 token 估算決定的，而估算會失準——工具結果多半是 JSON 與
+		// 識別碼，ASCII 權重每 4 字元 1 token 對這種內容低估一半以上。實測有一次
+		// 請求帶著 131,861 字歷史送出，估算卻只有約 3.5 萬 token、看起來還很空。
+		// 這道檢查不看估算，只看真的要送出去的字數。正常情況下它不會做任何事。
+		history = r.enforceHistoryCharacterLimit(history, logger, turn)
 		modelHistory := history
 		modelTools := activeDefinitions
 		if toolCallMode == ToolCallModeInstruction {
@@ -486,6 +501,20 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			return emitEvent(emit, "message.delta", map[string]any{"message_id": assistantID, "delta": delta})
 		}
 		streamedUsage := domain.Usage{}
+		// 每一輪都記下請求的組成。使用者回報「卡住」時，第一個要回答的問題是
+		// 「這次到底送了多少東西出去」——沒有這行就只能靠猜，而猜錯一次就是
+		// 使用者再等二十分鐘。
+		logger.Info("model request",
+			"turn", turn,
+			"turn_id", turnID,
+			"tools", len(modelTools),
+			"tool_chars", utf8.RuneCountInString(modelToolPrompt),
+			"steering_chars", utf8.RuneCountInString(modelSystemPrompt)+utf8.RuneCountInString(modelHostPrompt)+utf8.RuneCountInString(modelPhasePrompt)+utf8.RuneCountInString(modelContextPrompt),
+			"history_messages", len(modelHistory),
+			"history_chars", historyCharacters(modelHistory),
+			"user_chars", utf8.RuneCountInString(userPrompt),
+			"tool_names", availableToolNamesSorted(modelTools),
+		)
 		response, err := r.Model.Stream(ctx, domain.ModelRequest{
 			SessionID:     input.Session.ID,
 			ProviderID:    providerID,
@@ -552,8 +581,16 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			_ = r.finishTurn(context.WithoutCancel(ctx), input.Session.ID, operationID, turnID, turn, turnStartedAt, "failed", 0, response, err)
 			return domain.RunResult{}, err
 		}
+		// 原生工具呼叫模式下，模型有時會把工具參數寫進 content 而不是 tool_calls。
+		// 那一輪會被當成最終回答，使用者看到的是一整片 JSON——實測就是這樣收到
+		// 幾百個 {"cell":...,"sheet":...,"value":...} 而不是一份 Excel。
+		// 這種輸出是協定錯誤，不是答案，要走與指令模式相同的修復流程。
+		nativeArgumentsTool := ""
+		if toolCallMode == ToolCallModeNative && len(response.ToolCalls) == 0 && !forceFinalization {
+			nativeArgumentsTool = toolArgumentsLeak(response.Content, callableDefinitions)
+		}
 		protocolRepairExhausted := false
-		if toolCallMode == ToolCallModeInstruction && len(response.ToolCalls) == 0 {
+		if len(response.ToolCalls) == 0 && (toolCallMode == ToolCallModeInstruction || nativeArgumentsTool != "") {
 			instructionDefinitions := callableDefinitions
 			if forceFinalization {
 				// 收斂輪仍辨識完整目錄中的工具指令，才能將違反收斂要求的輸出
@@ -561,6 +598,9 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				instructionDefinitions = definitions
 			}
 			calls, matched, parseErr := parseInstructionToolCalls(response.Content, instructionDefinitions)
+			if parseErr == nil && !matched && nativeArgumentsTool != "" {
+				parseErr = fmt.Errorf("%w: 模型把 %s 的參數當成回答輸出，沒有實際呼叫工具", domain.ErrProviderProtocol, nativeArgumentsTool)
+			}
 			if parseErr != nil {
 				toolProtocolRepairAttempts++
 				if toolProtocolRepairAttempts <= maxToolProtocolRepairAttempts {
@@ -605,7 +645,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 					if err := emitEvent(emit, "turn.end", map[string]any{"turn": turn, "turn_id": turnID, "tool_result_count": 0}); err != nil {
 						return domain.RunResult{}, err
 					}
-					completionDirective = toolProtocolRepairDirective(parseErr, toolProtocolRepairAttempts)
+					completionDirective = toolProtocolRepairDirective(parseErr, toolProtocolRepairAttempts, nativeArgumentsTool)
 					continue
 				}
 				// 連續修正仍失敗時，以可見的部分完成回覆正常收尾。計畫狀態與
@@ -1177,7 +1217,15 @@ func internalAssistantMessage(message domain.Message) bool {
 	return value
 }
 
-func toolProtocolRepairDirective(cause error, attempt int) string {
+func toolProtocolRepairDirective(cause error, attempt int, nativeArgumentsTool string) string {
+	if nativeArgumentsTool != "" {
+		// 原生模式的修法跟指令模式不同：不是叫它輸出 JSON，而是叫它改用工具呼叫欄位。
+		return fmt.Sprintf(`<tool_protocol_repair>
+上一輪把 %s 的參數當成回答輸出了（第 %d/%d 次），使用者畫面上只看到一整片 JSON，檔案並沒有被建立。
+這是 Harness 的格式修正要求，不是新的使用者指令。這一輪請改用工具呼叫欄位實際呼叫 %s，把同樣的內容放進參數，不要再把參數寫進回答文字。
+工具執行完成後，回答只需要說明結果（檔案路徑、筆數），不要覆述參數內容。
+</tool_protocol_repair>`, nativeArgumentsTool, attempt, maxToolProtocolRepairAttempts, nativeArgumentsTool)
+	}
 	return fmt.Sprintf(`<tool_protocol_repair>
 上一輪的工具指令無法執行（第 %d/%d 次）：%s
 這是 Harness 的格式修正要求，不是新的使用者指令。若仍需要工具，只能重新輸出一個完整 JSON object：
@@ -1547,6 +1595,17 @@ func sessionSummaryPrompt(summary string) string {
 // toolSelectionPhasePrompt 說明目前 Run 所在的工具供應階段。工具目錄本身仍由
 // ToolPrompt／OpenAI tools 欄位提供；這裡只描述跨回合切換規則，避免模型在
 // Shell 失敗前假設內建工具存在，或解鎖後繼續重複同一個失敗命令。
+// waitingToolsPrompt 只在等待工具真的公開時才說明它們。
+//
+// 這兩個工具會實際阻塞（wait_for 單次最長 30 分鐘），無條件寫在提示裡等於邀請
+// 模型在不需要等待的任務上呼叫它——使用者看到的就是畫面停住、什麼都沒發生。
+func waitingToolsPrompt(active []domain.ToolDefinition) string {
+	if !toolExposed(active, waitToolName) && !toolExposed(active, sshWaitToolName) {
+		return ""
+	}
+	return "\n- wait_for 與 ssh_wait：只在確實要等待非同步作業或遠端狀態時使用，等待期間整個工作會停住；完成後仍須依結果重新檢查。不確定要等多久時先做一次檢查，不要先等再說。"
+}
+
 func toolSelectionPhasePrompt(builtinFallback bool, active []domain.ToolDefinition) string {
 	if builtinFallback {
 		return `## 工具供應階段
@@ -1559,10 +1618,9 @@ func toolSelectionPhasePrompt(builtinFallback bool, active []domain.ToolDefiniti
 目前是 OS 系統工具優先階段。本輪可以直接使用的工具：
 - 唯讀內建工具（檔案讀取、目錄盤點、搜尋、比較、文件檢視、記憶查詢等）：需要讀取 Sandbox 內既有狀態時直接呼叫，不必先用 shell_exec 試探。
 - shell_exec：需要 git、編譯器、套件管理器等主機程式，需要管線或複合命令，或唯讀工具做不到的操作時使用；不可只把命令交給使用者。
-- wait_for 與 ssh_wait（若已啟用）：等待非同步作業與確認遠端狀態；完成後仍須依結果重新檢查。
 - plan_get、plan_create、plan_step_update：Harness 計畫控制工具。
 
-寫入型內建工具（建立目錄、寫檔、編輯、文件產出）與 ssh_exec 尚未公開；需要這類副作用時先依 Host 執行環境用 shell_exec 實際執行。若 Shell 實際執行失敗，Harness 會在下一輪自動提供完整內建工具作為備援。` + mcpAvailabilityPrompt(active)
+寫入型內建工具（建立目錄、寫檔、編輯）與 ssh_exec 尚未公開；需要這類副作用時先依 Host 執行環境用 shell_exec 實際執行。若 Shell 實際執行失敗，Harness 會在下一輪自動提供完整內建工具作為備援。` + waitingToolsPrompt(active) + mcpAvailabilityPrompt(active)
 }
 
 // mcpAvailabilityPrompt 補上「MCP 工具在系統工具優先階段就能用」這件事。
@@ -1597,6 +1655,45 @@ func mcpAvailabilityPrompt(active []domain.ToolDefinition) string {
 %s
 使用者要的是外部系統的資料時，直接呼叫語意最接近的工具；不必先用 shell_exec 試探，也不要因為使用者沒有指名是哪個服務就改成詢問或先描述計畫。挑錯了就依工具結果換另一個，不要用回合猜測。`,
 		listing)
+}
+
+// enforceHistoryCharacterLimit 在超出字元上限時由舊而新丟棄訊息，直到裝得下。
+//
+// 這是壓縮沒能把歷史降下來時的最後手段：寧可讓模型少看到幾則舊訊息，也不要送出
+// 一份它要花二十分鐘 prefill 的請求——那對使用者而言與當機沒有分別。
+func (r *Runner) enforceHistoryCharacterLimit(messages []domain.Message, logger *slog.Logger, turn int) []domain.Message {
+	limit := r.Context.HistoryCharacterLimit()
+	total := historyCharacters(messages)
+	if limit <= 0 || total <= limit || len(messages) <= 1 {
+		return messages
+	}
+	kept := 0
+	size := 0
+	for index := len(messages) - 1; index >= 0; index-- {
+		size += historyCharacters(messages[index : index+1])
+		if size > limit && kept > 0 {
+			break
+		}
+		kept++
+	}
+	trimmed := repairMessages(messages[len(messages)-kept:])
+	logger.Warn("history trimmed before the request was assembled",
+		"turn", turn,
+		"limit_chars", limit,
+		"before_chars", total,
+		"after_chars", historyCharacters(trimmed),
+		"before_messages", len(messages),
+		"after_messages", len(trimmed),
+	)
+	return trimmed
+}
+
+func historyCharacters(messages []domain.Message) int {
+	total := 0
+	for _, message := range messages {
+		total += utf8.RuneCountInString(message.Content) + utf8.RuneCountInString(message.Reasoning)
+	}
+	return total
 }
 
 // retrievalQuery 是工具檢索的查詢字串：這次的需求，加上同一個 session 最近幾則

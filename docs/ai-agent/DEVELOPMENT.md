@@ -28,10 +28,17 @@
 | `AI_AGENT_MEMORY_AUTO_RECALL` | 每次 operation 自動召回相關記憶 |
 | `AI_AGENT_MEMORY_ALLOW_WRITES` | 開放記憶寫入與軟性遺忘工具 |
 
-服務設定也可由管理介面調整工具供應方式：`extended_tools` 預設關閉，只在需要完整文件、SSH
-或寫入工具時公開擴充集合；`tool_retrieval` 預設開啟，先依需求縮小工具提示，其他工具仍可由
+服務設定也可由管理介面調整工具供應方式：`extended_tools` 預設關閉，精簡集合已包含 Shell、
+讀檔、目錄、搜尋、計畫控制，以及 `document_inspect`、`document_read`、`document_create`、
+`document_convert`。需要文件編輯、驗證、渲染、SSH 或記憶等工具時再公開擴充集合；所有工具仍取
+`allowed_tools` 的交集。`tool_retrieval` 預設開啟，先依需求縮小工具提示，其他已啟用工具仍可由
 `find_tools` 取回；`tool_call_mode` 預設為 `native`，Provider 不支援原生 `tool_calls` 時才切換
-為 `instruction`。這些設定只影響之後開始的 Run。
+為 `instruction`。這些設定只影響之後開始的 Run。文件產出與轉換不必先等待 Shell 失敗；
+`wait_for`／`ssh_wait` 則依需求檢索，不再固定放入核心工具目錄。
+
+通知、工具供應、對外網路與實驗性功能開關在切換時即儲存；名稱、語言與數值上限仍由儲存按鈕
+提交。「回憶空間」的 `memory_space` 預設 `false`，目前只保存開關，**不會啟用新的共享、
+召回或淘汰機制，也不取代既有 `memory.*` 設定**。設計提案見 [回憶空間](MEMORY_SPACE.md)。
 
 載入優先序為：內建預設 → JSON 設定 → 管理介面持久化設定 → 環境變數。環境變數在持久化設定
 載入後會再套用一次，因此永遠具有最高優先權；管理介面不會覆寫部署環境明確注入的值。
@@ -82,6 +89,15 @@ OAuth Token、管理頁保存的 Provider 集合、MCP Server 集合、服務設
 Context 摘要可在 JSON 的 `context.summary_provider_id`／`summary_model` 指定較便宜的路由；
 Provider ID 必須已存在於 `providers`。留空時摘要沿用 Session 的 Provider 與 Model。
 
+`context.max_history_characters` 預設 60,000（非正值使用預設），用來補足 JSON、代碼等內容的
+token 估算誤差。整形後歷史超過此值也會觸發整理；送出前仍超量時再裁去較舊訊息，只改變模型
+所見的歷史，不刪除 transcript。至少保留最新一則，因此不是整份請求的硬性字元上限；system
+prompt、工具 schema 與當前輸入仍需另計。`max_tokens` 與 wall-clock 的 Run 預算不受此設定改變。
+
+後端啟動時會在背景探索 Provider 模型限制，使用共用 20 秒期限；探索失敗不阻擋服務啟動。
+未取得 context window 時，Harness 日誌會標示採用後備預算。Console 以星號標示後備估算的
+百分比；Provider 設定頁另列有效能力供比對，人工欄位的 0 不代表模型沒有上下文容量。
+
 模型成本表 `model_prices` 也是非秘密設定，依 Provider ID 與模型名稱指定每百萬 token 的 input／output
 單價；未設定價格時只顯示 token，不會假造成本。收尾後的 Run 成本是當時價格的快照，日後修改價格
 表不會改寫歷史 Run。
@@ -111,7 +127,7 @@ localhost、loopback、私有網段、link-local、CGNAT 與 multicast；不需�
 ## 獨立後端
 
 ```bash
-go run ./src/cmd/server -config ./configs/ai-agent/config.example.json
+go run -buildvcs=false ./src/cmd/server -config ./configs/ai-agent/config.example.json
 ```
 
 後端不載入前端資源，也不依賴桌面 package。
@@ -119,7 +135,7 @@ go run ./src/cmd/server -config ./configs/ai-agent/config.example.json
 ## 桌面 Console
 
 ```bash
-go run ./src/cmd/desktop -config ./configs/ai-agent/config.example.json
+go run -buildvcs=false ./src/cmd/desktop -config ./configs/ai-agent/config.example.json
 ```
 
 桌面 UI 預設使用 `http://127.0.0.1:8790`，後端使用 `http://127.0.0.1:8787`。如果後端已存在，桌面只連接；否則桌面會啟動自己的 backend child。
@@ -127,7 +143,7 @@ go run ./src/cmd/desktop -config ./configs/ai-agent/config.example.json
 連接其他已啟動後端：
 
 ```bash
-go run ./src/cmd/desktop \
+go run -buildvcs=false ./src/cmd/desktop \
   -auto-start=false \
   -backend-url http://127.0.0.1:9000 \
   -backend-token YOUR_TOKEN
@@ -139,8 +155,24 @@ macOS 版啟動時就建立狀態列項目；Windows 版啟動時就建立 Tray 
 UI／backend。桌面自行啟動的 backend child 會綁定父程序；父程序消失時 child 會自動退出，避免
 背景留下孤兒後端。
 
-Console 的待送訊息佇列只存在目前 Browser／WebView 記憶體，上一個 Run 結束後依序送出；重新整理
-頁面或結束 UI 不保證保留尚未送出的項目。已送出的 Run 則是 durable，UI 斷線不會取消。
+Console 的待送訊息使用目前 Browser／WebView profile 的 IndexedDB Durable Outbox，上一個 Run
+結束後依序送出；重新整理可載回待送內容，清除網站資料或更換 profile 則不保留。已送出的 Run
+由後端持久化，UI 斷線不會取消。重開 UI 時先由恢復視窗選擇要重新連線的 Session。
+
+長對話左側有提問段落導覽，兩則以上提問才顯示；滑過可預覽、點擊可跳轉。Session 用量以 K／M
+縮寫顯示，提示保留精確值；未設定模型價格時隱藏金額。用量包含已消耗的歷史 Run，重新提問
+不會扣回 token，也不等於當前送往模型的上下文大小。
+
+## 匯出設定
+
+管理介面「系統工具 → 下載設定包」透過 `GET /api/v1/admin/config-bundle` 下載
+`nr-intern-config.zip`。它只收錄 `data_dir` 已存在的 `providers.json`、`mcp-servers.json`、
+`netpass.json`、`service-settings.json` 與 `manifest.json`；不收錄對話或附件，不讀取 OAuth
+token 檔，也不是完整有效設定的快照：只在原始設定檔或環境變數中提供的值不會自動納入。
+
+設定包保留結構並遮蔽可辨識的秘密欄位，供換機時參考與重新設定；目前沒有設定包專用匯入端點，
+不能交給「還原備份」直接還原。金鑰需另外輸入。URL、帳號、路徑、command／args 等仍可能含
+敏感內容，分享前務必人工檢查，完整限制見 [安全設計](SECURITY.md)。
 
 側邊欄記事本使用 Browser／WebView 的 `localStorage`，內容只留在目前裝置，不會傳入後端、Session
 或 Agent Prompt。畫面擷取由 desktop-local bridge 處理：macOS 啟動系統 `Screenshot.app` 的區域

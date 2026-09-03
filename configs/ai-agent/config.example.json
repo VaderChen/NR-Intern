@@ -62,6 +62,7 @@
     "reserved_output_tokens": 4096,
     "retain_messages": 16,
     "max_tool_result_characters": 24000,
+    "max_history_characters": 60000,
     "max_summary_input_characters": 120000,
     "max_summary_characters": 16000
   },
@@ -131,5 +132,6 @@
     "blocked_hosts": []
   },
   "extended_tools": false,
-  "tool_retrieval": true
+  "tool_retrieval": true,
+  "memory_space": false
 }

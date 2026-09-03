@@ -33,6 +33,7 @@ type Handler struct {
 	diagnostics             func(context.Context) (any, error)
 	diagnosticsExport       func(context.Context) ([]byte, error)
 	backup                  func(context.Context) ([]byte, error)
+	configBundle            func(context.Context) ([]byte, error)
 	restore                 func(context.Context, []byte) (domain.RestoreResult, error)
 	permissions             func(context.Context) (domain.PermissionCenter, error)
 	updateStatus            func(context.Context) (domain.UpdateStatus, error)
@@ -83,6 +84,7 @@ func New(service *application.Service, config Config) (*Handler, error) {
 		diagnostics:             config.Diagnostics,
 		diagnosticsExport:       config.DiagnosticsExport,
 		backup:                  config.Backup,
+		configBundle:            config.ConfigBundle,
 		restore:                 config.Restore,
 		permissions:             config.Permissions,
 		updateStatus:            config.UpdateStatus,
@@ -122,6 +124,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/admin/diagnostics", h.serviceDiagnostics)
 	h.mux.HandleFunc("GET /api/v1/admin/diagnostics/export", h.exportDiagnostics)
 	h.mux.HandleFunc("GET /api/v1/admin/backup", h.downloadBackup)
+	h.mux.HandleFunc("GET /api/v1/admin/config-bundle", h.downloadConfigBundle)
 	h.mux.HandleFunc("POST /api/v1/admin/restore", h.restoreBackup)
 	h.mux.HandleFunc("GET /api/v1/admin/permissions", h.getPermissions)
 	h.mux.HandleFunc("GET /api/v1/admin/update", h.getUpdateStatus)
@@ -264,6 +267,24 @@ func (h *Handler) downloadBackup(writer http.ResponseWriter, request *http.Reque
 	}
 	writer.Header().Set("Content-Type", "application/zip")
 	writer.Header().Set("Content-Disposition", `attachment; filename="nr-intern-backup.zip"`)
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(value)
+}
+
+// downloadConfigBundle 匯出 Provider、MCP 與服務設定，金鑰一律遮蔽。
+// 不含 Workspace、Project 與對話紀錄——那些由「安全備份」負責。
+func (h *Handler) downloadConfigBundle(writer http.ResponseWriter, request *http.Request) {
+	if h.configBundle == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: config bundle is unavailable", errUnavailable))
+		return
+	}
+	value, err := h.configBundle(request.Context())
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/zip")
+	writer.Header().Set("Content-Disposition", `attachment; filename="nr-intern-config.zip"`)
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(value)
 }
