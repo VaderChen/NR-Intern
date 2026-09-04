@@ -73,19 +73,64 @@ func newRAMDisk(ctx context.Context, config RAMDiskConfig, ownerID string, logge
 	if err != nil {
 		return nil, err
 	}
-	return &RAMDisk{
+	disk := &RAMDisk{
 		root:     value.root,
 		mode:     value.mode,
 		volatile: value.volatile,
 		closeFn:  value.close,
-	}, nil
+	}
+	if err := disk.prepareLayout(); err != nil {
+		_ = disk.Close(ctx)
+		return nil, err
+	}
+	return disk, nil
 }
+
+// ramDiskWorkspaceDir 是 Agent 沙箱看得到的部分；ramDiskStoreDir 放後端自己的
+// 資料（transcript、計畫等）。
+//
+// 兩者必須分開：沙箱若直接用磁碟根目錄，Agent 就能讀寫自己的對話紀錄與計畫，
+// 隔離專案的「揮發」也會變成 Agent 可以自行竄改的東西。
+const (
+	ramDiskWorkspaceDir = "workspace"
+	ramDiskStoreDir     = "store"
+)
 
 func (disk *RAMDisk) Root() string {
 	if disk == nil {
 		return ""
 	}
 	return disk.root
+}
+
+// WorkspaceRoot 是要交給 Agent 沙箱的目錄。
+func (disk *RAMDisk) WorkspaceRoot() string {
+	if disk == nil || disk.root == "" {
+		return ""
+	}
+	return filepath.Join(disk.root, ramDiskWorkspaceDir)
+}
+
+// StoreRoot 是後端資料的根，Agent 看不到。
+func (disk *RAMDisk) StoreRoot() string {
+	if disk == nil || disk.root == "" {
+		return ""
+	}
+	return filepath.Join(disk.root, ramDiskStoreDir)
+}
+
+// prepareLayout 建立兩個子目錄。任一個失敗都視為磁碟不可用：
+// 少了 store 會讓對話悄悄落回 dataDir，少了 workspace 則沙箱根本不存在。
+func (disk *RAMDisk) prepareLayout() error {
+	if disk == nil || disk.root == "" {
+		return nil
+	}
+	for _, path := range []string{disk.WorkspaceRoot(), disk.StoreRoot()} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("create RAM disk layout: %w", err)
+		}
+	}
+	return nil
 }
 
 func (disk *RAMDisk) Mode() string {

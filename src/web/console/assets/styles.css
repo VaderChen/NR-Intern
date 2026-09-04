@@ -1040,6 +1040,31 @@ button.ghost { background: transparent; }
 /* 強制刪除比一般確認更難復原（連同對話一起移除），用實心紅與確認鍵分開。
    選擇器要帶 button：button.danger 已經把文字設成紅色，只用 class 蓋不過它，
    結果會是紅底紅字的一塊看不見的按鈕。 */
+/* 泡泡要放在按鈕外面：按鈕本身有 overflow: hidden 讓進度條不溢出圓角，
+   放進去會被整個裁掉。 */
+.confirmation-force-wrap { position: relative; display: inline-flex; }
+.confirmation-force-hint {
+  position: absolute; z-index: 60; bottom: calc(100% + 8px); left: 50%;
+  padding: 5px 9px; border-radius: 7px;
+  background: var(--tooltip-surface, #1f2937); color: #fff;
+  font-size: 11px; line-height: 1.5; white-space: nowrap;
+  opacity: 0; transform: translate(-50%, 4px); pointer-events: none;
+  transition: opacity .12s ease, transform .12s ease;
+}
+/* 箭頭指向按鈕，泡泡才不會看起來像浮在旁邊的無主標籤。 */
+.confirmation-force-hint::after {
+  position: absolute; top: 100%; left: 50%; width: 0; height: 0;
+  border: 5px solid transparent; border-top-color: var(--tooltip-surface, #1f2937);
+  transform: translateX(-50%); content: "";
+}
+.confirmation-force-wrap:hover .confirmation-force-hint,
+.confirmation-force:focus-visible ~ .confirmation-force-hint { opacity: 1; transform: translate(-50%, 0); }
+/* 按住之後進度條就是回饋，泡泡讓開。 */
+.confirmation-force.is-holding ~ .confirmation-force-hint { opacity: 0 !important; }
+@media (prefers-reduced-motion: reduce) {
+  .confirmation-force-hint { transition: none; }
+}
+
 button.confirmation-force { position: relative; overflow: hidden; border-color: var(--danger); background: var(--danger); color: #fff; font-weight: 700; }
 button.confirmation-force:hover:not(:disabled), button.confirmation-force:focus-visible:not(:disabled) { filter: brightness(1.08); }
 /* 長按進度：不給回饋的話，按下去兩秒都沒反應跟壞掉沒有分別。

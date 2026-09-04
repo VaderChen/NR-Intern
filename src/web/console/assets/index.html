@@ -1119,10 +1119,13 @@
       <p id="confirmationMessage"></p>
       <div class="dialog-actions">
         <button class="ghost" type="submit" value="cancel">取消</button>
-        <button id="confirmationForce" class="danger confirmation-force hidden" type="button" title="長按 2 秒才會執行">
-          <span id="confirmationForceFill" class="confirmation-force-fill" aria-hidden="true"></span>
-          <span id="confirmationForceLabel" class="confirmation-force-label">強制刪除</span>
-        </button>
+        <span id="confirmationForceWrap" class="confirmation-force-wrap hidden">
+          <button id="confirmationForce" class="danger confirmation-force" type="button" aria-describedby="confirmationForceHint">
+            <span id="confirmationForceFill" class="confirmation-force-fill" aria-hidden="true"></span>
+            <span id="confirmationForceLabel" class="confirmation-force-label">強制刪除</span>
+          </button>
+          <span id="confirmationForceHint" class="confirmation-force-hint" role="tooltip">長按 2 秒才會執行</span>
+        </span>
         <button id="confirmationConfirm" class="danger" type="submit" value="confirm">確認</button>
       </div>
     </form>

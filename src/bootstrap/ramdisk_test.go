@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -113,8 +114,14 @@ func TestRAMDiskPoolStagesFileInsideProjectDisk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StageFile: %v", err)
 	}
-	if filepath.Dir(filepath.Dir(staged)) != root {
-		t.Fatalf("staged path %q is outside RAM disk %q", staged, root)
+	// 附件必須落在沙箱內，Agent 才讀得到；同時不能落在後端資料區，
+	// 否則 Agent 就能看到自己的 transcript 與計畫。
+	disk := pool.disks["project_1"]
+	if !strings.HasPrefix(staged, disk.WorkspaceRoot()+string(filepath.Separator)) {
+		t.Fatalf("staged path %q 不在沙箱 %q 內", staged, disk.WorkspaceRoot())
+	}
+	if strings.HasPrefix(staged, disk.StoreRoot()+string(filepath.Separator)) {
+		t.Fatalf("staged path %q 落在後端資料區", staged)
 	}
 	content, err := os.ReadFile(staged)
 	if err != nil {

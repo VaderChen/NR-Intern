@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 const planFileVersion = 2
@@ -21,6 +22,37 @@ var _ ports.PlanRepository = (*PlanRepository)(nil)
 type PlanRepository struct {
 	mu   sync.RWMutex
 	root string
+	// roots 讓隔離專案的計畫跟著它的對話走，落在同一個 RAM disk 上。
+	// 計畫內容含步驟敘述與驗證條件，與 transcript 同樣不該留在硬碟。
+	roots atomic.Pointer[SessionRoots]
+}
+
+// SetSessionRoots 注入根目錄解析；傳入 nil 會回到單一根目錄的行為。
+func (r *PlanRepository) SetSessionRoots(roots SessionRoots) {
+	if r == nil {
+		return
+	}
+	if roots == nil {
+		r.roots.Store(nil)
+		return
+	}
+	r.roots.Store(&roots)
+}
+
+// planRootFor 回傳指定 session 的計畫目錄。
+//
+// 額外的根底下再開一層 plans，讓 RAM disk 的結構與 dataDir 一致；
+// 直接把檔案灑在根目錄會和其他後端資料混在一起。
+func (r *PlanRepository) planRootFor(sessionID string) string {
+	roots := r.roots.Load()
+	if roots == nil {
+		return r.root
+	}
+	resolved := strings.TrimSpace((*roots).RootFor(sessionID))
+	if resolved == "" {
+		return r.root
+	}
+	return filepath.Join(resolved, "plans")
 }
 
 type planFile struct {
@@ -421,5 +453,13 @@ func (r *PlanRepository) path(sessionID string) (string, error) {
 		return "", fmt.Errorf("%w: session id is required", domain.ErrInvalidInput)
 	}
 	name := base64.RawURLEncoding.EncodeToString([]byte(sessionID)) + ".json"
-	return filepath.Join(r.root, name), nil
+	root := r.planRootFor(sessionID)
+	// 隔離專案的計畫目錄要用時才建：RAM disk 可能還沒掛載，啟動時一律建立
+	// 會在磁碟不存在時失敗。
+	if root != r.root {
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			return "", fmt.Errorf("create plan store: %w", err)
+		}
+	}
+	return filepath.Join(root, name), nil
 }

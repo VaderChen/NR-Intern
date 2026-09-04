@@ -840,15 +840,16 @@ function confirmChoice(message, { forceLabel = "" } = {}) {
   const dialog = $("confirmationDialog");
   if (dialog.open) return Promise.resolve("cancel");
   $("confirmationMessage").textContent = message;
-  const force = $("confirmationForce");
-  force.classList.toggle("hidden", !forceLabel);
+  // 顯示與否控制在外層容器上：泡泡是它的子元素，只藏按鈕的話容器仍會佔一個
+  // flex gap，讓取消與確認之間多出一段空白。
+  $("confirmationForceWrap").classList.toggle("hidden", !forceLabel);
   if (forceLabel) $("confirmationForceLabel").textContent = forceLabel;
   cancelForceHold();
   dialog.returnValue = "cancel";
   return new Promise((resolve) => {
     dialog.addEventListener("close", () => {
       // 用完就收起來：這個對話框是共用的，留著會出現在下一個不相干的確認上。
-      force.classList.add("hidden");
+      $("confirmationForceWrap").classList.add("hidden");
       cancelForceHold();
       resolve(dialog.returnValue || "cancel");
     }, { once: true });

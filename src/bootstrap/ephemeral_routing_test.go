@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"AgenticService/src/adapters/filestore"
 	"AgenticService/src/domain"
@@ -152,4 +153,64 @@ func grepDir(t *testing.T, root, needle string) []string {
 		return nil
 	})
 	return found
+}
+
+// 計畫的內容含步驟敘述與驗證條件，與 transcript 同樣不該留在硬碟。
+func TestEphemeralPlansFollowTheirSession(t *testing.T) {
+	dataDir := t.TempDir()
+	volatileRoot := t.TempDir()
+	plans, err := filestore.NewPlanRepository(dataDir)
+	if err != nil {
+		t.Fatalf("new plan repository: %v", err)
+	}
+	plans.SetSessionRoots(fixedRoots{code: "abc123", root: volatileRoot})
+	ctx := context.Background()
+
+	volatileSession := domain.NewEphemeralSessionID("project_abc123")
+	for _, sessionID := range []string{volatileSession, "session_normal"} {
+		plan, err := domain.NewPlan(sessionID, domain.CreatePlanInput{
+			Title: "祕密計畫", Steps: []domain.CreatePlanStepInput{{Title: "祕密步驟", Verification: "完成"}},
+		}, time.Now())
+		if err != nil {
+			t.Fatalf("new plan: %v", err)
+		}
+		if _, err := plans.Create(ctx, plan); err != nil {
+			t.Fatalf("create plan for %s: %v", sessionID, err)
+		}
+	}
+
+	if found := grepDir(t, filepath.Join(volatileRoot, "plans"), "祕密步驟"); len(found) == 0 {
+		t.Fatal("隔離對話的計畫應寫在 RAM disk 上")
+	}
+	// 一般對話的計畫仍在 dataDir，而隔離對話的內容不能出現在那裡。
+	if found := grepDir(t, filepath.Join(dataDir, "plans"), "祕密步驟"); len(found) != 1 {
+		t.Fatalf("dataDir 的計畫數量不對：%v（應只有一般對話那一份）", found)
+	}
+	listed, err := plans.List(ctx, volatileSession)
+	if err != nil || len(listed) != 1 {
+		t.Fatalf("隔離對話的計畫應讀得回來：%d 筆 err=%v", len(listed), err)
+	}
+}
+
+// 沙箱不能看到後端資料。沙箱若直接用磁碟根目錄，Agent 就能讀寫自己的
+// transcript 與計畫，隔離也就失去意義。
+func TestRAMDiskSeparatesWorkspaceFromStore(t *testing.T) {
+	disk := &RAMDisk{root: t.TempDir()}
+	if err := disk.prepareLayout(); err != nil {
+		t.Fatalf("prepare layout: %v", err)
+	}
+	workspace := disk.WorkspaceRoot()
+	store := disk.StoreRoot()
+	if workspace == "" || store == "" || workspace == store {
+		t.Fatalf("兩個目錄必須存在且不同：workspace=%q store=%q", workspace, store)
+	}
+	if strings.HasPrefix(store, workspace+string(filepath.Separator)) {
+		t.Fatalf("後端資料區 %q 不能落在沙箱 %q 底下", store, workspace)
+	}
+	for _, path := range []string{workspace, store} {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			t.Fatalf("%q 應該已建立為目錄：%v", path, err)
+		}
+	}
 }

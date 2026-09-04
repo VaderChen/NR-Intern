@@ -41,7 +41,8 @@ func (pool *RAMDiskPool) StageFile(ctx context.Context, projectID, sourcePath, f
 		return "", fmt.Errorf("open staged file: %w", err)
 	}
 	defer source.Close()
-	directory := filepath.Join(disk.Root(), ".nr-intern-attachments")
+	// 附件要放進沙箱，Agent 才讀得到；磁碟根已經不在沙箱範圍內了。
+	directory := filepath.Join(disk.WorkspaceRoot(), ".nr-intern-attachments")
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return "", fmt.Errorf("create staged attachment directory: %w", err)
 	}
@@ -92,14 +93,15 @@ func (pool *RAMDiskPool) Prepare(ctx context.Context, projectID string, sizeMB i
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 	if disk := pool.disks[projectID]; disk != nil {
-		return disk.Root(), nil
+		return disk.WorkspaceRoot(), nil
 	}
 	disk, err := newRAMDisk(ctx, RAMDiskConfig{Enabled: true, SizeMB: sizeMB}, projectID, pool.logger.With("project_id", projectID))
 	if err != nil {
 		return "", err
 	}
 	pool.disks[projectID] = disk
-	return disk.Root(), nil
+	// 交出去的是沙箱目錄，不是磁碟根：後端資料另外放在 StoreRoot，Agent 看不到。
+	return disk.WorkspaceRoot(), nil
 }
 
 func (pool *RAMDiskPool) Release(ctx context.Context, projectID string) error {
@@ -160,7 +162,7 @@ func (pool *RAMDiskPool) RootForProjectCode(code string) string {
 			continue
 		}
 		if strings.TrimPrefix(projectID, "project_") == code {
-			return disk.Root()
+			return disk.StoreRoot()
 		}
 	}
 	return ""
@@ -180,7 +182,7 @@ func (pool *RAMDiskPool) MountedRoots() []string {
 		if disk == nil {
 			continue
 		}
-		if root := strings.TrimSpace(disk.Root()); root != "" {
+		if root := strings.TrimSpace(disk.StoreRoot()); root != "" {
 			roots = append(roots, root)
 		}
 	}
