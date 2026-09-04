@@ -103,6 +103,37 @@ func (index *entryIndex) latestOffsetOfType(entryType string) (int64, bool) {
 	return 0, false
 }
 
+// offsetOfRecentType 回傳「倒數第 count 個指定型別」的位移，
+// 以及這個範圍是否已經涵蓋整份 transcript。
+//
+// 用途是「只要最近幾則訊息」的查詢：從這個位移正向讀到結尾就夠，
+// 不必把整份 transcript 解碼一遍。complete 為真代表範圍就是全部，
+// 呼叫端可以據此判斷結果與完整掃描等價。
+func (index *entryIndex) offsetOfRecentType(entryType string, count int) (offset int64, complete bool) {
+	if count <= 0 || len(index.records) == 0 {
+		return index.size, len(index.records) == 0
+	}
+	seen := 0
+	for position := len(index.records) - 1; position >= 0; position-- {
+		if index.records[position].entryType != entryType {
+			continue
+		}
+		seen++
+		if seen < count {
+			continue
+		}
+		// 從這一筆開始讀。它之前若還有同型別的紀錄，代表範圍不完整。
+		for earlier := position - 1; earlier >= 0; earlier-- {
+			if index.records[earlier].entryType == entryType {
+				return index.records[position].offset, false
+			}
+		}
+		return index.records[position].offset, true
+	}
+	// 同型別的紀錄不足 count 筆，整份都要讀。
+	return 0, true
+}
+
 // lastSequence 回傳目前最大的序號，讓 append 不必為了取號重讀整個檔案。
 func (index *entryIndex) lastSequence() int64 {
 	if len(index.records) == 0 {

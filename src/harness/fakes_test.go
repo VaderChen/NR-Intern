@@ -84,6 +84,16 @@ func (r *memorySessions) ListEntriesAfter(ctx context.Context, sessionID string,
 	return result, nil
 }
 
+// 假物件保持最單純的語意：取尾端 limit 則。真正的實作要處理撤回與索引，
+// 那些行為由 filestore 自己的測試涵蓋。
+func (r *memorySessions) ListRecentMessages(ctx context.Context, sessionID string, limit int) ([]domain.Message, error) {
+	messages, err := r.ListMessages(ctx, sessionID)
+	if err != nil || limit <= 0 || len(messages) <= limit {
+		return messages, err
+	}
+	return messages[len(messages)-limit:], nil
+}
+
 func (r *memorySessions) ListEntriesPage(ctx context.Context, sessionID string, afterSequence int64, limit int) ([]domain.SessionEntry, bool, error) {
 	entries, err := r.ListEntriesAfter(ctx, sessionID, afterSequence)
 	if err != nil {

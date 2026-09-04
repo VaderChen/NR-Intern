@@ -14,6 +14,11 @@ type SessionRepository interface {
 	AppendEntry(context.Context, string, domain.SessionEntry) (domain.SessionEntry, error)
 	ListEntries(context.Context, string) ([]domain.SessionEntry, error)
 	ListMessages(context.Context, string) ([]domain.Message, error)
+	// ListRecentMessages 只取尾端最多 limit 則訊息。
+	//
+	// 「最近幾則使用者說了什麼」不該讓整份 transcript 解碼一遍；
+	// 撤回記錄無法在局部範圍內正確解讀時，實作應退回完整掃描而不是回傳近似值。
+	ListRecentMessages(context.Context, string, int) ([]domain.Message, error)
 
 	// ListEntriesAfter 只回傳序號大於 afterSequence 的 entry。
 	// 每個 turn 都重新解析整份 transcript 會讓長 session 變成 O(N²)，

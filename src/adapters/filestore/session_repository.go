@@ -612,6 +612,86 @@ func withoutPersistedReasoning(entry domain.SessionEntry) domain.SessionEntry {
 	return entry
 }
 
+// ListRecentMessages 只取尾端最多 limit 則訊息。
+//
+// 「最近幾則使用者說了什麼」是很常見的需求（例如工具檢索的查詢字串），但
+// ListMessages 為此要把整份 transcript 解碼一遍：實測 3.6 MB 的對話要 13–18 ms、
+// 解出 467 則訊息，而呼叫端只用到最後三則，且每個 Run 都付一次。
+//
+// 撤回記錄讓這件事不能只是「從尾端讀」：範圍內的撤回若指向範圍外的訊息，
+// 截斷結果會與完整掃描不同。遇到這種情況就退回 ListMessages，
+// 寧可慢一次也不要回傳與稽核紀錄不一致的內容。
+func (r *SessionRepository) ListRecentMessages(ctx context.Context, sessionID string, limit int) ([]domain.Message, error) {
+	if limit <= 0 {
+		return r.ListMessages(ctx, sessionID)
+	}
+	directory, err := r.sessionDir(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := r.Get(ctx, sessionID); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(directory, sessionEntriesFile)
+	index, indexErr := r.entryIndexFor(ctx, sessionID, path)
+	if indexErr != nil {
+		return r.ListMessages(ctx, sessionID)
+	}
+	r.mu.Lock()
+	offset, complete := index.offsetOfRecentType(domain.SessionEntryMessage, limit)
+	r.mu.Unlock()
+	if complete {
+		return r.ListMessages(ctx, sessionID)
+	}
+	messages := []domain.Message{}
+	truncated := false
+	if err := r.readEntriesFrom(ctx, path, offset, func(entry domain.SessionEntry) {
+		if from := domain.RetractedFromMessageID(entry); from != "" {
+			index := indexOfMessageID(messages, from)
+			if index < 0 {
+				// 撤回指向這個範圍之外的訊息，這裡算不出正確的截斷點。
+				truncated = true
+				return
+			}
+			messages = messages[:index]
+			return
+		}
+		if entry.Type != domain.SessionEntryMessage || entry.Message == nil {
+			return
+		}
+		messages = append(messages, *entry.Message)
+	}); err != nil {
+		return nil, err
+	}
+	if truncated {
+		return r.ListMessages(ctx, sessionID)
+	}
+	return messages, nil
+}
+
+// readEntriesFrom 從指定位移解碼到檔案結尾。
+func (r *SessionRepository) readEntriesFrom(ctx context.Context, path string, offset int64, visit func(domain.SessionEntry)) error {
+	file, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("open session transcript: %w", err)
+	}
+	defer file.Close()
+	if err := readJSONLinesAt(ctx, file, offset, func(_ int64, line []byte) error {
+		var entry domain.SessionEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return fmt.Errorf("decode session entry: %w", err)
+		}
+		visit(withoutPersistedReasoning(entry))
+		return nil
+	}); err != nil {
+		return fmt.Errorf("read session transcript: %w", err)
+	}
+	return nil
+}
+
 func (r *SessionRepository) ListMessages(ctx context.Context, sessionID string) ([]domain.Message, error) {
 	entries, err := r.ListEntries(ctx, sessionID)
 	if err != nil {

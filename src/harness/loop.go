@@ -33,6 +33,11 @@ const (
 	// 丟進去只會讓共通詞淹掉這一輪真正的重點。
 	retrievalQueryMessages = 3
 	retrievalQueryRunes    = 400
+	// retrievalQueryScanMessages 是往回掃描的訊息則數上限。
+	//
+	// 一輪工具密集的工作可能連續產生數十則助理與工具訊息，200 則足以涵蓋
+	// 十幾輪對話；再往回的使用者訊息對「這次要查什麼」也已經沒有參考價值。
+	retrievalQueryScanMessages = 200
 )
 
 type EventSink func(domain.EngineEvent) error
@@ -1738,7 +1743,10 @@ func (r *Runner) retrievalQuery(ctx context.Context, input Input) string {
 	if r == nil || r.Sessions == nil {
 		return current
 	}
-	messages, err := r.Sessions.ListMessages(ctx, input.Session.ID)
+	// 只要最近幾則使用者訊息，不必把整份 transcript 解碼一遍。取的則數比
+	// retrievalQueryMessages 寬鬆得多：中間夾雜的助理訊息與工具觀察也算在內，
+	// 太小會在長工具序列之後找不到任何使用者訊息。
+	messages, err := r.Sessions.ListRecentMessages(ctx, input.Session.ID, retrievalQueryScanMessages)
 	if err != nil {
 		return current
 	}
