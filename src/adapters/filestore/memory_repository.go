@@ -346,8 +346,39 @@ func (r *MemoryRepository) load() error {
 	return nil
 }
 
+// persistableMemoriesLocked 回傳可以寫進 memories.json 的記憶。
+//
+// 記憶體隔離對話寫下的記憶不落地：內容是該次對話的內容摘要，正是這個功能
+// 不想留在硬碟上的東西。memories.json 是單一檔案，沒辦法像 transcript 那樣
+// 按根目錄分流，所以在寫入時濾掉；記憶體中仍然完整，本次執行期間的召回、
+// 搜尋與遺忘都不受影響，程序結束就消失。
+//
+// 只看 SourceSessionID 是安全的，因為隔離對話有自己的 scope（見
+// memory.ScopeForSessionWithSpace），不會就地改寫別人寫的記憶。
+//
+// 沒有隔離記憶時直接回傳原 map，避免每次寫入都多複製一份。
+func (r *MemoryRepository) persistableMemoriesLocked() map[string]domain.Memory {
+	volatile := 0
+	for _, item := range r.items {
+		if domain.EphemeralProjectCodeFromID(item.SourceSessionID) != "" {
+			volatile++
+		}
+	}
+	if volatile == 0 {
+		return r.items
+	}
+	values := make(map[string]domain.Memory, len(r.items)-volatile)
+	for id, item := range r.items {
+		if domain.EphemeralProjectCodeFromID(item.SourceSessionID) != "" {
+			continue
+		}
+		values[id] = item
+	}
+	return values
+}
+
 func (r *MemoryRepository) persistLocked() error {
-	data, err := json.MarshalIndent(memoryFile{Version: 1, Items: r.items}, "", "  ")
+	data, err := json.MarshalIndent(memoryFile{Version: 1, Items: r.persistableMemoriesLocked()}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode memory store: %w", err)
 	}

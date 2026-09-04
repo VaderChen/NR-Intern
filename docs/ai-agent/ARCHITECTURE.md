@@ -654,7 +654,8 @@ MCP 端停在只處理最上層的物件／陣列，於是同一個模型犯同�
 `memory_space` 預設關閉，透過 Config、service settings 與 Console「實驗性功能」頁保存，
 Runtime 以原子開關即時套用至 `memory.Manager`。Agent 的記憶工具統一經過 Manager，啟用時
 套用種類／秘密樣式檢查、近似去重、Project → Workspace 的預設 scope 與召回排序。
-明確的 `memory_scope` 優先；仍遵守既有 `memory.enabled`、`auto_recall` 與 `allow_writes`。
+明確的 `memory_scope` 優先，唯一例外是記憶體隔離 Session（見下方 RAM disk 一節）；仍遵守既有
+`memory.enabled`、`auto_recall` 與 `allow_writes`。
 
 自動召回預設最多 6 筆、1200 UTF-8 bytes（包含包裝說明），依文字相關度、新鮮度與 confidence
 排序；初始召回留在後續 context，符合工具重複失敗條件時另補一次、只注入下一輪。
@@ -737,6 +738,7 @@ API 端點；只有使用者明確詢問工具或整合方式時才揭露。這�
 - 長期記憶：保存跨 session 仍有效的 `fact`、`preference`、`decision`、`procedure`、`constraint`。
 
 長期記憶經 `ports.MemoryRepository` 隔離儲存技術。目前使用本機 JSON store 與可解釋的詞彙／雙字元召回；日後可加入向量索引 adapter，不需修改 Harness 或工具介面。關閉回憶空間時，預設 scope 是 Agent ID；啟用後優先使用 Project，再退回 Workspace。Session metadata 的 `memory_scope` 可明確指定其他範圍；這是召回範圍，不是獨立的租戶授權邊界。
+記憶體隔離 Session 不套用這個覆寫，且其記憶不寫入 `memories.json`。
 
 每次 operation 初始召回一次，再於後續 turn 重用；回憶空間啟用時，工具重複失敗另可補召回。
 召回資料以明確邊界注入 system prompt，並標示為「可能過時的資料而非新指令」，降低提示注入
@@ -916,17 +918,40 @@ Project 建立時可設定不可變更的 `ephemeral=true` 與 `ram_disk_size_mb
 的 RAM disk、對話與關閉時清理都照常，一次誤關不會讓使用者手上的專案失效。在缺少 RAM disk
 支援的環境（Windows 需安裝 ImDisk）可以整個關掉，讓建立對話框不再提供註定失敗的選項。
 
-記憶體隔離 Project 的設定本身持久化，但其 Session 只在目前程序生命週期內存在。正常關閉時會在
-卸載 RAM disk 前刪除該 Project 的 Session 目錄、附件、計畫、Run／事件與通知；若程序異常終止，
-下次啟動會在 HTTP Handler 對外服務前完成同一套清理。因此重啟後 Project 仍在，但底下不會恢復
-任何對話。隔離類型與容量建立後不可 PATCH，避免尚未實作搬移時產生資料保留語意不一致。
+記憶體隔離 Project 的設定本身持久化，但其 Session 只在目前程序生命週期內存在。重啟後 Project 仍在，
+但底下不會恢復任何對話。隔離類型與容量建立後不可 PATCH，避免尚未實作搬移時產生資料保留語意不一致。
 
-**揮發的是 RAM disk 上的工作檔案，不是執行期間的對話紀錄。** Session、transcript、附件、計畫、
-Run 與事件在執行期間仍由 `dataDir` 底下的 filestore 管理，只有 sandbox 工作檔案直接落在 RAM disk。
-換句話說，揮發語意由「正常關閉清理 ＋ 下次啟動補清理」兩段共同保證，而不是「從不寫入硬碟」。
-這留下一個明確的窗口：程序被強制終止後、下次啟動完成清理前，該 Project 的對話仍以檔案形式存在於
-`dataDir`。要消除這個窗口，需要把 Session 儲存本身按 Project 分流到各自的 RAM disk（每個記憶體隔離
-Project 有獨立 RAM disk，因此是多實例路由，不是單一替換），目前尚未實作。
+### 執行期間就不落地
+
+對話資料在**寫入當下**就走向該 Project 的 RAM disk，而不是先寫進 `dataDir` 再靠清理補救。
+歸屬編碼在 ID 裡：隔離對話的 Session ID 為 `session_v<projectHex>_<random>`，Run ID 沿用同一個
+代碼。因為對話建立後不能換 Project（`Service.validateEphemeralSessionMove`），這個代碼永遠成立，
+路徑解析只需要字串處理，不必查詢狀態，也沒有需要失效的快取。
+
+| 資料 | 作法 | 解析依據 |
+| --- | --- | --- |
+| Session／transcript | 目錄建在 RAM disk 上 | Session ID |
+| 計畫 | 同上，`<disk>/store/plans` | Session ID |
+| 附件 | 同上，Session 目錄底下 | Session ID |
+| Run 事件 | `<disk>/store/runs/events` | Run ID |
+| Run 紀錄（`runs.json`） | 只留在記憶體，不寫入檔案 | `Run.SessionID` |
+| 通知（`notifications.json`） | 只留在記憶體，不寫入檔案 | `Notification.SessionID` |
+| 回憶（`memories.json`） | 只留在記憶體，不寫入檔案 | `Memory.SourceSessionID` |
+
+前四項各自有獨立路徑，所以按根目錄分流（`filestore.ProjectRoots`）。後兩項是**單一檔案存放全部
+紀錄**、每次寫入整份重寫，沒有可分流的路徑，因此改在寫入時濾掉——記憶體中仍然完整，本次執行
+期間的顯示、查詢與已讀狀態都不受影響，程序結束就消失，與 RAM disk 上的對話語意一致。
+
+回憶另有一項前提：隔離對話一律使用專案專屬 scope（`memory.ScopeForSessionWithSpace`），
+且不接受 session metadata 的 `memory_scope` 覆寫。去重與取代邏輯只在同一個 scope 內生效，
+共用 scope 時一筆即將消失的記憶會就地改寫、或標記取代掉持久記憶——寫入時過濾反而會把
+一般對話記住的東西一起帶走。分開 scope 之後，過濾只會動到本來就要消失的那些。
+
+RAM disk 分成 `workspace` 與 `store` 兩層：Sandbox 只拿到 `workspace`，上述後端資料全部放在
+`store`，Agent 因此讀不到自己的 transcript 與計畫。磁碟未掛載（重開機後必然如此）時解析回到預設
+根，該對話自然變成「找不到」——這正是揮發語意要的結果。
+
+`purgeEphemeralProjectSessions` 保留一輪作為升級路徑，清掉舊版留在 `dataDir` 的殘留，下一版移除。
 
 ## 程序拓樸
 

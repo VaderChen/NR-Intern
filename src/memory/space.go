@@ -102,7 +102,18 @@ func (c SpaceConfig) Admit(input domain.RememberMemoryInput) error {
 //
 // 回憶空間開啟時預設收斂到專案：跨對話共用不等於全域共用，甲專案的決策不該
 // 出現在乙專案的對話裡。session metadata 明確指定 memory_scope 時仍以它為準。
+//
+// 唯一的例外是記憶體隔離對話：它一律使用專案專屬 scope，也不接受 memory_scope
+// 覆寫。與一般對話共用 scope 會壞掉兩件事——內容會留在硬碟上的 memories.json，
+// 以及去重與取代邏輯只在同一個 scope 內生效：共用時，一筆隨程序結束就消失的
+// 記憶會就地改寫、或標記取代掉持久記憶，等於把持久那筆一起帶走。
 func ScopeForSessionWithSpace(session domain.Session, spaceEnabled bool) string {
+	if code := domain.EphemeralProjectCodeFromID(session.ID); code != "" {
+		if value := strings.TrimSpace(session.ProjectID); value != "" {
+			return "project:" + value
+		}
+		return "project:project_" + code
+	}
 	if session.Metadata != nil {
 		if value, ok := session.Metadata["memory_scope"].(string); ok {
 			if value = strings.TrimSpace(value); value != "" {

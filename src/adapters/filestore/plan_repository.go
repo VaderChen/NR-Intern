@@ -24,11 +24,11 @@ type PlanRepository struct {
 	root string
 	// roots 讓隔離專案的計畫跟著它的對話走，落在同一個 RAM disk 上。
 	// 計畫內容含步驟敘述與驗證條件，與 transcript 同樣不該留在硬碟。
-	roots atomic.Pointer[SessionRoots]
+	roots atomic.Pointer[ProjectRoots]
 }
 
-// SetSessionRoots 注入根目錄解析；傳入 nil 會回到單一根目錄的行為。
-func (r *PlanRepository) SetSessionRoots(roots SessionRoots) {
+// SetProjectRoots 注入根目錄解析；傳入 nil 會回到單一根目錄的行為。
+func (r *PlanRepository) SetProjectRoots(roots ProjectRoots) {
 	if r == nil {
 		return
 	}

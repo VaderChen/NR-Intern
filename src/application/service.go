@@ -948,7 +948,8 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 
 	now := s.now().UTC()
 	run := domain.Run{
-		ID:                     domain.NewID("run"),
+		// Run ID 沿用 Session 的 Project 歸屬，事件檔才找得到該放哪個 RAM disk。
+		ID:                     domain.NewRunIDForSession(session.ID),
 		AgentID:                session.AgentID,
 		SessionID:              session.ID,
 		Status:                 domain.RunStatusQueued,

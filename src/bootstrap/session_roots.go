@@ -9,16 +9,16 @@ import (
 	"AgenticService/src/ports"
 )
 
-// ephemeralSessionRoots 把「Session 該放在哪個根目錄」接到 RAM disk 池。
+// ephemeralProjectRoots 把「Session 該放在哪個根目錄」接到 RAM disk 池。
 //
 // 歸屬資訊編碼在 Session ID 裡，所以解析不需要查詢 Project 儲存，也不需要
 // 任何會過期的快取——Session 建立後不會換 Project（見
 // Service.validateEphemeralSessionMove），編進去的代碼永遠成立。
-type ephemeralSessionRoots struct{ pool *RAMDiskPool }
+type ephemeralProjectRoots struct{ pool *RAMDiskPool }
 
-var _ filestore.SessionRoots = ephemeralSessionRoots{}
+var _ filestore.ProjectRoots = ephemeralProjectRoots{}
 
-func (r ephemeralSessionRoots) RootFor(sessionID string) string {
+func (r ephemeralProjectRoots) RootFor(sessionID string) string {
 	code := domain.EphemeralProjectCodeFromSessionID(sessionID)
 	if code == "" {
 		return ""
@@ -26,7 +26,7 @@ func (r ephemeralSessionRoots) RootFor(sessionID string) string {
 	return r.pool.RootForProjectCode(code)
 }
 
-func (r ephemeralSessionRoots) AdditionalRoots() []string {
+func (r ephemeralProjectRoots) AdditionalRoots() []string {
 	return r.pool.MountedRoots()
 }
 

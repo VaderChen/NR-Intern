@@ -219,8 +219,36 @@ func (r *RunRepository) load() error {
 	return nil
 }
 
+// persistableRunsLocked 回傳可以寫進 runs.json 的 run。
+//
+// 記憶體隔離對話的 run 一律不落地。runs.json 是單一檔案、每次 Save 整份重寫，
+// 沒辦法像 session 那樣按根目錄分流；而 Run.Input 存的是使用者提問原文，正是
+// 這個功能最不想留在硬碟上的東西。留在記憶體裡不影響本次執行期間的任何讀取，
+// 程序結束就消失——RAM disk 上的對話本來也活不過重啟，語意一致。
+//
+// 沒有隔離 run 時直接回傳原 map，避免每次 Save 都多複製一份。
+func (r *RunRepository) persistableRunsLocked() map[string]domain.Run {
+	volatile := 0
+	for _, run := range r.runs {
+		if domain.EphemeralProjectCodeFromID(run.SessionID) != "" {
+			volatile++
+		}
+	}
+	if volatile == 0 {
+		return r.runs
+	}
+	values := make(map[string]domain.Run, len(r.runs)-volatile)
+	for id, run := range r.runs {
+		if domain.EphemeralProjectCodeFromID(run.SessionID) != "" {
+			continue
+		}
+		values[id] = run
+	}
+	return values
+}
+
 func (r *RunRepository) persistLocked() error {
-	data, err := json.MarshalIndent(runFile{Version: 1, Runs: r.runs}, "", "  ")
+	data, err := json.MarshalIndent(runFile{Version: 1, Runs: r.persistableRunsLocked()}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode run store: %w", err)
 	}

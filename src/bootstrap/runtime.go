@@ -203,9 +203,11 @@ func Build(config Config) (*Runtime, error) {
 	}
 	// 接上根目錄解析：隔離專案的對話直接落在該專案的 RAM disk，不經過 dataDir。
 	// 必須在任何 Session 讀寫之前完成，否則啟動時的清理會找錯位置。
-	sessionRoots := ephemeralSessionRoots{pool: ramDisks}
-	sessions.SetSessionRoots(sessionRoots)
+	sessionRoots := ephemeralProjectRoots{pool: ramDisks}
+	sessions.SetProjectRoots(sessionRoots)
 	sessions.SetSessionIDFactory(newEphemeralSessionIDFactory(projects, logger))
+	// 附件放在 Session 目錄底下，用同一個解析器就會跟著對話走。
+	attachments.SetProjectRoots(sessionRoots)
 	storedProjects, err := projects.List(context.Background())
 	if err != nil {
 		return nil, err
@@ -230,12 +232,15 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 事件檔用 Run ID 解析（Run ID 沿用 Session 的歸屬），逐筆工具輸入與模型
+	// 輸出因此不會落在 dataDir。Run 與通知紀錄則是單一檔案，改在寫入時濾掉。
+	events.SetProjectRoots(sessionRoots)
 	plans, err := filestore.NewPlanRepository(config.DataDir)
 	if err != nil {
 		return nil, err
 	}
 	// 計畫跟著對話走：內容含步驟敘述與驗證條件，與 transcript 同樣不該留在硬碟。
-	plans.SetSessionRoots(sessionRoots)
+	plans.SetProjectRoots(sessionRoots)
 	schedules, err := filestore.NewScheduleRepository(config.DataDir)
 	if err != nil {
 		return nil, err

@@ -313,7 +313,8 @@ curl -X PATCH http://127.0.0.1:8787/api/v1/sessions/SESSION_ID \
 
 所有欄位皆為選填，但 request 至少必須包含一個欄位。`thinking_mode` 傳入空字串或 `auto` 會移除
 Session override，恢復 Provider／後端預設；`lock_plans` 預設為 `false`。`memory_scope` 傳入空字串
-會移除 Session override，恢復 Agent 預設 scope。
+會移除 Session override，恢復 Agent 預設 scope。記憶體隔離專案的 Session 例外：一律使用專案
+專屬 scope，`memory_scope` 對它無效——共用 scope 會讓隨程序結束消失的記憶取代掉持久記憶。
 
 Session 有 queued 或 running Run 時，更新與刪除都回傳 `409 Conflict`；請先等待完成或明確取消 Run，避免執行途中更換權限／Provider 或刪除工具目錄。
 

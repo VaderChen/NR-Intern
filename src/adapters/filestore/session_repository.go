@@ -24,19 +24,22 @@ const (
 	sessionEntriesFile  = "entries.jsonl"
 )
 
-// SessionRoots 決定 session 目錄要落在哪個根。
+// ProjectRoots 決定資料要落在哪個根目錄。
 //
-// 記憶體隔離專案的對話要放在該專案自己的 RAM disk 上，而不是 dataDir。
-// 歸屬資訊編碼在 session ID 裡（對話建立後不會換專案，見
+// 記憶體隔離專案的資料要放在該專案自己的 RAM disk 上，而不是 dataDir。
+// 歸屬資訊編碼在 ID 裡（對話建立後不會換專案，見
 // Service.validateEphemeralSessionMove），所以 RootFor 只需要字串解析，
 // 不必查詢狀態，也沒有需要失效的快取。
 //
-// 需要兩個方法而不是單一函式：讀寫單一 session 靠 ID 解析就夠，但 List 要
+// Session、計畫、附件用 Session ID 解析，事件檔用 Run ID——Run ID 沿用所屬
+// Session 的編碼，因此同一個實作能服務兩種 ID，不需要各自的解析器。
+//
+// 需要兩個方法而不是單一函式：讀寫單一項目靠 ID 解析就夠，但 List 要
 // 列舉所有對話，必須知道還有哪些根目錄存在，否則側邊欄會看不到隔離專案的對話。
-type SessionRoots interface {
-	// RootFor 回傳指定 session 的根目錄；空字串代表使用預設根。
-	RootFor(sessionID string) string
-	// AdditionalRoots 回傳預設根以外、也可能存放 session 的根目錄。
+type ProjectRoots interface {
+	// RootFor 回傳指定 ID 應該使用的根目錄；空字串代表使用預設根。
+	RootFor(id string) string
+	// AdditionalRoots 回傳預設根以外、也可能存放資料的根目錄。
 	// 已經消失的根（例如 RAM disk 尚未掛載）可以直接省略。
 	AdditionalRoots() []string
 }
@@ -52,7 +55,7 @@ type SessionRepository struct {
 	root string
 	// roots 用 atomic 讀取：它在啟動時設定一次、之後只讀，而 sessionDir
 	// 是每次存取都會經過的熱路徑，不值得為它加鎖。
-	roots     atomic.Pointer[SessionRoots]
+	roots     atomic.Pointer[ProjectRoots]
 	idFactory atomic.Pointer[SessionIDFactory]
 
 	mu        sync.Mutex
@@ -62,8 +65,8 @@ type SessionRepository struct {
 	indexes map[string]*entryIndex
 }
 
-// SetSessionRoots 注入根目錄解析。傳入 nil 會回到單一根目錄的行為。
-func (r *SessionRepository) SetSessionRoots(roots SessionRoots) {
+// SetProjectRoots 注入根目錄解析。傳入 nil 會回到單一根目錄的行為。
+func (r *SessionRepository) SetProjectRoots(roots ProjectRoots) {
 	if r == nil {
 		return
 	}

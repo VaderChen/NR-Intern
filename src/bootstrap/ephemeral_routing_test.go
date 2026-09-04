@@ -24,7 +24,7 @@ func TestEphemeralSessionDirectoryNeverTouchesDataDir(t *testing.T) {
 	// 用固定的假 pool 取代真的 RAM disk：這個測試要驗證的是接線，
 	// 不是磁碟掛載本身（那有 ramdisk_test.go 涵蓋）。
 	projectID := "project_abc123"
-	sessions.SetSessionRoots(fixedRoots{code: "abc123", root: volatileRoot})
+	sessions.SetProjectRoots(fixedRoots{code: "abc123", root: volatileRoot})
 	sessions.SetSessionIDFactory(func(requested string) string {
 		if requested != projectID {
 			return ""
@@ -92,7 +92,7 @@ func TestEphemeralSessionDisappearsWithoutItsDisk(t *testing.T) {
 		t.Fatalf("new session repository: %v", err)
 	}
 	projectID := "project_abc123"
-	sessions.SetSessionRoots(fixedRoots{code: "abc123", root: volatileRoot})
+	sessions.SetProjectRoots(fixedRoots{code: "abc123", root: volatileRoot})
 	sessions.SetSessionIDFactory(func(string) string { return domain.NewEphemeralSessionID(projectID) })
 	ctx := context.Background()
 	volatile, err := sessions.Create(ctx, "agent", domain.CreateSessionInput{ProjectID: projectID})
@@ -104,7 +104,7 @@ func TestEphemeralSessionDisappearsWithoutItsDisk(t *testing.T) {
 	if err := os.RemoveAll(volatileRoot); err != nil {
 		t.Fatalf("remove volatile root: %v", err)
 	}
-	sessions.SetSessionRoots(fixedRoots{code: "abc123", root: ""})
+	sessions.SetProjectRoots(fixedRoots{code: "abc123", root: ""})
 
 	if _, err := sessions.Get(ctx, volatile.ID); err == nil {
 		t.Fatal("磁碟消失後不該還讀得到隔離對話")
@@ -163,7 +163,7 @@ func TestEphemeralPlansFollowTheirSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new plan repository: %v", err)
 	}
-	plans.SetSessionRoots(fixedRoots{code: "abc123", root: volatileRoot})
+	plans.SetProjectRoots(fixedRoots{code: "abc123", root: volatileRoot})
 	ctx := context.Background()
 
 	volatileSession := domain.NewEphemeralSessionID("project_abc123")

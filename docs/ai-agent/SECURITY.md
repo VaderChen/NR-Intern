@@ -164,9 +164,15 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - `http_fetch` 是唯一可由模型自行指定任意 URL 的內建工具，邊界見上節「網路邊界」；關閉後不會出現在模型的工具清單。
 - MCP 工具一律標記 `RequiresPermission=true`，必須通過 elevated profile；權限邊界不因唯讀而放寬。
 - **唯讀工具可免逐次 Approval，但不是無條件豁免。** MCP 工具的唯讀屬性來自 Server 自己宣告的 `readOnlyHint`，屬於外部不受信任資料，只有管理者對該 Server 開啟 `trust_annotations` 後才會被採信；未開啟時 MCP 工具不算唯讀，仍然逐次核准。跳過核准會發出 `run.approval_skipped`（`reason=read_only_tool`）留下紀錄。
-- **記憶體隔離專案的對話在執行期間仍寫入磁碟。** 揮發語意來自「正常關閉清理 ＋ 下次啟動補清理」，
-  不是「從不落地」。程序被強制終止後、下次啟動完成清理前，該 Project 的 transcript、附件、計畫與
-  Run 事件仍以檔案形式存在於 `dataDir`。若威脅模型要求對話絕不落地，這個功能目前不滿足該需求。
+- **記憶體隔離專案的對話在執行期間就不落地。** transcript、計畫、附件與 Run 事件在寫入當下即
+  指向該 Project 的 RAM disk；`runs.json` 與 `notifications.json` 是單一檔案無法分流，改為只留在
+  記憶體、不寫入。歸屬編碼在 Session／Run ID 裡，磁碟未掛載時解析回到預設根，該對話即視為不存在。
+  模型主動寫入回憶空間（`memory_remember`）的內容同樣不落地，且隔離對話一律使用專案專屬
+  記憶 scope、不接受 `memory_scope` 覆寫——共用 scope 會讓一筆隨程序結束消失的記憶就地改寫或
+  取代掉持久記憶。
+  **邊界**：`shell_exec` 啟動的是真實子行程，仍可寫到 RAM disk 以外的路徑；管理者透過記憶 API
+  直接寫入該專案 scope 的內容（非對話產生、無來源 Session）仍會持久化。作業系統的分頁檔、
+  當機傾印與外部備份也不在本功能的控制範圍內。
 - **記憶體隔離專案免逐次 Approval。** 這類專案的 sandbox 是揮發性 RAM Disk，關閉程式即消失，
   逐次詢問只會把使用者訓練成無條件按下核准，反而讓真正有副作用的操作更容易被順手放行。
   豁免會發出 `run.approval_skipped`（`reason=ephemeral_project`）留下紀錄。

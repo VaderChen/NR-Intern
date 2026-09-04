@@ -51,12 +51,12 @@ func twoRootRepository(t *testing.T) (*SessionRepository, string, string) {
 	if err != nil {
 		t.Fatalf("new repository: %v", err)
 	}
-	repository.SetSessionRoots(stubRoots{prefix: "session_e", root: volatileRoot})
+	repository.SetProjectRoots(stubRoots{prefix: "session_e", root: volatileRoot})
 	return repository, filepath.Join(dataDir, "sessions"), volatileRoot
 }
 
 // 同一個 repository 實例要能同時讀寫兩個根目錄下的 session。
-func TestSessionRootsPlaceDirectoriesInResolvedRoot(t *testing.T) {
+func TestProjectRootsPlaceDirectoriesInResolvedRoot(t *testing.T) {
 	repository, defaultRoot, volatileRoot := twoRootRepository(t)
 	ctx := context.Background()
 
@@ -82,7 +82,7 @@ func TestSessionRootsPlaceDirectoriesInResolvedRoot(t *testing.T) {
 }
 
 // transcript 的讀寫路徑在兩個根下必須行為一致。
-func TestSessionRootsKeepTranscriptOperationsConsistent(t *testing.T) {
+func TestProjectRootsKeepTranscriptOperationsConsistent(t *testing.T) {
 	repository, _, _ := twoRootRepository(t)
 	ctx := context.Background()
 	for _, sessionID := range []string{"session_normal02", "session_e_proj02"} {
@@ -117,7 +117,7 @@ func TestSessionRootsKeepTranscriptOperationsConsistent(t *testing.T) {
 }
 
 // List 必須涵蓋所有根，否則側邊欄會看不到隔離專案的對話。
-func TestSessionRootsListSpansEveryRoot(t *testing.T) {
+func TestProjectRootsListSpansEveryRoot(t *testing.T) {
 	repository, _, _ := twoRootRepository(t)
 	ctx := context.Background()
 	createIn(t, repository, "session_normal03")
@@ -139,13 +139,13 @@ func TestSessionRootsListSpansEveryRoot(t *testing.T) {
 }
 
 // 額外的根尚未掛載時（RAM disk 還沒建立）不該讓整份清單失敗。
-func TestSessionRootsToleratesMissingAdditionalRoot(t *testing.T) {
+func TestProjectRootsToleratesMissingAdditionalRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	repository, err := NewSessionRepository(dataDir)
 	if err != nil {
 		t.Fatalf("new repository: %v", err)
 	}
-	repository.SetSessionRoots(stubRoots{prefix: "session_e", root: filepath.Join(dataDir, "not-mounted")})
+	repository.SetProjectRoots(stubRoots{prefix: "session_e", root: filepath.Join(dataDir, "not-mounted")})
 	createIn(t, repository, "session_normal04")
 
 	sessions, err := repository.List(context.Background(), "agent")
@@ -157,8 +157,8 @@ func TestSessionRootsToleratesMissingAdditionalRoot(t *testing.T) {
 	}
 }
 
-// 沒有注入 SessionRoots 時，行為必須與改動前完全相同。
-func TestSessionRootsDefaultToSingleRoot(t *testing.T) {
+// 沒有注入 ProjectRoots 時，行為必須與改動前完全相同。
+func TestProjectRootsDefaultToSingleRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	repository, err := NewSessionRepository(dataDir)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestSessionRootsDefaultToSingleRoot(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dataDir, "sessions", session.ID)); err != nil {
 		t.Fatalf("未注入時應落在預設根：%v", err)
 	}
-	repository.SetSessionRoots(nil)
+	repository.SetProjectRoots(nil)
 	if _, err := repository.Get(context.Background(), session.ID); err != nil {
 		t.Fatalf("傳入 nil 應回到單一根行為：%v", err)
 	}

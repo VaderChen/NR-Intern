@@ -35,24 +35,50 @@ func randomIDSuffix() string {
 // 的機率就是 e，光看前綴會分不出兩者。v 不在十六進位字元集內，不可能誤判。
 const ephemeralSessionMarker = "v"
 
-// NewEphemeralSessionID 產生帶有 Project 歸屬的 Session ID。
+// NewEphemeralID 產生帶有 Project 歸屬的 ID。
 //
-// 格式為 session_e<projectHex>_<random>，其中 projectHex 是 Project ID 去掉
-// project_ 前綴後的部分。projectID 無法編碼時退回一般 ID——寧可讓對話落在
-// 預設根，也不要產生一個解析不出根目錄、之後每次存取都失敗的 ID。
-func NewEphemeralSessionID(projectID string) string {
+// 格式為 <prefix>_v<projectHex>_<random>，其中 projectHex 是 Project ID 去掉
+// project_ 前綴後的部分。Session 與 Run 都用這一套：兩者的儲存都要能只憑 ID
+// 找到所屬的 RAM disk，事件檔更是只拿得到 Run ID。
+//
+// projectID 無法編碼時退回一般 ID——寧可讓資料落在預設根，也不要產生一個
+// 解析得出代碼、卻對應不到任何磁碟的 ID，那種紀錄之後每次存取都會失敗。
+func NewEphemeralID(prefix, projectID string) string {
 	code := projectIDCode(projectID)
 	if code == "" {
-		return NewID("session")
+		return NewID(prefix)
 	}
-	return "session_" + ephemeralSessionMarker + code + "_" + randomIDSuffix()
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "id"
+	}
+	return prefix + "_" + ephemeralSessionMarker + code + "_" + randomIDSuffix()
 }
 
-// EphemeralProjectCodeFromSessionID 從 Session ID 取回 Project 代碼。
+// NewEphemeralSessionID 是 Session 專用的便利包裝。
+func NewEphemeralSessionID(projectID string) string {
+	return NewEphemeralID("session", projectID)
+}
+
+// NewRunIDForSession 讓 Run 沿用所屬 Session 的 Project 歸屬。
 //
-// 一般 Session 與所有既有格式都會回傳空字串，呼叫端據此使用預設根目錄。
-func EphemeralProjectCodeFromSessionID(sessionID string) string {
-	rest, found := strings.CutPrefix(strings.TrimSpace(sessionID), "session_"+ephemeralSessionMarker)
+// 事件檔以 Run ID 命名，讀取時手上只有 Run ID、也沒有記憶體快取可以回頭查
+// Session，所以歸屬必須編進 Run ID 本身。直接從 Session ID 取代碼即可，
+// 不需要再查一次 Project 儲存。
+func NewRunIDForSession(sessionID string) string {
+	code := EphemeralProjectCodeFromID(sessionID)
+	if code == "" {
+		return NewID("run")
+	}
+	return "run_" + ephemeralSessionMarker + code + "_" + randomIDSuffix()
+}
+
+// EphemeralProjectCodeFromID 從 Session 或 Run ID 取回 Project 代碼。
+//
+// 一般 ID 與所有既有格式都會回傳空字串，呼叫端據此使用預設根目錄。
+// 切在第一個 _v 是安全的：ID 的隨機部分是十六進位，不含 v。
+func EphemeralProjectCodeFromID(id string) string {
+	_, rest, found := strings.Cut(strings.TrimSpace(id), "_"+ephemeralSessionMarker)
 	if !found {
 		return ""
 	}
@@ -61,6 +87,11 @@ func EphemeralProjectCodeFromSessionID(sessionID string) string {
 		return ""
 	}
 	return projectIDCode(code)
+}
+
+// EphemeralProjectCodeFromSessionID 保留原名，語意與 EphemeralProjectCodeFromID 相同。
+func EphemeralProjectCodeFromSessionID(sessionID string) string {
+	return EphemeralProjectCodeFromID(sessionID)
 }
 
 // projectIDCode 取出 Project ID 中可用於編碼的部分，並確認它只含安全字元。

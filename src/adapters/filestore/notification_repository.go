@@ -197,13 +197,21 @@ func (r *NotificationRepository) load() error {
 }
 
 func (r *NotificationRepository) persistLocked() error {
+	// 記憶體隔離對話的通知一律不落地：Title 與 Message 帶的是該次對話的內容摘要。
+	// notifications.json 是單一檔案，沒辦法按根目錄分流，所以在寫入時濾掉；
+	// 記憶體裡仍然完整，本次執行期間的顯示、已讀、去重都不受影響。
+	items := make(map[string]domain.Notification, len(r.items))
 	dedupeKeys := make(map[string]string)
 	for id, item := range r.items {
+		if domain.EphemeralProjectCodeFromID(item.SessionID) != "" {
+			continue
+		}
+		items[id] = item
 		if item.DedupeKey != "" {
 			dedupeKeys[id] = item.DedupeKey
 		}
 	}
-	data, err := json.MarshalIndent(notificationFile{Version: 2, Items: r.items, DedupeKeys: dedupeKeys}, "", "  ")
+	data, err := json.MarshalIndent(notificationFile{Version: 2, Items: items, DedupeKeys: dedupeKeys}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode notification store: %w", err)
 	}

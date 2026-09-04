@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
@@ -18,6 +19,20 @@ const attachmentDirectory = "attachments"
 
 type AttachmentRepository struct {
 	sessionsRoot string
+
+	roots atomic.Pointer[ProjectRoots]
+}
+
+// SetProjectRoots 讓附件跟著所屬 Session 走。
+//
+// 附件放在 Session 目錄底下，所以 Session 搬到 RAM disk 時附件必須一起搬——
+// 否則使用者上傳的檔案會是隔離對話唯一留在硬碟上的內容。
+func (r *AttachmentRepository) SetProjectRoots(roots ProjectRoots) {
+	if roots == nil {
+		r.roots.Store(nil)
+		return
+	}
+	r.roots.Store(&roots)
 }
 
 func NewAttachmentRepository(dataDir string) (*AttachmentRepository, error) {
@@ -160,7 +175,13 @@ func (r *AttachmentRepository) attachmentDir(sessionID, attachmentID string) (st
 	if !safeStoreID(sessionID, "session_") || !safeStoreID(attachmentID, "attachment_") {
 		return "", fmt.Errorf("%w: invalid session or attachment id", domain.ErrInvalidInput)
 	}
-	return filepath.Join(r.sessionsRoot, sessionID, "workspace", attachmentDirectory, attachmentID), nil
+	root := r.sessionsRoot
+	if roots := r.roots.Load(); roots != nil {
+		if resolved := strings.TrimSpace((*roots).RootFor(sessionID)); resolved != "" {
+			root = resolved
+		}
+	}
+	return filepath.Join(root, sessionID, "workspace", attachmentDirectory, attachmentID), nil
 }
 
 func safeStoreID(value, prefix string) bool {

@@ -69,3 +69,29 @@ func TestEphemeralSessionIDRejectsUnsafeProjectID(t *testing.T) {
 		}
 	}
 }
+
+// Run ID 的歸屬要與所屬 Session 完全一致：事件檔靠它決定寫到哪個 RAM disk，
+// 對不上就等於資料落在錯的地方，而且不會有任何錯誤訊息。
+func TestRunIDInheritsSessionProject(t *testing.T) {
+	sessionID := NewEphemeralSessionID("project_abc123")
+	runID := NewRunIDForSession(sessionID)
+	if got := EphemeralProjectCodeFromID(runID); got != "abc123" {
+		t.Fatalf("Run ID 的歸屬應與 Session 相同：%q（來自 %s）", got, runID)
+	}
+	if a, b := NewRunIDForSession(sessionID), NewRunIDForSession(sessionID); a == b {
+		t.Fatalf("同一個 Session 的兩個 Run 不該拿到相同 ID：%s", a)
+	}
+}
+
+// 一般對話的 Run 維持原格式，既有紀錄與路徑組裝完全不受影響。
+func TestRunIDStaysPlainForNormalSessions(t *testing.T) {
+	for _, sessionID := range []string{"session_normal", "", "session_e0a1b2", "不是ID"} {
+		runID := NewRunIDForSession(sessionID)
+		if !strings.HasPrefix(runID, "run_") {
+			t.Fatalf("Run ID 前綴不正確：%s", runID)
+		}
+		if code := EphemeralProjectCodeFromID(runID); code != "" {
+			t.Fatalf("一般對話的 Run 不該解析出歸屬：%q（來自 session %q）", code, sessionID)
+		}
+	}
+}
