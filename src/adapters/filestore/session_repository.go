@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -23,14 +24,105 @@ const (
 	sessionEntriesFile  = "entries.jsonl"
 )
 
+// SessionRoots 決定 session 目錄要落在哪個根。
+//
+// 記憶體隔離專案的對話要放在該專案自己的 RAM disk 上，而不是 dataDir。
+// 歸屬資訊編碼在 session ID 裡（對話建立後不會換專案，見
+// Service.validateEphemeralSessionMove），所以 RootFor 只需要字串解析，
+// 不必查詢狀態，也沒有需要失效的快取。
+//
+// 需要兩個方法而不是單一函式：讀寫單一 session 靠 ID 解析就夠，但 List 要
+// 列舉所有對話，必須知道還有哪些根目錄存在，否則側邊欄會看不到隔離專案的對話。
+type SessionRoots interface {
+	// RootFor 回傳指定 session 的根目錄；空字串代表使用預設根。
+	RootFor(sessionID string) string
+	// AdditionalRoots 回傳預設根以外、也可能存放 session 的根目錄。
+	// 已經消失的根（例如 RAM disk 尚未掛載）可以直接省略。
+	AdditionalRoots() []string
+}
+
+// SessionIDFactory 產生新的 Session ID。
+//
+// 記憶體隔離專案要把歸屬編進 ID，而判斷「這個 Project 是不是隔離的」需要查
+// Project 儲存——那是 filestore 不該知道的事，所以做成注入點。
+// 回傳空字串代表使用預設格式。
+type SessionIDFactory func(projectID string) string
+
 type SessionRepository struct {
 	root string
+	// roots 用 atomic 讀取：它在啟動時設定一次、之後只讀，而 sessionDir
+	// 是每次存取都會經過的熱路徑，不值得為它加鎖。
+	roots     atomic.Pointer[SessionRoots]
+	idFactory atomic.Pointer[SessionIDFactory]
 
 	mu        sync.Mutex
 	locks     map[string]*sync.Mutex
 	sequences map[string]int64
 	// indexes 是各 session transcript 的位置索引，見 session_index.go。
 	indexes map[string]*entryIndex
+}
+
+// SetSessionRoots 注入根目錄解析。傳入 nil 會回到單一根目錄的行為。
+func (r *SessionRepository) SetSessionRoots(roots SessionRoots) {
+	if r == nil {
+		return
+	}
+	if roots == nil {
+		r.roots.Store(nil)
+		return
+	}
+	r.roots.Store(&roots)
+}
+
+// SetSessionIDFactory 注入 Session ID 產生方式。傳入 nil 會回到預設格式。
+func (r *SessionRepository) SetSessionIDFactory(factory SessionIDFactory) {
+	if r == nil {
+		return
+	}
+	if factory == nil {
+		r.idFactory.Store(nil)
+		return
+	}
+	r.idFactory.Store(&factory)
+}
+
+// newSessionID 產生新的 Session ID。
+func (r *SessionRepository) newSessionID(projectID string) string {
+	if factory := r.idFactory.Load(); factory != nil {
+		if id := strings.TrimSpace((*factory)(projectID)); id != "" {
+			return id
+		}
+	}
+	return domain.NewID("session")
+}
+
+// rootFor 回傳指定 session 應該使用的根目錄。
+func (r *SessionRepository) rootFor(sessionID string) string {
+	roots := r.roots.Load()
+	if roots == nil {
+		return r.root
+	}
+	if resolved := strings.TrimSpace((*roots).RootFor(sessionID)); resolved != "" {
+		return resolved
+	}
+	return r.root
+}
+
+// searchRoots 回傳列舉 session 時要掃描的所有根目錄，預設根排在最前面。
+func (r *SessionRepository) searchRoots() []string {
+	result := []string{r.root}
+	roots := r.roots.Load()
+	if roots == nil {
+		return result
+	}
+	seen := map[string]bool{r.root: true}
+	for _, root := range (*roots).AdditionalRoots() {
+		if root = strings.TrimSpace(root); root != "" && !seen[root] {
+			seen[root] = true
+			result = append(result, root)
+		}
+	}
+	return result
 }
 
 func NewSessionRepository(dataDir string) (*SessionRepository, error) {
@@ -77,7 +169,8 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 	}
 	localNow := time.Now()
 	now := localNow.UTC()
-	sessionID := domain.NewID("session")
+	// ID 決定目錄落在哪個根，所以要在建立目錄之前產生。
+	sessionID := r.newSessionID(projectID)
 	directory, err := r.sessionDir(sessionID)
 	if err != nil {
 		return domain.Session{}, err
@@ -140,23 +233,32 @@ func (r *SessionRepository) List(ctx context.Context, agentID string) ([]domain.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	items, err := os.ReadDir(r.root)
-	if err != nil {
-		return nil, fmt.Errorf("list sessions: %w", err)
-	}
-	sessions := make([]domain.Session, 0, len(items))
-	for _, item := range items {
-		if !item.IsDir() {
+	sessions := []domain.Session{}
+	seen := map[string]bool{}
+	for index, root := range r.searchRoots() {
+		items, err := os.ReadDir(root)
+		if err != nil {
+			// 預設根讀不到是真的故障；額外的根可能只是 RAM disk 還沒掛載，
+			// 那不該讓整份清單失敗。
+			if index == 0 {
+				return nil, fmt.Errorf("list sessions: %w", err)
+			}
 			continue
 		}
-		session, readErr := r.Get(ctx, item.Name())
-		if readErr != nil {
-			continue
+		for _, item := range items {
+			if !item.IsDir() || seen[item.Name()] {
+				continue
+			}
+			session, readErr := r.Get(ctx, item.Name())
+			if readErr != nil {
+				continue
+			}
+			if strings.TrimSpace(agentID) != "" && session.AgentID != strings.TrimSpace(agentID) {
+				continue
+			}
+			seen[item.Name()] = true
+			sessions = append(sessions, session)
 		}
-		if strings.TrimSpace(agentID) != "" && session.AgentID != strings.TrimSpace(agentID) {
-			continue
-		}
-		sessions = append(sessions, session)
 	}
 	sort.Slice(sessions, func(i, j int) bool { return sessions[i].UpdatedAt.After(sessions[j].UpdatedAt) })
 	return sessions, nil
@@ -729,7 +831,7 @@ func (r *SessionRepository) sessionDir(sessionID string) (string, error) {
 	if sessionID == "" || sessionID == "." || sessionID == ".." || filepath.Base(sessionID) != sessionID || strings.ContainsAny(sessionID, `/\\`) {
 		return "", fmt.Errorf("%w: invalid session id", domain.ErrInvalidInput)
 	}
-	return filepath.Join(r.root, sessionID), nil
+	return filepath.Join(r.rootFor(sessionID), sessionID), nil
 }
 
 func (r *SessionRepository) sessionLock(sessionID string) *sync.Mutex {

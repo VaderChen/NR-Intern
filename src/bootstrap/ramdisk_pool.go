@@ -143,3 +143,46 @@ func (pool *RAMDiskPool) Close(ctx context.Context) error {
 	}
 	return result
 }
+
+// RootForProjectCode 依 Session ID 裡編碼的 Project 代碼回傳 RAM disk 根目錄。
+//
+// 代碼是 Project ID 去掉 project_ 前綴的部分（見 domain.NewEphemeralSessionID）。
+// 磁碟尚未建立或已卸載時回傳空字串，呼叫端會退回預設根——重開機後的舊對話
+// 因此自然變成「找不到」，這正是揮發語意要的結果。
+func (pool *RAMDiskPool) RootForProjectCode(code string) string {
+	if pool == nil || strings.TrimSpace(code) == "" {
+		return ""
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	for projectID, disk := range pool.disks {
+		if disk == nil {
+			continue
+		}
+		if strings.TrimPrefix(projectID, "project_") == code {
+			return disk.Root()
+		}
+	}
+	return ""
+}
+
+// MountedRoots 回傳目前所有已掛載的 RAM disk 根目錄。
+//
+// 列舉 Session 時要掃過這些目錄，否則側邊欄看不到隔離專案的對話。
+func (pool *RAMDiskPool) MountedRoots() []string {
+	if pool == nil {
+		return nil
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	roots := make([]string, 0, len(pool.disks))
+	for _, disk := range pool.disks {
+		if disk == nil {
+			continue
+		}
+		if root := strings.TrimSpace(disk.Root()); root != "" {
+			roots = append(roots, root)
+		}
+	}
+	return roots
+}

@@ -201,6 +201,10 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 接上根目錄解析：隔離專案的對話直接落在該專案的 RAM disk，不經過 dataDir。
+	// 必須在任何 Session 讀寫之前完成，否則啟動時的清理會找錯位置。
+	sessions.SetSessionRoots(ephemeralSessionRoots{pool: ramDisks})
+	sessions.SetSessionIDFactory(newEphemeralSessionIDFactory(projects, logger))
 	storedProjects, err := projects.List(context.Background())
 	if err != nil {
 		return nil, err
