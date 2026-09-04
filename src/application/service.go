@@ -334,6 +334,11 @@ func (s *Service) UpdateSession(ctx context.Context, sessionID string, input dom
 			return domain.Session{}, err
 		}
 	}
+	if projectID != current.ProjectID {
+		if err := s.validateEphemeralSessionMove(ctx, current.ProjectID, projectID); err != nil {
+			return domain.Session{}, err
+		}
+	}
 	providerID := current.ProviderID
 	if input.ProviderID != nil {
 		providerID = strings.TrimSpace(*input.ProviderID)
@@ -401,6 +406,30 @@ func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectI
 //
 // 這是「寫一次、每次對話都適用」的常駐指示：使用者不必在每個新對話重述工作規則，
 // 排程建立的對話也會自動沿用所屬 Workspace 的說明。
+// validateEphemeralSessionMove 擋下記憶體隔離專案的對話搬移。
+//
+// 搬出去等於把揮發資料變成永久資料，搬進來則是把已經寫在硬碟上的對話「當成」
+// 揮發的——舊檔案其實還在。兩個方向都會讓使用者對「這個對話會不會留下」
+// 產生錯誤認知，而這正是隔離專案唯一的賣點。
+//
+// 這個限制同時是儲存分流的前提：對話的根目錄在建立時決定且永不改變，
+// 查詢時才不需要一份 sessionID 到專案的映射。
+func (s *Service) validateEphemeralSessionMove(ctx context.Context, fromProjectID, toProjectID string) error {
+	for _, projectID := range []string{fromProjectID, toProjectID} {
+		if strings.TrimSpace(projectID) == "" {
+			continue
+		}
+		project, err := s.projects.Get(ctx, projectID)
+		if err != nil {
+			return err
+		}
+		if project.Ephemeral {
+			return fmt.Errorf("%w: 記憶體隔離專案的對話不能移動；它的工作檔案綁在該專案的 RAM Disk 上", domain.ErrConflict)
+		}
+	}
+	return nil
+}
+
 func (s *Service) sessionInstructions(ctx context.Context, session domain.Session) ([]any, error) {
 	entries := []any{}
 	if workspaceID := strings.TrimSpace(session.WorkspaceID); workspaceID != "" {
