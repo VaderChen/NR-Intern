@@ -144,6 +144,34 @@ func (r *NotificationRepository) DeleteRead(ctx context.Context) error {
 	return r.persistLocked()
 }
 
+// DeleteSession 避免揮發性對話消失後，通知中心仍留下無法開啟的 Session 連結。
+func (r *NotificationRepository) DeleteSession(ctx context.Context, sessionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("%w: session id is required", domain.ErrInvalidInput)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := make(map[string]domain.Notification, len(r.items))
+	for id, item := range r.items {
+		previous[id] = item
+		if item.SessionID == sessionID {
+			delete(r.items, id)
+		}
+	}
+	if len(previous) == len(r.items) {
+		return nil
+	}
+	if err := r.persistLocked(); err != nil {
+		r.items = previous
+		return err
+	}
+	return nil
+}
+
 func (r *NotificationRepository) load() error {
 	data, err := os.ReadFile(r.filePath)
 	if errors.Is(err, os.ErrNotExist) {

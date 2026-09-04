@@ -311,6 +311,9 @@ func runBackendChild(value options) {
 	shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_ = server.Shutdown(shutdownContext)
+	if err := runtime.Close(shutdownContext); err != nil {
+		slog.Error("desktop backend shutdown failed", "error", err)
+	}
 }
 
 func backendParentAlive(pid int) bool {

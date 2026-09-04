@@ -32,6 +32,7 @@ type Config struct {
 	NotificationsEnabled bool                    `json:"notifications_enabled,omitempty"`
 	ListenAddress        string                  `json:"listen_address"`
 	DataDir              string                  `json:"data_dir"`
+	RAMDisk              RAMDiskConfig           `json:"ram_disk"`
 	APIToken             string                  `json:"api_token,omitempty"`
 	AllowedOrigins       []string                `json:"allowed_origins,omitempty"`
 	AllowedTools         []string                `json:"allowed_tools,omitempty"`
@@ -75,6 +76,10 @@ type Config struct {
 	// MemorySpace 是實驗性的跨對話共同記憶開關，預設關閉。
 	// 開啟後由 memory.Manager 套用准入、去重、專案 scope、召回視窗與淘汰。
 	MemorySpace bool `json:"memory_space"`
+	// MemoryIsolatedProjects 控制能不能新建記憶體隔離專案，預設開啟。
+	// 這個能力依賴平台的 RAM disk 支援，在不支援的環境可以整個關掉，
+	// 讓建立對話框不再提供一個註定失敗的選項。
+	MemoryIsolatedProjects bool `json:"memory_isolated_projects"`
 }
 
 type HTTPFetchConfig struct {
@@ -105,11 +110,15 @@ func (config ProviderConfig) IsEnabled() bool {
 
 func DefaultConfig() Config {
 	return Config{
-		ServiceName:            DefaultServiceName,
-		UILanguage:             DefaultUILanguage,
-		NotificationsEnabled:   false,
-		ListenAddress:          "127.0.0.1:8787",
-		DataDir:                filepath.Join("data", "ai-agent"),
+		ServiceName:          DefaultServiceName,
+		UILanguage:           DefaultUILanguage,
+		NotificationsEnabled: false,
+		ListenAddress:        "127.0.0.1:8787",
+		DataDir:              filepath.Join("data", "ai-agent"),
+		RAMDisk: RAMDiskConfig{
+			Enabled: true,
+			SizeMB:  DefaultRAMDiskSizeMB,
+		},
 		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "document_compare", "document_validate", "document_fonts", "document_create", "document_edit", "document_convert", "pdf_pages", "document_render", "http_fetch", "shell_exec", "wait_for", "ssh_exec", "ssh_wait", "memory_search", "memory_remember", "memory_forget"},
 		AllowElevatedTools:     true,
 		MaxTurns:               harness.DefaultMaxTurns,
@@ -117,12 +126,14 @@ func DefaultConfig() Config {
 		// 預設 native：由 Provider 的 tools／tool_calls 欄位傳遞工具，多數推論引擎會以
 		// grammar 約束輸出，比要求模型自行輸出 JSON 指令可靠得多（小型與本機模型尤其明顯）。
 		// Provider 不支援時可在管理介面切回 instruction。
-		ToolCallMode:        string(harness.ToolCallModeNative),
-		ToolRetrieval:       true,
-		MaxCompletionChecks: harness.DefaultMaxCompletionChecks,
-		MaxWallClockSeconds: 2 * 60 * 60,
-		MaxTokens:           0,
-		MaxToolCalls:        0,
+		ToolCallMode:  string(harness.ToolCallModeNative),
+		ToolRetrieval: true,
+		// 預設開啟：這是已經完成的功能，不像回憶空間那樣仍在設計中。
+		MemoryIsolatedProjects: true,
+		MaxCompletionChecks:    harness.DefaultMaxCompletionChecks,
+		MaxWallClockSeconds:    2 * 60 * 60,
+		MaxTokens:              0,
+		MaxToolCalls:           0,
 		// 單機 Harness 預設允許 Sandbox 內的寫入與 Shell，但每次高風險工具仍須人工 Approval。
 		// 不開放 Client 自行指定 profile；對外部署可將 AllowElevatedTools 關閉以停用全部寫入型工具。
 		Permissions: domain.PermissionPolicy{
@@ -232,6 +243,12 @@ func applyEnvironment(config *Config) {
 	setString("AI_AGENT_API_TOKEN", &config.APIToken)
 	setString("AI_AGENT_DEFAULT_PROVIDER_ID", &config.DefaultProviderID)
 	setString("AI_AGENT_TOOL_CALL_MODE", &config.ToolCallMode)
+	applyBoolEnvironment("AI_AGENT_RAM_DISK_ENABLED", &config.RAMDisk.Enabled)
+	if value, exists := os.LookupEnv("AI_AGENT_RAM_DISK_SIZE_MB"); exists {
+		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
+			config.RAMDisk.SizeMB = parsed
+		}
+	}
 	providerID := strings.TrimSpace(config.DefaultProviderID)
 	provider := config.Providers[providerID]
 	var llm *openaicompat.Config
@@ -337,6 +354,12 @@ func validateConfig(config *Config) error {
 	config.DataDir = strings.TrimSpace(config.DataDir)
 	if config.ServiceName == "" || config.ListenAddress == "" || config.DataDir == "" {
 		return fmt.Errorf("service_name, listen_address and data_dir are required")
+	}
+	if config.RAMDisk.SizeMB == 0 {
+		config.RAMDisk.SizeMB = DefaultRAMDiskSizeMB
+	}
+	if config.RAMDisk.SizeMB < minRAMDiskSizeMB || config.RAMDisk.SizeMB > maxRAMDiskSizeMB {
+		return fmt.Errorf("ram_disk.size_mb must be between %d and %d", minRAMDiskSizeMB, maxRAMDiskSizeMB)
 	}
 	if utf8.RuneCountInString(config.ServiceName) > 80 {
 		return fmt.Errorf("service_name must not exceed 80 characters")

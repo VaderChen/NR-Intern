@@ -164,6 +164,18 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - `http_fetch` 是唯一可由模型自行指定任意 URL 的內建工具，邊界見上節「網路邊界」；關閉後不會出現在模型的工具清單。
 - MCP 工具一律標記 `RequiresPermission=true`，必須通過 elevated profile；權限邊界不因唯讀而放寬。
 - **唯讀工具可免逐次 Approval，但不是無條件豁免。** MCP 工具的唯讀屬性來自 Server 自己宣告的 `readOnlyHint`，屬於外部不受信任資料，只有管理者對該 Server 開啟 `trust_annotations` 後才會被採信；未開啟時 MCP 工具不算唯讀，仍然逐次核准。跳過核准會發出 `run.approval_skipped`（`reason=read_only_tool`）留下紀錄。
+- **記憶體隔離專案的對話在執行期間仍寫入磁碟。** 揮發語意來自「正常關閉清理 ＋ 下次啟動補清理」，
+  不是「從不落地」。程序被強制終止後、下次啟動完成清理前，該 Project 的 transcript、附件、計畫與
+  Run 事件仍以檔案形式存在於 `dataDir`。若威脅模型要求對話絕不落地，這個功能目前不滿足該需求。
+- **記憶體隔離專案免逐次 Approval。** 這類專案的 sandbox 是揮發性 RAM Disk，關閉程式即消失，
+  逐次詢問只會把使用者訓練成無條件按下核准，反而讓真正有副作用的操作更容易被順手放行。
+  豁免會發出 `run.approval_skipped`（`reason=ephemeral_project`）留下紀錄。
+  依據是後端在組裝 Run metadata 時寫入的 `ephemeral_project` 旗標，與 `sandbox_roots`
+  一樣會先清除 Client 夾帶的同名值，且讀取端只接受布林 `true`。
+  **這個豁免的邊界必須講清楚**：`shell_exec` 啟動的是真實子行程，sandbox 對它沒有強制力——
+  working directory 在 RAM Disk 上，不代表命令不能寫到其他路徑。因此這裡豁免的語意是
+  「信任這個專案裡執行的命令」，不是「保證只會寫入 RAM Disk」。需要嚴格邊界時，
+  應改用一般專案並保留逐次核准。
 - `trust_annotations` **預設開啟**：MCP Server 由管理者自己加入，唯讀查詢逐次核准只會增加不必要的操作負擔。設定檔沒有這個欄位時採預設值；明確設為 `false` 時保存並沿用該決定，不會被預設值蓋掉。對不完全信任的 Server 應主動關閉——關閉後該 Server 的所有工具都逐次核准。
 - MCP stdio 子程序只繼承必要 OS 環境以及管理者明確設定的變數；SSE 與 Streamable HTTP 的 Bearer Token、Basic Auth 與 headers 不會顯示於工具定義、Prompt 或管理 API 回應。管理 API 只回傳 `auth_mode`（實際送出的驗證方式），讓使用者能確認憑證有被採用而不必顯示明文。
 - MCP 連線在伺服器 session 失效或重啟後會自動重連。只有「伺服器明確拒收」的錯誤（session not found／session 過期／連線未建立）才會自動重送工具呼叫，因為這種情況遠端不可能執行過；其餘連線錯誤仍只對宣告 idempotent 的工具重試，避免重複副作用。
@@ -186,6 +198,18 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
   不得視為不可刪除的帳務或稽核總帳。
 
 ## 本機資料
+
+記憶體隔離 Project 的掛載只接受後端驗證為至少 256 MB、且不超過主機實體記憶體 75% 的容量與程式產生的名稱，不把使用者
+輸入拼成 Shell 指令。每個 Project 使用獨立 RAM disk，不能以共用根目錄讀取其他隔離專案。
+macOS 殘留磁碟、Linux tmpfs 子目錄與 Windows ImDisk 磁碟都必須同時通過固定前綴、專用 JSON
+標記、平台種類及建立程序存活檢查才會清理；裝置名稱另做格式限制。正常卸載失敗才嘗試強制卸載。
+Windows 找不到 ImDisk 時直接回報相依套件缺失，不以硬碟暫存目錄冒充 RAM disk。ImDisk 的驅動
+安裝、提權方式、現代 Windows 與 ARM64 支援仍待實機驗證，因此目前不屬於已驗證的安全保證。
+
+`ephemeral=true` 時，Run 的 Project Sandbox 會導向 RAM disk，且 API 不接受同時指定主機
+`sandbox_roots`。執行期間 transcript、附件、計畫與 Run 資料仍由既有 Repository 管理；正常關閉
+會清除，異常退出則在下次啟動、HTTP Handler 對外服務前補做。Project 設定本身保留，因此重啟後
+只留下空的隔離 Project。隔離旗標與容量不提供 PATCH，避免未實作資料搬移前產生錯誤承諾。
 
 啟用 `memory_space` 時，Agent 記憶工具透過 Manager 檢查種類與常見憑證樣式，預設 scope
 收斂到 Project，沒有 Project 時退回 Workspace；明確 `memory_scope` 優先。此為檢索範圍

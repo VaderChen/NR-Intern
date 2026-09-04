@@ -32,6 +32,7 @@ type Service struct {
 	runs                 ports.RunRepository
 	events               ports.RunEventRepository
 	projects             ports.ProjectRepository
+	ephemeralProjects    ports.EphemeralProjectWorkspace
 	workspaces           ports.WorkspaceRepository
 	providers            ports.ProviderCatalog
 	approvals            ports.ApprovalCoordinator
@@ -42,7 +43,10 @@ type Service struct {
 	schedules            ports.ScheduleRepository
 	notifications        ports.NotificationRepository
 	notificationsEnabled atomic.Bool
-	modelPrices          map[string]map[string]domain.ModelPrice
+	// memoryIsolatedProjects 只擋新建。既有隔離專案仍照常運作，
+	// 否則一次誤關就會讓使用者現有的專案突然開不起來。
+	memoryIsolatedProjects atomic.Bool
+	modelPrices            map[string]map[string]domain.ModelPrice
 	// permissions 是後端唯一的 permission profile 依據。
 	// 呼叫端要求的 profile 必須先經過這裡解析，才不會讓 API request 自行決定提權。
 	permissions domain.PermissionPolicy
@@ -69,14 +73,16 @@ type Service struct {
 
 // Dependencies 取代一長串位置參數：這些欄位多半是介面，順序寫錯不會被型別系統擋下。
 type Dependencies struct {
-	Registry   *Registry
-	Runs       ports.RunRepository
-	Events     ports.RunEventRepository
-	Projects   ports.ProjectRepository
-	Workspaces ports.WorkspaceRepository
-	Providers  ports.ProviderCatalog
-	Approvals  ports.ApprovalCoordinator
-	Questions  ports.QuestionCoordinator
+	Registry *Registry
+	Runs     ports.RunRepository
+	Events   ports.RunEventRepository
+	Projects ports.ProjectRepository
+	// EphemeralProjects 可以是 nil；只有建立或執行記憶體隔離專案時才要求此能力。
+	EphemeralProjects ports.EphemeralProjectWorkspace
+	Workspaces        ports.WorkspaceRepository
+	Providers         ports.ProviderCatalog
+	Approvals         ports.ApprovalCoordinator
+	Questions         ports.QuestionCoordinator
 	// Memories 可以是 nil：後端停用長期記憶時，記憶 API 會回報 conflict 而不是假裝成功。
 	Memories ports.MemoryRepository
 	// Plans 是 Session 計畫的持久化來源，也是 Agent 與使用者介面共用的唯一真實狀態。
@@ -87,11 +93,12 @@ type Dependencies struct {
 	// 也不會啟動背景排程執行器。
 	Schedules ports.ScheduleRepository
 	// Notifications 可以是 nil，讓精簡測試與嵌入式使用者不必啟用通知儲存。
-	Notifications        ports.NotificationRepository
-	NotificationsEnabled bool
-	ModelPrices          map[string]map[string]domain.ModelPrice
-	Permissions          domain.PermissionPolicy
-	Logger               *slog.Logger
+	Notifications          ports.NotificationRepository
+	NotificationsEnabled   bool
+	MemoryIsolatedProjects bool
+	ModelPrices            map[string]map[string]domain.ModelPrice
+	Permissions            domain.PermissionPolicy
+	Logger                 *slog.Logger
 }
 
 func NewService(dependencies Dependencies) (*Service, error) {
@@ -102,35 +109,37 @@ func NewService(dependencies Dependencies) (*Service, error) {
 	}
 	rootCtx, stop := context.WithCancel(context.Background())
 	service := &Service{
-		registry:       registry,
-		runs:           runs,
-		events:         events,
-		projects:       projects,
-		workspaces:     workspaces,
-		providers:      providers,
-		approvals:      dependencies.Approvals,
-		questions:      dependencies.Questions,
-		memories:       dependencies.Memories,
-		plans:          dependencies.Plans,
-		attachments:    dependencies.Attachments,
-		schedules:      dependencies.Schedules,
-		notifications:  dependencies.Notifications,
-		modelPrices:    cloneModelPrices(dependencies.ModelPrices),
-		permissions:    dependencies.Permissions.Normalize(),
-		logger:         logging.Or(dependencies.Logger),
-		now:            time.Now,
-		rootCtx:        rootCtx,
-		stop:           stop,
-		active:         map[string]activeRun{},
-		sessionGates:   map[string]chan struct{}{},
-		pausedSessions: map[string]string{},
-		sessionSignals: map[string]chan struct{}{},
-		pausedRuns:     map[string]bool{},
-		runSignals:     map[string]chan struct{}{},
-		watchers:       map[string]map[uint64]chan struct{}{},
-		eventSequences: map[string]int64{},
+		registry:          registry,
+		runs:              runs,
+		events:            events,
+		projects:          projects,
+		ephemeralProjects: dependencies.EphemeralProjects,
+		workspaces:        workspaces,
+		providers:         providers,
+		approvals:         dependencies.Approvals,
+		questions:         dependencies.Questions,
+		memories:          dependencies.Memories,
+		plans:             dependencies.Plans,
+		attachments:       dependencies.Attachments,
+		schedules:         dependencies.Schedules,
+		notifications:     dependencies.Notifications,
+		modelPrices:       cloneModelPrices(dependencies.ModelPrices),
+		permissions:       dependencies.Permissions.Normalize(),
+		logger:            logging.Or(dependencies.Logger),
+		now:               time.Now,
+		rootCtx:           rootCtx,
+		stop:              stop,
+		active:            map[string]activeRun{},
+		sessionGates:      map[string]chan struct{}{},
+		pausedSessions:    map[string]string{},
+		sessionSignals:    map[string]chan struct{}{},
+		pausedRuns:        map[string]bool{},
+		runSignals:        map[string]chan struct{}{},
+		watchers:          map[string]map[uint64]chan struct{}{},
+		eventSequences:    map[string]int64{},
 	}
 	service.notificationsEnabled.Store(dependencies.NotificationsEnabled)
+	service.memoryIsolatedProjects.Store(dependencies.MemoryIsolatedProjects)
 	if err := service.reconcileTerminalEvents(context.Background()); err != nil {
 		stop()
 		return nil, err
@@ -366,7 +375,26 @@ func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectI
 	if _, err := s.workspaces.Get(ctx, input.WorkspaceID); err != nil {
 		return domain.Project{}, err
 	}
-	return s.projects.Create(ctx, input)
+	project, err := s.projects.Create(ctx, input)
+	if err != nil {
+		return domain.Project{}, err
+	}
+	if !project.Ephemeral {
+		return project, nil
+	}
+	if !s.memoryIsolatedProjects.Load() {
+		_ = s.projects.Delete(context.Background(), project.ID)
+		return domain.Project{}, fmt.Errorf("%w: 記憶體隔離專案已在實驗性功能中關閉", domain.ErrConflict)
+	}
+	if s.ephemeralProjects == nil {
+		_ = s.projects.Delete(context.Background(), project.ID)
+		return domain.Project{}, fmt.Errorf("%w: memory-isolated project support is unavailable", domain.ErrConflict)
+	}
+	if _, err := s.ephemeralProjects.Prepare(ctx, project.ID, project.RAMDiskSizeMB); err != nil {
+		_ = s.projects.Delete(context.Background(), project.ID)
+		return domain.Project{}, fmt.Errorf("prepare memory-isolated project: %w", err)
+	}
+	return project, nil
 }
 
 // sessionInstructions 依 Workspace → Project 的順序收集職務說明。
@@ -392,6 +420,17 @@ func (s *Service) sessionInstructions(ctx context.Context, session domain.Sessio
 		if text := strings.TrimSpace(project.Instructions); text != "" {
 			entries = append(entries, map[string]any{"scope": "project", "name": project.Name, "text": text})
 		}
+		// 記憶體隔離專案的工作區關閉即消失。不講明的話，模型會照常寫檔、回報完成，
+		// 使用者事後才發現硬碟上什麼都沒有——那不是模型說謊，是它根本不知道環境是揮發的。
+		if project.Ephemeral {
+			entries = append(entries, map[string]any{
+				"scope": "project",
+				"name":  project.Name,
+				"text": "這個專案的工作目錄建立在揮發性 RAM Disk 上，程式關閉或重啟後全部消失。" +
+					"需要長期保留的產出，必須在同一次對話裡告訴使用者它不會被保留，並說明可以複製到哪裡；" +
+					"不要假設下次對話還讀得到這次寫的檔案。",
+			})
+		}
 	}
 	return entries, nil
 }
@@ -416,7 +455,8 @@ func (s *Service) UpdateProject(ctx context.Context, projectID string, input dom
 // force 讓他在知道後果的前提下一次完成，而不是提高門檻逼他放棄。
 func (s *Service) DeleteProject(ctx context.Context, projectID string, force bool) error {
 	projectID = strings.TrimSpace(projectID)
-	if _, err := s.projects.Get(ctx, projectID); err != nil {
+	project, err := s.projects.Get(ctx, projectID)
+	if err != nil {
 		return err
 	}
 	type ownedSession struct {
@@ -444,6 +484,11 @@ func (s *Service) DeleteProject(ctx context.Context, projectID string, force boo
 	for _, session := range owned {
 		if err := session.engine.DeleteSession(ctx, session.id); err != nil {
 			return fmt.Errorf("刪除專案底下的對話 %s: %w", session.id, err)
+		}
+	}
+	if project.Ephemeral && s.ephemeralProjects != nil {
+		if err := s.ephemeralProjects.Release(ctx, projectID); err != nil {
+			return fmt.Errorf("release memory-isolated project: %w", err)
 		}
 	}
 	return s.projects.Delete(ctx, projectID)
@@ -737,6 +782,9 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	// attachments 同樣是後端解析 Attachment ID 後產生的可信 manifest；Client
 	// 直接夾帶同名 metadata 不能注入任意主機路徑。
 	delete(input.Metadata, "attachments")
+	// ephemeral_project 決定這次 Run 要不要跳過人工核准，因此必須是後端自己判定的
+	// 保留欄位。若讓 Client 夾帶，等於給了一個「宣告自己是記憶體專案就免審核」的後門。
+	delete(input.Metadata, "ephemeral_project")
 	// ThinkingMode 是明確的 Run override；為相容舊 Client，也接受 metadata 中的
 	// thinking_mode。若兩者都沒有，才沿用 Session 設定；空值表示 Provider 預設。
 	rawThinkingMode := strings.TrimSpace(input.ThinkingMode)
@@ -759,6 +807,7 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	// 保存到 Run metadata，讓重試時不會因 Session 後來變更而改變原本的設定。
 	input.Metadata["thinking_mode"] = thinkingMode
 	sandboxRoots := []string{}
+	ephemeralProjectID := ""
 	// 後端內部流程（排程執行器）帶進來的沙箱優先，讓相對路徑以它為基準。
 	for _, root := range input.SandboxRoots {
 		if root = strings.TrimSpace(root); root != "" {
@@ -770,17 +819,32 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 		if projectErr != nil {
 			return domain.Run{}, projectErr
 		}
-		for _, root := range project.SandboxRoots {
+		if project.Ephemeral {
+			if s.ephemeralProjects == nil {
+				return domain.Run{}, fmt.Errorf("%w: memory-isolated project support is unavailable", domain.ErrConflict)
+			}
+			root, prepareErr := s.ephemeralProjects.Prepare(ctx, project.ID, project.RAMDiskSizeMB)
+			if prepareErr != nil {
+				return domain.Run{}, fmt.Errorf("prepare memory-isolated project: %w", prepareErr)
+			}
 			sandboxRoots = appendUniqueString(sandboxRoots, root)
+			ephemeralProjectID = project.ID
+		} else {
+			for _, root := range project.SandboxRoots {
+				sandboxRoots = appendUniqueString(sandboxRoots, root)
+			}
 		}
 	}
 	// Session 私有工作目錄由後端建立，用來容納對話附件與未綁定 Project 的工作。
 	// Project 根目錄仍排第一，確保相對路徑維持以 Project 為基準。
-	if workspaceRoot, _ := session.Metadata["workspace_root"].(string); strings.TrimSpace(workspaceRoot) != "" {
+	if workspaceRoot, _ := session.Metadata["workspace_root"].(string); ephemeralProjectID == "" && strings.TrimSpace(workspaceRoot) != "" {
 		sandboxRoots = appendUniqueString(sandboxRoots, strings.TrimSpace(workspaceRoot))
 	}
 	if len(sandboxRoots) > 0 {
 		input.Metadata["sandbox_roots"] = sandboxRoots
+	}
+	if ephemeralProjectID != "" {
+		input.Metadata["ephemeral_project"] = true
 	}
 	// instructions 同樣是後端依 Workspace／Project 產生的保留欄位；
 	// 呼叫端不能藉 metadata 自行往提示注入內容。
@@ -801,6 +865,13 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 			attachment, attachmentErr := s.attachments.Get(ctx, session.ID, attachmentID)
 			if attachmentErr != nil {
 				return domain.Run{}, attachmentErr
+			}
+			if ephemeralProjectID != "" {
+				stagedPath, stageErr := s.ephemeralProjects.StageFile(ctx, ephemeralProjectID, attachment.Path, attachment.ID+"-"+attachment.Name)
+				if stageErr != nil {
+					return domain.Run{}, fmt.Errorf("stage attachment in memory-isolated project: %w", stageErr)
+				}
+				attachment.Path = stagedPath
 			}
 			manifest = append(manifest, attachment)
 		}

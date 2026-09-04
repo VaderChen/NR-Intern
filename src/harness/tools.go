@@ -101,6 +101,18 @@ func parallelizableToolNames(definitions []domain.ToolDefinition, approvals port
 // 反而讓真正有副作用的操作更容易被順手放行。MCP 工具的唯讀屬性來自 Server 自己宣告的
 // readOnlyHint，只有在管理者對該 Server 開啟 trust_annotations 後才會被採信；沒有開啟時
 // 這些工具不算唯讀，仍然逐次核准。
+// ephemeralProjectSession 判斷這個 Session 是否屬於記憶體隔離專案。
+//
+// 旗標由 application 在組裝 Run metadata 時寫入，與 sandbox_roots 同屬後端保留欄位；
+// Client 夾帶的同名值會先被清掉，因此這裡讀到的一定是後端自己判定的結果。
+func ephemeralProjectSession(session domain.Session) bool {
+	if session.Metadata == nil {
+		return false
+	}
+	value, _ := session.Metadata["ephemeral_project"].(bool)
+	return value
+}
+
 func approvalExemptToolNames(definitions []domain.ToolDefinition) map[string]bool {
 	result := make(map[string]bool, len(definitions))
 	for _, definition := range definitions {
@@ -296,12 +308,19 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			refused = true
 		}
 	}
+	// 記憶體隔離專案的工作區是揮發性 RAM Disk，關閉程式即消失，因此不再逐次詢問。
+	// 這裡放在 read-only 判斷之後，讓兩種豁免各自留下可辨識的原因。
+	exemptReason := "read_only_tool"
+	if !approvalExempt && ephemeralProjectSession(session) {
+		approvalExempt = true
+		exemptReason = "ephemeral_project"
+	}
 	if !refused && approvalExempt && r.Approvals != nil && r.Approvals.Required(call.Name) {
 		// 留下紀錄：使用者要能看出這次呼叫為什麼沒有跳核准。
 		_ = sink.emitEvent("run.approval_skipped", map[string]any{
 			"tool_call_id": call.ID,
 			"tool_name":    call.Name,
-			"reason":       "read_only_tool",
+			"reason":       exemptReason,
 		})
 	}
 	if !refused && !approvalExempt && r.Approvals != nil && !approvals.approved() && r.Approvals.Required(call.Name) {

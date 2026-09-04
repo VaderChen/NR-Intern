@@ -26,6 +26,10 @@ type ServiceSettings struct {
 	// 專案 scope、召回視窗與淘汰；關閉時維持既有長期記憶行為。
 	// 機制說明見 docs/ai-agent/MEMORY_SPACE.md。
 	MemorySpace bool `json:"memory_space"`
+	// MemoryIsolatedProjects 控制能不能「新建」記憶體隔離專案，預設開啟。
+	// 關閉只影響新建；既有的隔離專案仍照常運作，否則一次誤關就會讓使用者
+	// 現有的專案突然不能用。
+	MemoryIsolatedProjects bool `json:"memory_isolated_projects"`
 }
 
 // HTTPFetchSettings 是 http_fetch 工具的即時開關。
@@ -53,4 +57,5 @@ type UpdateServiceSettingsInput struct {
 	ToolCallMode                  *string `json:"tool_call_mode,omitempty"`
 	ToolRetrieval                 *bool   `json:"tool_retrieval,omitempty"`
 	MemorySpace                   *bool   `json:"memory_space,omitempty"`
+	MemoryIsolatedProjects        *bool   `json:"memory_isolated_projects,omitempty"`
 }

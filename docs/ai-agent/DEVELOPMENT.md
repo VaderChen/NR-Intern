@@ -8,6 +8,8 @@
 |---|---|
 | `AI_AGENT_LISTEN` | 後端監聽位址 |
 | `AI_AGENT_DATA_DIR` | Session、Run 與 workspace 根目錄 |
+| `AI_AGENT_RAM_DISK_ENABLED` | 是否在 Runtime 啟動時準備 RAM disk；預設開啟 |
+| `AI_AGENT_RAM_DISK_SIZE_MB` | RAM disk 預設容量，預設 512 MiB；Project 實際容量至少 256 MiB且不得超過主機實體記憶體的 75% |
 | `AI_AGENT_API_TOKEN` | HTTP Bearer token |
 | `AI_AGENT_DEFAULT_PROVIDER_ID` | 環境變數要覆寫的預設 Provider ID |
 | `AI_AGENT_LLM_BASE_URL` / `OPENAI_BASE_URL` | OpenAI-compatible base URL |
@@ -44,6 +46,14 @@
 
 載入優先序為：內建預設 → JSON 設定 → 管理介面持久化設定 → 環境變數。環境變數在持久化設定
 載入後會再套用一次，因此永遠具有最高優先權；管理介面不會覆寫部署環境明確注入的值。
+
+`ram_disk` 控制記憶體隔離 Project 的生命週期能力：macOS 以 `hdiutil` 建立 HFS+ RAM disk，Linux 在
+`/dev/shm` 建立專用子目錄，Windows 依賴 PATH 中可執行的 `imdisk.exe`。未知平台才使用系統
+暫存目錄並標示為非真正揮發性儲存。每個記憶體隔離 Project 都有獨立磁碟與包含 Project ID、
+建立程序 PID 的專用標記；正常關閉會清理，異常退出後由下次啟動清除。Run 的第一個 Sandbox
+根目錄會導向該磁碟。Session 執行期間仍使用既有 Repository，但正常關閉會清除隔離 Project 的
+Session、附件、計畫、Run／事件與通知；異常退出則在下次啟動、開始對外服務前補做，因此只有
+Project 設定跨程序保留。Windows ImDisk 尚待目標 x64／ARM64 封裝與權限實測。
 
 JSON 設定使用具名 Provider registry。`type` 是 adapter 工廠辨識欄位；目前支援
 `openai-compatible` 與 `openai-codex-responses`，新增類型時不修改 Workspace 或 Harness：

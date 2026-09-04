@@ -112,19 +112,24 @@ type Project struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	// Instructions 是 Project 的職務說明，接在所屬 Workspace 的說明之後注入。
-	Instructions string    `json:"instructions,omitempty"`
-	SandboxRoots []string  `json:"sandbox_roots,omitempty"`
-	Position     int       `json:"position"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	Instructions string `json:"instructions,omitempty"`
+	// Ephemeral 建立後不可變更，避免既有磁碟資料在切換儲存媒介時被誤認為已搬移。
+	Ephemeral     bool      `json:"ephemeral,omitempty"`
+	RAMDiskSizeMB int       `json:"ram_disk_size_mb,omitempty"`
+	SandboxRoots  []string  `json:"sandbox_roots,omitempty"`
+	Position      int       `json:"position"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type CreateProjectInput struct {
-	Name         string   `json:"name"`
-	WorkspaceID  string   `json:"workspace_id"`
-	Description  string   `json:"description,omitempty"`
-	Instructions string   `json:"instructions,omitempty"`
-	SandboxRoots []string `json:"sandbox_roots,omitempty"`
+	Name          string   `json:"name"`
+	WorkspaceID   string   `json:"workspace_id"`
+	Description   string   `json:"description,omitempty"`
+	Instructions  string   `json:"instructions,omitempty"`
+	Ephemeral     bool     `json:"ephemeral,omitempty"`
+	RAMDiskSizeMB int      `json:"ram_disk_size_mb,omitempty"`
+	SandboxRoots  []string `json:"sandbox_roots,omitempty"`
 }
 
 type UpdateProjectInput struct {

@@ -83,6 +83,7 @@ func promptPayloadSize(request capturedRequest) int {
 func buildTestRuntime(t *testing.T, provider *fakeProvider, extendedTools, retrieval bool) *Runtime {
 	t.Helper()
 	config := DefaultConfig()
+	config.RAMDisk.Enabled = false
 	config.DataDir = t.TempDir()
 	config.ExtendedTools = extendedTools
 	config.ToolRetrieval = retrieval
@@ -98,7 +99,7 @@ func buildTestRuntime(t *testing.T, provider *fakeProvider, extendedTools, retri
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	t.Cleanup(func() { _ = runtime.Application.Close(context.Background()) })
+	t.Cleanup(func() { _ = runtime.Close(context.Background()) })
 	return runtime
 }
 

@@ -50,6 +50,7 @@ type Runtime struct {
 	Tools        *tools.Runtime
 	MCP          *mcpclient.Manager
 	ReverseProxy *netpass.Manager
+	RAMDisks     *RAMDiskPool
 	StartedAt    time.Time
 	InstanceID   string
 	Model        *modelrouter.Router
@@ -66,6 +67,9 @@ type Runtime struct {
 	ProviderAuth *providerauth.Manager
 	// HTTPFetch 保留參考，讓管理介面的開關不必重啟後端就能生效。
 	HTTPFetch *nativenetwork.Tool
+	// cleanupEphemeralSessions 在正常關閉時清除隔離 Project 的對話；啟動清理則處理
+	// 異常終止來不及執行這個步驟的情況。
+	cleanupEphemeralSessions func(context.Context) error
 
 	configMu               sync.RWMutex
 	providerUsageContext   context.Context
@@ -127,17 +131,18 @@ type RedactedConfig struct {
 	// ExtendedTools、ToolCallMode 與 ToolRetrieval 是管理介面開機時唯一的
 	// 設定來源；漏掉任何一個，畫面就會顯示預設值而不是實際生效的設定，
 	// 使用者下一次存檔還會把後端一併改回預設。
-	ExtendedTools     bool                                    `json:"extended_tools"`
-	ToolCallMode      string                                  `json:"tool_call_mode"`
-	ToolRetrieval     bool                                    `json:"tool_retrieval"`
-	MemorySpace       bool                                    `json:"memory_space"`
-	Context           harness.ContextConfig                   `json:"context"`
-	Memory            memory.Config                           `json:"memory"`
-	DefaultProviderID string                                  `json:"default_provider_id"`
-	Providers         []domain.ProviderDescriptor             `json:"providers"`
-	ModelPrices       map[string]map[string]domain.ModelPrice `json:"model_prices,omitempty"`
-	SSHProfiles       []string                                `json:"ssh_profiles,omitempty"`
-	MCPServers        []string                                `json:"mcp_servers,omitempty"`
+	ExtendedTools          bool                                    `json:"extended_tools"`
+	ToolCallMode           string                                  `json:"tool_call_mode"`
+	ToolRetrieval          bool                                    `json:"tool_retrieval"`
+	MemorySpace            bool                                    `json:"memory_space"`
+	MemoryIsolatedProjects bool                                    `json:"memory_isolated_projects"`
+	Context                harness.ContextConfig                   `json:"context"`
+	Memory                 memory.Config                           `json:"memory"`
+	DefaultProviderID      string                                  `json:"default_provider_id"`
+	Providers              []domain.ProviderDescriptor             `json:"providers"`
+	ModelPrices            map[string]map[string]domain.ModelPrice `json:"model_prices,omitempty"`
+	SSHProfiles            []string                                `json:"ssh_profiles,omitempty"`
+	MCPServers             []string                                `json:"mcp_servers,omitempty"`
 }
 
 type ManagementDiagnostics struct {
@@ -159,6 +164,18 @@ func Build(config Config) (*Runtime, error) {
 	if err := os.MkdirAll(config.DataDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
+	ramDisks := NewRAMDiskPool(config.RAMDisk, logger.With("component", "ram-disk"))
+	buildComplete := false
+	defer func() {
+		if buildComplete {
+			return
+		}
+		cleanupContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := ramDisks.Close(cleanupContext); err != nil {
+			logger.Warn("failed to clean RAM disk after startup error", "error", err)
+		}
+	}()
 	_, backendPortText, err := net.SplitHostPort(config.ListenAddress)
 	if err != nil {
 		return nil, fmt.Errorf("parse backend listen address for NetPass: %w", err)
@@ -184,6 +201,18 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	storedProjects, err := projects.List(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	for _, project := range storedProjects {
+		if !project.Ephemeral {
+			continue
+		}
+		if _, err := ramDisks.Prepare(context.Background(), project.ID, project.RAMDiskSizeMB); err != nil {
+			return nil, fmt.Errorf("prepare memory-isolated project %q: %w", project.Name, err)
+		}
+	}
 	workspaces, err := filestore.NewWorkspaceRepository(config.DataDir)
 	if err != nil {
 		return nil, err
@@ -206,6 +235,9 @@ func Build(config Config) (*Runtime, error) {
 	}
 	notifications, err := filestore.NewNotificationRepository(config.DataDir)
 	if err != nil {
+		return nil, err
+	}
+	if err := purgeEphemeralProjectSessions(context.Background(), storedProjects, sessions, plans, runs, events, notifications, logger); err != nil {
 		return nil, err
 	}
 	providerValues, err := buildProviderValues(config, logger, providerAuth)
@@ -377,23 +409,25 @@ func Build(config Config) (*Runtime, error) {
 		return nil, err
 	}
 	service, err := application.NewService(application.Dependencies{
-		Registry:             registry,
-		Runs:                 runs,
-		Events:               events,
-		Projects:             projects,
-		Workspaces:           workspaces,
-		Providers:            model,
-		Approvals:            approvalCoordinator,
-		Questions:            questionCoordinator,
-		Memories:             memoryRepository,
-		Plans:                plans,
-		Attachments:          attachments,
-		Schedules:            schedules,
-		Notifications:        notifications,
-		NotificationsEnabled: config.NotificationsEnabled,
-		ModelPrices:          config.ModelPrices,
-		Permissions:          config.Permissions,
-		Logger:               logger,
+		Registry:               registry,
+		Runs:                   runs,
+		Events:                 events,
+		Projects:               projects,
+		EphemeralProjects:      ramDisks,
+		Workspaces:             workspaces,
+		Providers:              model,
+		Approvals:              approvalCoordinator,
+		Questions:              questionCoordinator,
+		Memories:               memoryRepository,
+		Plans:                  plans,
+		Attachments:            attachments,
+		Schedules:              schedules,
+		Notifications:          notifications,
+		NotificationsEnabled:   config.NotificationsEnabled,
+		MemoryIsolatedProjects: config.MemoryIsolatedProjects,
+		ModelPrices:            config.ModelPrices,
+		Permissions:            config.Permissions,
+		Logger:                 logger,
 	})
 	if err != nil {
 		return nil, err
@@ -405,6 +439,7 @@ func Build(config Config) (*Runtime, error) {
 		Tools:         toolRuntime,
 		MCP:           mcpManager,
 		ReverseProxy:  reverseProxy,
+		RAMDisks:      ramDisks,
 		StartedAt:     time.Now().UTC(),
 		InstanceID:    domain.NewID("instance"),
 		Model:         model,
@@ -418,6 +453,13 @@ func Build(config Config) (*Runtime, error) {
 		ProviderAuth:  providerAuth,
 		HTTPFetch:     httpFetch,
 		logger:        logger,
+		cleanupEphemeralSessions: func(ctx context.Context) error {
+			currentProjects, err := projects.List(ctx)
+			if err != nil {
+				return err
+			}
+			return purgeEphemeralProjectSessions(ctx, currentProjects, sessions, plans, runs, events, notifications, logger)
+		},
 	}
 	handler, err := httpapi.New(service, httpapi.Config{
 		APIToken:                config.APIToken,
@@ -461,6 +503,7 @@ func Build(config Config) (*Runtime, error) {
 	runtime.startStorageMaintenance()
 	runtime.startModelLimitDiscovery()
 	mcpManager.Warm(context.Background())
+	buildComplete = true
 	return runtime, nil
 }
 
@@ -535,6 +578,9 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	if input.MemorySpace != nil {
 		updatedConfig.MemorySpace = *input.MemorySpace
 	}
+	if input.MemoryIsolatedProjects != nil {
+		updatedConfig.MemoryIsolatedProjects = *input.MemoryIsolatedProjects
+	}
 	if input.ToolCallMode != nil {
 		if !harness.ValidToolCallMode(*input.ToolCallMode) {
 			return domain.ServiceSettings{}, fmt.Errorf("%w: tool_call_mode must be native or instruction", domain.ErrInvalidInput)
@@ -551,6 +597,7 @@ func (r *Runtime) UpdateServiceSettings(ctx context.Context, input domain.Update
 	r.Config = updatedConfig
 	if r.Application != nil {
 		r.Application.SetNotificationsEnabled(settings.NotificationsEnabled)
+		r.Application.SetMemoryIsolatedProjects(settings.MemoryIsolatedProjects)
 	}
 	if r.Agent != nil {
 		r.Agent.SetName(serviceName)
@@ -579,17 +626,18 @@ func serviceSettingsFromConfig(config Config) domain.ServiceSettings {
 		uiLanguage = DefaultUILanguage
 	}
 	return domain.ServiceSettings{
-		ServiceName:          config.ServiceName,
-		UILanguage:           uiLanguage,
-		NotificationsEnabled: config.NotificationsEnabled,
-		MaxWallClockSeconds:  config.MaxWallClockSeconds,
-		MaxTokens:            config.MaxTokens,
-		MaxToolCalls:         config.MaxToolCalls,
-		HTTPFetch:            httpFetchSettingsFromConfig(config),
-		ExtendedTools:        config.ExtendedTools,
-		ToolCallMode:         string(harness.NormalizeToolCallMode(config.ToolCallMode)),
-		ToolRetrieval:        config.ToolRetrieval,
-		MemorySpace:          config.MemorySpace,
+		ServiceName:            config.ServiceName,
+		UILanguage:             uiLanguage,
+		NotificationsEnabled:   config.NotificationsEnabled,
+		MaxWallClockSeconds:    config.MaxWallClockSeconds,
+		MaxTokens:              config.MaxTokens,
+		MaxToolCalls:           config.MaxToolCalls,
+		HTTPFetch:              httpFetchSettingsFromConfig(config),
+		ExtendedTools:          config.ExtendedTools,
+		ToolCallMode:           string(harness.NormalizeToolCallMode(config.ToolCallMode)),
+		ToolRetrieval:          config.ToolRetrieval,
+		MemorySpace:            config.MemorySpace,
+		MemoryIsolatedProjects: config.MemoryIsolatedProjects,
 	}
 }
 
@@ -1367,32 +1415,33 @@ func (r *Runtime) Diagnostics(ctx context.Context) (any, error) {
 	return ManagementDiagnostics{
 		Status: r.Status(),
 		Config: RedactedConfig{
-			ServiceName:          config.ServiceName,
-			UILanguage:           config.UILanguage,
-			NotificationsEnabled: config.NotificationsEnabled,
-			ListenAddress:        config.ListenAddress,
-			DataDir:              config.DataDir,
-			APITokenConfigured:   strings.TrimSpace(config.APIToken) != "",
-			AllowedOrigins:       append([]string(nil), config.AllowedOrigins...),
-			AllowedTools:         append([]string(nil), config.AllowedTools...),
-			AllowElevatedTools:   config.AllowElevatedTools,
-			Permissions:          config.Permissions.Normalize(),
-			MaxTurns:             config.MaxTurns,
-			MaxWallClockSeconds:  config.MaxWallClockSeconds,
-			MaxTokens:            config.MaxTokens,
-			MaxToolCalls:         config.MaxToolCalls,
-			HTTPFetch:            httpFetchSettingsFromConfig(config),
-			ExtendedTools:        config.ExtendedTools,
-			ToolCallMode:         string(harness.NormalizeToolCallMode(config.ToolCallMode)),
-			ToolRetrieval:        config.ToolRetrieval,
-			MemorySpace:          config.MemorySpace,
-			Context:              config.Context,
-			Memory:               config.Memory,
-			DefaultProviderID:    r.Model.DefaultProviderID(),
-			Providers:            r.Model.ListProviders(),
-			ModelPrices:          config.ModelPrices,
-			SSHProfiles:          profileNames,
-			MCPServers:           mcpServerNames,
+			ServiceName:            config.ServiceName,
+			UILanguage:             config.UILanguage,
+			NotificationsEnabled:   config.NotificationsEnabled,
+			ListenAddress:          config.ListenAddress,
+			DataDir:                config.DataDir,
+			APITokenConfigured:     strings.TrimSpace(config.APIToken) != "",
+			AllowedOrigins:         append([]string(nil), config.AllowedOrigins...),
+			AllowedTools:           append([]string(nil), config.AllowedTools...),
+			AllowElevatedTools:     config.AllowElevatedTools,
+			Permissions:            config.Permissions.Normalize(),
+			MaxTurns:               config.MaxTurns,
+			MaxWallClockSeconds:    config.MaxWallClockSeconds,
+			MaxTokens:              config.MaxTokens,
+			MaxToolCalls:           config.MaxToolCalls,
+			HTTPFetch:              httpFetchSettingsFromConfig(config),
+			ExtendedTools:          config.ExtendedTools,
+			ToolCallMode:           string(harness.NormalizeToolCallMode(config.ToolCallMode)),
+			ToolRetrieval:          config.ToolRetrieval,
+			MemorySpace:            config.MemorySpace,
+			MemoryIsolatedProjects: config.MemoryIsolatedProjects,
+			Context:                config.Context,
+			Memory:                 config.Memory,
+			DefaultProviderID:      r.Model.DefaultProviderID(),
+			Providers:              r.Model.ListProviders(),
+			ModelPrices:            config.ModelPrices,
+			SSHProfiles:            profileNames,
+			MCPServers:             mcpServerNames,
 		},
 		SessionCount:   sessionCount,
 		ProjectCount:   len(projects),
@@ -1429,6 +1478,17 @@ func (r *Runtime) Close(ctx context.Context) error {
 	}
 	if r.Application != nil {
 		if err := r.Application.Close(ctx); result == nil {
+			result = err
+		}
+	}
+	if r.cleanupEphemeralSessions != nil {
+		if err := r.cleanupEphemeralSessions(ctx); result == nil {
+			result = err
+		}
+	}
+	// 揮發性工作空間最後卸載，讓 Run、MCP 與其他子程序先釋放仍開啟的檔案。
+	if r.RAMDisks != nil {
+		if err := r.RAMDisks.Close(ctx); result == nil {
 			result = err
 		}
 	}

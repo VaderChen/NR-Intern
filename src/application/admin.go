@@ -76,6 +76,17 @@ func (s *Service) SetNotificationsEnabled(enabled bool) {
 	s.notificationsEnabled.Store(enabled)
 }
 
+// SetMemoryIsolatedProjects 即時切換「能不能新建記憶體隔離專案」。
+//
+// 只影響新建：既有隔離專案的 RAM disk、對話與清理流程都照常，關掉開關不會
+// 讓使用者手上的專案失效，也不會把資料留在一個沒人管的狀態。
+func (s *Service) SetMemoryIsolatedProjects(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.memoryIsolatedProjects.Store(enabled)
+}
+
 func (s *Service) notifyRunFinished(run domain.Run) {
 	level, title, message := "success", "Run 已完成", "工作已完成。"
 	switch run.Status {

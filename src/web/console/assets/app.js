@@ -57,6 +57,7 @@ const state = {
   newProjectSandboxRoots: [],
   editingProject: null,
   editProjectSandboxRoots: [],
+  systemMemoryBytes: 0,
   contextSession: null,
   contextProject: null,
   contextResource: null,
@@ -154,6 +155,8 @@ const displayModes = new Set(["auto", "light", "dark"]);
 const uiLanguagePreferences = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
 const systemColorScheme = window.matchMedia("(prefers-color-scheme: dark)");
 const applePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
+const windowsPlatform = /Win/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
+const linuxPlatform = /Linux/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
 const renderRichContent = window.RichTextRenderer.render;
 const scheduleRichContent = window.RichTextRenderer.schedule;
 const richContentSource = window.RichTextRenderer.source;
@@ -272,8 +275,11 @@ function normalizedServiceSettings(value = {}) {
     tool_call_mode: (value.tool_call_mode ?? current.tool_call_mode) === "instruction" ? "instruction" : "native",
     // 預設 true：舊的後端沒有這個欄位時，畫面要顯示實際生效的行為。
     tool_retrieval: Boolean(value.tool_retrieval ?? current.tool_retrieval ?? true),
-    // 實驗性功能一律預設關閉。
+    // 回憶空間仍在設計中，預設關閉。
     memory_space: Boolean(value.memory_space ?? current.memory_space ?? false),
+    // 記憶體隔離專案已經完成，預設開啟；舊後端沒有這個欄位時也要顯示成開啟，
+    // 否則畫面會說「已關閉」而實際上建立對話框仍提供這個選項。
+    memory_isolated_projects: Boolean(value.memory_isolated_projects ?? current.memory_isolated_projects ?? true),
   };
 }
 
@@ -297,6 +303,10 @@ function applyServiceSettings(value, { fields = true } = {}) {
     $("settingExtendedTools").checked = settings.extended_tools;
     $("settingInstructionToolCalls").checked = settings.tool_call_mode === "instruction";
     $("settingToolRetrieval").checked = settings.tool_retrieval;
+  }
+  if ($("settingMemoryIsolatedProjects")) {
+    $("settingMemoryIsolatedProjects").checked = settings.memory_isolated_projects;
+    syncMemoryIsolationAvailability();
   }
   if ($("settingMemorySpace")) {
     $("settingMemorySpace").checked = settings.memory_space;
@@ -1164,6 +1174,7 @@ function projectNode(project, sessions) {
   const projectID = project?.id || "uncategorized";
   const group = document.createElement("section");
   group.className = "project-group";
+  group.classList.toggle("memory-isolated", Boolean(project?.ephemeral));
   group.dataset.projectId = project?.id || "";
   const header = document.createElement("div");
   header.className = "project-head";
@@ -1177,6 +1188,14 @@ function projectNode(project, sessions) {
   name.className = "project-name";
   name.textContent = project?.name || "未分類";
   toggle.append(caret, icon, name);
+  if (project?.ephemeral) {
+    const badge = document.createElement("span");
+    badge.className = "memory-project-badge";
+    badge.textContent = "RAM";
+    badge.title = translate("記憶體隔離專案");
+    toggle.append(badge);
+    toggle.title = translate("工作檔案使用獨立 RAM Disk");
+  }
   toggle.addEventListener("click", () => toggleProject(projectID));
   if (project) {
     header.addEventListener("contextmenu", (event) => openProjectContextMenu(event, project));
@@ -5780,6 +5799,9 @@ async function createProject(event) {
   event.preventDefault();
   if (!state.workspace) return;
   try {
+    const ephemeral = $("newProjectEphemeral").checked;
+    // 先等實體記憶體偵測完成，容量上限才是這台機器的真實值。
+    if (ephemeral) await ensureProjectRAMRange();
     const project = await request("/api/v1/projects", {
       method: "POST",
       body: JSON.stringify({
@@ -5787,7 +5809,9 @@ async function createProject(event) {
         workspace_id: state.workspace.id,
         description: $("newProjectDescription").value.trim(),
         instructions: $("newProjectInstructions").value.trim(),
-        sandbox_roots: [...state.newProjectSandboxRoots],
+        ephemeral,
+        ram_disk_size_mb: ephemeral ? newProjectRAMSizeMB() : 0,
+        sandbox_roots: ephemeral ? [] : [...state.newProjectSandboxRoots],
       }),
     });
     $("projectDialog").close();
@@ -5940,8 +5964,103 @@ async function runScheduleNow(schedule) {
 
 function resetProjectForm() {
   $("projectForm").reset();
+  $("newProjectRAMSize").value = "512";
+  $("projectForm").querySelector(".project-extra-card").open = false;
   state.newProjectSandboxRoots = [];
   renderProjectSandboxRoots("create");
+  renderProjectRAMSize();
+  syncNewProjectIsolation();
+}
+
+function newProjectRAMSizeMB() {
+  const sizeMB = Math.round(Number($("newProjectRAMSize").value));
+  const maximum = Math.round(Number($("newProjectRAMSize").max));
+  if (!Number.isFinite(sizeMB) || sizeMB < 256 || sizeMB > maximum) {
+    throw new Error(translate("RAM SIZE 超出系統可用範圍"));
+  }
+  return sizeMB;
+}
+
+function formatRAMGigabytes(sizeMB) {
+  if (sizeMB === 256) return "0.2";
+  return (sizeMB / 1024).toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function renderProjectRAMSize() {
+  const sizeMB = Math.round(Number($("newProjectRAMSize").value || 512));
+  const maximumMB = Math.round(Number($("newProjectRAMSize").max || 6144));
+  $("newProjectRAMValue").textContent = `${formatRAMGigabytes(sizeMB)} GB`;
+  $("newProjectRAMLimit").textContent = `${formatRAMGigabytes(maximumMB)} GB（${translate("系統記憶體上限")}）`;
+}
+
+// configureProjectRAMRange 是非同步的（要問桌面端拿實體記憶體），而使用者可能在它
+// 完成前就按下建立。把 promise 存起來，讓送出端可以等它——否則在低於 8 GB 的機器上，
+// 前端會拿還沒更新的預設上限放行超額容量，變成只靠後端擋。
+let projectRAMRangeReady = null;
+
+function ensureProjectRAMRange() {
+  if (!projectRAMRangeReady) {
+    // 只快取「問到可信容量」的結果。若這次只拿到保守後備值（桌面端還沒起來），
+    // 快取起來會讓之後每一次都沿用那個猜測，永遠不再重試。
+    projectRAMRangeReady = configureProjectRAMRange().then((trusted) => {
+      if (!trusted) projectRAMRangeReady = null;
+    });
+  }
+  return projectRAMRangeReady;
+}
+
+async function configureProjectRAMRange() {
+  let totalBytes = Number(state.systemMemoryBytes || 0);
+  if (!totalBytes) {
+    const browserMemoryGB = Number(navigator.deviceMemory || 0);
+    if (browserMemoryGB > 0) totalBytes = browserMemoryGB * 1024 * 1024 * 1024;
+  }
+  try {
+    const systemInfo = await desktop("system-info");
+    const nativeBytes = Number(systemInfo?.total_memory_bytes || 0);
+    if (nativeBytes > 0) totalBytes = nativeBytes;
+  } catch (_) {
+    // 一般 Browser 沒有桌面控制端點時，使用瀏覽器提供的粗略容量；完全取不到才採保守後備值。
+  }
+  const trusted = totalBytes > 0;
+  if (!totalBytes) totalBytes = 8 * 1024 * 1024 * 1024;
+  state.systemMemoryBytes = totalBytes;
+  const maximumMB = Math.max(256, Math.floor((totalBytes * 0.75 / (1024 * 1024)) / 256) * 256);
+  const input = $("newProjectRAMSize");
+  input.max = String(maximumMB);
+  input.value = String(Math.min(512, maximumMB));
+  renderProjectRAMSize();
+  return trusted;
+}
+
+// syncMemoryIsolationAvailability 讓建立對話框跟著實驗性開關走。
+//
+// 關閉時直接把選項藏起來而不是停用：一個永遠按不下去的開關只會讓人以為壞了，
+// 而這個能力的說明就在實驗性功能頁，找得到地方重新開啟。
+function syncMemoryIsolationAvailability() {
+  const allowed = state.serviceSettings?.memory_isolated_projects !== false;
+  const control = document.querySelector(".memory-project-switch");
+  if (!control) return;
+  control.classList.toggle("hidden", !allowed);
+  if (!allowed && $("newProjectEphemeral").checked) {
+    // 開關關閉時把已勾選的狀態收回來，否則會送出一個後端必定拒絕的請求。
+    $("newProjectEphemeral").checked = false;
+    syncNewProjectIsolation();
+  }
+}
+
+function syncNewProjectIsolation() {
+  const enabled = $("newProjectEphemeral").checked;
+  $("newProjectSandboxLegend").textContent = translate(enabled ? "記憶體隔離 Sandbox" : "Sandbox 目錄");
+  $("newProjectDirectoryPanel").classList.toggle("hidden", enabled);
+  $("newProjectMemoryPanel").classList.toggle("hidden", !enabled);
+  let backend = translate("暫存目錄（非真正 RAM Disk）");
+  let filesystem = translate("平台預設");
+  if (applePlatform) [backend, filesystem] = ["hdiutil", "HFS+"];
+  else if (windowsPlatform) [backend, filesystem] = [translate("ImDisk（需先安裝）"), "NTFS"];
+  else if (linuxPlatform) [backend, filesystem] = ["/dev/shm", "tmpfs"];
+  $("newProjectRAMBackend").textContent = backend;
+  $("newProjectRAMFilesystem").textContent = filesystem;
 }
 
 function projectSandboxEditor(mode) {
@@ -6231,6 +6350,9 @@ function manageProject(project) {
   $("editProjectDescription").value = project.description || "";
   $("editProjectInstructions").value = project.instructions || "";
   $("projectSettingsState").textContent = "";
+  $("editProjectDirectoryFieldset").classList.toggle("hidden", Boolean(project.ephemeral));
+  $("editProjectMemoryFieldset").classList.toggle("hidden", !project.ephemeral);
+  $("editProjectRAMSize").textContent = project.ephemeral ? `${project.ram_disk_size_mb || 512} MB` : "";
   renderProjectSandboxRoots("settings");
   $("projectSettingsDialog").showModal();
   $("editProjectName").focus();
@@ -6249,15 +6371,16 @@ async function saveProjectSettings(event) {
   $("saveProjectSettings").disabled = true;
   $("projectSettingsState").textContent = "儲存中…";
   try {
+    const payload = {
+      name: $("editProjectName").value.trim(),
+      description: $("editProjectDescription").value.trim(),
+      instructions: $("editProjectInstructions").value,
+    };
+    if (!state.editingProject.ephemeral) payload.sandbox_roots = [...state.editProjectSandboxRoots];
     const updated = await request(`/api/v1/projects/${encodeURIComponent(state.editingProject.id)}`, {
       method: "PATCH",
       reconnects: 3,
-      body: JSON.stringify({
-        name: $("editProjectName").value.trim(),
-        description: $("editProjectDescription").value.trim(),
-        instructions: $("editProjectInstructions").value,
-        sandbox_roots: [...state.editProjectSandboxRoots],
-      }),
+      body: JSON.stringify(payload),
     });
     state.projects = state.projects.map((project) => project.id === updated.id ? updated : project);
     renderProjectOptions();
@@ -8479,6 +8602,7 @@ bindSettingSwitch("settingToolRetrieval", "toolSettingsState", (checked) => ({ t
 bindSettingSwitch("settingHTTPFetchEnabled", "toolSettingsState", (checked) => ({ http_fetch_enabled: checked }));
 bindSettingSwitch("settingHTTPFetchPrivateNetworks", "toolSettingsState", (checked) => ({ http_fetch_allow_private_networks: checked }));
 bindSettingSwitch("settingMemorySpace", "experimentalSettingsState", (checked) => ({ memory_space: checked }));
+bindSettingSwitch("settingMemoryIsolatedProjects", "experimentalSettingsState", (checked) => ({ memory_isolated_projects: checked }));
 $("refreshMemories")?.addEventListener("click", () => { void loadMemories(); });
 $("compactContext")?.addEventListener("click", () => { void compactContextNow(); });
 // 長按才執行。pointer 事件涵蓋滑鼠與觸控；離開按鈕範圍也算放開，
@@ -8544,7 +8668,9 @@ $("newWorkspaceProvider").addEventListener("change", async (event) => {
 });
 $("newProject").addEventListener("click", () => {
   resetProjectForm();
+  syncMemoryIsolationAvailability();
   $("projectDialog").showModal();
+  void ensureProjectRAMRange();
 });
 $("projectSectionToggle").addEventListener("click", toggleProjectSection);
 $("scheduleToggle").addEventListener("click", toggleScheduleSection);
@@ -8564,6 +8690,8 @@ $("cancelProject").addEventListener("click", () => {
   resetProjectForm();
 });
 $("projectForm").addEventListener("submit", createProject);
+$("newProjectEphemeral").addEventListener("change", syncNewProjectIsolation);
+$("newProjectRAMSize").addEventListener("input", renderProjectRAMSize);
 $("pickProjectFolders").addEventListener("click", () => pickProjectSandboxRoots("create"));
 $("pickProjectFolders").addEventListener("dragenter", (event) => handleProjectFolderDrag(event, "create"));
 $("pickProjectFolders").addEventListener("dragover", (event) => handleProjectFolderDrag(event, "create"));
@@ -9087,6 +9215,9 @@ window.addEventListener("nr-intern-language-change", () => {
   renderSchedules();
   if (state.restoreCandidates.length > 0) renderRestoreRunOptions({ preserveSelection: true });
   syncMCPToolListToggle();
+  syncNewProjectIsolation();
+  renderProjectRAMSize();
+  renderNavigation();
   for (const block of document.querySelectorAll(".message-reasoning, .session-content-reasoning")) {
     updateReasoningSummary(block);
   }

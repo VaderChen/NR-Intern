@@ -166,6 +166,41 @@ func (r *RunRepository) FindByIdempotencyKey(_ context.Context, sessionID string
 	return domain.Run{}, fmt.Errorf("%w: idempotency key", domain.ErrNotFound)
 }
 
+// DeleteSession 在記憶體隔離 Project 重啟清理時移除整個 Session 的 Run。
+// 回傳 ID 讓呼叫端同步刪除分開保存的事件檔，避免只剩無法從介面抵達的稽核資料。
+func (r *RunRepository) DeleteSession(ctx context.Context, sessionID string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("%w: session id is required", domain.ErrInvalidInput)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	previous := make(map[string]domain.Run, len(r.runs))
+	for id, run := range r.runs {
+		previous[id] = cloneRun(run)
+	}
+	deleted := []string{}
+	for id, run := range r.runs {
+		if run.SessionID != sessionID {
+			continue
+		}
+		deleted = append(deleted, id)
+		delete(r.runs, id)
+	}
+	if len(deleted) == 0 {
+		return nil, nil
+	}
+	if err := r.persistLocked(); err != nil {
+		r.runs = previous
+		return nil, err
+	}
+	sort.Strings(deleted)
+	return deleted, nil
+}
+
 func (r *RunRepository) load() error {
 	data, err := os.ReadFile(r.filePath)
 	if err != nil {

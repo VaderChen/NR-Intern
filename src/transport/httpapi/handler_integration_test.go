@@ -13,6 +13,7 @@ import (
 func testRuntime(t *testing.T, token string) *bootstrap.Runtime {
 	t.Helper()
 	config := bootstrap.DefaultConfig()
+	config.RAMDisk.Enabled = false
 	config.DataDir = t.TempDir()
 	config.APIToken = token
 	runtime, err := bootstrap.Build(config)
@@ -20,7 +21,7 @@ func testRuntime(t *testing.T, token string) *bootstrap.Runtime {
 		t.Fatalf("Build: %v", err)
 	}
 	t.Cleanup(func() {
-		if err := runtime.Application.Close(context.Background()); err != nil {
+		if err := runtime.Close(context.Background()); err != nil {
 			t.Errorf("Close: %v", err)
 		}
 	})

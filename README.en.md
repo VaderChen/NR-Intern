@@ -24,6 +24,7 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - Optional experimental Memory Space reuses preferences, decisions, and procedures with near-duplicate handling, project-first scopes, compact recall, and failure-triggered memory lookup.
 - Per-run input, output, and total token usage, with session totals across retained runs and estimated cost from configurable model prices. No price means tokens only.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
+- Memory-isolated projects retain project settings while clearing their conversations, plans, and work files when the app closes or restarts; each project gets a dedicated, size-configurable RAM disk sandbox. Tool calls in these projects skip per-call approval, and creating new ones can be turned off under Experimental features (on by default) without affecting existing projects.
 - The compact tool set includes document reading, creation, and conversion; extended tools, tool retrieval, and native or instruction tool-call modes are also available.
 - Indexed paging for long conversations, question previews, and section navigation. Cumulative usage uses K/M notation with exact values on hover.
 - Bounded, cancellable waiting with `wait_for`, plus `ssh_wait` polling for read-only remote checks so deployments are confirmed by bytes, SHA-256, or service readiness instead of an early upload return.

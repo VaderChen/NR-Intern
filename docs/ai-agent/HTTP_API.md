@@ -245,6 +245,20 @@ curl -X POST http://127.0.0.1:8787/api/v1/workspaces \
 }
 ```
 
+若建立時指定 `ephemeral=true`，後端會以 `ram_disk_size_mb`（最少 256，預設 512，上限為主機實體記憶體的 75%）建立該 Project
+專屬 RAM Disk，且 `sandbox_roots` 必須為空。隔離旗標與容量建立後不可 PATCH。Project 設定會
+持久化，但底下的 Session、附件、計畫、Run／事件與通知會在正常關閉時清除；程序異常退出時則於
+下次啟動、HTTP Handler 開始服務前補做，因此重啟後隔離 Project 會以空白狀態保留：
+
+```json
+{
+  "name": "一次性分析",
+  "workspace_id": "workspace_xxx",
+  "ephemeral": true,
+  "ram_disk_size_mb": 1024
+}
+```
+
 先建立 Project，再把 Session 明確歸入該 Project：
 
 ```bash
@@ -418,6 +432,7 @@ curl -X PUT http://127.0.0.1:8787/api/v1/admin/service-settings \
 | `tool_retrieval` | `true` | 依需求縮小模型工具目錄，其餘已啟用工具可由 `find_tools` 找回 |
 | `tool_call_mode` | `native` | 使用原生 `tool_calls`；不支援的 Provider 可切換 `instruction` |
 | `memory_space` | `false` | 即時套用 Agent 記憶准入、去重、Project 優先 scope、較小自動召回視窗與超量整理；仍受既有 memory 設定限制 |
+| `memory_isolated_projects` | `true` | 是否允許新建記憶體隔離專案。關閉只擋新建（回 409），既有隔離專案照常運作與清理 |
 
 自動召回預設最多 6 筆，注入預算為 1200 UTF-8 bytes（雖然設定名為
 `max_injected_characters`），另有綜合排序門檻。策略參數由 JSON 的 `memory.space` 提供，

@@ -27,6 +27,7 @@ type storedServiceSettings struct {
 	// LegacyMCPToolRetrieval 是 ToolRetrieval 的舊名稱，只讀不寫。
 	LegacyMCPToolRetrieval *bool `json:"mcp_tool_retrieval,omitempty"`
 	MemorySpace            *bool `json:"memory_space,omitempty"`
+	MemoryIsolatedProjects *bool `json:"memory_isolated_projects,omitempty"`
 }
 
 func loadPersistedServiceSettings(config *Config) error {
@@ -93,6 +94,10 @@ func loadPersistedServiceSettings(config *Config) error {
 	if stored.MemorySpace != nil {
 		config.MemorySpace = *stored.MemorySpace
 	}
+	// 沒有這個欄位的舊設定檔沿用預設的開啟，不會因為升級而突然少一項能力。
+	if stored.MemoryIsolatedProjects != nil {
+		config.MemoryIsolatedProjects = *stored.MemoryIsolatedProjects
+	}
 	return nil
 }
 
@@ -114,6 +119,7 @@ func persistServiceSettings(dataDir string, settings domain.ServiceSettings) err
 		ToolCallMode:                  stringPointer(settings.ToolCallMode),
 		ToolRetrieval:                 boolPointer(settings.ToolRetrieval),
 		MemorySpace:                   boolPointer(settings.MemorySpace),
+		MemoryIsolatedProjects:        boolPointer(settings.MemoryIsolatedProjects),
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode service settings: %w", err)

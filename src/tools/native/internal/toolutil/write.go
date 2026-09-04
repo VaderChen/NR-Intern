@@ -14,12 +14,12 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode, overwrite bool)
 	if !overwrite {
 		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 		if err != nil {
-			return err
+			return DescribeWriteError(path, err)
 		}
 		if err := writeAndSync(file, data); err != nil {
 			_ = file.Close()
 			_ = os.Remove(path)
-			return err
+			return DescribeWriteError(path, err)
 		}
 		return file.Close()
 	}
@@ -27,7 +27,8 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode, overwrite bool)
 	directory := filepath.Dir(path)
 	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+"-*")
 	if err != nil {
-		return fmt.Errorf("create temporary file: %w", err)
+		// 暫存檔就建不出來時，最常見的原因正是空間不足。
+		return DescribeWriteError(path, fmt.Errorf("create temporary file: %w", err))
 	}
 	temporaryPath := temporary.Name()
 	cleanup := func() {
@@ -40,7 +41,7 @@ func AtomicWriteFile(path string, data []byte, mode os.FileMode, overwrite bool)
 	}
 	if err := writeAndSync(temporary, data); err != nil {
 		cleanup()
-		return err
+		return DescribeWriteError(path, err)
 	}
 	if err := temporary.Close(); err != nil {
 		_ = os.Remove(temporaryPath)

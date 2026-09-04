@@ -816,7 +816,13 @@ MCP 工具與原生工具進入同一個 `ports.ToolRuntime`，並先通過同�
 唯讀工具是否免逐次人工 Approval 取決於 Server 宣告的 `readOnlyHint` 與管理者設定的
 `trust_annotations`；這個選項**預設開啟**（設定檔未提供時採預設值，明確設為 false 則沿用）。
 未信任的 Server 或非唯讀工具仍須逐次核准。豁免會發出 `run.approval_skipped`
-（`reason=read_only_tool`）留下紀錄，`trust_annotations` 同時仍用於唯讀並行排程。進度通知會轉成 `tool.execution.update`，結果文字受全域工具輸出上限約束；結構化
+（`reason=read_only_tool`）留下紀錄，`trust_annotations` 同時仍用於唯讀並行排程。
+
+記憶體隔離專案是第二種豁免：這類 Session 的所有工具都免逐次核准，紀錄的
+`reason` 為 `ephemeral_project`。判斷依據是 Run metadata 的 `ephemeral_project`
+旗標——與 `sandbox_roots` 同屬後端保留欄位，Client 夾帶的同名值會先被清除，
+因此不存在「宣告自己是記憶體專案就免審核」的路徑。這個豁免不改變並行排程：
+`shell_exec` 不是唯讀工具，仍然序列執行。進度通知會轉成 `tool.execution.update`，結果文字受全域工具輸出上限約束；結構化
 結果會一併提供給模型。Server 要求額外互動輸入時，會把 `input_required`、輸入請求與
 `requestState` 回傳給模型，模型可補上控制欄位後重試，不會假裝完成。
 
@@ -887,6 +893,40 @@ API 回傳，Token 另存於權限限制檔案。這是 NR-Intern 的 Provider �
 OpenAI-compatible Provider 會自動取得相同登入能力。
 
 OpenAI 官方協定參考：[Chat Completions API](https://developers.openai.com/api/reference/cli/resources/chat/subresources/completions)、[Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create)；request ID 診斷參考：[OpenAI API Overview](https://developers.openai.com/api/reference/overview#debugging-requests)。
+
+## 記憶體隔離 Project 與 RAM disk 生命週期
+
+Project 建立時可設定不可變更的 `ephemeral=true` 與 `ram_disk_size_mb`。`bootstrap.RAMDiskPool`
+以 Project ID 建立互不共用的揮發性工作空間；Application 在 Run 開始前取得該 Project 的可信任
+根目錄並放在 Sandbox 第一順位。Project 刪除時立即卸載，`Runtime.Close` 則在 Application、MCP
+與其他子程序都關閉後清理剩餘磁碟。啟動期間任一步驟失敗也會回滾已建立的磁碟。
+
+- macOS：以參數陣列直接呼叫 `hdiutil attach -nomount` 與 `diskutil eraseVolume`，不經 Shell；
+  正常卸載失敗時才使用強制 detach。
+- Linux：確認 `/dev/shm` 確實是 tmpfs 且可用空間不小於設定容量，再建立權限為 `0700` 的子目錄。
+- Windows：以 ImDisk 的 `vm` backing store 建立 NTFS RAM disk，自動挑選未使用的磁碟代號；找不到
+  `imdisk.exe` 時明確拒絕啟動，不會靜默落到硬碟。此路徑仍標示為待 x64／ARM64 實機驗證。
+- 其他平台：使用可清理的系統暫存目錄，但 `Volatile()` 回報 false，呼叫端不得把它呈現成 RAM disk。
+
+殘留清理由固定名稱前綴、結構化專用標記、平台種類與建立程序 PID 共同判定。仍活著的程序一律略過；
+缺少標記、標記格式不符或裝置名稱不合法時也不處理，以免卸載使用者自行建立的磁碟。
+
+能不能新建記憶體隔離 Project 由服務設定 `memory_isolated_projects` 控制，**預設開啟**——
+與仍在設計中的實驗性功能不同，這是已完成的能力。關閉只擋新建（回 409）：既有隔離 Project
+的 RAM disk、對話與關閉時清理都照常，一次誤關不會讓使用者手上的專案失效。在缺少 RAM disk
+支援的環境（Windows 需安裝 ImDisk）可以整個關掉，讓建立對話框不再提供註定失敗的選項。
+
+記憶體隔離 Project 的設定本身持久化，但其 Session 只在目前程序生命週期內存在。正常關閉時會在
+卸載 RAM disk 前刪除該 Project 的 Session 目錄、附件、計畫、Run／事件與通知；若程序異常終止，
+下次啟動會在 HTTP Handler 對外服務前完成同一套清理。因此重啟後 Project 仍在，但底下不會恢復
+任何對話。隔離類型與容量建立後不可 PATCH，避免尚未實作搬移時產生資料保留語意不一致。
+
+**揮發的是 RAM disk 上的工作檔案，不是執行期間的對話紀錄。** Session、transcript、附件、計畫、
+Run 與事件在執行期間仍由 `dataDir` 底下的 filestore 管理，只有 sandbox 工作檔案直接落在 RAM disk。
+換句話說，揮發語意由「正常關閉清理 ＋ 下次啟動補清理」兩段共同保證，而不是「從不寫入硬碟」。
+這留下一個明確的窗口：程序被強制終止後、下次啟動完成清理前，該 Project 的對話仍以檔案形式存在於
+`dataDir`。要消除這個窗口，需要把 Session 儲存本身按 Project 分流到各自的 RAM disk（每個記憶體隔離
+Project 有獨立 RAM disk，因此是多實例路由，不是單一替換），目前尚未實作。
 
 ## 程序拓樸
 

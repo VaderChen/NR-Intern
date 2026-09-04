@@ -4,6 +4,10 @@
   "notifications_enabled": false,
   "listen_address": "127.0.0.1:8787",
   "data_dir": "data/ai-agent",
+  "ram_disk": {
+    "enabled": true,
+    "size_mb": 512
+  },
   "api_token": "",
   "allowed_origins": [
     "http://127.0.0.1:8790",
@@ -140,5 +144,6 @@
   },
   "extended_tools": false,
   "tool_retrieval": true,
-  "memory_space": false
+  "memory_space": false,
+  "memory_isolated_projects": true
 }

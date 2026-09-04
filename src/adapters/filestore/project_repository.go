@@ -19,6 +19,12 @@ var _ ports.ProjectRepository = (*ProjectRepository)(nil)
 
 const maxInstructionCharacters = 8000
 
+const (
+	defaultProjectRAMDiskSizeMB = 512
+	minProjectRAMDiskSizeMB     = 256
+	maxProjectRAMDiskSizeMB     = 1024 * 1024
+)
+
 type ProjectRepository struct {
 	mu       sync.RWMutex
 	filePath string
@@ -62,6 +68,10 @@ func (r *ProjectRepository) Create(ctx context.Context, input domain.CreateProje
 	if err != nil {
 		return domain.Project{}, err
 	}
+	ramDiskSizeMB, err := normalizeProjectRAMDisk(input.Ephemeral, input.RAMDiskSizeMB, sandboxRoots)
+	if err != nil {
+		return domain.Project{}, err
+	}
 	instructions, err := normalizeInstructions(input.Instructions)
 	if err != nil {
 		return domain.Project{}, err
@@ -79,15 +89,17 @@ func (r *ProjectRepository) Create(ctx context.Context, input domain.CreateProje
 	}
 	now := time.Now().UTC()
 	value := domain.Project{
-		ID:           domain.NewID("project"),
-		WorkspaceID:  workspaceID,
-		Name:         name,
-		Description:  strings.TrimSpace(input.Description),
-		Instructions: instructions,
-		SandboxRoots: sandboxRoots,
-		Position:     position,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		ID:            domain.NewID("project"),
+		WorkspaceID:   workspaceID,
+		Name:          name,
+		Description:   strings.TrimSpace(input.Description),
+		Instructions:  instructions,
+		Ephemeral:     input.Ephemeral,
+		RAMDiskSizeMB: ramDiskSizeMB,
+		SandboxRoots:  sandboxRoots,
+		Position:      position,
+		CreatedAt:     now,
+		UpdatedAt:     now,
 	}
 	previous := cloneProjects(r.items)
 	r.items[value.ID] = value
@@ -165,6 +177,9 @@ func (r *ProjectRepository) Update(ctx context.Context, projectID string, input 
 		value.Instructions = instructions
 	}
 	if input.SandboxRoots != nil {
+		if value.Ephemeral {
+			return domain.Project{}, fmt.Errorf("%w: memory-isolated project sandbox is managed by the system", domain.ErrInvalidInput)
+		}
 		sandboxRoots, err := normalizeProjectSandboxRoots(*input.SandboxRoots)
 		if err != nil {
 			return domain.Project{}, err
@@ -225,6 +240,11 @@ func (r *ProjectRepository) load() error {
 				return fmt.Errorf("validate stored project %q: %w", id, normalizeErr)
 			}
 			value.SandboxRoots = sandboxRoots
+			ramDiskSizeMB, normalizeErr := normalizeProjectRAMDisk(value.Ephemeral, value.RAMDiskSizeMB, sandboxRoots)
+			if normalizeErr != nil {
+				return fmt.Errorf("validate stored project %q: %w", id, normalizeErr)
+			}
+			value.RAMDiskSizeMB = ramDiskSizeMB
 			snapshot.Items[id] = value
 		}
 		r.items = snapshot.Items
@@ -233,7 +253,7 @@ func (r *ProjectRepository) load() error {
 }
 
 func (r *ProjectRepository) persistLocked() error {
-	data, err := json.MarshalIndent(projectFile{Version: 2, Items: r.items}, "", "  ")
+	data, err := json.MarshalIndent(projectFile{Version: 3, Items: r.items}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode project store: %w", err)
 	}
@@ -317,4 +337,23 @@ func normalizeProjectSandboxRoots(values []string) ([]string, error) {
 		result = append(result, resolved)
 	}
 	return result, nil
+}
+
+func normalizeProjectRAMDisk(ephemeral bool, sizeMB int, sandboxRoots []string) (int, error) {
+	if !ephemeral {
+		if sizeMB != 0 {
+			return 0, fmt.Errorf("%w: RAM disk size is only valid for a memory-isolated project", domain.ErrInvalidInput)
+		}
+		return 0, nil
+	}
+	if len(sandboxRoots) > 0 {
+		return 0, fmt.Errorf("%w: memory-isolated project cannot use host sandbox roots", domain.ErrInvalidInput)
+	}
+	if sizeMB == 0 {
+		sizeMB = defaultProjectRAMDiskSizeMB
+	}
+	if sizeMB < minProjectRAMDiskSizeMB || sizeMB > maxProjectRAMDiskSizeMB {
+		return 0, fmt.Errorf("%w: RAM disk size must be between %d and %d MB", domain.ErrInvalidInput, minProjectRAMDiskSizeMB, maxProjectRAMDiskSizeMB)
+	}
+	return sizeMB, nil
 }

@@ -1403,6 +1403,8 @@ components:
         name: { type: string }
         description: { type: string }
         instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
+        ephemeral: { type: boolean, description: 是否使用專案專屬 RAM Disk；Project 設定保留，但底下的 Session 與相關資料在程式關閉或重啟時清除，且建立後不可變更。 }
+        ram_disk_size_mb: { type: integer, minimum: 256, description: 記憶體隔離專案的 RAM Disk 容量；上限為主機實體記憶體的 75%，一般專案為 0。 }
         sandbox_roots:
           type: array
           items: { type: string }
@@ -1418,10 +1420,12 @@ components:
         workspace_id: { type: string }
         description: { type: string }
         instructions: { type: string, maxLength: 8000, description: 職務說明；每次 Run 都會注入提示，Project 的說明接在所屬 Workspace 之後。 }
+        ephemeral: { type: boolean, default: false, description: 建立記憶體隔離專案；Project 設定保留，但底下的 Session 與相關資料在程式關閉或重啟時清除，且建立後不可透過 PATCH 變更。 }
+        ram_disk_size_mb: { type: integer, minimum: 256, default: 512, description: ephemeral=true 時適用；上限為主機實體記憶體的 75%，且不可與 sandbox_roots 同時使用。 }
         sandbox_roots:
           type: array
           items: { type: string }
-          description: 可同時指定多個既有的絕對目錄。
+          description: 可同時指定多個既有的絕對目錄；ephemeral=true 時必須為空。
     UpdateProjectInput:
       type: object
       minProperties: 1
@@ -1432,7 +1436,7 @@ components:
         sandbox_roots:
           type: array
           items: { type: string }
-          description: 完整取代 Project 的 Sandbox 目錄集合；空陣列表示恢復 Session 私有工作目錄。
+          description: 完整取代一般 Project 的 Sandbox 目錄集合；記憶體隔離專案不可更新此欄位。
         position: { type: integer, minimum: 0 }
     Schedule:
       type: object
@@ -1580,6 +1584,7 @@ components:
         tool_call_mode: { type: string, enum: [native, instruction], description: native 使用 Provider 的 tool_calls 欄位；Provider 不支援時才用 instruction。 }
         tool_retrieval: { type: boolean, description: 預設 true。工具目錄先經檢索，只有與本次需求相關的工具進入提示（內建工具與 MCP 工具都適用）；其餘工具仍可由模型以 find_tools 取回後直接呼叫。關閉後整份目錄會進入每一次請求。 }
         memory_space: { type: boolean, default: false, description: 實驗性功能。Agent 記憶工具套用種類／憑證樣式檢查及近似去重，預設 scope 優先 Project、其次 Workspace，明確 memory_scope 優先。自動召回預設最多 6 筆與 1200 UTF-8 bytes 注入預算及綜合排序門檻；scope 超量時軟性淘汰。仍受既有 memory 設定限制，手動記憶 API 不套用此策略。切換不搬移既有資料，30 天失效記憶清理則獨立執行。 }
+        memory_isolated_projects: { type: boolean, default: true, description: 是否允許新建記憶體隔離專案。關閉只擋新建；既有隔離專案的 RAM disk、對話與關閉時清理都照常運作，避免一次誤關讓使用者現有專案失效。可在缺少 RAM disk 支援的環境（Windows 需 ImDisk）整個關閉。 }
     HTTPFetchSettings:
       type: object
       required: [enabled, allow_private_networks]
@@ -1603,6 +1608,7 @@ components:
         tool_call_mode: { type: string, enum: [native, instruction], description: 省略時保留目前設定。 }
         tool_retrieval: { type: boolean, description: 省略時保留目前設定。 }
         memory_space: { type: boolean, description: 省略時保留目前設定；切換立即生效，不必重啟後端。 }
+        memory_isolated_projects: { type: boolean, description: 省略時保留目前設定；切換立即生效，不必重啟後端。關閉後建立隔離專案會得到 409。 }
     ProviderSettings:
       type: object
       required: [default_provider_id, providers]

@@ -4,6 +4,7 @@ import (
 	"AgenticService/src/desktop/folderpicker"
 	"AgenticService/src/desktop/supervisor"
 	"AgenticService/src/domain"
+	"AgenticService/src/internal/systeminfo"
 	"AgenticService/src/web/console"
 	"crypto/subtle"
 	"encoding/json"
@@ -87,6 +88,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /.well-known/nr-intern-desktop", s.desktopIdentity)
 	s.mux.HandleFunc("POST /desktop/restore", s.restoreDesktop)
 	s.mux.HandleFunc("GET /desktop/api/status", s.status)
+	s.mux.HandleFunc("GET /desktop/api/system-info", s.systemInfo)
 	s.mux.HandleFunc("GET /desktop/api/logs", s.logs)
 	s.mux.HandleFunc("POST /desktop/api/start", s.start)
 	s.mux.HandleFunc("POST /desktop/api/stop", s.stop)
@@ -117,6 +119,15 @@ func (s *Server) restoreDesktop(writer http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) status(writer http.ResponseWriter, request *http.Request) {
 	writeData(writer, s.supervisor.Status(request.Context()))
+}
+
+func (s *Server) systemInfo(writer http.ResponseWriter, _ *http.Request) {
+	totalMemoryBytes, err := systeminfo.TotalMemoryBytes()
+	if err != nil {
+		writeJSON(writer, http.StatusNotImplemented, map[string]any{"error": err.Error()})
+		return
+	}
+	writeData(writer, map[string]any{"total_memory_bytes": totalMemoryBytes})
 }
 
 func (s *Server) logs(writer http.ResponseWriter, _ *http.Request) {

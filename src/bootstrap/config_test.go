@@ -24,6 +24,21 @@ func TestDefaultConfigAllowsSandboxedWriteTools(t *testing.T) {
 	if !config.HTTPFetch.AllowPrivateNetworks {
 		t.Fatal("http_fetch must allow localhost and private networks by default")
 	}
+	if !config.RAMDisk.Enabled || config.RAMDisk.SizeMB != DefaultRAMDiskSizeMB {
+		t.Fatalf("RAM disk defaults = %+v", config.RAMDisk)
+	}
+}
+
+func TestValidateConfigRejectsInvalidRAMDiskSize(t *testing.T) {
+	config := DefaultConfig()
+	config.RAMDisk.SizeMB = minRAMDiskSizeMB - 1
+	if err := validateConfig(&config); err == nil {
+		t.Fatal("RAM disk size below the safe minimum was accepted")
+	}
+	config.RAMDisk.SizeMB = maxRAMDiskSizeMB + 1
+	if err := validateConfig(&config); err == nil {
+		t.Fatal("RAM disk size above the safe maximum was accepted")
+	}
 }
 
 func TestValidateAdjustableRunLimitsAllowsUnlimitedCounts(t *testing.T) {

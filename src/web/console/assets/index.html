@@ -361,10 +361,18 @@
       <div id="experimentalPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="experimentalManagementTab">
         <form id="experimentalSettings" class="management-section">
           <div class="section-head"><h2>實驗性功能</h2><span id="experimentalSettingsState" class="save-state"></span></div>
-          <p class="hint">這裡的功能還在設計或開發中，預設關閉。開啟後行為可能改變或被移除，正式工作請先評估風險。</p>
+          <p class="hint">這裡的功能仍在演進中，行為可能改變或被移除，正式工作請先評估風險。各項的預設值標示在卡片右側。</p>
           <div class="settings-fieldset experimental-card">
             <div class="experimental-head">
-              <span class="experimental-title">回憶空間<span class="experimental-badge">實驗性</span></span>
+              <span class="experimental-title">記憶體隔離專案<span class="experimental-badge badge-on">預設開啟</span></span>
+              <label class="switch-label"><input id="settingMemoryIsolatedProjects" type="checkbox" role="switch" aria-label="允許新建記憶體隔離專案"><span class="switch-track" aria-hidden="true"></span></label>
+            </div>
+            <p class="hint">建立專案時可選擇把工作目錄放在獨立的 RAM Disk 上：專案設定保留，但對話、計畫與工作檔案會在程式關閉或重啟時全部清除。適合不想留下資料夾的 POC 實驗。這類專案的工具呼叫不會逐次詢問核准。</p>
+            <p class="hint">關閉後<strong>只是不能再新建</strong>，既有的隔離專案仍照常運作與清理。在沒有 RAM Disk 支援的環境（Windows 需安裝 ImDisk）可以整個關掉，避免建立對話框提供一個註定失敗的選項。</p>
+          </div>
+          <div class="settings-fieldset experimental-card">
+            <div class="experimental-head">
+              <span class="experimental-title">回憶空間<span class="experimental-badge">預設關閉</span></span>
               <label class="switch-label"><input id="settingMemorySpace" type="checkbox" role="switch" aria-label="啟用回憶空間"><span class="switch-track" aria-hidden="true"></span></label>
             </div>
             <p class="hint">讓 Agent 跨對話存取共同記憶：在別的對話裡確認過的偏好、決策與作法，下一次不必重講。只保存偏好、決策、限制與作法，密碼與金鑰一律排除；共享範圍是專案，單次注入最多 6 條。關閉後不影響既有記憶資料。</p>
@@ -888,19 +896,43 @@
     <form method="dialog" id="projectForm">
       <h2>建立新專案</h2>
       <label>名稱<input id="newProjectName" placeholder="例如：NR-Intern" required></label>
-      <label>說明<textarea id="newProjectDescription" rows="3" placeholder="選填"></textarea></label>
-      <label>職務說明<textarea id="newProjectInstructions" rows="4" placeholder="這個專案的常駐工作規則；每次對話都會自動套用"></textarea></label>
-      <fieldset class="sandbox-fieldset">
-        <legend>Sandbox 目錄</legend>
-        <p class="hint">可加入多個既有的絕對目錄。Agent 的檔案與 Shell 工具只能在這些範圍內運作。</p>
-        <button id="pickProjectFolders" class="ghost full folder-picker" type="button">
-          <span class="folder-picker-icon" aria-hidden="true">▱</span>
-          <span><strong>拖入一個或多個目錄</strong><small>或按一下使用系統目錄選擇器</small></span>
-        </button>
-        <p id="projectSandboxEmpty" class="sandbox-empty">尚未加入目錄；將使用 Session 私有工作目錄。</p>
-        <div id="projectSandboxRoots" class="sandbox-root-list" aria-live="polite"></div>
+      <details class="project-extra-card">
+        <summary><span>專案說明與工作規則</span><small>選填</small></summary>
+        <div class="project-extra-fields">
+          <label>說明<textarea id="newProjectDescription" rows="3" placeholder="選填"></textarea></label>
+          <label>職務說明<textarea id="newProjectInstructions" rows="4" placeholder="這個專案的常駐工作規則；每次對話都會自動套用"></textarea></label>
+        </div>
+      </details>
+      <fieldset class="sandbox-fieldset memory-project-fieldset">
+        <legend id="newProjectSandboxLegend">Sandbox 目錄</legend>
+        <div id="newProjectDirectoryPanel">
+          <p class="hint">可加入多個既有的絕對目錄。Agent 的檔案與 Shell 工具只能在這些範圍內運作。</p>
+          <button id="pickProjectFolders" class="ghost full folder-picker" type="button">
+            <span class="folder-picker-icon" aria-hidden="true">▱</span>
+            <span><strong>拖入一個或多個目錄</strong><small>或按一下使用系統目錄選擇器</small></span>
+          </button>
+          <p id="projectSandboxEmpty" class="sandbox-empty">尚未加入目錄；將使用 Session 私有工作目錄。</p>
+          <div id="projectSandboxRoots" class="sandbox-root-list" aria-live="polite"></div>
+        </div>
+        <div id="newProjectMemoryPanel" class="memory-project-panel hidden">
+          <p class="hint">為此專案建立獨立的揮發性工作空間；關閉程式後，RAM Disk 內的工作檔案會消失。</p>
+          <div class="ram-range-control">
+            <div class="ram-range-head"><label for="newProjectRAMSize">RAM SIZE</label><output id="newProjectRAMValue" for="newProjectRAMSize">0.5 GB</output></div>
+            <input id="newProjectRAMSize" type="range" min="256" max="6144" step="256" value="512">
+            <div class="ram-range-limits"><span>0.2 GB（256 MB）</span><span id="newProjectRAMLimit">6 GB</span></div>
+          </div>
+          <div class="ram-parameter-list" aria-label="RAM Disk 參數">
+            <span>磁碟後端</span><strong id="newProjectRAMBackend">自動選擇（依作業系統）</strong>
+            <span>檔案系統</span><strong id="newProjectRAMFilesystem">平台預設</strong>
+            <span>卸載策略</span><strong>程式關閉時清除</strong>
+          </div>
+          <p class="warning">專案設定會保留；此專案下的對話、計畫與工作檔案會在程式關閉或重啟時全部清除。</p>
+        </div>
       </fieldset>
-      <div class="dialog-actions"><button type="button" id="cancelProject" class="ghost">取消</button><button id="createProject" value="default" class="primary">建立</button></div>
+      <div class="dialog-actions split-actions">
+        <label class="switch-label memory-project-switch"><input id="newProjectEphemeral" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span>記憶體隔離專案</span></label>
+        <span class="dialog-action-group"><button type="button" id="cancelProject" class="ghost">取消</button><button id="createProject" value="default" class="primary">建立</button></span>
+      </div>
     </form>
   </dialog>
 
@@ -913,7 +945,7 @@
       <label>名稱<input id="editProjectName" required></label>
       <label>說明<textarea id="editProjectDescription" rows="3" placeholder="選填"></textarea></label>
       <label>職務說明<textarea id="editProjectInstructions" rows="4" placeholder="這個專案的常駐工作規則；每次對話都會自動套用"></textarea></label>
-      <fieldset class="sandbox-fieldset">
+      <fieldset id="editProjectDirectoryFieldset" class="sandbox-fieldset">
         <legend>Sandbox 目錄</legend>
         <p class="hint">可加入多個既有的絕對目錄。儲存後，Agent 的檔案與 Shell 工具會使用更新後的範圍。</p>
         <button id="pickEditProjectFolders" class="ghost full folder-picker" type="button">
@@ -922,6 +954,16 @@
         </button>
         <p id="editProjectSandboxEmpty" class="sandbox-empty">尚未加入目錄；將使用 Session 私有工作目錄。</p>
         <div id="editProjectSandboxRoots" class="sandbox-root-list" aria-live="polite"></div>
+      </fieldset>
+      <fieldset id="editProjectMemoryFieldset" class="sandbox-fieldset memory-project-panel hidden">
+        <legend>記憶體隔離</legend>
+        <div class="ram-parameter-list">
+          <span>RAM SIZE</span><strong id="editProjectRAMSize"></strong>
+          <span>磁碟後端</span><strong>自動選擇（依作業系統）</strong>
+          <span>卸載策略</span><strong>程式關閉時清除</strong>
+        </div>
+        <p class="hint">隔離類型與容量在建立後固定，避免既有工作檔案在切換儲存媒介時遺失。</p>
+        <p class="warning">專案設定會保留；此專案下的對話、計畫與工作檔案會在程式關閉或重啟時全部清除。</p>
       </fieldset>
       <div class="dialog-actions split-actions">
         <button type="button" id="deleteProjectSettings" class="danger ghost">刪除專案</button>
