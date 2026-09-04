@@ -2062,3 +2062,18 @@ func cloneToolCalls(input []domain.ToolCall) []domain.ToolCall {
 	}
 	return out
 }
+
+// CompactSession 手動壓縮一個 Session 的對話歷史。
+//
+// 系統提示與工具目錄都會計入 context，估算時必須帶上，否則算出來的「壓縮後」
+// 會比實際送出時樂觀，使用者按完仍然可能一送就爆。
+func (r *Runner) CompactSession(ctx context.Context, session domain.Session) (domain.ContextCompactionResult, error) {
+	if r == nil || r.Context == nil {
+		return domain.ContextCompactionResult{}, fmt.Errorf("%w: context manager is unavailable", domain.ErrInvalidInput)
+	}
+	definitions, err := r.Tools.Definitions(ctx, session)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	return r.Context.CompactNow(ctx, session, r.SystemPrompt, definitions)
+}

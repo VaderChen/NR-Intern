@@ -225,6 +225,28 @@ func (r *MemoryRepository) Search(ctx context.Context, query domain.MemoryQuery)
 	return result, nil
 }
 
+// Scopes 回傳目前有生效記憶的所有 scope，依名稱排序。
+func (r *MemoryRepository) Scopes(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	r.mu.RLock()
+	for _, value := range r.items {
+		if value.Status != domain.MemoryStatusActive {
+			continue
+		}
+		seen[value.Scope] = true
+	}
+	r.mu.RUnlock()
+	result := make([]string, 0, len(seen))
+	for scope := range seen {
+		result = append(result, scope)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
 // ListScope 回傳 scope 內所有仍生效的記憶，依建立時間排序。
 func (r *MemoryRepository) ListScope(ctx context.Context, scope string) ([]domain.Memory, error) {
 	if err := ctx.Err(); err != nil {

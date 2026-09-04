@@ -15,7 +15,7 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 		"file_read", "file_search", "file_compare", "file_write", "file_edit",
 		"document_inspect", "document_read", "document_create", "document_convert",
 		"document_edit", "http_fetch", "shell_exec", "ssh_exec",
-		"memory_search", "memory_remember", "memory_forget",
+		"memory_search", "memory_remember", "memory_forget", "ask_user",
 	}}
 
 	lean := EffectiveAllowedTools(config)
@@ -27,6 +27,11 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 	// shell 寫一個沒有 BOM 的 CSV 交差。寫入、編輯、SSH 與記憶仍然要擴充工具集。
 	if !strings.Contains(strings.Join(lean, ","), "document_create") {
 		t.Fatalf("document_create must stay in the lean set: %v", lean)
+	}
+	// 問答選單同理：中途需要使用者決定是基本互動。放進擴充集合等於預設關掉它，
+	// 模型就只能自己猜，或把選擇題寫進最終答案要使用者再開一輪。
+	if !strings.Contains(strings.Join(lean, ","), "ask_user") {
+		t.Fatalf("ask_user must stay in the lean set: %v", lean)
 	}
 	for _, name := range []string{"file_write", "file_edit", "ssh_exec", "document_edit", "memory_remember", "http_fetch"} {
 		if strings.Contains(strings.Join(lean, ","), name) {

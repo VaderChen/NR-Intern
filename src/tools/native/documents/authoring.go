@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -133,12 +134,12 @@ func NewEditTool(maxInputBytes int, maxDocumentBytes int64) *EditTool {
 func (t *CreateTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
 		Name:               "document_create",
-		Label:              "建立辦公文件（Word／Excel／PowerPoint／PDF）",
+		Label:              "建立本地文件（Word／Excel／PowerPoint／PDF／Markdown／CSV／HTML／純文字）",
 		Version:            "1.0.0",
 		Category:           "documents",
-		Description:        "在 Project／Session Sandbox 內以結構化內容建立 Word 文件（DOCX）、Excel 試算表（XLSX）、PowerPoint 簡報（PPTX）或 PDF。使用者說「轉成 Excel」「做一份 Word」「產生簡報」時就是用這個工具，不要改用 Shell 或 CSV 代替。XLSX 用 sheets（每張表給 name 與 rows）；只給 cell_updates（sheet／cell／value）時會自動組成工作表。可用 template_path 保留既有文件樣式，再以 replacements、cell_updates 或 annotations 填入內容。預設不覆寫既有檔案；Unicode PDF 會優先使用指定字型，否則自動探索完整覆蓋的系統字型。",
+		Description:        "在 Project／Session Sandbox 內以結構化內容建立本地文件：Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）、PDF、Markdown（MD）、純文字（TXT）、CSV 與 HTML。使用者說「做一份 Word」「轉成 Excel」「產生簡報」「寫成 Markdown」「輸出 CSV」時都用這個工具，不要改用 Shell 的 echo、cat 或 heredoc——那會在中文、引號與換行上出錯。內容結構：DOCX／PDF／MD／TXT／HTML 用 blocks（heading／paragraph／bullet／numbered／table／page_break）；XLSX 用 sheets（每張表給 name 與 rows），CSV 用同樣的 sheets 但只能一張表；只給 cell_updates（sheet／cell／value）時會自動組成工作表。template_path 可保留既有 Office／PDF 文件樣式，再以 replacements、cell_updates 或 annotations 填入內容。預設不覆寫既有檔案；Unicode PDF 會優先使用指定字型，否則自動探索完整覆蓋的系統字型。",
 		Platforms:          []string{"darwin", "linux", "windows"},
-		Capabilities:       []string{"document-create", "template-preservation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "workspace-sandbox", "atomic-write", "atomic-replace", "bounded-input"},
+		Capabilities:       []string{"document-create", "template-preservation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "markdown", "csv", "html", "plain-text", "workspace-sandbox", "atomic-write", "atomic-replace", "bounded-input"},
 		RequiresPermission: true,
 		InputSchema:        documentCreateSchema(),
 	}
@@ -180,6 +181,11 @@ func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _
 		return documentFailure(invocation.Call, err.Error()), nil
 	}
 	var authored authoredDocument
+	if strings.TrimSpace(request.TemplatePath) != "" && textDocumentFormat(format) {
+		// 讓錯誤講清楚為什麼不行。沒有這一段會落到 detectDocumentFormat，
+		// 回一句「unsupported office document」，模型只會換個範本再試一次。
+		return documentFailure(invocation.Call, fmt.Sprintf("template_path 只適用於 Office 與 PDF 文件；.%s 是純文字格式，請直接用 blocks 或 sheets 提供內容", format)), nil
+	}
 	if strings.TrimSpace(request.TemplatePath) != "" {
 		templatePath, resolveErr := resolveTemplatePath(roots, request.TemplatePath, format, t.MaxDocumentBytes)
 		if resolveErr != nil {
@@ -201,6 +207,14 @@ func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _
 				authored, err = createPPTX(ctx, request)
 			case formatPDF:
 				authored, err = createPDF(ctx, request, fontPath)
+			case formatMarkdown:
+				authored, err = createMarkdown(ctx, request)
+			case formatText:
+				authored, err = createPlainText(ctx, request)
+			case formatCSV:
+				authored, err = createCSV(ctx, request)
+			case formatHTML:
+				authored, err = createHTML(ctx, request)
 			}
 		}
 	}
@@ -227,6 +241,7 @@ func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _
 	details["bytes"] = len(authored.Data)
 	details["sha256"] = fmt.Sprintf("%x", sha256.Sum256(authored.Data))
 	details["overwrite"] = request.Overwrite
+	details = toolutil.ProducedFiles(details, outputPath)
 	return domain.ToolExecution{
 		ToolCallID: invocation.Call.ID,
 		ToolName:   invocation.Call.Name,
@@ -310,6 +325,7 @@ func (t *EditTool) Execute(ctx context.Context, invocation tools.Invocation, _ p
 	details["format"] = string(format)
 	details["bytes"] = len(authored.Data)
 	details["sha256"] = fmt.Sprintf("%x", sha256.Sum256(authored.Data))
+	details = toolutil.ProducedFiles(details, outputPath)
 	return domain.ToolExecution{
 		ToolCallID: invocation.Call.ID,
 		ToolName:   invocation.Call.Name,
@@ -327,9 +343,48 @@ func decodeAuthoringArguments(arguments map[string]any, maxBytes int, target any
 		return fmt.Errorf("document input exceeds %d bytes", maxBytes)
 	}
 	if err := json.Unmarshal(data, target); err != nil {
-		return fmt.Errorf("invalid document input: %w", err)
+		return authoringDecodeError(err)
 	}
 	return nil
+}
+
+// authoringDecodeError 把 Go 的解碼錯誤翻成模型能照著修的說明。
+//
+// 原本直接回傳 "json: cannot unmarshal object into documentCreateRequest.blocks.0.rows.0
+// of type []string"。實測模型讀完的結論是「document_create 不支援這種結構」，
+// 於是整個放棄改用別的工具——它其實只要把那一列改成陣列就好。錯誤訊息要講的是
+// 「這裡該長什麼樣」，不是「Go 的型別對不上」。
+func authoringDecodeError(err error) error {
+	var typeError *json.UnmarshalTypeError
+	if !errors.As(err, &typeError) || typeError.Field == "" {
+		return fmt.Errorf("invalid document input: %w", err)
+	}
+	field := typeError.Field
+	if hint := authoringFieldHint(field); hint != "" {
+		return fmt.Errorf("欄位 %s 的格式不對（收到 %s）。%s", field, typeError.Value, hint)
+	}
+	return fmt.Errorf("欄位 %s 的格式不對：收到 %s，需要 %s", field, typeError.Value, typeError.Type)
+}
+
+// authoringFieldHint 針對實際踩過的欄位給出可以照抄的正確寫法。
+func authoringFieldHint(field string) string {
+	switch {
+	case strings.Contains(field, ".rows"):
+		return `表格的 rows 是「陣列的陣列」，每一列是一組儲存格：` +
+			`"rows": [["批號","數量"],["A-001","264"]]。不要把一列寫成物件，也不要把整張表寫成單層陣列。`
+	case strings.HasSuffix(field, ".level"):
+		return `level 是 1 到 3 的數字，例如 "level": 2。`
+	case strings.Contains(field, "blocks"):
+		return `blocks 是區塊陣列，每個區塊給 type（heading／paragraph／bullet／numbered／table／page_break）；` +
+			`heading 與段落用 text，table 用 rows。`
+	case strings.Contains(field, "sheets"):
+		return `sheets 是工作表陣列，每張表給 name 與 rows：` +
+			`"sheets": [{"name":"明細","rows":[["批號","數量"],["A-001",264]]}]。`
+	case strings.Contains(field, "slides"):
+		return `slides 是投影片陣列，每張給 title，內容用 body 或 bullets。`
+	default:
+		return ""
+	}
 }
 
 func resolveAuthoringOutput(roots []string, requested string, createParent bool) (string, error) {
@@ -359,16 +414,40 @@ func requestedDocumentFormat(requested, outputPath string) (documentFormat, erro
 	if requested == "" {
 		requested = extension
 	}
+	// markdown 與 htm 是同一種格式的常見寫法，接受它們比要求模型記住哪個能用實在。
+	switch requested {
+	case "markdown":
+		requested = string(formatMarkdown)
+	case "htm":
+		requested = string(formatHTML)
+	case "text":
+		requested = string(formatText)
+	}
 	format := documentFormat(requested)
 	switch format {
-	case formatDOCX, formatXLSX, formatPPTX, formatPDF:
+	case formatDOCX, formatXLSX, formatPPTX, formatPDF, formatMarkdown, formatText, formatCSV, formatHTML:
 	default:
-		return "", fmt.Errorf("format must be docx, xlsx, pptx or pdf")
+		return "", fmt.Errorf("format must be docx, xlsx, pptx, pdf, md, txt, csv or html")
 	}
-	if extension != string(format) {
+	if !extensionMatchesFormat(extension, format) {
 		return "", fmt.Errorf("path extension must be .%s", format)
 	}
 	return format, nil
+}
+
+// extensionMatchesFormat 允許同一格式的常見副檔名。
+func extensionMatchesFormat(extension string, format documentFormat) bool {
+	if extension == string(format) {
+		return true
+	}
+	switch format {
+	case formatMarkdown:
+		return extension == "markdown"
+	case formatHTML:
+		return extension == "htm"
+	default:
+		return false
+	}
 }
 
 func resolveOptionalFont(roots []string, requested string) (string, error) {
@@ -421,7 +500,7 @@ func documentCreateSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"path":          map[string]any{"type": "string", "description": "輸出檔路徑，副檔名須與 format 一致"},
-			"format":        map[string]any{"type": "string", "enum": []string{"docx", "xlsx", "pptx", "pdf"}, "description": "省略時由 path 副檔名判斷"},
+			"format":        map[string]any{"type": "string", "enum": []string{"docx", "xlsx", "pptx", "pdf", "md", "txt", "csv", "html"}, "description": "省略時由 path 副檔名判斷"},
 			"template_path": map[string]any{"type": "string", "description": "可選的同格式來源範本；DOCX/PPTX 用 replacements、XLSX 用 cell_updates、PDF 用 annotations 填入，未提供操作時原樣複製"},
 			"title":         map[string]any{"type": "string"},
 			"subject":       map[string]any{"type": "string"},
@@ -429,7 +508,7 @@ func documentCreateSchema() map[string]any {
 			"overwrite":     map[string]any{"type": "boolean", "default": false},
 			"create_parent": map[string]any{"type": "boolean", "default": false},
 			"font_path":     map[string]any{"type": "string", "description": "PDF Unicode 文字使用的 Sandbox 內 TTF 字型"},
-			"blocks":        map[string]any{"type": "array", "items": block, "description": "DOCX/PDF 內容區塊"},
+			"blocks":        map[string]any{"type": "array", "items": block, "description": "DOCX/PDF/MD/TXT/HTML 內容區塊"},
 			"sheets": map[string]any{"type": "array", "items": map[string]any{
 				"type": "object", "required": []string{"name", "rows"}, "properties": map[string]any{
 					"name":          map[string]any{"type": "string"},
@@ -439,7 +518,7 @@ func documentCreateSchema() map[string]any {
 					"header_rows":   map[string]any{"type": "integer", "minimum": 0, "maximum": 100},
 					"freeze_rows":   map[string]any{"type": "integer", "minimum": 0, "maximum": 1000000},
 					"auto_filter":   map[string]any{"type": "boolean"},
-				}}, "description": "XLSX 工作表"},
+				}}, "description": "XLSX 工作表；CSV 只取第一張表的 rows"},
 			"slides": map[string]any{"type": "array", "items": map[string]any{
 				"type": "object", "properties": map[string]any{
 					"title": map[string]any{"type": "string"}, "subtitle": map[string]any{"type": "string"},

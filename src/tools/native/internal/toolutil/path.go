@@ -132,3 +132,30 @@ func DisplayPathInRoots(workspaceRoots []string, path string) string {
 	}
 	return filepath.ToSlash(path)
 }
+
+// ProducedFiles 在工具結果的 details 裡標記這次實際產生或修改的檔案。
+//
+// 結果的 details 只會送到 UI，不會進入模型的請求（Message.Metadata 從來不編進
+// provider payload），所以這裡放絕對路徑是安全的——而桌面端的開檔橋接只接受絕對
+// 路徑，display path 在單一 sandbox 根目錄時是相對的，前端自己拼不回來。
+//
+// 少了這個標記，Agent 產出的檔案在畫面上只是一行文字：使用者知道有這個檔案，
+// 但要自己去 Finder 裡找。
+func ProducedFiles(details map[string]any, paths ...string) map[string]any {
+	if details == nil {
+		details = map[string]any{}
+	}
+	produced := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" || !filepath.IsAbs(path) {
+			continue
+		}
+		produced = append(produced, filepath.Clean(path))
+	}
+	if len(produced) == 0 {
+		return details
+	}
+	details["produced_paths"] = produced
+	return details
+}

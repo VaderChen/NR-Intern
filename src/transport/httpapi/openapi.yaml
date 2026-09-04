@@ -564,8 +564,16 @@ paths:
               schema: { $ref: "#/components/schemas/ProjectEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
     delete:
-      summary: 刪除空 Project
-      description: Project 仍有 Session 時回傳 409，不會隱含級聯刪除。
+      summary: 刪除 Project
+      description: >-
+        預設只刪空的 Project：仍有 Session 時回傳 409，不會隱含級聯刪除——那些 Session 是使用者的
+        工作紀錄，不該因為刪一個分類就一起消失。force=true 才連同底下的 Session 一起永久刪除，
+        供管理介面的「強制刪除」使用。只有字面上的 true 會級聯，其餘值（含 1、yes、空字串）一律視為未指定。
+      parameters:
+        - name: force
+          in: query
+          description: 設為 true 時連同 Project 底下的所有 Session 一起刪除。
+          schema: { type: boolean, default: false }
       responses:
         "204": { description: 已刪除 }
         default: { $ref: "#/components/responses/Problem" }
@@ -939,10 +947,11 @@ paths:
   /api/v1/memories:
     get:
       summary: 搜尋長期記憶
-      description: 未指定 scope 時使用後端預設 scope。記憶被遺忘後不再出現在結果中。
+      description: 未指定 scope 時使用後端預設 scope。scope=all 會跨所有 scope 列出目前生效的記憶（最近更新在前），管理介面用它在不知道 scope 的情況下呈現 Agent 記住了什麼；此時 q、kinds 與 tags 不適用。記憶被遺忘後不再出現在結果中。
       parameters:
         - name: scope
           in: query
+          description: 記憶範圍；填入 all 代表跨所有 scope 列出。
           schema: { type: string }
         - name: q
           in: query
@@ -1093,6 +1102,73 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/RunEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/context:compact:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      summary: 手動壓縮對話歷史
+      description: >-
+        自動壓縮只在接近 context 上限時才觸發。使用者知道自己接下來要送出大量內容時，
+        那個門檻剛好擋住他，這個端點把決定權交回去。與自動壓縮共用同一條路徑，
+        因此摘要格式與 transcript 紀錄一致，只有 reason 標為 manual。
+        Session 有進行中的工作時回 409：壓縮會寫入 transcript，而 Run 正在同一份 transcript 上讀寫。
+        壓縮後估算不會變小（短對話的摘要可能比原文長）時保持原狀並回報 compacted=false。
+      responses:
+        "200":
+          description: 壓縮結果；compacted 為 false 時對話未被更動
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      compacted: { type: boolean }
+                      reason: { type: string, description: "manual、nothing_to_compact 或 no_reduction。" }
+                      compacted_messages: { type: integer }
+                      retained_messages: { type: integer }
+                      estimated_tokens_before: { type: integer }
+                      estimated_tokens_after: { type: integer }
+                      budget_tokens: { type: integer }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/questions/{question_id}/answer:
+    parameters:
+      - name: question_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      summary: 回覆 Agent 的問答選單
+      description: >-
+        Agent 呼叫 ask_user 時會送出 tool.execution.update 事件（details.phase 為 user_question，
+        details.question 是問題本身），並停在那裡等待。這個端點把使用者的抉擇送回去。
+        問題只存在於工具等待的那段時間，不落地；工具每五秒重送一次事件，因此重新連線後仍收得到。
+        取消（canceled=true）是合法答案而不是錯誤：使用者沒有義務回答，Agent 收到後會自行決定並說明假設。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                selected: { type: string, description: 選中的選項文字，必須與問題提供的其中一個 label 完全相同。 }
+                custom: { type: string, description: 使用者自行輸入的答案，不受選項清單限制；與 selected 擇一。 }
+                canceled: { type: boolean, default: false, description: 取消這次選擇；此時 selected 與 custom 可省略。 }
+      responses:
+        "202":
+          description: 答案已送交等待中的工具
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      question_id: { type: string }
+                      accepted: { type: boolean }
         default: { $ref: "#/components/responses/Problem" }
   /api/v1/runs/{run_id}/retry:
     parameters:

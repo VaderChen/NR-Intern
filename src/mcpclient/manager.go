@@ -4,6 +4,7 @@ import (
 	"AgenticService/src/domain"
 	"AgenticService/src/internal/logging"
 	"AgenticService/src/ports"
+	"AgenticService/src/schemaargs"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -448,7 +449,7 @@ func (m *Manager) callToolParams(call domain.ToolCall, tool resolvedTool) (*mcp.
 	}
 	// 小型模型常把巢狀參數整個 JSON 字串化，遠端 Server 會直接以 schema 驗證失敗。
 	// 依工具自己宣告的 schema 把該是 array／object 的字串解回結構；解不開就原樣送出。
-	arguments = normalizeArgumentsForSchema(arguments, tool.definition.InputSchema)
+	arguments = schemaargs.Normalize(arguments, tool.definition.InputSchema)
 	params := &mcp.CallToolParams{Name: tool.remoteName, Arguments: arguments}
 	if value, exists := call.Arguments[mcpInputResponsesArgument]; exists {
 		responses, err := decodeMCPInputResponses(value)

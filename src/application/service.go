@@ -35,6 +35,7 @@ type Service struct {
 	workspaces           ports.WorkspaceRepository
 	providers            ports.ProviderCatalog
 	approvals            ports.ApprovalCoordinator
+	questions            ports.QuestionCoordinator
 	memories             ports.MemoryRepository
 	plans                ports.PlanRepository
 	attachments          ports.AttachmentRepository
@@ -75,6 +76,7 @@ type Dependencies struct {
 	Workspaces ports.WorkspaceRepository
 	Providers  ports.ProviderCatalog
 	Approvals  ports.ApprovalCoordinator
+	Questions  ports.QuestionCoordinator
 	// Memories 可以是 nil：後端停用長期記憶時，記憶 API 會回報 conflict 而不是假裝成功。
 	Memories ports.MemoryRepository
 	// Plans 是 Session 計畫的持久化來源，也是 Agent 與使用者介面共用的唯一真實狀態。
@@ -107,6 +109,7 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		workspaces:     workspaces,
 		providers:      providers,
 		approvals:      dependencies.Approvals,
+		questions:      dependencies.Questions,
 		memories:       dependencies.Memories,
 		plans:          dependencies.Plans,
 		attachments:    dependencies.Attachments,
@@ -406,20 +409,41 @@ func (s *Service) UpdateProject(ctx context.Context, projectID string, input dom
 }
 
 // DeleteProject 只刪除空專案；Session 必須先移至其他專案或未分類，避免隱含級聯刪除。
-func (s *Service) DeleteProject(ctx context.Context, projectID string) error {
+// DeleteProject 刪除專案。force 為真時連同專案底下的對話一起刪除。
+//
+// 預設拒絕是對的：專案裡的對話是使用者的工作紀錄，不該因為刪一個分類就一起消失。
+// 但拒絕之後使用者唯一的出路是手動一則一則刪，對話多的時候等於刪不掉——
+// force 讓他在知道後果的前提下一次完成，而不是提高門檻逼他放棄。
+func (s *Service) DeleteProject(ctx context.Context, projectID string, force bool) error {
 	projectID = strings.TrimSpace(projectID)
 	if _, err := s.projects.Get(ctx, projectID); err != nil {
 		return err
 	}
+	type ownedSession struct {
+		engine ports.AgentEngine
+		id     string
+	}
+	owned := []ownedSession{}
 	for _, engine := range s.registry.Engines() {
 		sessions, err := engine.ListSessions(ctx)
 		if err != nil {
 			return err
 		}
 		for _, session := range sessions {
-			if session.ProjectID == projectID {
+			if session.ProjectID != projectID {
+				continue
+			}
+			if !force {
 				return fmt.Errorf("%w: project still contains sessions", domain.ErrConflict)
 			}
+			owned = append(owned, ownedSession{engine: engine, id: session.ID})
+		}
+	}
+	// 對話先刪、專案後刪：反過來的話中途失敗會留下一批指向不存在專案的孤兒對話，
+	// 它們在側邊欄不屬於任何分組，使用者也找不到入口處理。
+	for _, session := range owned {
+		if err := session.engine.DeleteSession(ctx, session.id); err != nil {
+			return fmt.Errorf("刪除專案底下的對話 %s: %w", session.id, err)
 		}
 	}
 	return s.projects.Delete(ctx, projectID)
@@ -622,6 +646,28 @@ func (s *Service) ListEntriesPage(ctx context.Context, sessionID string, afterSe
 		return nil, false, err
 	}
 	return engine.ListEntriesPage(ctx, sessionID, afterSequence, limit)
+}
+
+// CompactSession 手動壓縮 Session 的對話歷史。
+//
+// 有 Run 在跑時拒絕：壓縮會寫入 transcript，而 Run 正在同一份 transcript 上讀寫，
+// 兩邊同時動會讓那一輪送給模型的歷史跟畫面上的對不起來。
+func (s *Service) CompactSession(ctx context.Context, sessionID string) (domain.ContextCompactionResult, error) {
+	engine, session, err := s.resolveSession(ctx, sessionID)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	runs, err := s.runs.List(ctx, session.ID)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	for _, run := range runs {
+		switch run.Status {
+		case domain.RunStatusQueued, domain.RunStatusRunning, domain.RunStatusPaused, domain.RunStatusWaitingApproval:
+			return domain.ContextCompactionResult{}, fmt.Errorf("%w: 這個 Session 還有進行中的工作，結束後才能手動壓縮", domain.ErrConflict)
+		}
+	}
+	return engine.CompactSession(ctx, session.ID)
 }
 
 func (s *Service) ListRuns(ctx context.Context, sessionID string) ([]domain.Run, error) {
@@ -1013,6 +1059,17 @@ func (s *Service) persistImmediateCancellation(run domain.Run) (domain.Run, erro
 	}
 	s.notifyRunFinished(latest)
 	return latest, nil
+}
+
+// AnswerQuestion 把使用者的抉擇送回正在等待的工具。
+//
+// 取消也走這裡：使用者沒有義務回答，取消是一種合法答案而不是錯誤。
+func (s *Service) AnswerQuestion(_ context.Context, questionID string, answer domain.UserQuestionAnswer) error {
+	if s.questions == nil {
+		return fmt.Errorf("%w: question workflow is unavailable", domain.ErrConflict)
+	}
+	answer.QuestionID = strings.TrimSpace(questionID)
+	return s.questions.Answer(answer)
 }
 
 func (s *Service) DecideRun(ctx context.Context, runID string, input domain.ToolApprovalDecisionInput) (domain.Run, error) {

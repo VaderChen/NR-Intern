@@ -23,5 +23,7 @@ type AgentEngine interface {
 	ListEntries(context.Context, string) ([]domain.SessionEntry, error)
 	// ListEntriesPage 讓分頁在儲存層生效，不必為了一頁載入整份 transcript。
 	ListEntriesPage(context.Context, string, int64, int) ([]domain.SessionEntry, bool, error)
+	// CompactSession 手動壓縮對話歷史，不看自動壓縮的門檻。
+	CompactSession(context.Context, string) (domain.ContextCompactionResult, error)
 	Run(context.Context, domain.RunInput, AgentEventSink) (domain.RunResult, error)
 }

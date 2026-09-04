@@ -150,6 +150,7 @@ func (t *RenderTool) Execute(ctx context.Context, invocation tools.Invocation, _
 	if len(result.Warnings) > 0 {
 		details["warnings"] = result.Warnings
 	}
+	details = toolutil.ProducedFiles(details, result.RenderedPaths...)
 	content := fmt.Sprintf("rendered %d page(s) from %s to %s", len(displayPaths), strings.ToUpper(string(format)), toolutil.DisplayPathInRoots(roots, outputDir))
 	return domain.ToolExecution{ToolCallID: invocation.Call.ID, ToolName: invocation.Call.Name, Content: content, Details: details}, nil
 }

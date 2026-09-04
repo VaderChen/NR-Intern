@@ -102,7 +102,7 @@ func (t *ConvertTool) Execute(ctx context.Context, invocation tools.Invocation, 
 		ToolCallID: invocation.Call.ID,
 		ToolName:   invocation.Call.Name,
 		Content:    fmt.Sprintf("converted document to %s at %s", strings.ToUpper(strings.TrimPrefix(targetExtension, ".")), displayPath),
-		Details: map[string]any{
+		Details: toolutil.ProducedFiles(map[string]any{
 			"source_path": toolutil.DisplayPathInRoots(roots, sourcePath),
 			"path":        displayPath,
 			"source_type": strings.TrimPrefix(sourceExtension, "."),
@@ -110,7 +110,7 @@ func (t *ConvertTool) Execute(ctx context.Context, invocation tools.Invocation, 
 			"backend":     filepath.Base(availability.OfficeConverter),
 			"bytes":       len(converted),
 			"sha256":      fmt.Sprintf("%x", sha256.Sum256(converted)),
-		},
+		}, outputPath),
 	}, nil
 }
 

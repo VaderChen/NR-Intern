@@ -206,6 +206,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/resume", h.resumeRun)
 	h.mux.HandleFunc("POST /api/v1/runs/cancel-all", h.cancelAllRuns)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/decision", h.decideRun)
+	h.mux.HandleFunc("POST /api/v1/questions/{question_id}/answer", h.answerQuestion)
+	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/context:compact", h.compactSessionContext)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/retry", h.retryRun)
 }
 
@@ -845,7 +847,9 @@ func (h *Handler) updateProject(writer http.ResponseWriter, request *http.Reques
 }
 
 func (h *Handler) deleteProject(writer http.ResponseWriter, request *http.Request) {
-	if err := h.service.DeleteProject(request.Context(), request.PathValue("project_id")); err != nil {
+	// force 讓使用者在知道後果的前提下連同對話一起刪。預設仍然拒絕。
+	force := strings.EqualFold(strings.TrimSpace(request.URL.Query().Get("force")), "true")
+	if err := h.service.DeleteProject(request.Context(), request.PathValue("project_id"), force); err != nil {
 		writeProblem(writer, request, err)
 		return
 	}
@@ -1175,6 +1179,36 @@ func (h *Handler) decideRun(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	writeData(writer, http.StatusAccepted, value)
+}
+
+// compactSessionContext 手動壓縮對話歷史。
+//
+// 自動壓縮只在快爆掉時才動作。使用者知道自己接下來要貼一大段東西時，那個門檻
+// 剛好擋住他——這個端點把決定權交回去。
+func (h *Handler) compactSessionContext(writer http.ResponseWriter, request *http.Request) {
+	value, err := h.service.CompactSession(request.Context(), request.PathValue("session_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+// answerQuestion 把使用者在選單裡的抉擇送回等待中的工具。
+//
+// 不掛在 run 底下：問題只存在於工具等待的那段時間，用問題自己的 ID 定址就夠了，
+// 不必為它在 Run 上多存一份狀態。
+func (h *Handler) answerQuestion(writer http.ResponseWriter, request *http.Request) {
+	var input domain.UserQuestionAnswer
+	if err := h.decodeJSON(writer, request, &input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	if err := h.service.AnswerQuestion(request.Context(), request.PathValue("question_id"), input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusAccepted, map[string]any{"question_id": request.PathValue("question_id"), "accepted": true})
 }
 
 func (h *Handler) retryRun(writer http.ResponseWriter, request *http.Request) {

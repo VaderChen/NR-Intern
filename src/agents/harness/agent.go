@@ -323,3 +323,12 @@ func stringSliceFromMap(values map[string]any, key string) []string {
 	}
 	return result
 }
+
+// CompactSession 讓使用者在送出下一個問題之前先把 context 空間清出來。
+func (a *Agent) CompactSession(ctx context.Context, sessionID string) (domain.ContextCompactionResult, error) {
+	session, err := a.GetSession(ctx, sessionID)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	return a.runner.CompactSession(ctx, session)
+}

@@ -193,7 +193,7 @@ func (m *ContextManager) BuildObserved(
 		var compactErr error
 		summary, messages, estimated, compacted, compactErr = m.compactMessages(
 			ctx, session, baseSystemPrompt, definitions, compactionConfig, counter,
-			summary, throughSequence, messages, budget, estimated, softCompactionRatio,
+			summary, throughSequence, messages, budget, estimated, softCompactionRatio, "context_budget", false,
 		)
 		if compactErr != nil {
 			return ContextWindow{}, compactErr
@@ -231,6 +231,13 @@ func (m *ContextManager) compactMessages(
 	budget int,
 	estimated int,
 	triggerRatio float64,
+	reason string,
+	// requireReduction 讓壓縮在「壓完反而更大」時放棄並保持原狀。
+	//
+	// 短對話的摘要可能比被摘要的訊息還長。自動壓縮不會遇到這件事——它只在
+	// context 已經很大時才觸發——但手動按鈕沒有這層保護：使用者在一個小對話上
+	// 按下去，看到用量不減反增，只會認為這個功能壞了。
+	requireReduction bool,
 ) (string, []sequencedMessage, int, bool, error) {
 	older, retained := splitForCompaction(messages, config.RetainMessages)
 	if len(older) == 0 {
@@ -256,12 +263,16 @@ func (m *ContextManager) compactMessages(
 		newSummary = fitSummaryToBudget(counter, baseSystemPrompt, newSummary, retained, definitions, budget)
 		afterTokens = estimateContextTokens(counter, withSummary(baseSystemPrompt, newSummary), retained, definitions)
 	}
+	if requireReduction && afterTokens >= estimated {
+		// 還沒寫進 transcript，所以放棄是乾淨的：對話完全沒有被動過。
+		return previousSummary, messages, estimated, false, nil
+	}
 	if _, err := m.Sessions.AppendEntry(ctx, session.ID, domain.SessionEntry{
 		ID:        domain.NewID("entry"),
 		SessionID: session.ID,
 		Type:      domain.SessionEntryCompaction,
 		Data: map[string]any{
-			"reason":                  "context_budget",
+			"reason":                  reason,
 			"decay_policy":            "quadratic_recency",
 			"summary":                 newSummary,
 			"through_sequence":        throughSequence,
@@ -958,4 +969,74 @@ func normalizeContextConfig(config ContextConfig) ContextConfig {
 	config.SummaryProviderID = strings.TrimSpace(config.SummaryProviderID)
 	config.SummaryModel = strings.TrimSpace(config.SummaryModel)
 	return config
+}
+
+// CompactNow 不看門檻直接壓縮一次，供使用者手動觸發。
+//
+// 自動壓縮只在超過門檻時才動作，而門檻是以「送出前會不會爆掉」為準。使用者想在
+// 送出下一個問題之前先把空間清出來時，那個門檻剛好擋住他——畫面顯示還有 85%
+// 可用，但他知道接下來要貼一大段東西。這個入口把決定權交回去。
+//
+// 與自動壓縮共用同一條 compactMessages，因此摘要格式、transcript 記錄與後續讀取
+// 完全一致；差別只在觸發條件與 reason。
+func (m *ContextManager) CompactNow(
+	ctx context.Context,
+	session domain.Session,
+	baseSystemPrompt string,
+	definitions []domain.ToolDefinition,
+) (domain.ContextCompactionResult, error) {
+	if m == nil || m.Model == nil || m.Sessions == nil {
+		return domain.ContextCompactionResult{}, fmt.Errorf("%w: context manager dependencies are incomplete", domain.ErrInvalidInput)
+	}
+	config := normalizeContextConfig(m.Config)
+	counter := m.counter()
+	summary, throughSequence, _, err := m.latestCompaction(ctx, session.ID)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	entries, err := m.Sessions.ListEntriesAfter(ctx, session.ID, throughSequence)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	messages := repairToolCallPairs(messagesFromEntries(entries))
+	budget := m.budget(config, session)
+	estimated := estimateContextTokens(counter, withSummary(baseSystemPrompt, summary), messages, definitions)
+	older, _ := splitForCompaction(messages, config.RetainMessages)
+	if len(older) == 0 {
+		// 保留則數以內的對話沒有東西可以壓。照實說，不要回一個「已壓縮」
+		// 卻什麼都沒變的結果讓使用者以為按鈕壞了。
+		return domain.ContextCompactionResult{
+			Reason:                "nothing_to_compact",
+			RetainedMessages:      len(messages),
+			EstimatedTokensBefore: estimated,
+			EstimatedTokensAfter:  estimated,
+			BudgetTokens:          budget,
+		}, nil
+	}
+	newSummary, retained, afterTokens, compacted, err := m.compactMessages(
+		ctx, session, baseSystemPrompt, definitions, config, counter,
+		summary, throughSequence, messages, budget, estimated, 0, "manual", true,
+	)
+	if err != nil {
+		return domain.ContextCompactionResult{}, err
+	}
+	_ = newSummary
+	if !compacted {
+		return domain.ContextCompactionResult{
+			Reason:                "no_reduction",
+			RetainedMessages:      len(messages),
+			EstimatedTokensBefore: estimated,
+			EstimatedTokensAfter:  estimated,
+			BudgetTokens:          budget,
+		}, nil
+	}
+	return domain.ContextCompactionResult{
+		Compacted:             compacted,
+		Reason:                "manual",
+		CompactedMessages:     len(messages) - len(retained),
+		RetainedMessages:      len(retained),
+		EstimatedTokensBefore: estimated,
+		EstimatedTokensAfter:  afterTokens,
+		BudgetTokens:          budget,
+	}, nil
 }

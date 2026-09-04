@@ -215,6 +215,10 @@
               <dt>最大輸出</dt><dd id="contextUsageOutputLimit">-</dd>
               <dt>剩餘空間</dt><dd id="contextUsageRemaining">-</dd>
             </dl>
+            <div class="context-usage-actions">
+              <small id="compactContextState" class="save-state"></small>
+              <button id="compactContext" class="small compact-context-button" type="button">立即壓縮</button>
+            </div>
           </section>
         </div>
         <button id="openPlan" class="plan-trigger ghost hidden" type="button" aria-haspopup="dialog" title="檢視或建立工作計畫">
@@ -364,6 +368,15 @@
               <label class="switch-label"><input id="settingMemorySpace" type="checkbox" role="switch" aria-label="啟用回憶空間"><span class="switch-track" aria-hidden="true"></span></label>
             </div>
             <p class="hint">讓 Agent 跨對話存取共同記憶：在別的對話裡確認過的偏好、決策與作法，下一次不必重講。只保存偏好、決策、限制與作法，密碼與金鑰一律排除；共享範圍是專案，單次注入最多 6 條。關閉後不影響既有記憶資料。</p>
+            <div class="memory-space-store">
+              <div class="memory-store-head">
+                <strong>已保存的記憶</strong>
+                <button id="refreshMemories" class="small" type="button">重新整理</button>
+              </div>
+              <p class="hint">跨對話記憶會讓回答取決於你看不見的狀態。這裡列出 Agent 目前記住的內容；不該記的可以直接刪除，刪除後不再被召回。</p>
+              <div id="memoryList" class="memory-list"></div>
+              <p id="memoryEmpty" class="quiet hidden">目前沒有已保存的記憶。</p>
+            </div>
           </div>
         </form>
       </div>
@@ -802,6 +815,24 @@
     </form>
   </dialog>
 
+  <dialog id="userQuestionDialog" class="user-question-dialog">
+    <form id="userQuestionForm">
+      <h2 id="userQuestionTitle">Agent 需要你的決定</h2>
+      <p id="userQuestionText" class="user-question-text"></p>
+      <p id="userQuestionContext" class="hint hidden"></p>
+      <div id="userQuestionOptions" class="user-question-options" role="radiogroup" aria-labelledby="userQuestionText"></div>
+      <label class="user-question-custom">
+        <span id="userQuestionCustomLabel">或自己輸入答案</span>
+        <input id="userQuestionCustom" type="text" placeholder="不在上面選項裡的話，寫在這裡" autocomplete="off">
+      </label>
+      <p class="hint">可以取消。取消後 Agent 會自行選一個做法繼續，並說明它的假設。</p>
+      <div class="dialog-actions">
+        <button type="button" id="cancelUserQuestion" class="ghost">取消</button>
+        <button id="submitUserQuestion" class="primary" type="submit">送出</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="sessionDialog">
     <form method="dialog" id="sessionForm">
       <h2>建立新 Session</h2>
@@ -1046,7 +1077,11 @@
       <p id="confirmationMessage"></p>
       <div class="dialog-actions">
         <button class="ghost" type="submit" value="cancel">取消</button>
-        <button class="danger" type="submit" value="confirm">確認</button>
+        <button id="confirmationForce" class="danger confirmation-force hidden" type="button" title="長按 2 秒才會執行">
+          <span id="confirmationForceFill" class="confirmation-force-fill" aria-hidden="true"></span>
+          <span id="confirmationForceLabel" class="confirmation-force-label">強制刪除</span>
+        </button>
+        <button id="confirmationConfirm" class="danger" type="submit" value="confirm">確認</button>
       </div>
     </form>
   </dialog>

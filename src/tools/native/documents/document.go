@@ -13,7 +13,24 @@ const (
 	formatDOCX documentFormat = "docx"
 	formatXLSX documentFormat = "xlsx"
 	formatPPTX documentFormat = "pptx"
+	// 純文字類：與 Office 文件共用 document_create，輸入結構也沿用同一組。
+	formatMarkdown documentFormat = "md"
+	formatText     documentFormat = "txt"
+	formatCSV      documentFormat = "csv"
+	formatHTML     documentFormat = "html"
 )
+
+// textDocumentFormat 判斷是否為純文字輸出。
+//
+// 這些格式不走 Office 的封裝流程，也不需要字型探索：內容就是最終位元組。
+func textDocumentFormat(format documentFormat) bool {
+	switch format {
+	case formatMarkdown, formatText, formatCSV, formatHTML:
+		return true
+	default:
+		return false
+	}
+}
 
 func inspectDocument(ctx context.Context, path string, info os.FileInfo) (documentInspection, error) {
 	format, err := detectDocumentFormat(path)

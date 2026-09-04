@@ -109,7 +109,7 @@ func (t *EditTool) Execute(ctx context.Context, invocation tools.Invocation, _ p
 		ToolCallID: invocation.Call.ID,
 		ToolName:   invocation.Call.Name,
 		Content:    fmt.Sprintf("replaced %d occurrence(s) in %s; result is %d bytes (%d Unicode characters, %d lines)", replacements, toolutil.DisplayPathInRoots(sandboxRoots, path), updatedBytes, updatedCharacters, updatedLines),
-		Details: map[string]any{
+		Details: toolutil.ProducedFiles(map[string]any{
 			"path":               toolutil.DisplayPathInRoots(sandboxRoots, path),
 			"replacements":       replacements,
 			"bytes":              updatedBytes,
@@ -117,6 +117,6 @@ func (t *EditTool) Execute(ctx context.Context, invocation tools.Invocation, _ p
 			"lines":              updatedLines,
 			"before_sha256":      fmt.Sprintf("%x", sha256.Sum256(data)),
 			"after_sha256":       fmt.Sprintf("%x", sha256.Sum256([]byte(updated))),
-		},
+		}, path),
 	}, nil
 }

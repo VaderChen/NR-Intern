@@ -94,13 +94,13 @@ func (t *WriteTool) Execute(ctx context.Context, invocation tools.Invocation, _ 
 		ToolCallID: invocation.Call.ID,
 		ToolName:   invocation.Call.Name,
 		Content:    fmt.Sprintf("wrote %d bytes (%d Unicode characters, %d lines) to %s", bytesWritten, charactersWritten, lineCount, toolutil.DisplayPathInRoots(sandboxRoots, path)),
-		Details: map[string]any{
+		Details: toolutil.ProducedFiles(map[string]any{
 			"path":               toolutil.DisplayPathInRoots(sandboxRoots, path),
 			"bytes":              bytesWritten,
 			"unicode_characters": charactersWritten,
 			"lines":              lineCount,
 			"sha256":             fmt.Sprintf("%x", sha256.Sum256([]byte(content))),
 			"overwrite":          overwrite,
-		},
+		}, path),
 	}, nil
 }

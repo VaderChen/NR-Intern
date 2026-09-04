@@ -594,6 +594,22 @@ output_schema、read_only、requires_permission）。`platforms` 與 `capabiliti
 
 實測（`tool_retrieval_smoke_test.go`）：67 個工具的目錄，工具負載從 30,210 字降到 1,399 字。
 
+### 手動壓縮
+
+自動壓縮的門檻是以「送出前會不會爆掉」為準。使用者知道自己接下來要貼一大段東西時，
+那個門檻剛好擋住他——上下文用量彈窗的「立即壓縮」把決定權交回去
+（`POST /api/v1/sessions/{id}/context:compact`）。執行期間沿用與自動壓縮相同的
+「正在壓縮上下文」指示器：按鈕在彈窗裡，沒有這個提示，對話區完全沒有反應。
+
+與自動壓縮共用同一條 `compactMessages`，摘要格式、transcript 紀錄與後續讀取完全一致，
+只有 `reason` 標為 `manual` 而不是 `context_budget`。兩個保護條件：
+
+- **Session 有進行中的工作時拒絕**：壓縮會寫入 transcript，而 Run 正在同一份 transcript
+  上讀寫，兩邊同時動會讓那一輪送給模型的歷史跟畫面上的對不起來。
+- **壓完不會變小時保持原狀**：短對話的摘要可能比被摘要的訊息還長。自動壓縮遇不到這件事
+  （它只在 context 已經很大時觸發），但手動按鈕沒有那層保護；判斷在寫入 transcript 之前，
+  因此放棄是乾淨的，對話完全沒有被動過。
+
 ## 對話歷史的字元上限
 
 歷史整理有兩個獨立觸發條件：token 使用量達到輸入預算的 90%，或整形後的歷史字元數超過
@@ -618,10 +634,20 @@ token 估算誤差；單則工具結果會先套用 `max_tool_result_characters`
 比對 JSON 物件或陣列，進入有限次數的協定修正，要求模型改用工具呼叫欄位。修正耗盡會以
 部分完成收尾；JSON 文字本身不代表檔案已建立或工具已執行。這是啟發式偵測，不是語意理解保證。
 
-`tools.Registry` 依頂層參數 schema 還原字串化的物件、陣列、數字與布林值；對部分非標準
-JSON 嘗試格式修復，失敗則保留原值，交由工具驗證。純文字欄位不因看起來像 JSON 而轉型。
-MCP 呼叫前則只對 schema 指定的物件／陣列做標準 JSON 字串解碼，不沿用原生工具的寬鬆修復。
-兩者都不改變 allowlist、權限、Sandbox 與輸入大小限制。
+參數校正集中在 `src/schemaargs`，原生工具（`tools.Registry`）與 MCP 呼叫共用同一份。
+先前兩邊各有一份幾乎相同的實作然後開始分岔——原生端陸續補上布林、數字與巢狀遞迴，
+MCP 端停在只處理最上層的物件／陣列，於是同一個模型犯同一個錯，走原生會被救回來、
+走 MCP 就失敗；這種差異從各自的檔案裡看不出來，抽成同一份才不會再飄。
+
+校正依 schema **遞迴**進行，只往下走 `object.properties` 與 `array.items` 兩種語意明確的
+構造（不處理 `$ref`／`oneOf`：猜錯會默默改壞一個本來正確的參數）。宣告為字串的位置接受
+數字、布林與 null（表格的數量欄寫成 `264` 而不是 `"264"` 是最自然的寫法）；宣告為數字或
+布林的位置接受 `"2"`、`"true"`。字串化的物件與陣列會被解回結構，並對部分非標準 JSON
+嘗試格式修復（尾逗號、單引號、裸鍵、Python 字面值、彎引號、缺少的右括號，上限四個）。
+
+**結構寫錯不轉**：一列表格寫成物件不是型別問題，硬轉只會把錯誤藏進文件內容裡；
+這類情況保留原值交由工具驗證，並由工具回報可以照抄的正確寫法。純文字欄位不因看起來
+像 JSON 而轉型。校正不改變 allowlist、權限、Sandbox 與輸入大小限制。
 
 ## 實驗性回憶空間
 
@@ -737,7 +763,13 @@ API 端點；只有使用者明確詢問工具或整合方式時才揭露。這�
 - `document_compare`：以相同範圍抽取兩份支援文件的可見文字並產生 bounded unified diff，同時回傳原始檔 SHA-256；內容相同不等同版面相同。
 - `document_validate`：唯讀驗證 Open XML 容器、XML、Content Types、內部關聯、必要部件與格式特有結構；掃描 XLSX 公式錯誤，辨識巨集、外部關聯與嵌入物件，並回報視覺渲染後端狀態。
 - `document_fonts`：唯讀探索應用程式、使用者與系統 TrueType 字型，使用 SFNT cmap 驗證指定文字的字形覆蓋率；輸出不揭露絕對路徑。
-- `document_create`：以結構化輸入建立 DOCX、XLSX、PPTX 或 PDF。也可指定同格式 `template_path`，在不重建版面的情況下以 replacements、cell_updates 或 annotations 填入既有範本。Unicode PDF 優先使用指定字型，未指定時自動選擇完整覆蓋的系統 TTF。
+- `ask_user`：工作進行到一半需要使用者做抉擇時跳出選單，選項之外一律附自訂輸入欄。
+  阻塞在工具裡而不是結束 Run 再開一輪——需要抉擇時 Agent 正做到一半，中斷再重來會讓它
+  把已經確認過的事重新查一遍；對模型來說這只是一個比較慢的工具。等待狀態只在記憶體裡
+  （`src/question`），工具每五秒重送一次事件讓重新連線的介面把對話框叫回來，逾時（預設
+  10 分鐘）與取消都回傳「未回答」而不是錯誤：使用者沒有義務回答，把它當失敗會讓迴圈防護
+  開始計數。同一輪不與其他工具並行，因為使用者一次只看得到一個對話框。
+- `document_create`：以結構化輸入建立 DOCX、XLSX、PPTX、PDF、Markdown、TXT、CSV 或 HTML。純文字格式沿用同一組輸入結構（blocks 對應 Markdown／TXT／HTML，sheets 對應 CSV），不另開工具——它們原本沒有第一級建立路徑，會被 Shell 優先政策推到 heredoc，中文與引號在那裡最容易出錯。也可指定同格式 `template_path`，在不重建版面的情況下以 replacements、cell_updates 或 annotations 填入既有範本。Unicode PDF 優先使用指定字型，未指定時自動選擇完整覆蓋的系統 TTF。
 - `document_edit`：來源與輸出路徑分離，保留原檔。DOCX/PPTX 可跨相鄰文字 run 精確替換，XLSX 可更新指定工作表儲存格或文字，PDF 則保留原頁並疊加文字、線段或方框。
 - `document_convert`：elevated 工具；由固定探索的 LibreOffice 將 Office／OpenDocument 文件轉成 PDF，或將舊式 DOC／XLS／PPT 與 ODT／ODS／ODP／RTF 遷移到同家族 Open XML。來源與輸出不可為同一路徑。
 - `pdf_pages`：elevated 工具；以純 Go PDF 匯入器完成合併、擷取、重排與分批拆分，保留來源檔與各頁尺寸，單次最多 500 頁。

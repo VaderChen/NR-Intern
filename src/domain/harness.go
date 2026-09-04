@@ -237,3 +237,17 @@ type SessionEntry struct {
 	Data      map[string]any `json:"data,omitempty"`
 	CreatedAt time.Time      `json:"created_at"`
 }
+
+// ContextCompactionResult 是一次手動壓縮的結果。
+//
+// 使用者按下「立即壓縮」之後要看得到究竟發生了什麼：壓了幾則、估算從多少降到多少。
+// 沒有這些數字，按鈕按下去跟沒按一樣，只能再開一輪看百分比有沒有變。
+type ContextCompactionResult struct {
+	Compacted             bool   `json:"compacted"`
+	Reason                string `json:"reason,omitempty"`
+	CompactedMessages     int    `json:"compacted_messages"`
+	RetainedMessages      int    `json:"retained_messages"`
+	EstimatedTokensBefore int    `json:"estimated_tokens_before"`
+	EstimatedTokensAfter  int    `json:"estimated_tokens_after"`
+	BudgetTokens          int    `json:"budget_tokens"`
+}

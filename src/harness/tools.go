@@ -17,7 +17,10 @@ import (
 const maxParallelTools = 8
 
 const (
-	systemShellToolName      = "shell_exec"
+	systemShellToolName = "shell_exec"
+	// askUserToolName 用字串而不是 import：harness 不依賴具體的工具實作，
+	// 與 systemShellToolName 同一個理由。
+	askUserToolName          = "ask_user"
 	waitToolName             = "wait_for"
 	sshWaitToolName          = "ssh_wait"
 	toolStageSystemShell     = "system_shell"
@@ -80,6 +83,11 @@ func parallelizableToolNames(definitions []domain.ToolDefinition, approvals port
 			continue
 		}
 		if approvals != nil && approvals.Required(definition.Name) {
+			continue
+		}
+		// 問答選單同理：使用者一次只看得到一個對話框。兩個並行的問題會有一個
+		// 完全沒有機會被回答，最後靜靜地逾時。
+		if definition.Name == askUserToolName {
 			continue
 		}
 		result[definition.Name] = true

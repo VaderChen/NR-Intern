@@ -120,6 +120,10 @@ func (e *fakeEngine) ListEntriesPage(context.Context, string, int64, int) ([]dom
 	return nil, false, nil
 }
 
+func (e *fakeEngine) CompactSession(context.Context, string) (domain.ContextCompactionResult, error) {
+	return domain.ContextCompactionResult{Compacted: true, Reason: "manual"}, nil
+}
+
 func (e *fakeEngine) RetractMessages(_ context.Context, _, messageID string) ([]domain.Message, error) {
 	e.retractedMessageID = messageID
 	return nil, nil

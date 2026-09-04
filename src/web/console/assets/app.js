@@ -75,6 +75,12 @@ const state = {
   restoreSkippedSessionIDs: new Set(),
   trackedRunId: "",
   runStartedAt: new Map(),
+  // producedFiles: operationID -> 這一輪實際寫出的檔案絕對路徑。
+  producedFiles: new Map(),
+  // userQuestionID: 目前正在等待回答的問題；空字串代表沒有。
+  userQuestionID: "",
+  // compactResultSessionId: 壓縮結果訊息屬於哪個 Session。
+  compactResultSessionId: "",
   // lastRunDuration 記住每個 Session 最後一次 Run 花了多久，Run 結束後留在狀態列。
   lastRunDuration: new Map(),
   sessionSelectionVersion: 0,
@@ -815,14 +821,62 @@ function toast(message) {
 }
 
 function confirmAction(message) {
+  return confirmChoice(message).then((choice) => choice === "confirm");
+}
+
+// confirmChoice 回傳實際按下的選項，讓需要第三種結果的地方（例如「強制刪除」）
+// 不必另做一個對話框。forceLabel 省略時只有取消與確認，與原本完全相同。
+function confirmChoice(message, { forceLabel = "" } = {}) {
   const dialog = $("confirmationDialog");
-  if (dialog.open) return Promise.resolve(false);
+  if (dialog.open) return Promise.resolve("cancel");
   $("confirmationMessage").textContent = message;
+  const force = $("confirmationForce");
+  force.classList.toggle("hidden", !forceLabel);
+  if (forceLabel) $("confirmationForceLabel").textContent = forceLabel;
+  cancelForceHold();
   dialog.returnValue = "cancel";
   return new Promise((resolve) => {
-    dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), { once: true });
+    dialog.addEventListener("close", () => {
+      // 用完就收起來：這個對話框是共用的，留著會出現在下一個不相干的確認上。
+      force.classList.add("hidden");
+      cancelForceHold();
+      resolve(dialog.returnValue || "cancel");
+    }, { once: true });
     dialog.showModal();
   });
+}
+
+// forceHoldMilliseconds 是強制刪除要按住的時間。
+//
+// 這個動作會連同對話一起永久刪除，而且就在「取消」旁邊——一次誤點的代價太高。
+// 長按不是為了讓人更難用，是為了讓「不小心」做不到：手滑點一下不會發生任何事。
+const forceHoldMilliseconds = 2000;
+let forceHoldTimer = 0;
+
+function startForceHold() {
+  const force = $("confirmationForce");
+  if (!force || forceHoldTimer) return;
+  force.classList.add("is-holding");
+  forceHoldTimer = window.setTimeout(() => {
+    forceHoldTimer = 0;
+    force.classList.remove("is-holding");
+    const dialog = $("confirmationDialog");
+    if (dialog.open) dialog.close("force");
+  }, forceHoldMilliseconds);
+}
+
+// cancelForceHold 中止長按。released 為真代表使用者是放開手才中止的，
+// 這時要說明為什麼沒有反應——放開得太早跟按鈕壞掉在畫面上長得一模一樣。
+function cancelForceHold({ released = false } = {}) {
+  const force = $("confirmationForce");
+  if (!force) return;
+  const wasHolding = Boolean(forceHoldTimer);
+  if (forceHoldTimer) {
+    window.clearTimeout(forceHoldTimer);
+    forceHoldTimer = 0;
+  }
+  force.classList.remove("is-holding");
+  if (wasHolding && released) toast(translate("請按住 2 秒才會強制刪除"));
 }
 
 async function refreshBackend() {
@@ -1843,6 +1897,7 @@ function renderContextUsage() {
   const estimated = snapshot.percent !== null && !snapshot.declaredWindow;
   $("contextUsagePercent").textContent = estimated ? `${percentText}*` : percentText;
   $("contextUsageDetailPercent").textContent = estimated ? `${percentText}*` : percentText;
+  syncCompactButton();
   $("contextUsageProvider").textContent = providerDisplayName(snapshot.providerID) || snapshot.providerID || "-";
   $("contextUsageModel").textContent = snapshot.model || "-";
   setTokenField("contextUsageInput", snapshot.inputTokens);
@@ -1908,6 +1963,45 @@ async function loadContextCapabilities(sessionID = state.session?.id) {
   renderContextUsage();
 }
 
+// compactContextNow 手動壓縮對話歷史。
+//
+// 自動壓縮只在快爆掉時才動作，門檻是以「送出前會不會爆」為準。使用者知道自己
+// 接下來要貼一大段東西時，那個門檻剛好擋住他——這個按鈕把決定權交回去。
+async function compactContextNow() {
+  const button = $("compactContext");
+  const stateLabel = $("compactContextState");
+  if (!button || !state.session) return;
+  const sessionID = state.session.id;
+  button.disabled = true;
+  state.compactResultSessionId = sessionID;
+  stateLabel.textContent = translate("壓縮中…");
+  // 用與自動壓縮完全相同的指示器。手動壓縮發生在對話區之外（彈窗裡的按鈕），
+  // 沒有這個提示，使用者按下去之後對話區完全沒有反應，只能盯著一個小小的狀態字。
+  setContextCompactionState(sessionID, true);
+  try {
+    const result = await request(`/api/v1/sessions/${encodeURIComponent(state.session.id)}/context:compact`, { method: "POST" });
+    if (!result?.compacted) {
+      // 兩種都是「按了但沒動」，原因不同：一種是還太短沒東西壓，一種是壓了
+      // 反而更大。照實說明，不要讓使用者以為按鈕壞了。
+      stateLabel.textContent = result?.reason === "no_reduction"
+        ? translate("目前壓縮不會變小，已保持原狀")
+        : translate("目前沒有可壓縮的內容");
+      return;
+    }
+    const before = formatContextTokenCount(result.estimated_tokens_before);
+    const after = formatContextTokenCount(result.estimated_tokens_after);
+    stateLabel.textContent = `${translate("已壓縮")} ${result.compacted_messages} ${translate("則")}：${before} → ${after}`;
+    // 壓縮寫進了 transcript，畫面上的對話與百分比都要跟著重讀。
+    await loadMessages();
+    renderContextUsage();
+  } catch (error) {
+    stateLabel.textContent = error.message;
+  } finally {
+    setContextCompactionState(sessionID, false);
+    button.disabled = false;
+  }
+}
+
 function closeContextUsagePopover() {
   $("contextUsagePopover")?.classList.add("hidden");
   $("contextUsageButton")?.setAttribute("aria-expanded", "false");
@@ -1922,6 +2016,28 @@ function toggleContextUsagePopover() {
   if (opening) {
     renderContextUsage();
     void loadContextCapabilities();
+  }
+}
+
+// syncCompactButton 讓按鈕的可用狀態跟後端的規則一致。
+//
+// 壓縮會寫入 transcript，而 Run 正在同一份 transcript 上讀寫；後端會拒絕，
+// 但先在畫面上擋住比讓使用者按了再看到錯誤好。
+function syncCompactButton() {
+  const button = $("compactContext");
+  if (!button) return;
+  const running = selectedSessionIsRunning();
+  button.disabled = running || !state.session;
+  button.title = running ? translate("工作進行中，結束後才能手動壓縮") : "";
+  // 壓縮結果只描述某一個 Session。切走之後那行字還留著，會被讀成目前這個
+  // Session 的狀態——數字完全對不上，卻沒有任何線索說它是舊的。
+  //
+  // 在這裡判斷而不是在切換 Session 的地方清：renderContextUsage 是所有
+  // 顯示路徑的交會點，逐一去每個切換點補會漏掉。
+  if (state.compactResultSessionId && state.compactResultSessionId !== (state.session?.id || "")) {
+    state.compactResultSessionId = "";
+    const stateLabel = $("compactContextState");
+    if (stateLabel) stateLabel.textContent = "";
   }
 }
 
@@ -2412,6 +2528,8 @@ function clearSessionUI() {
   state.contextUsage = null;
   state.contextCapabilities = null;
   state.contextCapabilitiesRequest += 1;
+  state.compactResultSessionId = "";
+  $("compactContextState").textContent = "";
   closeContextUsagePopover();
   $("sessionTitle").textContent = state.workspace?.name || "選擇或建立對話";
   $("sessionUsage").classList.add("hidden");
@@ -3251,6 +3369,8 @@ async function loadMessages() {
   let visibleEntries = 0;
   let activeOperationID = "";
   const operationStartedAt = new Map();
+  const operationsWithOutputs = new Set();
+  state.producedFiles.clear();
   for (const entry of entries) {
     if (entry.type === "operation_started") {
       activeOperationID = String(entry.data?.operation_id || entry.data?.run_id || "");
@@ -3258,6 +3378,12 @@ async function loadMessages() {
       continue;
     }
     if (entry.type === "message" && entry.message) {
+      if (entry.message.role === "tool") {
+        // tool 訊息不會顯示，但它的 metadata 記著這一輪產出了哪些檔案。
+        // 不在這裡攔下來，重新載入對話後晶片就消失了。
+        const produced = producedPathsFrom(entry.message.metadata);
+        if (rememberProducedFiles(activeOperationID, produced)) operationsWithOutputs.add(activeOperationID);
+      }
       if (entry.message.role === "assistant" && entry.message.usage) {
         const identity = activeContextIdentity();
         recordContextUsage(
@@ -3293,6 +3419,8 @@ async function loadMessages() {
       }
     }
   }
+  // 晶片要掛在該輪的回答底下，所以等訊息都建好之後再統一附上。
+  for (const operationID of operationsWithOutputs) renderProducedFiles(operationID);
   $("emptyState").classList.toggle("hidden", visibleEntries > 0);
   container.classList.toggle("hidden", visibleEntries === 0);
   renderContextUsage();
@@ -3579,6 +3707,165 @@ function appendMessageAttachments(container, attachments) {
     list.append(item);
   }
   container.append(list);
+}
+
+// producedPathsFrom 取出工具這一輪實際寫出的檔案（絕對路徑）。
+//
+// details 只送到 UI、不會進模型請求，所以裡面放得了絕對路徑；桌面端的開檔橋接
+// 也只接受絕對路徑——display path 在單一 sandbox 根目錄下是相對的，前端拼不回來。
+function producedPathsFrom(details) {
+  const values = details?.produced_paths;
+  if (!Array.isArray(values)) return [];
+  // 只收絕對路徑。開檔橋接一律拒絕相對路徑，渲染出來的晶片會是點了必定失敗的按鈕；
+  // 後端已經濾過一次，但前端與後端各自改版，這裡不能假設對面永遠是新的。
+  return values
+    .map((value) => String(value || "").trim())
+    .filter((value) => value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value));
+}
+
+// rememberProducedFiles 累積某一輪產出的檔案，重複的路徑只留一份。
+//
+// 同一個檔案常常被寫兩次（先建立、再修正），使用者要的是「最後有這個檔案」，
+// 不是每次寫入都給一個晶片。
+function rememberProducedFiles(operationID, paths) {
+  if (!operationID || paths.length === 0) return false;
+  const existing = state.producedFiles.get(operationID) || [];
+  let changed = false;
+  for (const path of paths) {
+    if (existing.includes(path)) continue;
+    existing.push(path);
+    changed = true;
+  }
+  if (changed) state.producedFiles.set(operationID, existing);
+  return changed;
+}
+
+// renderProducedFiles 把產出的檔案掛在那一輪的回答底下。
+//
+// Agent 能產出八種文件，但使用者原本只能在文字裡看到一個檔名，要自己去 Finder
+// 裡找。晶片用既有的 resource-link 機制：點擊開啟、右鍵可選在檔案管理器中顯示。
+function renderProducedFiles(operationID) {
+  const paths = state.producedFiles.get(operationID);
+  if (!operationID || !paths || paths.length === 0) return;
+  const nodes = $("messages").querySelectorAll(`.message.assistant[data-operation-id="${CSS.escape(operationID)}"]`);
+  const host = nodes[nodes.length - 1];
+  if (!host) return;
+  let list = host.querySelector(".message-outputs");
+  if (!list) {
+    list = document.createElement("div");
+    list.className = "message-attachments message-outputs";
+    host.append(list);
+  }
+  if (list.dataset.renderedCount === String(paths.length)) return;
+  list.dataset.renderedCount = String(paths.length);
+  list.replaceChildren();
+  const caption = document.createElement("small");
+  caption.className = "message-outputs-caption";
+  caption.textContent = translate("本次產出");
+  list.append(caption);
+  for (const path of paths) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "message-attachment resource-link";
+    item.dataset.resourceKind = "path";
+    item.dataset.resourceTarget = path;
+    item.title = path;
+    const icon = document.createElement("span");
+    icon.className = "pending-attachment-icon";
+    icon.textContent = outputIcon(path);
+    const copy = document.createElement("span");
+    copy.className = "attachment-copy";
+    const name = document.createElement("strong");
+    name.textContent = path.split(/[\\/]/).pop() || path;
+    const detail = document.createElement("small");
+    detail.textContent = translate("點擊開啟");
+    copy.append(name, detail);
+    item.append(icon, copy);
+    list.append(item);
+  }
+}
+
+function outputIcon(path) {
+  switch ((path.split(".").pop() || "").toLowerCase()) {
+    case "xlsx": case "csv": return "📊";
+    case "docx": case "md": case "markdown": case "txt": return "📝";
+    case "pptx": return "📽";
+    case "pdf": return "📕";
+    case "html": case "htm": return "🌐";
+    case "png": case "jpg": case "jpeg": case "webp": return "🖼";
+    default: return "📄";
+  }
+}
+
+// showUserQuestion 跳出問答選單。
+//
+// 問題只活在工具等待的那段時間，不落地；工具會每五秒重送一次，所以重新整理或
+// 斷線重連之後對話框會自己回來。重送的是同一個問題 ID，這裡靠它避免重複開啟，
+// 也避免把使用者已經選好的內容洗掉。
+function showUserQuestion(question) {
+  if (!question || !question.id) return;
+  const dialog = $("userQuestionDialog");
+  if (state.userQuestionID === question.id && dialog.open) return;
+  state.userQuestionID = question.id;
+  $("userQuestionText").textContent = question.question || "";
+  const context = $("userQuestionContext");
+  context.textContent = question.context || "";
+  context.classList.toggle("hidden", !question.context);
+  const list = $("userQuestionOptions");
+  list.replaceChildren();
+  for (const [index, option] of (question.options || []).entries()) {
+    const label = document.createElement("label");
+    label.className = "user-question-option";
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = "userQuestionOption";
+    input.value = option.label || "";
+    if (index === 0) input.checked = true;
+    const copy = document.createElement("div");
+    copy.className = "user-question-option-copy";
+    const title = document.createElement("strong");
+    title.textContent = option.label || "";
+    copy.append(title);
+    if (option.description) {
+      const detail = document.createElement("small");
+      detail.textContent = option.description;
+      copy.append(detail);
+    }
+    label.append(input, copy);
+    list.append(label);
+  }
+  $("userQuestionCustomLabel").textContent = question.custom_label || translate("或自己輸入答案");
+  $("userQuestionCustom").value = "";
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeUserQuestion(questionID = "") {
+  const dialog = $("userQuestionDialog");
+  if (questionID && state.userQuestionID !== questionID) return;
+  state.userQuestionID = "";
+  if (dialog.open) dialog.close();
+}
+
+// answerUserQuestion 送出抉擇。自訂輸入優先於選項：使用者特地打了字，
+// 那就是他要的答案，不該被預選的第一個選項蓋掉。
+async function answerUserQuestion({ canceled = false } = {}) {
+  const questionID = state.userQuestionID;
+  if (!questionID) return;
+  const custom = $("userQuestionCustom").value.trim();
+  const selected = $("userQuestionOptions").querySelector("input:checked")?.value || "";
+  if (!canceled && !custom && !selected) {
+    toast(translate("請選一個選項或自己輸入答案"));
+    return;
+  }
+  closeUserQuestion();
+  try {
+    await request(`/api/v1/questions/${encodeURIComponent(questionID)}/answer`, {
+      method: "POST",
+      body: JSON.stringify(canceled ? { canceled: true } : { selected: custom ? "" : selected, custom }),
+    });
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 function createReasoningBlock(value, className = "message-reasoning") {
@@ -4819,13 +5106,24 @@ function handleEvent(event, sessionID) {
     if (phase === "mcp_waiting" || phase === "waiting_approval") {
       setRunActivity(String(payload.update?.content || "").trim(), sessionID);
     }
+    if (phase === "user_question") {
+      setRunActivity(translate("等待你的選擇"), sessionID);
+      // 只有正在看這個 Session 時才跳；背景 Session 的問題等切回去再跳，
+      // 那時 heartbeat 會再送一次。
+      if (visible) showUserQuestion(payload.update?.details?.question);
+    }
   } else if (event.type === "tool.execution.end") {
     setRunActivity("", sessionID);
+    // 問題已經有結果（回答、取消或逾時），對話框沒有理由再留著。
+    closeUserQuestion(payload.result?.tool_name === "ask_user" ? "" : state.userQuestionID);
     const draft = ensureRunDraft(sessionID, operationID);
     const failedTool = payload.result?.is_error ? String(payload.result?.tool_name || "").trim() : "";
     if (draft && failedTool) {
       draft.reasoning = joinReasoningParts(draft.reasoning, `${translate("工具失敗")}：\`${failedTool}\``);
       if (visible) renderSelectedRunDraft();
+    }
+    if (!payload.result?.is_error) {
+      rememberProducedFiles(operationID, producedPathsFrom(payload.result?.details));
     }
   } else if (event.type === "memory.recalled") {
     // 回憶空間讓這次的答案取決於使用者看不見的狀態。至少要讓人知道「這次有用到
@@ -4877,6 +5175,8 @@ function handleEvent(event, sessionID) {
     setContextCompactionState(sessionID, false);
     finalizeLiveReasoningDuration(event, operationID, visible, sessionID);
     if (visible) setAgentProcessing(runState.liveMessage, false);
+    // 回答已經定案，這時才掛產出檔案：晶片要落在最終那則訊息底下。
+    if (visible) renderProducedFiles(operationID);
     if (visible) loadPlans(sessionID).catch(() => {});
 		} else if (event.type === "run.failed" || event.type === "run.canceled") {
     if (runState.terminalHandled) return;
@@ -5983,12 +6283,36 @@ async function deleteProjectSettings() {
 }
 
 async function deleteProject(project, { closeSettings = false } = {}) {
-  if (!project || !(await confirmAction(`確定刪除專案「${project.name}」？含有對話時後端會拒絕。`))) return false;
+  if (!project) return false;
+  // 專案底下有對話時，只給「確認」等於給一個一定會失敗的按鈕：後端會拒絕，
+  // 使用者唯一的出路是回去一則一則刪。多一個強制刪除，把後果講明白讓他自己決定。
+  const owned = state.sessions.filter((session) => session.project_id === project.id).length;
+  const message = owned > 0
+    ? `${translate("確定刪除專案")}「${project.name}」？${translate("底下還有")} ${owned} ${translate("個對話")}。${translate("只刪專案會被拒絕；強制刪除會連同這些對話一起永久移除。")}`
+    : `${translate("確定刪除專案")}「${project.name}」？`;
+  const choice = await confirmChoice(message, {
+    forceLabel: owned > 0 ? `${translate("強制刪除")}（${owned}）` : "",
+  });
+  if (choice !== "confirm" && choice !== "force") return false;
+  const query = choice === "force" ? "?force=true" : "";
   try {
-    await request(`/api/v1/projects/${encodeURIComponent(project.id)}`, { method: "DELETE" });
+    await request(`/api/v1/projects/${encodeURIComponent(project.id)}${query}`, { method: "DELETE" });
     if (closeSettings && state.editingProject?.id === project.id) closeProjectSettings();
+    // 強制刪除會一起移除對話，側邊欄與目前選取的對話都要跟著更新。
+    if (choice === "force") {
+      // 目前開著的對話如果就在這個專案底下，它已經不存在了；不清掉的話畫面上
+      // 還留著它的訊息與工具列，送出任何東西都會失敗。
+      const current = state.sessions.find((session) => session.id === state.session?.id);
+      if (current && current.project_id === project.id) {
+        state.session = null;
+        clearSessionUI();
+      }
+      await loadSessions();
+    }
     await loadProjects();
-    toast(`已刪除專案「${project.name}」`);
+    toast(choice === "force"
+      ? `${translate("已刪除專案")}「${project.name}」${translate("與")} ${owned} ${translate("個對話")}`
+      : `${translate("已刪除專案")}「${project.name}」`);
     return true;
   } catch (error) {
     toast(error.message);
@@ -6065,6 +6389,85 @@ async function saveSessionSettings(event) {
   }
 }
 
+// loadMemories 列出 Agent 目前記住的內容。
+//
+// 跨對話記憶讓「這次的回答」取決於使用者看不見的狀態，出錯時很難重現。看得到、
+// 刪得掉是這個功能能不能信任的前提，不是附加價值。
+//
+// 用 scope=all：回憶空間開啟後記憶落在 project:<id>，那串 ID 使用者猜不到，
+// 要求先選 scope 等於要求先知道答案。
+async function loadMemories() {
+  const list = $("memoryList");
+  if (!list) return;
+  try {
+    const values = await request("/api/v1/memories?scope=all&limit=200");
+    renderMemories(Array.isArray(values) ? values : []);
+  } catch (error) {
+    list.replaceChildren();
+    const failure = document.createElement("p");
+    failure.className = "quiet";
+    failure.textContent = `${translate("讀取記憶失敗")}：${error.message}`;
+    list.append(failure);
+    $("memoryEmpty").classList.add("hidden");
+  }
+}
+
+function renderMemories(values) {
+  const list = $("memoryList");
+  list.replaceChildren();
+  $("memoryEmpty").classList.toggle("hidden", values.length > 0);
+  for (const value of values) {
+    const row = document.createElement("article");
+    row.className = "memory-row";
+    const body = document.createElement("div");
+    body.className = "memory-row-body";
+    const text = document.createElement("p");
+    text.className = "memory-row-content";
+    text.textContent = value.content || "";
+    const meta = document.createElement("div");
+    meta.className = "memory-row-meta";
+    const updatedAt = value.updated_at ? new Date(value.updated_at).toLocaleString() : "";
+    for (const label of [memoryKindLabel(value.kind), value.scope, updatedAt]) {
+      if (!label) continue;
+      const chip = document.createElement("span");
+      chip.textContent = label;
+      meta.append(chip);
+    }
+    body.append(text, meta);
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "small danger";
+    remove.textContent = translate("刪除");
+    remove.addEventListener("click", () => { void forgetMemory(value, remove); });
+    row.append(body, remove);
+    list.append(row);
+  }
+}
+
+async function forgetMemory(value, button) {
+  if (!confirm(`${translate("確定要刪除這則記憶嗎？刪除後不再被召回。")}\n\n${value.content || ""}`)) return;
+  button.disabled = true;
+  try {
+    const scope = encodeURIComponent(value.scope || "");
+    await request(`/api/v1/memories/${encodeURIComponent(value.id)}?scope=${scope}&reason=${encodeURIComponent("使用者手動刪除")}`, { method: "DELETE" });
+    await loadMemories();
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message);
+  }
+}
+
+function memoryKindLabel(kind) {
+  switch (String(kind || "")) {
+    case "preference": return translate("偏好");
+    case "decision": return translate("決策");
+    case "constraint": return translate("限制");
+    case "procedure": return translate("作法");
+    case "fact": return translate("事實");
+    default: return String(kind || "");
+  }
+}
+
 function openManagement(panel = "overview") {
   document.querySelector(".shell").classList.add("management-open");
   $("managementPanel").classList.remove("hidden");
@@ -6093,6 +6496,7 @@ async function activatePanel(name) {
   if (name === "reverseProxy") await loadReverseProxyStatus({ hydrate: !state.reverseProxyHydrated });
   if (name === "tools") await loadTools();
   if (name === "permissions") await loadPermissionCenter();
+  if (name === "experimental") await loadMemories();
   if (name === "about") {
     renderAboutVersionInfo();
     renderUpdateStatus();
@@ -8075,6 +8479,46 @@ bindSettingSwitch("settingToolRetrieval", "toolSettingsState", (checked) => ({ t
 bindSettingSwitch("settingHTTPFetchEnabled", "toolSettingsState", (checked) => ({ http_fetch_enabled: checked }));
 bindSettingSwitch("settingHTTPFetchPrivateNetworks", "toolSettingsState", (checked) => ({ http_fetch_allow_private_networks: checked }));
 bindSettingSwitch("settingMemorySpace", "experimentalSettingsState", (checked) => ({ memory_space: checked }));
+$("refreshMemories")?.addEventListener("click", () => { void loadMemories(); });
+$("compactContext")?.addEventListener("click", () => { void compactContextNow(); });
+// 長按才執行。pointer 事件涵蓋滑鼠與觸控；離開按鈕範圍也算放開，
+// 否則使用者按著滑走以為取消了，兩秒後照樣刪除。
+$("confirmationForce").addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  startForceHold();
+});
+for (const type of ["pointerup", "pointerleave", "pointercancel"]) {
+  $("confirmationForce").addEventListener(type, () => cancelForceHold({ released: true }));
+}
+// 鍵盤同樣要按住：Space／Enter 的 keydown 會連續觸發，startForceHold 只會起一次計時。
+$("confirmationForce").addEventListener("keydown", (event) => {
+  if (event.key !== " " && event.key !== "Enter") return;
+  event.preventDefault();
+  startForceHold();
+});
+$("confirmationForce").addEventListener("keyup", (event) => {
+  if (event.key !== " " && event.key !== "Enter") return;
+  cancelForceHold({ released: true });
+});
+$("confirmationForce").addEventListener("blur", () => cancelForceHold());
+$("userQuestionForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  void answerUserQuestion();
+});
+$("cancelUserQuestion").addEventListener("click", () => { void answerUserQuestion({ canceled: true }); });
+// Esc 關閉對話框等同取消：使用者本來就沒有義務回答，不能讓 Run 就這樣一直等下去。
+$("userQuestionDialog").addEventListener("cancel", (event) => {
+  event.preventDefault();
+  void answerUserQuestion({ canceled: true });
+});
+// 打字時取消選項：自訂輸入與選項互斥，同時亮著會讓人看不出送出的是哪一個。
+$("userQuestionCustom").addEventListener("input", (event) => {
+  if (!event.target.value.trim()) return;
+  const checked = $("userQuestionOptions").querySelector("input:checked");
+  if (checked) checked.checked = false;
+});
+$("userQuestionOptions").addEventListener("change", () => { $("userQuestionCustom").value = ""; });
 $("settingPinned").addEventListener("change", async (event) => {
   const input = event.currentTarget;
   input.disabled = true;

@@ -5,6 +5,7 @@ import (
 	"AgenticService/src/ports"
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -33,6 +34,39 @@ func (s *Service) SearchMemories(ctx context.Context, query domain.MemoryQuery) 
 		query.Limit = 50
 	}
 	return repository.Search(ctx, query)
+}
+
+// ListAllMemories 跨 scope 列出目前生效的記憶，最近更新的排在前面。
+//
+// 管理介面需要「不指定 scope 也看得到 Agent 記了什麼」：回憶空間開啟後記憶會
+// 落在 project:<id>，使用者沒辦法猜出那串 ID，指定不到就等於看不到。
+func (s *Service) ListAllMemories(ctx context.Context, limit int) ([]domain.Memory, error) {
+	repository, err := s.memoryRepository()
+	if err != nil {
+		return nil, err
+	}
+	scopes, err := repository.Scopes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	values := []domain.Memory{}
+	for _, scope := range scopes {
+		scoped, scopeErr := repository.ListScope(ctx, scope)
+		if scopeErr != nil {
+			return nil, scopeErr
+		}
+		values = append(values, scoped...)
+	}
+	sort.SliceStable(values, func(first, second int) bool {
+		return values[first].UpdatedAt.After(values[second].UpdatedAt)
+	})
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	if len(values) > limit {
+		values = values[:limit]
+	}
+	return values, nil
 }
 
 func (s *Service) GetMemory(ctx context.Context, scope, memoryID string) (domain.Memory, error) {

@@ -309,6 +309,15 @@ small { color: var(--muted); }
 .context-usage-details { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 12px; margin: 0; font-size: 10px; }
 .context-usage-details dt { color: var(--muted); }
 .context-usage-details dd { min-width: 0; margin: 0; overflow: hidden; color: var(--text); text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+/* 手動壓縮：自動壓縮只在快爆掉時才動作，這裡把決定權交回使用者。
+   按鈕靠右與其他對話框的主要動作一致；結果訊息填滿左側剩餘空間。 */
+.context-usage-actions { display: flex; align-items: center; justify-content: flex-end; gap: 9px; margin-top: 11px; padding-top: 10px; border-top: 1px solid var(--line); }
+.context-usage-actions .save-state { min-width: 0; flex: 1 1 auto; overflow: hidden; font-size: 10px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+/* 帶紅：壓縮會把較早的對話換成摘要，細節收不回來。用色調提醒而不是擋人，
+   所以是淡底加紅字，不是實心的危險按鈕。 */
+.compact-context-button { flex: none; border-color: var(--danger); background: var(--danger-ring); color: var(--danger); }
+.compact-context-button:hover:not(:disabled), .compact-context-button:focus-visible:not(:disabled) { background: var(--danger); color: var(--accent-ink); }
+.compact-context-button:disabled { border-color: var(--line); background: transparent; color: var(--muted); }
 .plan-trigger { display: inline-flex; min-height: 26px; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 10px; }
 .plan-trigger strong { padding: 0 5px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 9px; }
 .plan-trigger[data-status="active"] { border-color: var(--accent); }
@@ -500,6 +509,9 @@ details[open] > .reasoning-summary::after { transform: rotate(45deg); }
 .attachment-copy small { font-size: 10px; }
 .remove-attachment { width: 24px; height: 24px; flex: none; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); }
 .message-attachments { margin-top: 8px; }
+/* 產出檔案掛在回答底下，與附件同一套外觀，但多一行標題把「這是這輪做出來的東西」講明白。 */
+.message-outputs { align-items: center; margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--line); }
+.message-outputs-caption { width: 100%; color: var(--muted); font-size: 11px; }
 .message-attachment { max-width: 100%; cursor: pointer; }
 
 @keyframes agent-processing-wave {
@@ -784,6 +796,16 @@ dialog label { display: grid; gap: 5px; margin: 13px 0; color: var(--muted); }
 .experimental-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .experimental-title { color: var(--text); font-size: 13px; font-weight: 750; }
 .experimental-card .hint { margin: 6px 0 0; }
+/* 已保存的記憶：看得到、刪得掉，是這個功能能不能信任的前提。 */
+.memory-space-store { margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line); }
+.memory-store-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.memory-store-head strong { color: var(--text); font-size: 12px; }
+.memory-list { display: flex; flex-direction: column; gap: 7px; margin-top: 9px; max-height: 320px; overflow-y: auto; }
+.memory-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.memory-row-body { min-width: 0; flex: 1 1 auto; }
+.memory-row-content { margin: 0; color: var(--text); font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.memory-row-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 5px; }
+.memory-row-meta span { padding: 1px 6px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 10px; }
 .sandbox-fieldset .hint { margin: 0 0 10px; }
 .folder-picker { display: flex; min-height: 72px; align-items: center; justify-content: center; gap: 10px; border-style: dashed; }
 .folder-picker > span:last-child { display: grid; text-align: left; }
@@ -956,4 +978,38 @@ button.ghost { background: transparent; }
   .image-editor-dialog { width: calc(100% - 16px); height: calc(100vh - 16px); padding: 12px; }
   .image-editor-toolbar-spacer { display: none; }
   .image-editor-text-control { order: 2; flex-basis: 100%; }
+}
+
+/* 問答選單：Agent 中途需要使用者做抉擇時跳出。 */
+.user-question-dialog { max-width: 460px; }
+.user-question-text { margin: 0 0 4px; color: var(--text); font-size: 14px; font-weight: 650; line-height: 1.55; }
+.user-question-options { display: flex; flex-direction: column; gap: 7px; margin: 11px 0; }
+.user-question-option { display: flex; align-items: flex-start; gap: 9px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); cursor: pointer; text-align: left; }
+.user-question-option:hover { border-color: var(--line-strong); }
+/* 選中狀態用邊框而不是只有圓鈕：一眼看得出目前會送出什麼。 */
+.user-question-option:has(input:checked) { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+/* 全域的 input { width: 100%; padding; border; background } 是給文字欄用的，
+   套在單選鈕上會變成一個 300px 寬的方框把選項文字擠到旁邊。這裡全部歸零。 */
+.user-question-option input { flex: none; width: auto; margin-top: 3px; padding: 0; border: none; background: none; accent-color: var(--accent); }
+.user-question-option-copy { min-width: 0; flex: 1 1 auto; }
+.user-question-option-copy strong { display: block; color: var(--text); font-size: 13px; font-weight: 600; }
+.user-question-option-copy small { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.user-question-custom { display: block; margin-bottom: 10px; }
+.user-question-custom span { display: block; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
+
+/* 強制刪除比一般確認更難復原（連同對話一起移除），用實心紅與確認鍵分開。
+   選擇器要帶 button：button.danger 已經把文字設成紅色，只用 class 蓋不過它，
+   結果會是紅底紅字的一塊看不見的按鈕。 */
+button.confirmation-force { position: relative; overflow: hidden; border-color: var(--danger); background: var(--danger); color: #fff; font-weight: 700; }
+button.confirmation-force:hover:not(:disabled), button.confirmation-force:focus-visible:not(:disabled) { filter: brightness(1.08); }
+/* 長按進度：不給回饋的話，按下去兩秒都沒反應跟壞掉沒有分別。
+   用 animation 而不是 transition——加上 class 與元素取得版面若落在同一次
+   樣式計算，transition 會被跳過，進度條直接跳到滿格。 */
+.confirmation-force-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; background: rgb(0 0 0 / .28); pointer-events: none; }
+button.confirmation-force.is-holding .confirmation-force-fill { animation: force-hold-progress 2s linear forwards; }
+.confirmation-force-label { position: relative; }
+@keyframes force-hold-progress { from { width: 0; } to { width: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  /* 進度動畫關掉，但長按這件事本身要留著——那是保護不是裝飾。 */
+  button.confirmation-force.is-holding .confirmation-force-fill { width: 100%; animation: none; opacity: .55; }
 }

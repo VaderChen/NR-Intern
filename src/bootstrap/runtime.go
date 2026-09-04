@@ -14,10 +14,12 @@ import (
 	"AgenticService/src/netpass"
 	"AgenticService/src/ports"
 	"AgenticService/src/providerauth"
+	"AgenticService/src/question"
 	"AgenticService/src/tokens"
 	"AgenticService/src/tools"
 	nativedocuments "AgenticService/src/tools/native/documents"
 	nativefiles "AgenticService/src/tools/native/files"
+	nativeinteraction "AgenticService/src/tools/native/interaction"
 	nativememories "AgenticService/src/tools/native/memories"
 	nativenetwork "AgenticService/src/tools/native/network"
 	nativeplans "AgenticService/src/tools/native/plans"
@@ -54,7 +56,9 @@ type Runtime struct {
 	Memory       ports.MemoryRepository
 	// MemoryManager 保留參考，讓回憶空間開關不必重啟後端就能生效。
 	MemoryManager *memory.Manager
-	Events        ports.RunEventRepository
+	// Questions 保留參考，讓桌面端與測試能直接看到等待中的問答選單。
+	Questions ports.QuestionCoordinator
+	Events    ports.RunEventRepository
 	// Runs 保留參考，讓背景清理能把只增不減的 run 紀錄與事件檔壓回上限。
 	Runs         ports.RunRepository
 	Plans        ports.PlanRepository
@@ -286,6 +290,10 @@ func Build(config Config) (*Runtime, error) {
 			)
 		}
 	}
+	// 問答選單：Agent 在工作中途需要使用者做抉擇時用。協調器只活在記憶體裡，
+	// 問題的壽命就是工具等待的那段時間。
+	questionCoordinator := question.NewCoordinator()
+	nativeToolValues = append(nativeToolValues, nativeinteraction.New(questionCoordinator, 0))
 	if len(config.SSHProfiles) > 0 {
 		nativeToolValues = append(nativeToolValues,
 			nativessh.New(config.SSHProfiles, config.MaxToolOutputBytes, 30*time.Minute),
@@ -376,6 +384,7 @@ func Build(config Config) (*Runtime, error) {
 		Workspaces:           workspaces,
 		Providers:            model,
 		Approvals:            approvalCoordinator,
+		Questions:            questionCoordinator,
 		Memories:             memoryRepository,
 		Plans:                plans,
 		Attachments:          attachments,
@@ -402,6 +411,7 @@ func Build(config Config) (*Runtime, error) {
 		Memory:        memoryRepository,
 		MemoryManager: memoryManager,
 		Events:        events,
+		Questions:     questionCoordinator,
 		Runs:          runs,
 		Plans:         plans,
 		Agent:         agent,

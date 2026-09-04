@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"crypto/sha256"
+	"debug/buildinfo"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"html"
@@ -257,20 +259,17 @@ func stageNetPassClient(platformDirectory string, value target) (bool, error) {
 		return false, nil
 	}
 	sourceRoot := strings.TrimSpace(os.Getenv("NR_INTERN_NETPASS_SOURCE"))
+	explicitSource := sourceRoot != ""
 	if sourceRoot == "" {
 		workingDirectory, err := os.Getwd()
 		if err != nil {
 			return false, fmt.Errorf("解析 NetPassClient 預設來源目錄: %w", err)
 		}
-		sourceRoot = filepath.Join(workingDirectory, "..", "NetPassService", "Client", "bin")
+		sourceRoot = filepath.Join(workingDirectory, "..", "NetPassService", "Client")
 	}
 	sourceRoot, err := filepath.Abs(sourceRoot)
 	if err != nil {
 		return false, fmt.Errorf("解析 NetPassClient 來源目錄: %w", err)
-	}
-	source := filepath.Join(sourceRoot, sourceName)
-	if info, err := os.Stat(source); err != nil || !info.Mode().IsRegular() {
-		return false, fmt.Errorf("%s 缺少 NetPassClient Runtime；請設定 NR_INTERN_NETPASS_SOURCE 指向外部預編譯檔目錄", value.directoryName())
 	}
 	destinationDirectory := filepath.Join(platformDirectory, "netpass-client")
 	if err := os.MkdirAll(destinationDirectory, 0o750); err != nil {
@@ -280,11 +279,64 @@ func stageNetPassClient(platformDirectory string, value target) (bool, error) {
 	if value.os == "windows" {
 		destinationName += ".exe"
 	}
-	if err := copyFile(source, filepath.Join(destinationDirectory, destinationName), 0o755); err != nil {
-		return false, fmt.Errorf("封裝 %s NetPassClient: %w", value.directoryName(), err)
+	destination := filepath.Join(destinationDirectory, destinationName)
+	moduleInfo, moduleErr := os.Stat(filepath.Join(sourceRoot, "go.mod"))
+	if moduleErr == nil && moduleInfo.Mode().IsRegular() {
+		// 輔助程式也屬於發行內容，不能沿用可能含有開發者目錄的舊 bin。
+		// trimpath 保留套件相對的來源位置，堆疊仍可定位，且不需修改執行時路徑。
+		command := exec.Command("go", "build", "-buildvcs=false", "-trimpath", "-ldflags=-s -w", "-o", destination, ".")
+		command.Dir = sourceRoot
+		command.Env = buildEnvironment(value)
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			return false, fmt.Errorf("以套件相對路徑建置 %s NetPassClient: %w", value.directoryName(), err)
+		}
+		if err := validateNetPassBuild(destination, value); err != nil {
+			return false, err
+		}
+	} else {
+		if moduleErr != nil && !os.IsNotExist(moduleErr) {
+			return false, fmt.Errorf("檢查 NetPassClient Go 專案: %w", moduleErr)
+		}
+		if moduleErr == nil {
+			return false, fmt.Errorf("NetPassClient go.mod 必須是一般檔案")
+		}
+		if !explicitSource {
+			sourceRoot = filepath.Join(sourceRoot, "bin")
+		}
+		source := filepath.Join(sourceRoot, sourceName)
+		if info, err := os.Stat(source); err != nil || !info.Mode().IsRegular() {
+			return false, fmt.Errorf("%s 缺少 NetPassClient Runtime；請設定 NR_INTERN_NETPASS_SOURCE 指向 Go 專案或以 -trimpath 建置的預編譯檔目錄", value.directoryName())
+		}
+		// 外部預編譯檔同樣檢查，避免自訂來源繞過發行檔的路徑保護。
+		if err := validateNetPassBuild(source, value); err != nil {
+			return false, err
+		}
+		if err := copyFile(source, destination, 0o755); err != nil {
+			return false, fmt.Errorf("封裝 %s NetPassClient: %w", value.directoryName(), err)
+		}
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "packaged %s NetPassClient runtime\n", value.directoryName())
 	return true, nil
+}
+
+func validateNetPassBuild(path string, value target) error {
+	info, err := buildinfo.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("無法驗證 %s NetPassClient 建置資訊: %w", value.directoryName(), err)
+	}
+	settings := make(map[string]string, len(info.Settings))
+	for _, setting := range info.Settings {
+		settings[setting.Key] = setting.Value
+	}
+	if settings["-trimpath"] != "true" {
+		return fmt.Errorf("%s NetPassClient 未以 -trimpath 建置，拒絕封裝可能含開發者絕對路徑的檔案；請使用 Go 專案來源，或重新以 go build -buildvcs=false -trimpath 建置", value.directoryName())
+	}
+	if settings["GOOS"] != value.os || settings["GOARCH"] != value.arch {
+		return fmt.Errorf("NetPassClient 架構 %s/%s 與目標 %s/%s 不符", settings["GOOS"], settings["GOARCH"], value.os, value.arch)
+	}
+	return nil
 }
 
 func buildLinkerFlags(packagePath, version string, value target) string {
@@ -344,11 +396,8 @@ func buildMacApplication(platformDirectory string, version releaseVersion, value
 			if err != nil {
 				return err
 			}
-			command := exec.Command(codesign, "--force", "--deep", "--sign", identity, appDirectory)
-			command.Stdout = os.Stdout
-			command.Stderr = os.Stderr
-			if err := command.Run(); err != nil {
-				return fmt.Errorf("替 macOS App 套用簽章 %q: %w", identity, err)
+			if err := signMacApp(codesign, identity, appDirectory); err != nil {
+				return err
 			}
 			if identity == "-" {
 				_, _ = fmt.Fprintln(os.Stderr,
@@ -360,6 +409,104 @@ func buildMacApplication(platformDirectory string, version releaseVersion, value
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "packaged %s\n", appDirectory)
 	return nil
+}
+
+// signMacApp 由內而外簽署 App Bundle。
+//
+// 先逐一簽署巢狀的 Mach-O 與 code bundle，最後才簽最外層——直接對整包下 --deep
+// 會讓巢狀項目沿用外層設定，Apple 也明確不建議只靠 --deep。
+//
+// --options runtime 是重點：沒有 hardened runtime 就無法送公證。原本缺這個旗標，
+// 產物雖然有 Developer ID 簽章，spctl 仍判為 "Unnotarized Developer ID" 而拒絕，
+// 別台 Mac 打開會被 Gatekeeper 擋下。ad-hoc 簽章（identity "-"）不支援這些選項，
+// 因此維持原本的簡單簽法。
+func signMacApp(codesign, identity, appDirectory string) error {
+	run := func(arguments ...string) error {
+		command := exec.Command(codesign, arguments...)
+		command.Stdout = os.Stdout
+		command.Stderr = os.Stderr
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("替 macOS App 套用簽章 %q: %w", identity, err)
+		}
+		return nil
+	}
+	if identity == "-" {
+		return run("--force", "--deep", "--sign", identity, appDirectory)
+	}
+	options := []string{"--options", "runtime", "--timestamp"}
+	nested, err := nestedMachOFiles(filepath.Join(appDirectory, "Contents"))
+	if err != nil {
+		return err
+	}
+	mainExecutable, err := macMainExecutable(appDirectory)
+	if err != nil {
+		return err
+	}
+	for _, object := range nested {
+		// 主執行檔交由最後的 App 簽章納入：先簽它會讓 codesign 提前回溯整包。
+		if object == mainExecutable {
+			continue
+		}
+		if err := run(append([]string{"--force", "--sign", identity}, append(options, object)...)...); err != nil {
+			return err
+		}
+	}
+	if err := run(append([]string{"--force", "--deep", "--sign", identity}, append(options, appDirectory)...)...); err != nil {
+		return err
+	}
+	return run("--verify", "--deep", "--strict", "--verbose=2", appDirectory)
+}
+
+// nestedMachOFiles 找出 Bundle 內所有 Mach-O 執行檔。
+func nestedMachOFiles(root string) ([]string, error) {
+	objects := []string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || !entry.Type().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		header := make([]byte, 4)
+		count, readErr := io.ReadFull(file, header)
+		_ = file.Close()
+		if readErr != nil || count < 4 {
+			return nil
+		}
+		if isMachOHeader(header) {
+			objects = append(objects, path)
+		}
+		return nil
+	})
+	return objects, err
+}
+
+// isMachOHeader 認出 Mach-O 與 universal binary 的 magic number。
+func isMachOHeader(header []byte) bool {
+	magic := binary.BigEndian.Uint32(header)
+	switch magic {
+	case 0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe, 0xbebafeca:
+		return true
+	default:
+		return false
+	}
+}
+
+func macMainExecutable(appDirectory string) (string, error) {
+	entries, err := os.ReadDir(filepath.Join(appDirectory, "Contents", "MacOS"))
+	if err != nil {
+		return "", fmt.Errorf("讀取 macOS App 執行檔目錄: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			return filepath.Join(appDirectory, "Contents", "MacOS", entry.Name()), nil
+		}
+	}
+	return "", nil
 }
 
 // resolveMacSigningIdentity 優先採用明確設定；未設定時只自動選擇適合

@@ -539,6 +539,9 @@ func validateConfig(config *Config) error {
 // 這一輪相關的工具），沒有必要再用「拿掉能力」來換。
 var LeanToolNames = []string{
 	"shell_exec",
+	// ask_user 屬於精簡集合：中途需要使用者決定是基本互動，不是進階能力，
+	// 而且 schema 很小。放進擴充集合等於預設關掉它，功能就等於不存在。
+	"ask_user",
 	"file_read",
 	"directory_list",
 	"file_search",
