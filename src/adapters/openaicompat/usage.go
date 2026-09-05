@@ -16,7 +16,19 @@ import (
 const maxCodexUsageResponseBytes = 2 * 1024 * 1024
 
 type codexUsageResponse struct {
-	RateLimit *codexUsageRateLimit `json:"rate_limit"`
+	RateLimit    *codexUsageRateLimit      `json:"rate_limit"`
+	ResetCredits *codexResetCreditsPayload `json:"rate_limit_reset_credits"`
+}
+
+type codexResetCreditsPayload struct {
+	AvailableCount *int64             `json:"available_count"`
+	Credits        []codexResetCredit `json:"credits"`
+}
+
+type codexResetCredit struct {
+	ID        string  `json:"id"`
+	Status    string  `json:"status"`
+	ExpiresAt *string `json:"expires_at"`
 }
 
 type codexUsageRateLimit struct {
@@ -79,16 +91,70 @@ func (m *Model) RefreshProviderUsage(ctx context.Context) error {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return fmt.Errorf("decode Codex usage response: %w", err)
 	}
+	now := time.Now().UTC()
+	// 重置額度與配額視窗來自同一份回應，但要分開存：只有額度、沒有視窗的回應
+	// 仍然有意義，而 storeProviderUsage 在兩個視窗都不可用時會直接跳過。
+	m.storeResetCredits(ctx, payload.ResetCredits)
 	if payload.RateLimit == nil {
 		return nil
 	}
-	now := time.Now().UTC()
 	m.storeProviderUsage(
 		codexAPIUsageWindow(payload.RateLimit.PrimaryWindow, now),
 		codexAPIUsageWindow(payload.RateLimit.SecondaryWindow, now),
 		now,
 	)
 	return nil
+}
+
+// storeResetCredits 記下帳號目前可用的重置次數。
+//
+// 上游沒有回報這個欄位時保持 Available=false，讓介面完全不顯示重置入口；
+// 顯示成「0 次」會讓使用者以為自己用完了，而不是「這條路線沒有這功能」。
+func (m *Model) storeResetCredits(ctx context.Context, payload *codexResetCreditsPayload) {
+	if m == nil {
+		return
+	}
+	credits := domain.ProviderResetCredits{}
+	if payload != nil && payload.AvailableCount != nil && *payload.AvailableCount >= 0 {
+		credits.Available = true
+		credits.Count = *payload.AvailableCount
+		// 到期時間**一律以明細端點為準**。/wham/usage 的 credits 欄位不完整——
+		// 有時整個缺席，有時只帶一筆摘要；拿它當主要來源會顯示成比實際更晚的
+		// 到期時間，而且看起來完全正常，不會有任何錯誤。
+		// 沒有額度就不必問——沒有東西會到期。
+		if credits.Count > 0 {
+			_, credits.NextExpiresAt = m.fetchEarliestResetCredit(ctx)
+		}
+		// 明細端點讀不到時才退回 usage 帶的那份。
+		if credits.NextExpiresAt == "" {
+			_, credits.NextExpiresAt = earliestResetCredit(payload.Credits)
+		}
+	}
+	m.usageMu.Lock()
+	m.providerUsage.ResetCredits = credits
+	m.usageMu.Unlock()
+}
+
+// earliestResetCredit 回傳最早到期的「可用」額度的 ID 與到期時間。
+//
+// 已兌換或已過期的額度即使到期更早也不算：拿它去顯示會讓使用者以為快過期了，
+// 拿它去兌換則會失敗。
+func earliestResetCredit(credits []codexResetCredit) (id string, expiresAt string) {
+	var earliest time.Time
+	for _, credit := range credits {
+		if !strings.EqualFold(strings.TrimSpace(credit.Status), "available") || credit.ExpiresAt == nil {
+			continue
+		}
+		value := strings.TrimSpace(*credit.ExpiresAt)
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			continue
+		}
+		if expiresAt == "" || parsed.Before(earliest) {
+			id, expiresAt, earliest = strings.TrimSpace(credit.ID), value, parsed
+		}
+	}
+	return id, expiresAt
 }
 
 func (m *Model) clearProviderUsage() {

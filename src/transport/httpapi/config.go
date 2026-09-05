@@ -35,6 +35,7 @@ type Config struct {
 	StopReverseProxy        func(context.Context) (domain.ReverseProxyStatus, error)
 	ProviderModels          func(context.Context, string) (domain.ProviderModels, error)
 	ProviderUsage           func(context.Context, string) (domain.ProviderUsage, error)
+	ProviderRateLimitReset  func(context.Context, string, string) (domain.ProviderResetResult, error)
 	TestProvider            func(context.Context, string) (domain.ProviderTestResult, error)
 	StartProviderOAuth      func(context.Context, string) (domain.ProviderOAuthStartResult, error)
 	ProviderOAuthStatus     func(context.Context, string) (domain.ProviderOAuthStatus, error)

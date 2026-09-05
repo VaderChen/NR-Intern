@@ -96,6 +96,16 @@ ChatGPT／Codex OAuth：
 }
 ```
 
+Codex 的模型清單來自帳號專屬的 model manifest，而 manifest **依 client version 分流**。
+`codexManifestClientVersion`（`src/adapters/openaicompat/probe.go`）太舊會拿到舊清單、新模型
+不會出現，而且不會有任何錯誤訊息——症狀就只是「模型沒有更新」。對不到新模型時先查這個常數，
+並對照 Codex CLI 目前的版本。
+
+同一組 OAuth 也用於「用量上限重置」：可用次數來自 `/wham/usage`，**到期時間一律以**
+`/wham/rate-limit-reset-credits` 明細端點為準——用量回應的 `credits` 不完整，拿它當主要來源
+會顯示成比實際更晚的到期時間。兌換會消耗帳號有限額度且不可還原，只在使用者於 Provider
+設定按下「重置」並完成二次確認時送出。
+
 OAuth Token、管理頁保存的 Provider 集合、MCP Server 集合、服務設定與 NetPass Key 都位於
 `data_dir` 下的權限限制檔案，不應複製回範例設定或提交版本庫。管理 API 只回傳是否已設定，
 不提供秘密明文。

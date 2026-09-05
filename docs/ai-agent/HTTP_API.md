@@ -43,6 +43,7 @@ Authorization: Bearer <token>
 | GET | `/api/v1/providers` | 已註冊 Provider adapter 清單 |
 | GET | `/api/v1/providers/{provider_id}/capabilities` | 讀取 Provider／Model 的 Context 與輸出限制 |
 | GET | `/api/v1/providers/{provider_id}/usage` | 讀取最近一次 5 小時／7 天用量視窗；無資料時標記 unavailable |
+| POST | `/api/v1/providers/{provider_id}/usage/reset` | 兌換一次用量上限重置（僅 ChatGPT／Codex OAuth）；消耗帳號有限額度且不可還原 |
 | GET | `/api/v1/memories` | 搜尋長期記憶（`scope`、`q`、`kinds`、`tags`、`limit`） |
 | POST | `/api/v1/memories` | 由使用者寫入長期記憶 |
 | GET | `/api/v1/memories/{memory_id}` | 讀取單筆長期記憶 |
@@ -179,6 +180,15 @@ OAuth 流程如下：
 4. `DELETE .../{provider_id}/oauth` 中斷連線並刪除該 Provider 的本機 Token。
 
 OpenAI Codex Responses 不提供模型目錄時，models endpoint 回傳空陣列，Console 顯示 `-`，仍可
+`POST /api/v1/providers/{provider_id}/usage/reset` 兌換一次「用量上限重置」，只適用於以
+ChatGPT／Codex OAuth 登入的 Provider。這會消耗該帳號有限的重置額度且**無法還原**，因此只能由
+使用者明確操作觸發，不可放進自動排程或預先擷取。連線中斷後重送請沿用同一個 `Idempotency-Key`
+標頭——那時無法分辨「沒送出」與「送出了但沒收到回應」，換一把鑰匙會扣掉第二次額度。
+額度不足（`no_credit`）或先前已兌換（`already_redeemed`）都以 200 加上對應的 `outcome` 回覆，
+不算錯誤。可用次數在 `GET .../usage` 的 `reset_credits` 中回報；`available=false` 代表這條路線
+沒有這項功能，與「剩下 0 次」是不同的狀態，介面不應把它顯示成 0。`next_expires_at` 是最早
+到期的**可用**額度（已兌換或過期的不列入），上游未提供明細時為空字串。
+
 手動設定模型名稱。`GET /api/v1/providers/{provider_id}/usage` 的 5 小時／7 天視窗若沒有上游資料，
 `available=false`，呼叫端不得推測為 100%。
 
@@ -315,6 +325,8 @@ curl -X PATCH http://127.0.0.1:8787/api/v1/sessions/SESSION_ID \
 Session override，恢復 Provider／後端預設；`lock_plans` 預設為 `false`。`memory_scope` 傳入空字串
 會移除 Session override，恢復 Agent 預設 scope。記憶體隔離專案的 Session 例外：一律使用專案
 專屬 scope，`memory_scope` 對它無效——共用 scope 會讓隨程序結束消失的記憶取代掉持久記憶。
+反過來，`project:` 開頭的 `memory_scope` 只准指向該 Session 自己的 Project，指向別的 Project
+會被忽略並退回預設 scope；`user:`、`tenant:` 等非 Project scope 不受限制。
 
 Session 有 queued 或 running Run 時，更新與刪除都回傳 `409 Conflict`；請先等待完成或明確取消 Run，避免執行途中更換權限／Provider 或刪除工具目錄。
 

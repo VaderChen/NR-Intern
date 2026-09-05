@@ -8,7 +8,7 @@ NR-Intern は Go で開発されたデスクトップ AI Agent です。現在�
 
 ## 主な機能
 
-- OpenAI-compatible Chat Completions と、ChatGPT／Codex OAuth で認証する OpenAI Codex Responses に対応した拡張可能な Provider Router。
+- OpenAI-compatible Chat Completions と、ChatGPT／Codex OAuth で認証する OpenAI Codex Responses に対応した拡張可能な Provider Router。Codex アカウントに使用量上限のリセット回数があれば Provider 設定から引き換えでき、確認画面に残り回数と最短の有効期限を表示します。
 - 会話ごとに Provider とモデルを選択できる `Workspace → Project → Session` 構造。
 - Workspace と Project の常時指示。作業ルールを一度書けば、以降の会話とスケジュールに自動的に引き継がれます。
 - 複数の作業計画、ドラッグによる順序変更、ステップ状態、ツール結果に基づく検証証拠。

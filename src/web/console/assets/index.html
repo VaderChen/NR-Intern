@@ -459,7 +459,7 @@
                   <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
                   <small id="providerSettingAPIKeyState"></small>
                 </label>
-                <label id="providerSettingClearKeyRow" class="check-label plain-check hidden"><input id="providerSettingClearKey" type="checkbox">清除目前已儲存的 API Key</label>
+                <button id="providerSettingClearKey" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 API Key</button>
               </div>
               <div id="providerOAuthFields" class="provider-field-full provider-auth-fields hidden">
                 <small>將開啟 ChatGPT 登入頁，登入與帳號選擇都在瀏覽器中完成。</small>
@@ -483,6 +483,10 @@
               </label>
               <label id="providerSettingInstructionRoleField">Instruction role<select id="providerSettingInstructionRole"><option value="system">system</option><option value="developer">developer</option></select></label>
               <label>重試次數<input id="providerSettingMaxAttempts" type="number" min="1" max="3" required></label>
+              <div id="providerResetRateLimitField" class="provider-reset-field hidden">
+                <span id="providerResetRateLimitHint" class="provider-reset-caption">用量上限</span>
+                <button id="providerResetRateLimit" class="primary" type="button" aria-describedby="providerResetRateLimitHint">重置</button>
+              </div>
             </div>
             <div class="provider-check-grid">
               <label class="check-label"><input id="providerSettingDefault" type="checkbox">設為系統預設</label>
@@ -566,7 +570,7 @@
                     <input id="mcpSettingAPIKey" type="password" autocomplete="new-password" placeholder="輸入 MCP Server 金鑰">
                     <small id="mcpAPIKeyState">金鑰不會從後端讀回；留空會保留目前設定。</small>
                   </label>
-                  <button id="mcpSettingClearKey" class="mcp-clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 MCP 金鑰</button>
+                  <button id="mcpSettingClearKey" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 MCP 金鑰</button>
                   <label>帳號
                     <input id="mcpSettingUsername" autocomplete="username" placeholder="輸入 MCP Server 帳號">
                     <small id="mcpBasicAuthState">帳號密碼不會從後端讀回；留空會保留目前設定。</small>
@@ -574,7 +578,7 @@
                   <label>密碼
                     <input id="mcpSettingPassword" type="password" autocomplete="current-password" placeholder="輸入 MCP Server 密碼">
                   </label>
-                  <button id="mcpSettingClearBasicAuth" class="mcp-clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的帳號密碼</button>
+                  <button id="mcpSettingClearBasicAuth" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的帳號密碼</button>
                 </div>
                 <label class="provider-field-full">HTTP Headers（JSON 物件）
                   <textarea id="mcpSettingHeaders" rows="3" spellcheck="false" placeholder='{"Authorization":"Bearer ..."}'></textarea>
@@ -653,7 +657,7 @@
                 <input id="reverseProxyAPIKey" type="password" autocomplete="new-password" placeholder="輸入 NetPass API Key">
                 <small id="reverseProxyAPIKeyState">API Key 不會從後端讀回；留空會保留目前設定。</small>
               </label>
-              <label id="reverseProxyClearKeyRow" class="check-label plain-check hidden"><input id="reverseProxyClearKey" type="checkbox">清除目前已儲存的 NetPass API Key</label>
+              <button id="reverseProxyClearKey" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 NetPass API Key</button>
             </div>
             <label>裝置名稱（選填）
               <input id="reverseProxyName" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,62}[A-Za-z0-9]" autocomplete="off" placeholder="nr-intern">

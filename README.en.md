@@ -8,7 +8,7 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 
 ## Highlights
 
-- Extensible provider routing for OpenAI-compatible Chat Completions and OpenAI Codex Responses authenticated through ChatGPT/Codex OAuth.
+- Extensible provider routing for OpenAI-compatible Chat Completions and OpenAI Codex Responses authenticated through ChatGPT/Codex OAuth. When a Codex account has usage-limit reset credits, they can be redeemed from the provider settings; the confirmation shows how many remain and when the next one expires.
 - A `Workspace → Project → Session` hierarchy with per-conversation provider and model selection.
 - Standing instructions on workspaces and projects: write the working rules once and every conversation and schedule carries them.
 - Multiple ordered work plans with drag-and-drop ordering, step states, and tool-backed evidence.

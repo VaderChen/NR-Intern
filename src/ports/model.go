@@ -19,6 +19,14 @@ type ProviderUsageSource interface {
 	ProviderUsage() domain.ProviderUsage
 }
 
+// ProviderRateLimitResetter 由支援「用量上限重置」的 adapter 實作。
+//
+// 兌換會消耗帳號層級的有限額度且不可還原，所以只在使用者明確要求時呼叫，
+// 絕不放進任何自動排程。
+type ProviderRateLimitResetter interface {
+	ConsumeRateLimitReset(ctx context.Context, idempotencyKey string) (domain.ProviderResetResult, error)
+}
+
 // ProviderUsageRefresher 由能主動查詢上游配額的 adapter 實作。
 // 實作不得用會消耗模型額度的推理請求模擬用量查詢。
 type ProviderUsageRefresher interface {

@@ -51,6 +51,7 @@ type Handler struct {
 	stopReverseProxy        func(context.Context) (domain.ReverseProxyStatus, error)
 	providerModels          func(context.Context, string) (domain.ProviderModels, error)
 	providerUsage           func(context.Context, string) (domain.ProviderUsage, error)
+	providerRateLimitReset  func(context.Context, string, string) (domain.ProviderResetResult, error)
 	testProvider            func(context.Context, string) (domain.ProviderTestResult, error)
 	startProviderOAuth      func(context.Context, string) (domain.ProviderOAuthStartResult, error)
 	providerOAuthStatus     func(context.Context, string) (domain.ProviderOAuthStatus, error)
@@ -102,6 +103,7 @@ func New(service *application.Service, config Config) (*Handler, error) {
 		stopReverseProxy:        config.StopReverseProxy,
 		providerModels:          config.ProviderModels,
 		providerUsage:           config.ProviderUsage,
+		providerRateLimitReset:  config.ProviderRateLimitReset,
 		testProvider:            config.TestProvider,
 		startProviderOAuth:      config.StartProviderOAuth,
 		providerOAuthStatus:     config.ProviderOAuthStatus,
@@ -154,6 +156,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/providers", h.listProviders)
 	h.mux.HandleFunc("GET /api/v1/providers/{provider_id}/capabilities", h.getProviderCapabilities)
 	h.mux.HandleFunc("GET /api/v1/providers/{provider_id}/usage", h.getProviderUsage)
+	h.mux.HandleFunc("POST /api/v1/providers/{provider_id}/usage/reset", h.consumeProviderRateLimitReset)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}/export", h.exportSession)
 	h.mux.HandleFunc("GET /api/v1/memories", h.listMemories)
 	h.mux.HandleFunc("POST /api/v1/memories", h.createMemory)
@@ -748,6 +751,29 @@ func (h *Handler) getProviderUsage(writer http.ResponseWriter, request *http.Req
 		return
 	}
 	value, err := h.providerUsage(request.Context(), request.PathValue("provider_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+// consumeProviderRateLimitReset 兌換一次用量上限重置。
+//
+// 這會消耗使用者 ChatGPT 帳號的有限額度且無法還原，所以是 POST 而非 GET，
+// 也絕不能被預先擷取或重試機制自動觸發。Idempotency-Key 讓呼叫端在連線中斷後
+// 安全重送——那時無法分辨「沒送出」與「送出了但沒收到回應」。
+func (h *Handler) consumeProviderRateLimitReset(writer http.ResponseWriter, request *http.Request) {
+	if h.providerRateLimitReset == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: provider rate limit reset is unavailable", errUnavailable))
+		return
+	}
+	// 沿用本 API 既有的 Idempotency-Key 標頭慣例，不另立 body 欄位。
+	value, err := h.providerRateLimitReset(
+		request.Context(),
+		request.PathValue("provider_id"),
+		request.Header.Get("Idempotency-Key"),
+	)
 	if err != nil {
 		writeProblem(writer, request, err)
 		return

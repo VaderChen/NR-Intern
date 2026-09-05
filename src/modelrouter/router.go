@@ -104,6 +104,36 @@ func (r *Router) HasProvider(providerID string) bool {
 
 // ProviderUsage 回傳指定 Provider 最近一次由上游明確提供的用量快照。
 // 不支援或尚未收到資料的 Provider 仍回傳 provider_id，但兩個視窗皆為不可用。
+// ConsumeRateLimitReset 兌換指定 Provider 的一次用量上限重置。
+//
+// 不支援這項功能的 Provider 回 ErrConflict 而不是靜默成功：使用者按了按鈕就會
+// 期待有事發生，回報「這條路線沒有這功能」才是誠實的。
+func (r *Router) ConsumeRateLimitReset(ctx context.Context, providerID, idempotencyKey string) (domain.ProviderResetResult, error) {
+	if r == nil {
+		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
+	}
+	r.mu.RLock()
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		providerID = r.defaultID
+	}
+	provider, exists := r.providers[providerID]
+	r.mu.RUnlock()
+	if !exists {
+		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider %q", domain.ErrNotFound, providerID)
+	}
+	resetter, ok := provider.Model.(ports.ProviderRateLimitResetter)
+	if !ok {
+		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider %q 不支援用量上限重置", domain.ErrConflict, providerID)
+	}
+	result, err := resetter.ConsumeRateLimitReset(ctx, idempotencyKey)
+	if err != nil {
+		return domain.ProviderResetResult{}, err
+	}
+	result.ProviderID = providerID
+	return result, nil
+}
+
 func (r *Router) ProviderUsage(providerID string) (domain.ProviderUsage, error) {
 	if r == nil {
 		return domain.ProviderUsage{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)

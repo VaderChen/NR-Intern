@@ -8,7 +8,7 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 ## 主要能力
 
-- 可擴充的 Provider Router，支援 OpenAI-compatible Chat Completions，以及使用 ChatGPT／Codex OAuth 的 OpenAI Codex Responses。
+- 可擴充的 Provider Router，支援 OpenAI-compatible Chat Completions，以及使用 ChatGPT／Codex OAuth 的 OpenAI Codex Responses。Codex 帳號若有用量上限重置額度，可在 Provider 設定直接兌換，確認前會揭露可用次數與最早到期時間。
 - `Workspace → Project → Session` 管理結構，以及每個對話獨立的 Provider 與模型選擇。
 - Workspace 與 Project 的職務說明：常駐工作規則只寫一次，之後每次對話與排程都自動帶入。
 - 多份有序工作計畫、拖曳排序、步驟狀態與工具驗證證據。

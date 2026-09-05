@@ -461,6 +461,31 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ProviderUsageEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/providers/{provider_id}/usage/reset:
+    parameters:
+      - in: path
+        name: provider_id
+        required: true
+        schema: { type: string }
+    post:
+      summary: 兌換一次用量上限重置
+      description: >
+        僅適用於以 ChatGPT／Codex OAuth 登入的 Provider。會消耗該帳號有限的重置額度且無法還原，
+        因此只應由使用者明確操作觸發，不得放入自動排程或預先擷取。連線中斷後重送請沿用同一個
+        Idempotency-Key，否則可能扣掉兩次額度。額度不足或先前已兌換都會以 200 加上對應的
+        outcome 回覆，不算錯誤。
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema: { type: string }
+      responses:
+        "200":
+          description: 兌換結果
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderResetResultEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/workspaces:
     get:
       summary: 列出 Workspaces
@@ -1334,7 +1359,7 @@ components:
         thinking_mode: { type: string, enum: [auto, none, minimal, low, medium, high, xhigh], description: 思考程度；空字串或 auto 恢復 Provider／後端預設。 }
         lock_plans: { type: boolean, description: 是否以 Session 為單位鎖定計畫；開啟時未完成計畫必須依序執行。 }
         permission_profile: { type: string, description: 只有後端設定 permissions.allow_client_choice=true 時才可指定，且必須是後端已宣告的 profile；否則回傳 400。 }
-        memory_scope: { type: string, description: 空字串會恢復 Agent 預設 scope。記憶體隔離專案的 Session 一律使用專案專屬 scope，此欄位對它無效。 }
+        memory_scope: { type: string, description: "空字串會恢復 Agent 預設 scope。記憶體隔離專案的 Session 一律使用專案專屬 scope，此欄位對它無效；project: 開頭的 scope 只准指向該 Session 自己的 Project，指向其他 Project 會被忽略。" }
         pinned: { type: boolean }
         position: { type: integer, minimum: 0 }
     Plan:
@@ -1835,6 +1860,21 @@ components:
         updated_at: { type: string, format: date-time }
         five_hour: { $ref: "#/components/schemas/ProviderUsageWindow" }
         seven_day: { $ref: "#/components/schemas/ProviderUsageWindow" }
+        reset_credits: { $ref: "#/components/schemas/ProviderResetCredits" }
+    ProviderResetCredits:
+      type: object
+      required: [available, count]
+      properties:
+        available: { type: boolean, description: 上游是否回報這項功能。false 代表這條路線沒有重置額度，與「剩下 0 次」不同。 }
+        count: { type: integer, format: int64 }
+        next_expires_at: { type: string, format: date-time, description: 最早到期的可用額度；已兌換或已過期的不列入。上游未提供明細時為空字串。 }
+    ProviderResetResult:
+      type: object
+      required: [provider_id, outcome, windows_reset]
+      properties:
+        provider_id: { type: string }
+        outcome: { type: string, enum: [reset, nothing_to_reset, no_credit, already_redeemed] }
+        windows_reset: { type: integer, format: int64 }
     ProviderTestResult:
       type: object
       required: [ok, tool_calling, provider_id, model, duration_milliseconds, usage]
@@ -2204,6 +2244,11 @@ components:
       required: [data]
       properties:
         data: { $ref: "#/components/schemas/ProviderUsage" }
+    ProviderResetResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data: { $ref: "#/components/schemas/ProviderResetResult" }
     ProviderTestResultEnvelope:
       type: object
       required: [data]

@@ -99,10 +99,32 @@ type ProviderUsageWindow struct {
 // ProviderUsage 保存每個 Provider 最近一次實際回應的用量標頭。
 // Codex primary／secondary 視窗分別呈現為 5 小時與 7 天；未回傳的視窗保持不可用。
 type ProviderUsage struct {
-	ProviderID string              `json:"provider_id"`
-	UpdatedAt  string              `json:"updated_at,omitempty"`
-	FiveHour   ProviderUsageWindow `json:"five_hour"`
-	SevenDay   ProviderUsageWindow `json:"seven_day"`
+	ProviderID   string               `json:"provider_id"`
+	UpdatedAt    string               `json:"updated_at,omitempty"`
+	FiveHour     ProviderUsageWindow  `json:"five_hour"`
+	SevenDay     ProviderUsageWindow  `json:"seven_day"`
+	ResetCredits ProviderResetCredits `json:"reset_credits"`
+}
+
+// ProviderResetCredits 是 ChatGPT／Codex 帳號可用的「用量上限重置」次數。
+//
+// Available 與 Count 分開：上游沒有回報這個欄位時（非 Codex 路線、或帳號沒有這項
+// 功能）Available 為 false，介面據此完全不顯示重置入口——而不是顯示一個「0 次」，
+// 那會讓使用者以為自己用完了。
+type ProviderResetCredits struct {
+	Available     bool   `json:"available"`
+	Count         int64  `json:"count"`
+	NextExpiresAt string `json:"next_expires_at,omitempty"`
+}
+
+// ProviderResetResult 是一次重置兌換的結果。
+//
+// Outcome 直接沿用上游代碼（reset／nothing_to_reset／no_credit／already_redeemed），
+// 由介面決定怎麼說；後端不把「沒有額度」翻譯成錯誤，那是正常結果而非失敗。
+type ProviderResetResult struct {
+	ProviderID   string `json:"provider_id"`
+	Outcome      string `json:"outcome"`
+	WindowsReset int64  `json:"windows_reset"`
 }
 
 // ProviderTestResult 是管理介面的最小實際模型請求結果。

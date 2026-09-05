@@ -7014,8 +7014,8 @@ function renderProviderSettings() {
   $("providerSettingAPIKey").value = "";
   $("providerSettingAPIKey").placeholder = settings.has_api_key ? "已設定；留空表示保留" : "尚未設定";
   $("providerSettingAPIKeyState").textContent = settings.has_api_key ? "API Key 已安全儲存，畫面不會顯示明文。" : "目前未設定 API Key；本機服務可保持空白。";
-  $("providerSettingClearKeyRow").classList.toggle("hidden", !settings.has_api_key || isNew);
-  $("providerSettingClearKey").checked = false;
+  $("providerSettingClearKey").classList.toggle("hidden", !settings.has_api_key || isNew);
+  $("providerSettingClearKey").setAttribute("aria-pressed", "false");
   $("providerSettingModel").value = settings.model || "";
 	$("providerSettingModel").dataset.configuredModel = settings.model || "";
   $("refreshProviderModels").disabled = isNew;
@@ -7077,6 +7077,8 @@ function renderProviderTypeFields(providerType, settings, isNew, providerID) {
 	$("providerSettingDisableStreamingField").classList.toggle("hidden", isCodex);
 	$("providerSettingStreamUsageField").classList.toggle("hidden", isCodex);
 	$("providerSettingOmitToolChoiceField").classList.toggle("hidden", isCodex);
+	// 切離 Codex 就收起重置入口，否則會殘留在不相干的 Provider 上。
+	if (!isCodex) hideProviderResetRateLimit();
 	if (isCodex) $("providerSettingDisableStreaming").checked = false;
 	$("connectProviderOAuth").disabled = isNew;
 	const connected = Boolean(settings.has_oauth_token);
@@ -7215,7 +7217,7 @@ function providerSettingFormValue() {
     };
     const apiKey = $("providerSettingAPIKey").value.trim();
     if (apiKey) provider.openai_compatible.api_key = apiKey;
-    if ($("providerSettingClearKey").checked) provider.openai_compatible.api_key = "";
+    if ($("providerSettingClearKey").getAttribute("aria-pressed") === "true") provider.openai_compatible.api_key = "";
   }
   return provider;
 }
@@ -7383,6 +7385,67 @@ function updateProviderOAuthStatusUI(status = {}) {
 	$("connectProviderOAuth").disabled = pending;
 	$("connectProviderOAuth").textContent = connected ? "重新登入 ChatGPT／Codex" : "使用 ChatGPT 帳號登入";
 	$("disconnectProviderOAuth").classList.toggle("hidden", !connected);
+	if (!connected) hideProviderResetRateLimit();
+}
+
+// hideProviderResetRateLimit 收起重置入口。切換 Provider 或斷線時一定要收，
+// 否則會把上一個帳號的可用次數顯示在這一個上。
+function hideProviderResetRateLimit() {
+	const button = $("providerResetRateLimit");
+	$("providerResetRateLimitField").classList.add("hidden");
+	button.disabled = false;
+	delete button.dataset.count;
+	delete button.dataset.expiresAt;
+	$("providerResetRateLimitHint").textContent = translate("用量上限");
+}
+
+// loadProviderResetRateLimit 讀取該帳號可用的「用量上限重置」次數。
+//
+// 上游沒有回報這個欄位時完全不顯示入口——顯示成「0 次」會讓使用者以為自己用完了，
+// 而實際上是這條路線沒有這項功能。
+async function loadProviderResetRateLimit(providerID) {
+	hideProviderResetRateLimit();
+	providerID = String(providerID || "").trim();
+	if (!providerID) return;
+	try {
+		const usage = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage`, { reconnects: 0 });
+		const credits = usage?.reset_credits;
+		if (!credits?.available) return;
+		if (state.selectedProviderSettingsID !== providerID) return;
+		const count = Number(credits.count) || 0;
+		const button = $("providerResetRateLimit");
+		const hint = $("providerResetRateLimitHint");
+		button.dataset.count = String(count);
+		button.dataset.expiresAt = String(credits.next_expires_at || "");
+		button.disabled = count <= 0;
+		$("providerResetRateLimitField").classList.remove("hidden");
+		// 數字擺在可翻譯句子之後，不把句子拆成片段——拆開的話其他語言語序會壞掉。
+		hint.textContent = count > 0
+			? `${translate("用量上限")} · ${translate("可用重置次數")}：${count}`
+			: `${translate("用量上限")} · ${translate("目前沒有可用的重置次數")}`;
+	} catch (_) {
+		// 讀不到額度不該影響其他設定，安靜略過即可。
+	}
+}
+
+// providerResetOutcomeMessage 把上游代碼翻成使用者看得懂的結果。
+// 「沒有額度」與「先前已完成」都是正常結果，不是錯誤。
+function providerResetOutcomeMessage(result) {
+	const windows = Number(result?.windows_reset) || 0;
+	switch (result?.outcome) {
+		case "reset":
+			return windows > 0
+				? `${translate("重置完成，已重置")} ${windows} ${translate("個用量視窗")}`
+				: translate("重置完成");
+		case "already_redeemed":
+			return translate("此重置請求先前已完成");
+		case "no_credit":
+			return translate("目前沒有可用的重置次數");
+		case "nothing_to_reset":
+			return translate("目前沒有需要重置的用量視窗");
+		default:
+			return translate("重置完成");
+	}
 }
 
 async function loadProviderOAuthStatus(providerID, { quiet = false } = {}) {
@@ -7395,6 +7458,7 @@ async function loadProviderOAuthStatus(providerID, { quiet = false } = {}) {
 	  }
 	  const provider = state.providerSettings?.providers?.find((item) => item.id === providerID);
 	  if (provider?.openai_codex_responses) provider.openai_codex_responses.has_oauth_token = status.status === "connected";
+	  if (status.status === "connected") void loadProviderResetRateLimit(providerID);
 	  return status;
 	} catch (error) {
 	  if (!quiet) toast(error.message);
@@ -8050,14 +8114,14 @@ function renderMCPSettings() {
   $("mcpSettingClearKey").setAttribute("aria-pressed", "false");
   $("mcpSettingClearKey").classList.toggle("hidden", !selected.has_api_key);
   $("mcpAPIKeyState").textContent = selected.has_api_key
-    ? "已儲存 MCP 金鑰；留空會保留，勾選下方選項可清除。"
+    ? "已儲存 MCP 金鑰；留空會保留，按下方按鈕可清除。"
     : "尚未儲存 MCP 金鑰；金鑰不會從後端讀回。";
   $("mcpSettingUsername").value = "";
   $("mcpSettingPassword").value = "";
   $("mcpSettingClearBasicAuth").setAttribute("aria-pressed", "false");
   $("mcpSettingClearBasicAuth").classList.toggle("hidden", !selected.has_basic_auth);
   $("mcpBasicAuthState").textContent = selected.has_basic_auth
-    ? "已儲存帳號密碼；留空會保留，勾選下方選項可清除。"
+    ? "已儲存帳號密碼；留空會保留，按下方按鈕可清除。"
     : "尚未儲存帳號密碼；帳密不會從後端讀回。";
   $("mcpSettingEnvironment").value = "";
   $("mcpSettingHeaders").value = "";
@@ -8332,13 +8396,13 @@ function renderReverseProxyStatus({ hydrate = false } = {}) {
     $("reverseProxyEndpoint").value = status.endpoint || "https://netpass.mars-cloud.com";
     $("reverseProxyName").value = status.name || "";
     $("reverseProxyAPIKey").value = "";
-    $("reverseProxyClearKey").checked = false;
+    $("reverseProxyClearKey").setAttribute("aria-pressed", "false");
     state.reverseProxyHydrated = true;
   }
   $("reverseProxyTargetPort").value = status.target_port || "—";
-  $("reverseProxyClearKeyRow").classList.toggle("hidden", !status.api_key_set);
+  $("reverseProxyClearKey").classList.toggle("hidden", !status.api_key_set);
   $("reverseProxyAPIKeyState").textContent = status.api_key_set
-    ? "已儲存 NetPass API Key；留空會保留，勾選下方選項可清除。"
+    ? "已儲存 NetPass API Key；留空會保留，按下方按鈕可清除。"
     : "尚未儲存 NetPass API Key；API Key 不會從後端讀回。";
 
   const badge = $("reverseProxyConnectionBadge");
@@ -8378,7 +8442,7 @@ async function persistReverseProxySettings({ showToast = true } = {}) {
       body: JSON.stringify({
         endpoint: $("reverseProxyEndpoint").value.trim(),
         api_key: apiKey,
-        clear_api_key: $("reverseProxyClearKey").checked,
+        clear_api_key: $("reverseProxyClearKey").getAttribute("aria-pressed") === "true",
         name: $("reverseProxyName").value.trim(),
       }),
     });
@@ -9067,11 +9131,14 @@ $("startReverseProxy").addEventListener("click", startReverseProxy);
 $("stopReverseProxy").addEventListener("click", stopReverseProxy);
 $("refreshReverseProxy").addEventListener("click", () => loadReverseProxyStatus());
 $("reverseProxyAPIKey").addEventListener("input", (event) => {
-  if (event.target.value) $("reverseProxyClearKey").checked = false;
+  if (event.target.value) $("reverseProxyClearKey").setAttribute("aria-pressed", "false");
   refreshReverseProxyControls();
 });
-$("reverseProxyClearKey").addEventListener("change", (event) => {
-  if (event.target.checked) $("reverseProxyAPIKey").value = "";
+$("reverseProxyClearKey").addEventListener("click", (event) => {
+  const button = event.currentTarget;
+  const clear = button.getAttribute("aria-pressed") !== "true";
+  button.setAttribute("aria-pressed", String(clear));
+  if (clear) $("reverseProxyAPIKey").value = "";
   refreshReverseProxyControls();
 });
 $("reverseProxyAcceptPolicy").addEventListener("change", refreshReverseProxyControls);
@@ -9140,11 +9207,47 @@ $("providerSettingModelCatalog").addEventListener("change", (event) => {
   }
   $("providerSettingModel").value = event.target.value;
 });
-$("providerSettingAPIKey").addEventListener("input", (event) => {
-  if (event.target.value) $("providerSettingClearKey").checked = false;
+// 兌換會消耗 ChatGPT 帳號的有限額度且無法還原，所以一定先確認。
+$("providerResetRateLimit").addEventListener("click", async () => {
+  const providerID = state.selectedProviderSettingsID;
+  if (!providerID) return;
+  const button = $("providerResetRateLimit");
+  const count = Number(button.dataset.count) || 0;
+  // 到期時間要揭露：額度會過期，使用者需要據此判斷「現在用」還是「留著」。
+  const expiry = button.dataset.expiresAt
+    ? formatProviderUsageReset(button.dataset.expiresAt, true)
+    : translate("上游未提供");
+  const message = [
+    translate("確定要使用 1 次用量上限重置嗎？此操作無法復原。"),
+    `${translate("目前可用")}：${count}`,
+    `${translate("最早到期")}：${expiry === "-" ? translate("上游未提供") : expiry}`,
+  ].join("\n");
+  if (!(await confirmAction(message))) return;
+  // 同一次嘗試沿用同一把鑰匙：連線中斷後重送才不會扣掉兩次額度。
+  if (!button.dataset.key) button.dataset.key = `reset-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  button.disabled = true;
+  try {
+    const result = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage/reset`, {
+      method: "POST",
+      headers: { "Idempotency-Key": button.dataset.key },
+      reconnects: 0,
+    });
+    delete button.dataset.key;
+    toast(providerResetOutcomeMessage(result));
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    await loadProviderResetRateLimit(providerID);
+  }
 });
-$("providerSettingClearKey").addEventListener("change", (event) => {
-  if (event.target.checked) $("providerSettingAPIKey").value = "";
+$("providerSettingAPIKey").addEventListener("input", (event) => {
+  if (event.target.value) $("providerSettingClearKey").setAttribute("aria-pressed", "false");
+});
+$("providerSettingClearKey").addEventListener("click", (event) => {
+  const button = event.currentTarget;
+  const clear = button.getAttribute("aria-pressed") !== "true";
+  button.setAttribute("aria-pressed", String(clear));
+  if (clear) $("providerSettingAPIKey").value = "";
 });
 $("refreshTools").addEventListener("click", loadTools);
 $("refreshAudit").addEventListener("click", () => loadAudit(true));

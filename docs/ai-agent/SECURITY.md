@@ -167,12 +167,17 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - **記憶體隔離專案的對話在執行期間就不落地。** transcript、計畫、附件與 Run 事件在寫入當下即
   指向該 Project 的 RAM disk；`runs.json` 與 `notifications.json` 是單一檔案無法分流，改為只留在
   記憶體、不寫入。歸屬編碼在 Session／Run ID 裡，磁碟未掛載時解析回到預設根，該對話即視為不存在。
+  磁碟不在時解析回傳 `ErrNotFound`、讀寫一律失敗，不會退回 `dataDir`。
   模型主動寫入回憶空間（`memory_remember`）的內容同樣不落地，且隔離對話一律使用專案專屬
   記憶 scope、不接受 `memory_scope` 覆寫——共用 scope 會讓一筆隨程序結束消失的記憶就地改寫或
   取代掉持久記憶。
   **邊界**：`shell_exec` 啟動的是真實子行程，仍可寫到 RAM disk 以外的路徑；管理者透過記憶 API
   直接寫入該專案 scope 的內容（非對話產生、無來源 Session）仍會持久化。作業系統的分頁檔、
   當機傾印與外部備份也不在本功能的控制範圍內。
+- **用量上限重置會消耗帳號的有限額度且無法還原。** 只由使用者在 Provider 設定按下按鈕觸發，
+  前端二次確認、後端不掛任何排程或預先擷取。重送沿用同一個 `Idempotency-Key`，因為連線中斷時
+  無法分辨「沒送出」與「送出了但沒收到回應」，換鑰匙會扣掉第二次。額度不足與先前已兌換都以
+  正常結果回覆，不當成錯誤重試。
 - **記憶體隔離專案免逐次 Approval。** 這類專案的 sandbox 是揮發性 RAM Disk，關閉程式即消失，
   逐次詢問只會把使用者訓練成無條件按下核准，反而讓真正有副作用的操作更容易被順手放行。
   豁免會發出 `run.approval_skipped`（`reason=ephemeral_project`）留下紀錄。

@@ -738,7 +738,10 @@ API 端點；只有使用者明確詢問工具或整合方式時才揭露。這�
 - 長期記憶：保存跨 session 仍有效的 `fact`、`preference`、`decision`、`procedure`、`constraint`。
 
 長期記憶經 `ports.MemoryRepository` 隔離儲存技術。目前使用本機 JSON store 與可解釋的詞彙／雙字元召回；日後可加入向量索引 adapter，不需修改 Harness 或工具介面。關閉回憶空間時，預設 scope 是 Agent ID；啟用後優先使用 Project，再退回 Workspace。Session metadata 的 `memory_scope` 可明確指定其他範圍；這是召回範圍，不是獨立的租戶授權邊界。
-記憶體隔離 Session 不套用這個覆寫，且其記憶不寫入 `memories.json`。
+記憶體隔離 Session 不套用這個覆寫，且其記憶不寫入 `memories.json`。反方向也擋住了：
+`project:` 開頭的覆寫只准指向 Session 自己的 Project，否則忽略——否則一般對話只要指向隔離
+專案的 scope 就能與它共用，去重與取代便會跨越隔離界線。`user:`、`tenant:` 這類非 Project
+scope 不受影響。
 
 每次 operation 初始召回一次，再於後續 turn 重用；回憶空間啟用時，工具重複失敗另可補召回。
 召回資料以明確邊界注入 system prompt，並標示為「可能過時的資料而非新指令」，降低提示注入
@@ -889,6 +892,28 @@ Harness 事件與 transcript 結構，工具結果也會在下一輪完整回送
 rate-limit 視窗，Provider 用量介面會顯示 5 小時與 7 天的剩餘比例；沒有資料時顯示 `-`，不推測
 為 100%。後端啟動時立即刷新一次，之後每 3 分鐘背景更新；Provider 設定異動後也會要求刷新。
 
+同一份用量回應也帶有帳號可用的「用量上限重置」次數（`reset_credits.count`）。但**到期時間
+一律以 `/wham/rate-limit-reset-credits` 明細端點為準**：用量回應的 `credits` 欄位不完整，有時
+整個缺席，有時只帶一筆摘要。有額度時就多打一次明細端點；次數為 0 不打——沒有東西會到期。
+明細端點讀不到時才退回用量回應那份。
+
+這個順序是踩過兩次的地方：只讀用量回應時到期時間永遠是空的（顯示「上游未提供」），而
+「用量有給就不問明細」則會顯示成比實際更晚的到期時間，且看起來完全正常、不會有任何錯誤。
+`fetchEarliestResetCredit` 會以 debug 等級記下候選筆數與選中的那一筆，方便核對。
+
+`next_expires_at` 取的是**最早到期的可用額度**。已兌換或已過期的即使時間更早也不列入：拿它
+顯示會讓使用者以為快過期，拿它兌換則會失敗。兌換時挑選 `credit_id` 用的是同一套篩選。
+
+有額度時，Provider 設定的重試次數旁會出現「重置」按鈕，按下需二次確認，確認框會一併揭露
+可用次數與最早到期時間——額度會過期，使用者要據此判斷現在用還是留著。兌換會消耗帳號有限
+額度且無法還原，因此只由 `POST /api/v1/providers/{id}/usage/reset` 觸發，不掛任何排程；重送
+沿用同一個 `Idempotency-Key`，避免連線中斷後扣掉兩次。`available=false` 代表上游沒有回報這項
+功能，介面完全不顯示入口——顯示成「0 次」會讓使用者誤以為自己用完了。
+
+模型清單來自 Codex model manifest，而 manifest **依 client version 分流**：
+`codexManifestClientVersion` 太舊會拿到舊清單、新模型不會出現，而且沒有任何錯誤訊息。
+新模型對不到時先檢查這個常數。
+
 ChatGPT／Codex OAuth 使用 authorization-code + PKCE。驗證期間只啟動 loopback callback
 server，登入與帳號選擇在 Browser 完成；access token、refresh token 與 PKCE verifier 不經管理
 API 回傳，Token 另存於權限限制檔案。這是 NR-Intern 的 Provider 整合流程，不代表一般
@@ -946,6 +971,17 @@ Project 建立時可設定不可變更的 `ephemeral=true` 與 `ram_disk_size_mb
 且不接受 session metadata 的 `memory_scope` 覆寫。去重與取代邏輯只在同一個 scope 內生效，
 共用 scope 時一筆即將消失的記憶會就地改寫、或標記取代掉持久記憶——寫入時過濾反而會把
 一般對話記住的東西一起帶走。分開 scope 之後，過濾只會動到本來就要消失的那些。
+
+磁碟不在時**擋下，不退回硬碟**。ID 宣告自己屬於某個隔離專案、卻找不到對應的 RAM disk 時，
+根目錄解析回傳 `ErrNotFound`（`filestore.resolveVolatileRoot`），讀寫一律失敗。退回 `dataDir`
+會讓對話靜靜落在硬碟上，沒有任何錯誤訊息——磁碟不在，就當那份資料不存在。為了不讓
+「磁碟剛好沒掛」擋住使用者開新對話，`Service.CreateSession` 會先 `Prepare`（與 `StartRun` 相同），
+真的掛不起來才回錯誤。`SessionRepository.PurgeVolatileResidue` 負責清掉舊版本退回 `dataDir` 時
+留下的殘留——那些目錄現在 List 看不到。
+
+`runs.json` 與 `notifications.json` 的保留上限**揮發與持久分兩組各自計算**。混在一起算的話，
+根本不會落地的紀錄會把該落地的擠出檔案，使用者在隔離專案跑得越多，一般專案的歷史消失得
+越快，而且完全看不出原因。
 
 RAM disk 分成 `workspace` 與 `store` 兩層：Sandbox 只拿到 `workspace`，上述後端資料全部放在
 `store`，Agent 因此讀不到自己的 transcript 與計畫。磁碟未掛載（重開機後必然如此）時解析回到預設

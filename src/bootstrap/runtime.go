@@ -501,6 +501,7 @@ func Build(config Config) (*Runtime, error) {
 		StopReverseProxy:        runtime.StopReverseProxy,
 		ProviderModels:          runtime.ProviderModels,
 		ProviderUsage:           runtime.ProviderUsage,
+		ProviderRateLimitReset:  runtime.ConsumeProviderRateLimitReset,
 		TestProvider:            runtime.TestProvider,
 		StartProviderOAuth:      runtime.StartProviderOAuth,
 		ProviderOAuthStatus:     runtime.ProviderOAuthStatus,
@@ -528,6 +529,23 @@ func (r *Runtime) ProviderUsage(ctx context.Context, providerID string) (domain.
 		return domain.ProviderUsage{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
 	}
 	return r.Model.ProviderUsage(providerID)
+}
+
+// ConsumeProviderRateLimitReset 兌換一次用量上限重置。
+//
+// 這會消耗使用者 ChatGPT 帳號的有限額度且無法還原，因此只由明確的 API 呼叫觸發，
+// 不掛任何排程；idempotencyKey 空白時由後端補一組，讓單次點擊仍有重試保護。
+func (r *Runtime) ConsumeProviderRateLimitReset(ctx context.Context, providerID, idempotencyKey string) (domain.ProviderResetResult, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.ProviderResetResult{}, err
+	}
+	if r == nil || r.Model == nil {
+		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		idempotencyKey = domain.NewID("reset")
+	}
+	return r.Model.ConsumeRateLimitReset(ctx, providerID, idempotencyKey)
 }
 
 func (r *Runtime) ServiceSettings(ctx context.Context) (domain.ServiceSettings, error) {
