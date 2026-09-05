@@ -19,8 +19,13 @@ const (
 )
 
 const (
-	codexModelsEndpoint        = "https://chatgpt.com/backend-api/codex/models"
-	codexManifestClientVersion = "0.150.0"
+	codexModelsEndpoint = "https://chatgpt.com/backend-api/codex/models"
+	// codexManifestClientVersion 決定上游回傳哪一份模型清單。
+	//
+	// manifest 是依 client version 分流的：版本太舊會拿到舊的清單，新模型不會出現，
+	// 而且不會有任何錯誤——看起來就只是「模型沒有更新」。新模型上線後對不到時，
+	// 這裡是第一個要檢查的地方。對照 Codex CLI 目前的版本更新即可。
+	codexManifestClientVersion = "0.153.0"
 )
 
 // ListModels 讀取 OpenAI-compatible 的模型目錄。
