@@ -89,14 +89,36 @@ func terminalRunStatus(status domain.RunStatus) bool {
 	}
 }
 
+// volatileRun 判斷這個 run 是否屬於記憶體隔離對話（因此不會寫進 runs.json）。
+func volatileRun(run domain.Run) bool {
+	return domain.EphemeralProjectCodeFromID(run.SessionID) != ""
+}
+
 // pruneLocked 把 run 數量壓回上限，最舊的先淘汰。回傳是否有變動。
+//
+// 揮發與持久分兩組各自計算上限。混在一起算的話，根本不會落地的 run 會把該落地
+// 的擠出 runs.json——使用者在隔離專案跑得越多，一般專案的歷史消失得越快，而且
+// 完全看不出原因。分開之後兩邊互不影響，揮發那組也仍有上限，不會無限成長。
 func (r *RunRepository) pruneLocked() bool {
-	if r.retention <= 0 || len(r.runs) <= r.retention {
+	if r.retention <= 0 {
 		return false
 	}
+	before := len(r.pruned)
+	r.pruneGroupLocked(false)
+	r.pruneGroupLocked(true)
+	return len(r.pruned) > before
+}
+
+func (r *RunRepository) pruneGroupLocked(volatile bool) {
 	ordered := make([]domain.Run, 0, len(r.runs))
 	for _, run := range r.runs {
+		if volatileRun(run) != volatile {
+			continue
+		}
 		ordered = append(ordered, run)
+	}
+	if len(ordered) <= r.retention {
+		return
 	}
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt.Before(ordered[j].CreatedAt) })
 	for index := 0; index < len(ordered)-r.retention; index++ {
@@ -108,7 +130,6 @@ func (r *RunRepository) pruneLocked() bool {
 		delete(r.runs, ordered[index].ID)
 		r.pruned = append(r.pruned, ordered[index].ID)
 	}
-	return len(r.pruned) > 0
 }
 
 func (r *RunRepository) Save(_ context.Context, run domain.Run) error {
@@ -230,7 +251,7 @@ func (r *RunRepository) load() error {
 func (r *RunRepository) persistableRunsLocked() map[string]domain.Run {
 	volatile := 0
 	for _, run := range r.runs {
-		if domain.EphemeralProjectCodeFromID(run.SessionID) != "" {
+		if volatileRun(run) {
 			volatile++
 		}
 	}
@@ -239,7 +260,7 @@ func (r *RunRepository) persistableRunsLocked() map[string]domain.Run {
 	}
 	values := make(map[string]domain.Run, len(r.runs)-volatile)
 	for id, run := range r.runs {
-		if domain.EphemeralProjectCodeFromID(run.SessionID) != "" {
+		if volatileRun(run) {
 			continue
 		}
 		values[id] = run

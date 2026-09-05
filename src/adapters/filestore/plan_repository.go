@@ -43,16 +43,17 @@ func (r *PlanRepository) SetProjectRoots(roots ProjectRoots) {
 //
 // 額外的根底下再開一層 plans，讓 RAM disk 的結構與 dataDir 一致；
 // 直接把檔案灑在根目錄會和其他後端資料混在一起。
-func (r *PlanRepository) planRootFor(sessionID string) string {
-	roots := r.roots.Load()
-	if roots == nil {
-		return r.root
+//
+// 磁碟不在時回傳錯誤而不是退回 dataDir，理由見 resolveVolatileRoot。
+func (r *PlanRepository) planRootFor(sessionID string) (string, error) {
+	root, routed, err := resolveVolatileRoot(&r.roots, sessionID, r.root)
+	if err != nil {
+		return "", err
 	}
-	resolved := strings.TrimSpace((*roots).RootFor(sessionID))
-	if resolved == "" {
-		return r.root
+	if !routed {
+		return root, nil
 	}
-	return filepath.Join(resolved, "plans")
+	return filepath.Join(root, "plans"), nil
 }
 
 type planFile struct {
@@ -453,7 +454,10 @@ func (r *PlanRepository) path(sessionID string) (string, error) {
 		return "", fmt.Errorf("%w: session id is required", domain.ErrInvalidInput)
 	}
 	name := base64.RawURLEncoding.EncodeToString([]byte(sessionID)) + ".json"
-	root := r.planRootFor(sessionID)
+	root, err := r.planRootFor(sessionID)
+	if err != nil {
+		return "", err
+	}
 	// 隔離專案的計畫目錄要用時才建：RAM disk 可能還沒掛載，啟動時一律建立
 	// 會在磁碟不存在時失敗。
 	if root != r.root {

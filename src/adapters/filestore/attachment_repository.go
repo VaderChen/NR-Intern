@@ -175,11 +175,9 @@ func (r *AttachmentRepository) attachmentDir(sessionID, attachmentID string) (st
 	if !safeStoreID(sessionID, "session_") || !safeStoreID(attachmentID, "attachment_") {
 		return "", fmt.Errorf("%w: invalid session or attachment id", domain.ErrInvalidInput)
 	}
-	root := r.sessionsRoot
-	if roots := r.roots.Load(); roots != nil {
-		if resolved := strings.TrimSpace((*roots).RootFor(sessionID)); resolved != "" {
-			root = resolved
-		}
+	root, _, err := resolveVolatileRoot(&r.roots, sessionID, r.sessionsRoot)
+	if err != nil {
+		return "", err
 	}
 	return filepath.Join(root, sessionID, "workspace", attachmentDirectory, attachmentID), nil
 }

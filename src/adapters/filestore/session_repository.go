@@ -99,16 +99,26 @@ func (r *SessionRepository) newSessionID(projectID string) string {
 	return domain.NewID("session")
 }
 
-// rootFor 回傳指定 session 應該使用的根目錄。
-func (r *SessionRepository) rootFor(sessionID string) string {
-	roots := r.roots.Load()
-	if roots == nil {
-		return r.root
+// resolveVolatileRoot 解析 ID 應該使用的根目錄，供本套件各儲存共用。
+//
+// routed 為 true 代表落在額外的根（RAM disk），呼叫端可據此再往下開子目錄。
+//
+// ID 宣告自己屬於記憶體隔離專案、卻找不到對應的根目錄時回傳錯誤，而不是退回
+// fallback。退回等於把該對話寫上硬碟——那正是這個功能保證不會發生的事，而且
+// 不會有任何錯誤訊息，使用者要到重啟後才會發現資料還在。磁碟不在，就當那份
+// 資料不存在。
+func resolveVolatileRoot(roots *atomic.Pointer[ProjectRoots], id, fallback string) (root string, routed bool, err error) {
+	loaded := roots.Load()
+	if loaded == nil {
+		return fallback, false, nil
 	}
-	if resolved := strings.TrimSpace((*roots).RootFor(sessionID)); resolved != "" {
-		return resolved
+	if resolved := strings.TrimSpace((*loaded).RootFor(id)); resolved != "" {
+		return resolved, true, nil
 	}
-	return r.root
+	if domain.EphemeralProjectCodeFromID(id) != "" {
+		return "", false, fmt.Errorf("%w: %q 所屬記憶體隔離專案的 RAM disk 未掛載", domain.ErrNotFound, id)
+	}
+	return fallback, false, nil
 }
 
 // searchRoots 回傳列舉 session 時要掃描的所有根目錄，預設根排在最前面。
@@ -834,7 +844,41 @@ func (r *SessionRepository) sessionDir(sessionID string) (string, error) {
 	if sessionID == "" || sessionID == "." || sessionID == ".." || filepath.Base(sessionID) != sessionID || strings.ContainsAny(sessionID, `/\\`) {
 		return "", fmt.Errorf("%w: invalid session id", domain.ErrInvalidInput)
 	}
-	return filepath.Join(r.rootFor(sessionID), sessionID), nil
+	root, _, err := resolveVolatileRoot(&r.roots, sessionID, r.root)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, sessionID), nil
+}
+
+// PurgeVolatileResidue 刪除預設根底下宣稱屬於記憶體隔離專案的 session 目錄。
+//
+// 正確路由的隔離對話只存在於 RAM disk 上，所以 dataDir 出現這種目錄一定是殘留：
+// 舊版本在磁碟未掛載時會靜靜退回 dataDir。這些目錄現在靠 List 找不到（根目錄
+// 解析會直接失敗），所以另外掃一次，否則它們會永遠留在硬碟上。
+func (r *SessionRepository) PurgeVolatileResidue() (int, error) {
+	entries, err := os.ReadDir(r.root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("scan session store: %w", err)
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || domain.EphemeralProjectCodeFromID(entry.Name()) == "" {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(r.root, entry.Name())); err != nil {
+			return removed, fmt.Errorf("delete memory-isolated session residue: %w", err)
+		}
+		r.mu.Lock()
+		delete(r.indexes, entry.Name())
+		delete(r.sequences, entry.Name())
+		r.mu.Unlock()
+		removed++
+	}
+	return removed, nil
 }
 
 func (r *SessionRepository) sessionLock(sessionID string) *sync.Mutex {

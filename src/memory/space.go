@@ -107,6 +107,24 @@ func (c SpaceConfig) Admit(input domain.RememberMemoryInput) error {
 // 覆寫。與一般對話共用 scope 會壞掉兩件事——內容會留在硬碟上的 memories.json，
 // 以及去重與取代邏輯只在同一個 scope 內生效：共用時，一筆隨程序結束就消失的
 // 記憶會就地改寫、或標記取代掉持久記憶，等於把持久那筆一起帶走。
+// allowedMemoryScopeOverride 擋下指向別的 Project 的 scope 覆寫。
+//
+// 隔離專案的 scope 就是 project:<該專案 ID>。一般對話若能指過去，兩者就共用
+// scope，而去重與取代只在同一個 scope 內生效：同內容的記憶會被就地合併並改寫
+// 來源，於是隔離對話的內容被寫進 memories.json，或反過來讓持久記憶跟著那筆
+// 揮發的一起消失。單靠「隔離對話用自己的 scope」擋不住這條路徑，因為是一般
+// 對話主動指過去的。
+//
+// 規則刻意做得單純：只准指自己的 Project，不必查詢哪些 Project 是隔離的。
+// user:、tenant: 這類非 Project scope 完全不受影響。
+func allowedMemoryScopeOverride(session domain.Session, scope string) bool {
+	target, isProjectScope := strings.CutPrefix(scope, "project:")
+	if !isProjectScope {
+		return true
+	}
+	return strings.TrimSpace(target) == strings.TrimSpace(session.ProjectID)
+}
+
 func ScopeForSessionWithSpace(session domain.Session, spaceEnabled bool) string {
 	if code := domain.EphemeralProjectCodeFromID(session.ID); code != "" {
 		if value := strings.TrimSpace(session.ProjectID); value != "" {
@@ -116,7 +134,7 @@ func ScopeForSessionWithSpace(session domain.Session, spaceEnabled bool) string 
 	}
 	if session.Metadata != nil {
 		if value, ok := session.Metadata["memory_scope"].(string); ok {
-			if value = strings.TrimSpace(value); value != "" {
+			if value = strings.TrimSpace(value); value != "" && allowedMemoryScopeOverride(session, value) {
 				return value
 			}
 		}

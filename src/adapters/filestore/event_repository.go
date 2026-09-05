@@ -234,23 +234,25 @@ func (r *RunEventRepository) eventPath(runID string) (string, error) {
 	if runID == "" || runID == "." || runID == ".." || filepath.Base(runID) != runID || strings.ContainsAny(runID, `/\\`) {
 		return "", fmt.Errorf("%w: invalid run id", domain.ErrInvalidInput)
 	}
-	return filepath.Join(r.eventRoot(runID), runID+".jsonl"), nil
+	root, err := r.eventRoot(runID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, runID+".jsonl"), nil
 }
 
 // eventRoot 回傳指定 run 的事件目錄。
 //
-// 隔離專案的 RAM disk 尚未掛載（重開機後必然如此）時回到預設根：該 run 的
-// 事件檔本來就不在那裡，讀取會得到空事件流，正是揮發語意要的結果。
-func (r *RunEventRepository) eventRoot(runID string) string {
-	roots := r.roots.Load()
-	if roots == nil {
-		return r.root
+// 磁碟不在時回傳錯誤而不是退回 dataDir，理由見 resolveVolatileRoot。
+func (r *RunEventRepository) eventRoot(runID string) (string, error) {
+	root, routed, err := resolveVolatileRoot(&r.roots, runID, r.root)
+	if err != nil {
+		return "", err
 	}
-	resolved := strings.TrimSpace((*roots).RootFor(runID))
-	if resolved == "" {
-		return r.root
+	if !routed {
+		return root, nil
 	}
-	return filepath.Join(resolved, "runs", "events")
+	return filepath.Join(root, "runs", "events"), nil
 }
 
 func (r *RunEventRepository) runLock(runID string) *sync.RWMutex {

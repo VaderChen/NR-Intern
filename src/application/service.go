@@ -179,6 +179,9 @@ func (s *Service) CreateSession(ctx context.Context, agentID string, input domai
 	if err := s.validateSessionPlacement(ctx, input.WorkspaceID, input.ProjectID); err != nil {
 		return domain.Session{}, err
 	}
+	if err := s.ensureEphemeralProjectReady(ctx, input.ProjectID); err != nil {
+		return domain.Session{}, err
+	}
 	workspace, err := s.workspaces.Get(ctx, input.WorkspaceID)
 	if err != nil {
 		return domain.Session{}, err
@@ -414,6 +417,36 @@ func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectI
 //
 // 這個限制同時是儲存分流的前提：對話的根目錄在建立時決定且永不改變，
 // 查詢時才不需要一份 sessionID 到專案的映射。
+// ensureEphemeralProjectReady 在建立對話前確保隔離專案的 RAM disk 已掛載。
+//
+// 對話的儲存位置由 Session ID 決定，磁碟不在時根目錄解析會失敗（見
+// filestore.resolveVolatileRoot）——那是刻意的，退回硬碟等於讓這個功能失效。
+// 但「磁碟剛好沒掛」不該讓使用者無法開新對話，所以這裡先把它準備好；
+// 真的掛不起來就明確擋下，絕不悄悄改用硬碟。
+//
+// StartRun 也會做同一件事（見組裝 sandbox 根目錄處），但那太晚了：對話目錄
+// 在建立當下就寫出去了。
+func (s *Service) ensureEphemeralProjectReady(ctx context.Context, projectID string) error {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return nil
+	}
+	project, err := s.projects.Get(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	if !project.Ephemeral {
+		return nil
+	}
+	if s.ephemeralProjects == nil {
+		return fmt.Errorf("%w: memory-isolated project support is unavailable", domain.ErrConflict)
+	}
+	if _, err := s.ephemeralProjects.Prepare(ctx, project.ID, project.RAMDiskSizeMB); err != nil {
+		return fmt.Errorf("prepare memory-isolated project: %w", err)
+	}
+	return nil
+}
+
 func (s *Service) validateEphemeralSessionMove(ctx context.Context, fromProjectID, toProjectID string) error {
 	for _, projectID := range []string{fromProjectID, toProjectID} {
 		if strings.TrimSpace(projectID) == "" {

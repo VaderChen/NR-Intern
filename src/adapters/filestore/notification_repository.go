@@ -66,16 +66,35 @@ func (r *NotificationRepository) Save(ctx context.Context, value domain.Notifica
 		value.Metadata = cloneAnyMap(value.Metadata)
 	}
 	r.items[value.ID] = value
+	// 揮發與持久分兩組各自計算上限。混在一起算的話，根本不會落地的通知會把該
+	// 落地的擠出 notifications.json——隔離專案跑得越久，一般專案的通知消失得越
+	// 快，而且完全看不出原因。分開之後兩邊互不影響，揮發那組也仍有上限。
+	r.trimLocked(true)
+	r.trimLocked(false)
+	return r.persistLocked()
+}
+
+func (r *NotificationRepository) trimLocked(volatile bool) {
 	values := make([]domain.Notification, 0, len(r.items))
 	for _, item := range r.items {
+		if volatileNotification(item) != volatile {
+			continue
+		}
 		values = append(values, item)
+	}
+	if len(values) <= maxStoredNotifications {
+		return
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i].CreatedAt.Before(values[j].CreatedAt) })
 	for len(values) > maxStoredNotifications {
 		delete(r.items, values[0].ID)
 		values = values[1:]
 	}
-	return r.persistLocked()
+}
+
+// volatileNotification 判斷這則通知是否屬於記憶體隔離對話（因此不會落地）。
+func volatileNotification(item domain.Notification) bool {
+	return domain.EphemeralProjectCodeFromID(item.SessionID) != ""
 }
 
 func (r *NotificationRepository) List(ctx context.Context, limit int, unreadOnly bool) ([]domain.Notification, error) {
@@ -203,7 +222,7 @@ func (r *NotificationRepository) persistLocked() error {
 	items := make(map[string]domain.Notification, len(r.items))
 	dedupeKeys := make(map[string]string)
 	for id, item := range r.items {
-		if domain.EphemeralProjectCodeFromID(item.SessionID) != "" {
+		if volatileNotification(item) {
 			continue
 		}
 		items[id] = item

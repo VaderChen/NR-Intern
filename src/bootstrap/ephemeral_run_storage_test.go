@@ -346,3 +346,55 @@ func seedEveryStore(
 		t.Fatalf("remember: %v", err)
 	}
 }
+
+// 隔離對話用自己的 scope 只擋住一半：漏的是一般對話主動把 memory_scope 指過去。
+// 那條路徑會讓兩者共用 scope，去重與取代就能跨越隔離界線。
+func TestMemoryScopeOverrideCannotTargetAnotherProject(t *testing.T) {
+	volatileScope := "project:" + volatileProjectID
+	normal := func(scope string) domain.Session {
+		return domain.Session{
+			ID: "session_normal", ProjectID: "project_other", AgentID: "agent-default",
+			Metadata: map[string]any{"memory_scope": scope},
+		}
+	}
+	cases := []struct {
+		name         string
+		session      domain.Session
+		wantSpaceOn  string
+		wantSpaceOff string
+	}{
+		{
+			// 覆寫被忽略後走預設解析：開啟回憶空間時收斂到自己的 Project，
+			// 關閉時退回 Agent scope——兩者都不會是隔離專案的 scope。
+			name:         "指向隔離專案的 scope 會被忽略",
+			session:      normal(volatileScope),
+			wantSpaceOn:  "project:project_other",
+			wantSpaceOff: "agent-default",
+		},
+		{
+			name:         "指向自己的專案照常生效",
+			session:      normal("project:project_other"),
+			wantSpaceOn:  "project:project_other",
+			wantSpaceOff: "project:project_other",
+		},
+		{
+			name:         "非 Project scope 不受影響",
+			session:      normal("tenant:acme"),
+			wantSpaceOn:  "tenant:acme",
+			wantSpaceOff: "tenant:acme",
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			for spaceEnabled, want := range map[bool]string{true: testCase.wantSpaceOn, false: testCase.wantSpaceOff} {
+				got := memory.ScopeForSessionWithSpace(testCase.session, spaceEnabled)
+				if got != want {
+					t.Fatalf("space=%v：scope 應為 %q，得到 %q", spaceEnabled, want, got)
+				}
+				if got == volatileScope {
+					t.Fatalf("space=%v：一般對話不該落在隔離專案的 scope", spaceEnabled)
+				}
+			}
+		})
+	}
+}
