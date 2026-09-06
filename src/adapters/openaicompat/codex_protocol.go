@@ -32,10 +32,11 @@ type codexInputItem struct {
 	Name      string             `json:"name,omitempty"`
 	Arguments string             `json:"arguments,omitempty"`
 	// Output 用指標而不是 string：function_call_output 的 output 是**必填**，
-	// 但工具結果可能是空字串（沒有輸出的指令、沒有命中的搜尋）。用 string 搭配
-	// omitempty 時整個欄位會消失，上游直接回 400
-	// 「Missing required parameter: 'input[N].output'」，整個 Run 就死在那裡。
-	// 指標讓「空字串」與「沒有這個欄位」分得開。
+	// 而 string 搭配 omitempty 會在空字串時讓整個欄位消失。指標讓「空字串」
+	// 與「沒有這個欄位」分得開。
+	//
+	// 但光是分得開還不夠——上游把**空字串也當成缺少參數**，同樣回 400。
+	// 因此空結果一律代換成 emptyToolResult，見 codexInput。
 	Output *string `json:"output,omitempty"`
 }
 
@@ -95,6 +96,13 @@ func codexInstructions(request domain.ModelRequest) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// emptyToolResult 代替空的工具結果送給上游。
+//
+// Codex Responses 的 function_call_output.output 是必填，而且「必填」包含
+// 不接受空字串：欄位存在但為空，仍然回 400 Missing required parameter。
+// 沒有輸出的指令、沒有命中的搜尋都會產生空結果，因此這不是罕見情況。
+const emptyToolResult = "[工具執行完成，但沒有任何輸出。]"
+
 func codexInput(request domain.ModelRequest) []codexInputItem {
 	items := make([]codexInputItem, 0, len(request.History)*2+2)
 	appendMessage := func(role, text string) {
@@ -129,7 +137,14 @@ func codexInput(request domain.ModelRequest) []codexInputItem {
 			}
 		case "tool":
 			if callID := strings.TrimSpace(message.ToolCallID); callID != "" {
+				// 空結果要換成明確的文字。上游對 output 的要求不只是「欄位存在」，
+				// 空字串一樣會回 400 Missing required parameter——實測用
+				// "output":"" 仍然被拒。順帶讓模型看得出「這個工具沒有輸出」，
+				// 而不是收到一段空白自己揣測。
 				output := message.Content
+				if strings.TrimSpace(output) == "" {
+					output = emptyToolResult
+				}
 				items = append(items, codexInputItem{Type: "function_call_output", CallID: callID, Output: &output})
 			} else {
 				appendMessage("user", message.Content)

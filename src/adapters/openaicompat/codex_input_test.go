@@ -7,10 +7,11 @@ import (
 	"testing"
 )
 
-// function_call_output 的 output 是必填。工具結果為空字串時（沒有輸出的指令、
-// 沒有命中的搜尋）若讓欄位消失，上游會回
-// 「400 Missing required parameter: 'input[N].output'」，整個 Run 就死在那裡——
-// 實際發生過，而且要跑到第 40 個項目才炸，前面的工作全部作廢。
+// function_call_output 的 output 是必填，而且「必填」包含不接受空字串。
+//
+// 實測兩階段：欄位被 omitempty 拿掉時回 400；改成一定送出但值為 "" 時，
+// **仍然**回 400 Missing required parameter。所以空結果必須代換成明確文字。
+// 這個錯誤要跑到第 40 個項目才炸，前面的工作全部作廢。
 func TestCodexInputKeepsOutputFieldForEmptyToolResult(t *testing.T) {
 	items := codexInput(domain.ModelRequest{
 		History: []domain.Message{
@@ -27,8 +28,12 @@ func TestCodexInputKeepsOutputFieldForEmptyToolResult(t *testing.T) {
 	if !strings.Contains(body, `"type":"function_call_output"`) {
 		t.Fatalf("應產生 function_call_output：%s", body)
 	}
-	if !strings.Contains(body, `"output":""`) {
-		t.Fatalf("空工具結果仍必須送出 output 欄位：%s", body)
+	// 欄位存在還不夠：上游把空字串也當成缺少參數，實測 "output":"" 仍回 400。
+	if strings.Contains(body, `"output":""`) {
+		t.Fatalf("空字串仍會被上游當成缺少參數，必須代換成明確文字：%s", body)
+	}
+	if !strings.Contains(body, emptyToolResult) {
+		t.Fatalf("空工具結果應代換成 emptyToolResult：%s", body)
 	}
 }
 
