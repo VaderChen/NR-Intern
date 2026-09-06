@@ -28,6 +28,7 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 	if err != nil {
 		return domain.ModelResponse{}, fmt.Errorf("encode Codex Responses request: %w", err)
 	}
+	inputShape := DescribeCodexInput(payload.Input)
 
 	var lastErr error
 	for attempt := 1; attempt <= m.maxAttempts; attempt++ {
@@ -44,7 +45,7 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 				return nil
 			}
 		}
-		result, retryAfter, attemptErr := m.executeCodexAttempt(ctx, body, modelName, request.SessionID, attemptSink)
+		result, retryAfter, attemptErr := m.executeCodexAttempt(ctx, body, modelName, request.SessionID, inputShape, attemptSink)
 		if attemptErr == nil {
 			return result, nil
 		}
@@ -86,7 +87,10 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 	return domain.ModelResponse{}, lastErr
 }
 
-func (m *Model) executeCodexAttempt(ctx context.Context, body []byte, modelName, sessionID string, sink ports.ModelEventSink) (domain.ModelResponse, time.Duration, error) {
+// inputShape 只在 4xx 時用到：上游回報的是索引（input[40].output），
+// 光看索引無從得知那一項是什麼。在組裝處算好一次帶下來，比在錯誤路徑上
+// 重新解析 body 便宜也可靠。
+func (m *Model) executeCodexAttempt(ctx context.Context, body []byte, modelName, sessionID, inputShape string, sink ports.ModelEventSink) (domain.ModelResponse, time.Duration, error) {
 	clientRequestID := domain.NewID("llmreq")
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, m.endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -127,6 +131,14 @@ func (m *Model) executeCodexAttempt(ctx context.Context, body []byte, modelName,
 	m.recordProviderUsage(response.Header)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		providerErr, retryAfter := providerHTTPError(response, clientRequestID)
+		// 4xx 多半是請求本體的結構問題，而上游只回報索引（input[40].output）。
+		// 把結構摘要記下來，下次就不必靠推論還原第 N 項是什麼。
+		if response.StatusCode >= 400 && response.StatusCode < 500 && m.logger != nil && inputShape != "" {
+			m.logger.Warn("codex request rejected",
+				"status", response.StatusCode,
+				"client_request_id", clientRequestID,
+				"input_shape", inputShape)
+		}
 		return domain.ModelResponse{}, retryAfter, providerErr
 	}
 	requestID := strings.TrimSpace(response.Header.Get("X-Request-ID"))

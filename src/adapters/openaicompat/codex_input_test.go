@@ -59,3 +59,26 @@ func TestCodexInputOmitsOutputForOtherItemTypes(t *testing.T) {
 		t.Fatalf("一般訊息不該帶 output：%s", encoded)
 	}
 }
+
+// 4xx 時要留下可直接對照的結構摘要：上游只回報索引（input[40].output），
+// 光看索引無從得知那一項是什麼——這個錯誤已經靠推論修錯兩次。
+func TestDescribeCodexInputShowsShapeWithoutContent(t *testing.T) {
+	empty := ""
+	filled := "機密內容不該出現在紀錄裡"
+	shape := DescribeCodexInput([]codexInputItem{
+		{Type: "message", Role: "user", Content: []codexContentPart{{Type: "input_text", Text: filled}}},
+		{Type: "function_call", CallID: "call_abcdefghijklmno", Name: "shell_exec"},
+		{Type: "function_call_output", CallID: "call_abcdefghijklmno", Output: &filled},
+		{Type: "function_call_output", CallID: "call_short", Output: &empty},
+		{Type: "function_call_output", CallID: "call_nil"},
+	})
+	for _, want := range []string{"0:message/user", "1:call/call_abcde", "2:out/call_abcde/set", "3:out/call_short/empty", "4:out/call_nil/nil"} {
+		if !strings.Contains(shape, want) {
+			t.Fatalf("摘要應包含 %q：%s", want, shape)
+		}
+	}
+	// 內容絕不能進紀錄——診斷需要的是形狀，不是對話。
+	if strings.Contains(shape, filled) {
+		t.Fatalf("結構摘要不該含任何內容：%s", shape)
+	}
+}

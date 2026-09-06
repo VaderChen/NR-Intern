@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -102,6 +103,48 @@ func codexInstructions(request domain.ModelRequest) string {
 // 不接受空字串：欄位存在但為空，仍然回 400 Missing required parameter。
 // 沒有輸出的指令、沒有命中的搜尋都會產生空結果，因此這不是罕見情況。
 const emptyToolResult = "[工具執行完成，但沒有任何輸出。]"
+
+// DescribeCodexInput 回傳 input 陣列的結構摘要，供 4xx 時診斷用。
+//
+// 只列型別與 call_id，**不含任何內容**：診斷需要的是「第 N 項是什麼」，
+// 而上游只會回報索引（例如 input[40].output），光看索引無從得知那是什麼。
+// 兩次靠推論修正這個錯誤都失敗過，所以留下可直接對照的紀錄。
+func DescribeCodexInput(items []codexInputItem) string {
+	var builder strings.Builder
+	for index, item := range items {
+		if index > 0 {
+			builder.WriteString(" ")
+		}
+		builder.WriteString(strconv.Itoa(index))
+		builder.WriteString(":")
+		switch item.Type {
+		case "function_call":
+			builder.WriteString("call/" + shortCallID(item.CallID))
+		case "function_call_output":
+			state := "set"
+			if item.Output == nil {
+				state = "nil"
+			} else if *item.Output == "" {
+				state = "empty"
+			}
+			builder.WriteString("out/" + shortCallID(item.CallID) + "/" + state)
+		default:
+			builder.WriteString(item.Type + "/" + item.Role)
+		}
+	}
+	return builder.String()
+}
+
+func shortCallID(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 10 {
+		return value[:10]
+	}
+	if value == "" {
+		return "<空>"
+	}
+	return value
+}
 
 func codexInput(request domain.ModelRequest) []codexInputItem {
 	items := make([]codexInputItem, 0, len(request.History)*2+2)
