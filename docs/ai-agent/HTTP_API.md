@@ -43,10 +43,10 @@ Authorization: Bearer <token>
 | GET | `/api/v1/providers` | 已註冊 Provider adapter 清單 |
 | GET | `/api/v1/providers/{provider_id}/capabilities` | 讀取 Provider／Model 的 Context 與輸出限制 |
 | GET | `/api/v1/providers/{provider_id}/usage` | 讀取最近一次 5 小時／7 天用量視窗；無資料時標記 unavailable |
-| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 啟動計畫多輪執行（僅使用者可啟動） |
+| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 啟動計畫 LOOP（僅使用者可啟動） |
 | POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/resume` | 從檢查點的下一輪續跑 |
-| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/pause` | 立刻中止當前輪並保留檢查點 |
-| DELETE | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 終結多輪，不留續跑餘地 |
+| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/pause` | 立刻中止當前這一次並保留檢查點 |
+| DELETE | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 終結 LOOP，不留續跑餘地 |
 | POST | `/api/v1/providers/{provider_id}/usage/reset` | 兌換一次用量上限重置（僅 ChatGPT／Codex OAuth）；消耗帳號有限額度且不可還原 |
 | GET | `/api/v1/memories` | 搜尋長期記憶（`scope`、`q`、`kinds`、`tags`、`limit`） |
 | POST | `/api/v1/memories` | 由使用者寫入長期記憶 |

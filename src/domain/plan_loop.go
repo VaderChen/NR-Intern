@@ -284,12 +284,12 @@ func EvaluatePlanLoopAfterRound(plan Plan, progressed bool, now time.Time) (Plan
 		return stopped, PlanLoopDecision{StopBy: PlanLoopStopCompleted, Reason: "計畫已完成"}
 	}
 	if loop.IdleRounds >= PlanLoopIdleLimit {
-		reason := "連續 " + strconv.Itoa(loop.IdleRounds) + " 輪沒有任何步驟前進"
+		reason := "連續 " + strconv.Itoa(loop.IdleRounds) + " 次沒有任何步驟前進"
 		stopped, _ := StopPlanLoop(plan, PlanLoopStopNoProgress, reason, now)
 		return stopped, PlanLoopDecision{StopBy: PlanLoopStopNoProgress, Reason: reason}
 	}
 	if loop.Round >= loop.MaxRounds {
-		reason := "已用完設定的 " + strconv.Itoa(loop.MaxRounds) + " 輪"
+		reason := "已用完設定的 " + strconv.Itoa(loop.MaxRounds) + " 次"
 		stopped, _ := StopPlanLoop(plan, PlanLoopStopMaxRounds, reason, now)
 		return stopped, PlanLoopDecision{StopBy: PlanLoopStopMaxRounds, Reason: reason}
 	}
@@ -318,15 +318,15 @@ func PlanRoundBrief(plan Plan) string {
 		return ""
 	}
 	var builder strings.Builder
-	builder.WriteString("這是同一個任務的多輪執行，第 ")
+	builder.WriteString("這是同一個任務的 LOOP，第 ")
 	builder.WriteString(strconv.Itoa(plan.Loop.Round))
-	builder.WriteString(" 輪／共 ")
+	builder.WriteString(" 次／共 ")
 	builder.WriteString(strconv.Itoa(plan.Loop.MaxRounds))
-	builder.WriteString(" 輪。\n")
+	builder.WriteString(" 次。\n")
 	// 輪次緊接著編號步驟清單，很容易被讀成「第 N 輪＝做第 N 步」。
 	// 兩者無關：輪是「再推進一次」的機會，步驟是任務本身的結構。
-	builder.WriteString("「輪」是再推進一次的機會，與步驟編號無關——")
-	builder.WriteString("這一輪該做什麼由下面的步驟狀態決定，不是由輪次決定。\n\n")
+	builder.WriteString("這裡的「次」是再推進一次的機會，與步驟編號無關——")
+	builder.WriteString("這一次該做什麼由下面的步驟狀態決定，不是由次數決定。\n\n")
 
 	// 目標逐字給，不要摘要——這是不可變的錨。
 	builder.WriteString("原始目標（不可變更）：\n")
@@ -364,7 +364,7 @@ func PlanRoundBrief(plan Plan) string {
 		// 但該採取的行動不一樣——要接續，不是重做。
 		builder.WriteString("\n上一次在第 ")
 		builder.WriteString(strconv.Itoa(checkpoint.Round))
-		builder.WriteString(" 輪被中斷")
+		builder.WriteString(" 次執行時被中斷")
 		if stepTitle := planStepTitle(plan, checkpoint.StepID); stepTitle != "" {
 			builder.WriteString("，當時進行到「")
 			builder.WriteString(stepTitle)
@@ -377,7 +377,7 @@ func PlanRoundBrief(plan Plan) string {
 
 	builder.WriteString("\n完成的唯一方式是把每個步驟都做到 completed 並附上證據；")
 	builder.WriteString("宣稱完成但沒有證據不算數。\n")
-	builder.WriteString("這一輪若沒有任何步驟前進，會被記為空轉。\n")
+	builder.WriteString("這一次若沒有任何步驟前進，會被記為空轉。\n")
 	builder.WriteString("判斷再做下去沒有意義時，呼叫 plan_loop_interrupt 立刻中止，")
 	builder.WriteString("並寫下做到哪裡，之後才能從那裡接續。")
 	return builder.String()

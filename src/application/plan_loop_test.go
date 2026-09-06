@@ -119,15 +119,15 @@ func TestPlanLoopRunsMultipleRoundsAndAnchorsEachOne(t *testing.T) {
 	for index, input := range inputs {
 		// 每一輪都要重新錨定，而不是只有第一輪。
 		if !strings.Contains(input, "把儲存層搬離硬碟") {
-			t.Fatalf("第 %d 輪的輸入沒有帶原始目標：%s", index+1, input)
+			t.Fatalf("第 %d 次的輸入沒有帶原始目標：%s", index+1, input)
 		}
 		// 不含模型上一輪的輸出——複述是走鐘的傳染途徑。
 		if strings.Contains(input, "這一輪做完了") {
-			t.Fatalf("第 %d 輪的輸入混入了上一輪的模型輸出：%s", index+1, input)
+			t.Fatalf("第 %d 次的輸入混入了上一次的模型輸出：%s", index+1, input)
 		}
 	}
-	if !strings.Contains(inputs[1], "第 2 輪") {
-		t.Fatalf("第 2 輪應告知輪次：%s", inputs[1])
+	if !strings.Contains(inputs[1], "第 2 次") {
+		t.Fatalf("第 2 次執行應告知次數：%s", inputs[1])
 	}
 }
 

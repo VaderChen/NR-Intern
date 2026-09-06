@@ -229,7 +229,7 @@ func TestPlanRoundBriefAnchorsOnStoredObjective(t *testing.T) {
 	plan := startLoop(t, loopTestPlan(t), 3)
 	plan, _ = BeginPlanLoopRound(plan, time.Now())
 	brief := PlanRoundBrief(plan)
-	for _, want := range []string{"原始目標", "第 1 輪／共 3 輪", "步驟一", "條件一", "plan_loop_interrupt"} {
+	for _, want := range []string{"原始目標", "LOOP", "第 1 次／共 3 次", "步驟一", "條件一", "plan_loop_interrupt"} {
 		if !strings.Contains(brief, want) {
 			t.Fatalf("每輪輸入應包含 %q：\n%s", want, brief)
 		}
@@ -253,8 +253,8 @@ func TestPlanRoundBriefCarriesCheckpointNote(t *testing.T) {
 	if !strings.Contains(brief, "不要重新開始") {
 		t.Fatalf("續跑要明說接續而非重做：\n%s", brief)
 	}
-	if !strings.Contains(brief, "第 2 輪") {
-		t.Fatalf("續跑應為第 2 輪：\n%s", brief)
+	if !strings.Contains(brief, "第 2 次") {
+		t.Fatalf("續跑應為第 2 次：\n%s", brief)
 	}
 }
 
@@ -265,59 +265,10 @@ func TestPlanRoundBriefSeparatesRoundsFromSteps(t *testing.T) {
 	plan, _ = BeginPlanLoopRound(plan, time.Now())
 	brief := PlanRoundBrief(plan)
 	if !strings.Contains(brief, "與步驟編號無關") {
-		t.Fatalf("每輪輸入必須說明輪與步驟不是同一件事：\n%s", brief)
+		t.Fatalf("每次的輸入必須說明次數與步驟不是同一件事：\n%s", brief)
 	}
 	// 說明要出現在步驟清單之前，否則讀到清單時已經先建立了錯誤的對應。
 	if strings.Index(brief, "與步驟編號無關") > strings.Index(brief, "計畫目前的狀態") {
 		t.Fatalf("釐清要放在步驟清單之前：\n%s", brief)
-	}
-}
-
-// 把步驟命名為「第 N 輪」是實際觀察到的誤解，光靠工具說明擋不住——
-// 這個功能其他地方（完成必須有證據）都是強制的，這裡也要。
-func TestAgentPlanRejectsRoundStyleStepTitles(t *testing.T) {
-	for _, title := range []string{
-		"第 1 輪：基線與最小重現",
-		"第2輪 左右 context scoring",
-		"第五輪：收斂",
-		"Round 3 - verification",
-		"第 4 回：排序穩定性",
-	} {
-		_, err := NewPlan("session_1", CreatePlanInput{
-			Title: "任務", CreatedBy: PlanCreatedByAgent,
-			Steps: []CreatePlanStepInput{{Title: title, Verification: "條件"}},
-		}, time.Now())
-		if !errors.Is(err, ErrInvalidInput) {
-			t.Fatalf("步驟命名為 %q 應被擋下，得到 %v", title, err)
-		}
-		if err != nil && !strings.Contains(err.Error(), "多輪執行") {
-			t.Fatalf("錯誤訊息要說明正確的機制是什麼：%v", err)
-		}
-	}
-}
-
-// 真實工作裡出現「輪」不該被誤擋——只有拿它當標題前綴切分計畫才是問題。
-func TestAgentPlanAllowsLegitimateTitlesContainingRound(t *testing.T) {
-	for _, title := range []string{
-		"輪詢遠端狀態直到就緒",
-		"補上第二輪審查的意見",
-		"實作 round-robin 排程",
-	} {
-		if _, err := NewPlan("session_1", CreatePlanInput{
-			Title: "任務", CreatedBy: PlanCreatedByAgent,
-			Steps: []CreatePlanStepInput{{Title: title, Verification: "條件"}},
-		}, time.Now()); err != nil {
-			t.Fatalf("正常標題 %q 不該被擋下：%v", title, err)
-		}
-	}
-}
-
-// 使用者要怎麼命名是他的自由；這裡要修正的是 Agent 的概念混淆。
-func TestUserPlanKeepsRoundStyleStepTitles(t *testing.T) {
-	if _, err := NewPlan("session_1", CreatePlanInput{
-		Title: "任務", CreatedBy: PlanCreatedByUser,
-		Steps: []CreatePlanStepInput{{Title: "第 1 輪：我就是要這樣命名", Verification: "條件"}},
-	}, time.Now()); err != nil {
-		t.Fatalf("使用者建立的計畫不該被擋：%v", err)
 	}
 }

@@ -3147,7 +3147,7 @@ function renderPlanCard(plan, index, visiblePlanCount) {
   return card;
 }
 
-// renderPlanLoopBadge 在卡片標頭顯示「第 N／共 M 輪」。
+// renderPlanLoopBadge 在卡片標頭顯示 LOOP 的進度。
 // 自動消耗成本的功能，進度必須一眼看得到，否則使用者只會看到帳單。
 function renderPlanLoopBadge(plan) {
   const loop = plan.loop;
@@ -3155,8 +3155,7 @@ function renderPlanLoopBadge(plan) {
   const badge = document.createElement("span");
   badge.className = "plan-loop-badge";
   badge.dataset.state = loop.status;
-  // 單一可翻譯詞加數字，不要拆成「第」「輪」兩段——其他語言的語序會壞掉。
-  badge.textContent = `${translate("輪次")} ${loop.round}/${loop.max_rounds}`;
+  badge.textContent = `LOOP ${loop.round}/${loop.max_rounds}`;
   badge.title = planLoopStatusText(loop);
   badge.setAttribute("aria-label", badge.title);
   return badge;
@@ -3165,9 +3164,9 @@ function renderPlanLoopBadge(plan) {
 const planLoopStopLabels = {
   agent: "Agent 中止",
   user: "使用者停止",
-  max_rounds: "已用完輪數",
+  max_rounds: "已用完次數",
   no_progress: "連續空轉",
-  run_failed: "這一輪未正常結束",
+  run_failed: "這一次未正常結束",
   completed: "計畫完成",
 };
 
@@ -3178,7 +3177,7 @@ function planLoopStatusText(loop) {
   return by ? `${translate(state)}（${by}${reason}）` : translate(state);
 }
 
-// renderPlanLoopControls 是多輪的操作列。
+// renderPlanLoopControls 是 LOOP 的操作列。
 //
 // 啟動與續跑只有使用者能做——讓 Agent 自行啟動等於讓它決定開始無人看管地花錢。
 // 暫停保留檢查點可續跑；停止則是終結。
@@ -3194,18 +3193,18 @@ function renderPlanLoopControls(plan, locked, terminal) {
       row.classList.add("hidden");
       return row;
     }
-    info.textContent = translate("多輪執行：讓這個計畫自動跑幾輪，每一輪都會被錨回同一個目標");
+    info.textContent = translate("LOOP：讓這個計畫自動再跑幾次，每一次都會被錨回同一個目標");
     const rounds = document.createElement("input");
     rounds.type = "number";
     rounds.className = "plan-loop-rounds";
     rounds.min = "1";
     rounds.max = "20";
     rounds.value = "3";
-    rounds.setAttribute("aria-label", translate("輪數"));
+    rounds.setAttribute("aria-label", translate("次數"));
     const start = document.createElement("button");
     start.type = "button";
     start.className = "small primary";
-    start.textContent = translate("啟動多輪");
+    start.textContent = translate("啟動 LOOP");
     start.disabled = locked;
     start.addEventListener("click", () => startPlanLoop(plan.id, Number(rounds.value) || 0));
     row.append(info, rounds, start);
@@ -3213,10 +3212,10 @@ function renderPlanLoopControls(plan, locked, terminal) {
   }
 
   const lines = [planLoopStatusText(loop)];
-  // 停在等待核准時要講出來。多輪看起來還在跑，其實不會前進——
-  // 沒有這一行，無人看管的多輪就只是「怎麼半天沒動靜」。
+  // 停在等待核准時要講出來。LOOP 看起來還在跑，其實不會前進——
+  // 沒有這一行，無人看管的 LOOP 就只是「怎麼半天沒動靜」。
   if (loop.status === "running" && activeRunFor()?.status === "waiting_approval") {
-    lines.push(translate("這一輪正在等待工具核准，核准後才會繼續"));
+    lines.push(translate("這一次正在等待工具核准，核准後才會繼續"));
   }
   if (loop.checkpoint?.note) {
     // 檢查點內容要看得到：使用者要據此判斷該續跑還是換個做法。
@@ -3230,13 +3229,13 @@ function renderPlanLoopControls(plan, locked, terminal) {
     pause.type = "button";
     pause.className = "small ghost";
     pause.textContent = translate("暫停");
-    pause.title = translate("立刻中止這一輪，保留進度可續跑");
+    pause.title = translate("立刻中止這一次，保留進度可續跑");
     pause.addEventListener("click", () => pausePlanLoop(plan.id));
     const stop = document.createElement("button");
     stop.type = "button";
     stop.className = "small danger ghost";
     stop.textContent = translate("停止");
-    stop.title = translate("結束多輪，不保留續跑");
+    stop.title = translate("結束 LOOP，不保留續跑");
     stop.addEventListener("click", () => stopPlanLoop(plan.id));
     row.append(pause, stop);
     return row;
@@ -3247,7 +3246,7 @@ function renderPlanLoopControls(plan, locked, terminal) {
     resume.className = "small primary";
     resume.textContent = translate("續跑");
     resume.disabled = locked || loop.round >= loop.max_rounds;
-    resume.title = resume.disabled ? translate("已用完輪數") : translate("從中斷的下一輪接續");
+    resume.title = resume.disabled ? translate("已用完次數") : translate("從中斷的下一次接續");
     resume.addEventListener("click", () => resumePlanLoop(plan.id));
     const stop = document.createElement("button");
     stop.type = "button";
@@ -3277,7 +3276,7 @@ async function callPlanLoop(planID, suffix, options) {
 
 async function startPlanLoop(planID, maxRounds) {
   // 啟動就會開始自動花錢，先確認。
-  if (!(await confirmAction(`${translate("要讓這個計畫自動執行嗎？")}\n${translate("輪數")}：${maxRounds || 3}`))) return;
+  if (!(await confirmAction(`${translate("要讓這個計畫自動執行嗎？")}\n${translate("次數")}：${maxRounds || 3}`))) return;
   await callPlanLoop(planID, "", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

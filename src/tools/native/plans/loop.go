@@ -21,8 +21,8 @@ func NewInterruptTool(controller ports.PlanLoopController) *InterruptTool {
 
 func (t *InterruptTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
-		Name: "plan_loop_interrupt", Label: "中止多輪執行", Version: "1.0.0", Category: "planning",
-		Description: "在多輪執行中判斷再做下去沒有意義時，立刻中止這一輪。" +
+		Name: "plan_loop_interrupt", Label: "中止 LOOP", Version: "1.0.0", Category: "planning",
+		Description: "在 LOOP 中判斷再做下去沒有意義時，立刻中止這一次。" +
 			"適用於：需要使用者決定才能繼續、發現自己在重複同樣的嘗試、或前提已經不成立。" +
 			"必須寫下做到哪裡（state_note），使用者續跑時會原樣交還給你，你要從那裡接續而不是重來。" +
 			"這不是宣告完成——完成的唯一方式是把每個步驟做到 completed 並附上證據。",
@@ -54,7 +54,7 @@ func (t *InterruptTool) Execute(ctx context.Context, invocation tools.Invocation
 	}
 	plan, active := t.Controller.ActivePlanLoop(ctx, invocation.Session.ID)
 	if !active {
-		return failure(invocation.Call, "這個對話目前沒有進行中的多輪執行"), nil
+		return failure(invocation.Call, "這個對話目前沒有進行中的 LOOP"), nil
 	}
 	reason := strings.TrimSpace(stringArgument(invocation.Call.Arguments, "reason"))
 	note := strings.TrimSpace(stringArgument(invocation.Call.Arguments, "state_note"))

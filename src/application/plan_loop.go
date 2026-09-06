@@ -22,7 +22,7 @@ func (s *Service) StartPlanLoop(ctx context.Context, sessionID, planID string, m
 	}
 	// 鎖定計畫時 Agent 不能改計畫，多輪也就沒有意義。
 	if session.LockPlans {
-		return domain.Plan{}, fmt.Errorf("%w: 這個對話鎖定了計畫，無法啟動多輪執行", domain.ErrConflict)
+		return domain.Plan{}, fmt.Errorf("%w: 這個對話鎖定了計畫，無法啟動 LOOP", domain.ErrConflict)
 	}
 	started, err := domain.StartPlanLoop(plan, maxRounds, s.now())
 	if err != nil {
@@ -129,7 +129,7 @@ func (s *Service) startPlanLoopRound(ctx context.Context, plan domain.Plan) (dom
 		// 送不出去就把這一輪標記為暫停，讓使用者看得到原因並自行續跑，
 		// 而不是留下一個看起來在跑、其實不會前進的多輪。
 		failed, interruptErr := domain.InterruptPlanLoop(saved, domain.PlanLoopStopRunFailed,
-			"無法送出這一輪："+err.Error(), "", s.now())
+			"無法送出這一次："+err.Error(), "", s.now())
 		if interruptErr == nil {
 			if updated, updateErr := s.plans.Update(ctx, failed); updateErr == nil {
 				return updated, err
@@ -162,7 +162,7 @@ func (s *Service) advancePlanLoop(runID string) {
 		return
 	}
 	if run.Status != domain.RunStatusCompleted {
-		reason := "這一輪的 Run 未正常結束（" + string(run.Status) + "）"
+		reason := "這一次的 Run 未正常結束（" + string(run.Status) + "）"
 		paused, interruptErr := domain.InterruptPlanLoop(plan, domain.PlanLoopStopRunFailed, reason, "", s.now())
 		if interruptErr == nil {
 			_, _ = s.plans.Update(ctx, paused)

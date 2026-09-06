@@ -147,14 +147,19 @@ func TestInterruptToolWithoutActiveLoop(t *testing.T) {
 	}
 }
 
-// Agent 在「設計計畫」的當下就要知道輪與步驟的差別。
-// 它只有在多輪已經在跑時才讀得到每輪輸入，設計計畫時看到的只有這段說明；
-// 少了它，就會出現把步驟命名為「第 N 輪」這種誤解。
-func TestCreatePlanDescriptionSeparatesRoundsFromSteps(t *testing.T) {
+// 使用者說「跑五輪」時，計畫的內容與執行次數是兩件事：
+// 前者照工作本身的結構拆，後者由使用者在計畫建立之後設定。
+// 這個分工只寫在 plan_create 的說明裡——Agent 設計計畫時只讀得到那段。
+func TestCreatePlanDescriptionSeparatesContentFromRepeatCount(t *testing.T) {
 	description := (&CreateTool{}).Definition().Description
-	for _, want := range []string{"第 N 輪", "多輪執行", "與步驟數無關"} {
+	for _, want := range []string{"先規劃內容，再談次數", "LOOP", "與步驟數無關"} {
 		if !strings.Contains(description, want) {
-			t.Fatalf("plan_create 的說明應澄清 %q：%s", want, description)
+			t.Fatalf("plan_create 的說明應交代兩段式分工 %q：%s", want, description)
 		}
+	}
+	// 舊的做法是直接禁止某種命名；那會誤傷使用者自己的領域用語（例如
+	// 輸入法演算法的「五輪修正」），已經移除，不要再回來。
+	if strings.Contains(description, "不要命名為") {
+		t.Fatalf("不應再以禁止命名的方式處理：%s", description)
 	}
 }
