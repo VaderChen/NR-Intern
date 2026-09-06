@@ -186,6 +186,7 @@
       <section id="contextCompactionIndicator" class="context-compaction-indicator hidden" role="status" aria-live="assertive">
         <span class="context-compaction-spinner" aria-hidden="true"></span>
         <strong>正在壓縮上下文</strong>
+        <span id="contextCompactionReason" class="context-compaction-reason"></span>
         <span class="context-compaction-dots" aria-hidden="true"><i></i><i></i><i></i></span>
       </section>
 
@@ -483,11 +484,14 @@
               </label>
               <label id="providerSettingInstructionRoleField">Instruction role<select id="providerSettingInstructionRole"><option value="system">system</option><option value="developer">developer</option></select></label>
               <label>重試次數<input id="providerSettingMaxAttempts" type="number" min="1" max="3" required></label>
-              <div id="providerResetRateLimitField" class="provider-reset-field hidden">
-                <span id="providerResetRateLimitHint" class="provider-reset-caption">用量上限</span>
-                <button id="providerResetRateLimit" class="primary" type="button" aria-describedby="providerResetRateLimitHint">重置</button>
-              </div>
             </div>
+            <details id="providerResetRateLimitPanel" class="provider-reset-panel hidden" open>
+              <summary>
+                <span class="provider-reset-title">使用量限制重設</span>
+                <span id="providerResetRateLimitCount" class="provider-reset-count"></span>
+              </summary>
+              <div id="providerResetRateLimitList" class="provider-reset-list"></div>
+            </details>
             <div class="provider-check-grid">
               <label class="check-label"><input id="providerSettingDefault" type="checkbox">設為系統預設</label>
               <label id="providerSettingDisableStreamingField" class="check-label"><input id="providerSettingDisableStreaming" type="checkbox">停用 Streaming</label>
@@ -500,10 +504,12 @@
                 <label>請求逾時（秒）<input id="providerSettingTimeout" type="number" min="1" required></label>
                 <label>連線逾時（秒）<input id="providerSettingConnectTimeout" type="number" min="1" required></label>
                 <label>回應標頭逾時（秒）<input id="providerSettingHeaderTimeout" type="number" min="1" required></label>
-                <label>Context window<input id="providerSettingContextWindow" type="number" min="0"></label>
-                <label>最大輸出 Tokens<input id="providerSettingMaxOutputTokens" type="number" min="0"></label>
+                <label>Context window<select id="providerSettingContextWindow"></select></label>
+                <label>最大輸出 Tokens<select id="providerSettingMaxOutputTokens"></select></label>
+                <label>歷史字元上限<select id="providerSettingMaxHistoryCharacters"></select></label>
               </div>
-              <p id="providerSettingLimitsHint" class="hint">填 0 表示採用 Provider 自己回報的值。</p>
+              <p id="providerSettingLimitsHint" class="hint">選「自動」表示採用 Provider 自己回報的值。</p>
+              <p class="hint">歷史字元上限管的是<strong>對話歷史的字元數</strong>，與上面以 token 計的 Context window 是同一批內容的兩種量法——token 估算對 JSON 與代碼容易低估一半以上，這道字元閘門是估算失準時的最後防線，超過就強制壓縮。全域預設 60,000 是為本機模型的 prefill 時間而訂；視窗大的 Provider 可在這裡調高。選「自動」表示採用該類型的預設值（Codex 為 200,000，其餘沿用全域）。</p>
             </details>
             <div class="provider-editor-actions">
               <button id="deleteProviderSetting" class="danger ghost" type="button">刪除 Provider</button>

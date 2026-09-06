@@ -62,7 +62,7 @@ func TestResetCreditsUseEarliestExpiry(t *testing.T) {
 // 非 OAuth 的 Provider 不能走這條路：API Key 路線沒有帳號層級的重置額度。
 func TestConsumeRateLimitResetRequiresOAuth(t *testing.T) {
 	model := &Model{authMode: "api_key"}
-	if _, err := model.ConsumeRateLimitReset(t.Context(), "key"); err == nil {
+	if _, err := model.ConsumeRateLimitReset(t.Context(), "key", ""); err == nil {
 		t.Fatal("非 OAuth Provider 應被擋下")
 	}
 }
@@ -70,7 +70,7 @@ func TestConsumeRateLimitResetRequiresOAuth(t *testing.T) {
 // 少了 idempotency key 就不該送出：連線中斷重送時會扣掉第二次額度。
 func TestConsumeRateLimitResetRequiresIdempotencyKey(t *testing.T) {
 	model := &Model{authMode: "oauth"}
-	if _, err := model.ConsumeRateLimitReset(t.Context(), "  "); err == nil {
+	if _, err := model.ConsumeRateLimitReset(t.Context(), "  ", ""); err == nil {
 		t.Fatal("空白的 idempotency key 應被擋下")
 	}
 }
@@ -191,5 +191,68 @@ func TestResetCreditsFallBackToUsageWhenDetailUnavailable(t *testing.T) {
 
 	if got := model.ProviderUsage().ResetCredits.NextExpiresAt; got != "2026-10-04T02:09:00Z" {
 		t.Fatalf("明細端點失敗時應退回 usage 那份，得到 %q", got)
+	}
+}
+
+// 介面要逐筆列出額度，所以明細必須完整帶回來並依到期時間排序——
+// 只給最早那一筆的話，使用者無從選擇要用掉哪一個。
+func TestResetCreditsExposeEveryAvailableCreditSorted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"available_count":2,"credits":[
+			{"id":"late","status":"available","expires_at":"2026-10-05T04:21:06Z"},
+			{"id":"redeemed","status":"redeemed","expires_at":"2026-09-01T00:00:00Z"},
+			{"id":"early","status":"available","expires_at":"2026-10-04T05:42:41Z"}]}`))
+	}))
+	defer server.Close()
+	model := oauthTestModel(t, server.URL)
+
+	var payload codexUsageResponse
+	if err := json.Unmarshal([]byte(`{"rate_limit_reset_credits":{"available_count":2}}`), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	model.storeResetCredits(t.Context(), payload.ResetCredits)
+
+	credits := model.ProviderUsage().ResetCredits
+	if len(credits.Items) != 2 {
+		t.Fatalf("應列出兩筆可用額度，得到 %d 筆：%+v", len(credits.Items), credits.Items)
+	}
+	if credits.Items[0].ID != "early" || credits.Items[1].ID != "late" {
+		t.Fatalf("應依到期時間由近到遠排序：%+v", credits.Items)
+	}
+	// 已兌換的到期更早，但不該出現在清單裡。
+	for _, item := range credits.Items {
+		if item.ID == "redeemed" {
+			t.Fatal("已兌換的額度不該列出")
+		}
+	}
+	if credits.NextExpiresAt != credits.Items[0].ExpiresAt {
+		t.Fatalf("最早到期應與清單第一筆一致：%q", credits.NextExpiresAt)
+	}
+}
+
+// 使用者在介面上挑了哪一筆，就要送哪一筆——替他決定等於幫他丟掉想留的額度。
+func TestConsumeRateLimitResetHonoursChosenCredit(t *testing.T) {
+	sent := ""
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			_, _ = writer.Write([]byte(`{"available_count":2,"credits":[
+				{"id":"early","status":"available","expires_at":"2026-10-04T05:42:41Z"}]}`))
+			return
+		}
+		var body struct {
+			CreditID string `json:"credit_id"`
+		}
+		_ = json.NewDecoder(request.Body).Decode(&body)
+		sent = body.CreditID
+		_, _ = writer.Write([]byte(`{"code":"reset","windows_reset":2}`))
+	}))
+	defer server.Close()
+	model := oauthTestModel(t, server.URL)
+
+	if _, err := model.ConsumeRateLimitReset(t.Context(), "key-1", "late"); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	if sent != "late" {
+		t.Fatalf("應送出使用者挑的那一筆，得到 %q", sent)
 	}
 }

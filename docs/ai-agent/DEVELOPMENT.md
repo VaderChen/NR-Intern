@@ -116,7 +116,13 @@ Context 摘要可在 JSON 的 `context.summary_provider_id`／`summary_model` �
 Provider ID 必須已存在於 `providers`。留空時摘要沿用 Session 的 Provider 與 Model。
 
 `context.max_history_characters` 預設 60,000（非正值使用預設），用來補足 JSON、代碼等內容的
-token 估算誤差。整形後歷史超過此值也會觸發整理；送出前仍超量時再裁去較舊訊息，只改變模型
+token 估算誤差。這個預設值是為**本機模型的 prefill 時間**訂的；視窗大的雲端 Provider 沿用它
+會在很低的使用率就被壓縮（例如 262K 視窗約在 25% 就觸發），可在該 Provider 的
+`max_history_characters` 調高。填 0 表示採用該類型的預設：**Codex Responses 為 200,000**
+（它一定走雲端、視窗以 20 萬 token 起跳，全域那個值從來就不適用），其餘沿用全域。
+預設值在設定載入時也會套用，既有設定不必重存即可生效。壓縮事件會回報是哪一道閘門觸發
+（`trigger` 為 `context_budget` 或 `history_characters`）與當時的字元數，
+介面據此說明原因——只轉圈圈不說原因時，使用者會以為系統在沒有數據的情況下亂壓。整形後歷史超過此值也會觸發整理；送出前仍超量時再裁去較舊訊息，只改變模型
 所見的歷史，不刪除 transcript。至少保留最新一則，因此不是整份請求的硬性字元上限；system
 prompt、工具 schema 與當前輸入仍需另計。`max_tokens` 與 wall-clock 的 Run 預算不受此設定改變。
 

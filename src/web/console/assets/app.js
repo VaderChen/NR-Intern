@@ -1874,6 +1874,62 @@ function setTokenField(elementID, value, suffix = "") {
   else element.title = `${exact} tokens`;
 }
 
+// 容量欄位的級距。以 1024 為底，與模型視窗的宣告方式一致
+// （這個 codebase 既有的 256*1024 也是同一套）。
+//
+// 輸入與輸出分成兩組：Context window 與歷史上限以 10 萬為起點才有意義，
+// 但模型的輸出上限多半落在 4K–64K，用同一組會讓最小的選項就已經超過
+// 大部分模型的能力，等於只剩「自動」可選。
+const capacityScaleOptions = [
+  { value: 128 * 1024, label: "128K" },
+  { value: 256 * 1024, label: "256K" },
+  { value: 512 * 1024, label: "512K" },
+  { value: 1024 * 1024, label: "1M" },
+  { value: 1536 * 1024, label: "1.5M" },
+  { value: 2048 * 1024, label: "2M" },
+];
+
+const outputScaleOptions = [
+  { value: 4 * 1024, label: "4K" },
+  { value: 8 * 1024, label: "8K" },
+  { value: 16 * 1024, label: "16K" },
+  { value: 32 * 1024, label: "32K" },
+  { value: 64 * 1024, label: "64K" },
+  { value: 128 * 1024, label: "128K" },
+  { value: 256 * 1024, label: "256K" },
+  { value: 512 * 1024, label: "512K" },
+];
+
+// fillCapacityOptions 把容量欄位填成下拉選單。
+//
+// 一定要保留「自動」與「目前設定」兩個選項：前者是 0 的語意（採用 Provider 回報
+// 或類型預設），少了它就無法表達；後者是因為既有值不一定落在級距上——直接渲染
+// 固定選項的話，select 會落到第一個選項，使用者只是打開設定頁就把值改掉了。
+function fillCapacityOptions(elementID, currentValue, scale = capacityScaleOptions, unitSuffix = "") {
+  const select = $(elementID);
+  if (!select) return;
+  const current = Number(currentValue) || 0;
+  select.replaceChildren();
+  const auto = document.createElement("option");
+  auto.value = "0";
+  auto.textContent = translate("自動");
+  select.append(auto);
+  if (current > 0 && !scale.some((option) => option.value === current)) {
+    const existing = document.createElement("option");
+    existing.value = String(current);
+    existing.textContent = `${current.toLocaleString("en-US")}（${translate("目前設定")}）`;
+    select.append(existing);
+  }
+  for (const option of scale) {
+    const item = document.createElement("option");
+    item.value = String(option.value);
+    // 字元欄位與 token 欄位共用同一組 K/M 標籤，不標單位就會被當成 token 讀。
+    item.textContent = unitSuffix ? `${option.label} ${unitSuffix}` : option.label;
+    select.append(item);
+  }
+  select.value = String(current);
+}
+
 function contextUsageSnapshot() {
   const identity = activeContextIdentity();
   const usage = state.contextUsage;
@@ -3035,6 +3091,7 @@ function renderPlanCard(plan, index, visiblePlanCount) {
   const status = document.createElement("span");
   status.className = "plan-status";
   status.textContent = planStatusLabels[plan.status] || plan.status;
+  const loopBadge = renderPlanLoopBadge(plan);
   const quickActions = document.createElement("div");
   quickActions.className = "plan-card-quick-actions";
   if (terminal) {
@@ -3058,7 +3115,9 @@ function renderPlanCard(plan, index, visiblePlanCount) {
     else state.expandedPlanIDs.add(plan.id);
     renderPlanDialog();
   });
-  header.append(handle, order, summary, progress, status, quickActions, toggle);
+  header.append(handle, order, summary, progress);
+  if (loopBadge) header.append(loopBadge);
+  header.append(status, quickActions, toggle);
   card.append(header);
 
   const details = document.createElement("div");
@@ -3083,9 +3142,160 @@ function renderPlanCard(plan, index, visiblePlanCount) {
   rebuild.addEventListener("click", () => editPlan(plan));
   if (!terminal) actions.append(remove);
   actions.append(rebuild);
-  details.append(stepList, actions);
+  details.append(stepList, renderPlanLoopControls(plan, locked, terminal), actions);
   card.append(details);
   return card;
+}
+
+// renderPlanLoopBadge 在卡片標頭顯示「第 N／共 M 輪」。
+// 自動消耗成本的功能，進度必須一眼看得到，否則使用者只會看到帳單。
+function renderPlanLoopBadge(plan) {
+  const loop = plan.loop;
+  if (!loop) return null;
+  const badge = document.createElement("span");
+  badge.className = "plan-loop-badge";
+  badge.dataset.state = loop.status;
+  // 單一可翻譯詞加數字，不要拆成「第」「輪」兩段——其他語言的語序會壞掉。
+  badge.textContent = `${translate("輪次")} ${loop.round}/${loop.max_rounds}`;
+  badge.title = planLoopStatusText(loop);
+  badge.setAttribute("aria-label", badge.title);
+  return badge;
+}
+
+const planLoopStopLabels = {
+  agent: "Agent 中止",
+  user: "使用者停止",
+  max_rounds: "已用完輪數",
+  no_progress: "連續空轉",
+  run_failed: "這一輪未正常結束",
+  completed: "計畫完成",
+};
+
+function planLoopStatusText(loop) {
+  const state = { running: "執行中", paused: "已暫停", stopped: "已結束" }[loop.status] || loop.status;
+  const by = loop.stopped_by ? `${translate(planLoopStopLabels[loop.stopped_by] || loop.stopped_by)}` : "";
+  const reason = loop.stopped_reason ? `：${loop.stopped_reason}` : "";
+  return by ? `${translate(state)}（${by}${reason}）` : translate(state);
+}
+
+// renderPlanLoopControls 是多輪的操作列。
+//
+// 啟動與續跑只有使用者能做——讓 Agent 自行啟動等於讓它決定開始無人看管地花錢。
+// 暫停保留檢查點可續跑；停止則是終結。
+function renderPlanLoopControls(plan, locked, terminal) {
+  const row = document.createElement("div");
+  row.className = "plan-loop-controls";
+  const loop = plan.loop;
+  const info = document.createElement("div");
+  info.className = "plan-loop-info";
+
+  if (!loop) {
+    if (terminal) {
+      row.classList.add("hidden");
+      return row;
+    }
+    info.textContent = translate("多輪執行：讓這個計畫自動跑幾輪，每一輪都會被錨回同一個目標");
+    const rounds = document.createElement("input");
+    rounds.type = "number";
+    rounds.className = "plan-loop-rounds";
+    rounds.min = "1";
+    rounds.max = "20";
+    rounds.value = "3";
+    rounds.setAttribute("aria-label", translate("輪數"));
+    const start = document.createElement("button");
+    start.type = "button";
+    start.className = "small primary";
+    start.textContent = translate("啟動多輪");
+    start.disabled = locked;
+    start.addEventListener("click", () => startPlanLoop(plan.id, Number(rounds.value) || 0));
+    row.append(info, rounds, start);
+    return row;
+  }
+
+  const lines = [planLoopStatusText(loop)];
+  // 停在等待核准時要講出來。多輪看起來還在跑，其實不會前進——
+  // 沒有這一行，無人看管的多輪就只是「怎麼半天沒動靜」。
+  if (loop.status === "running" && activeRunFor()?.status === "waiting_approval") {
+    lines.push(translate("這一輪正在等待工具核准，核准後才會繼續"));
+  }
+  if (loop.checkpoint?.note) {
+    // 檢查點內容要看得到：使用者要據此判斷該續跑還是換個做法。
+    lines.push(`${translate("中斷時的交接")}：${loop.checkpoint.note}`);
+  }
+  info.textContent = lines.join("\n");
+  row.append(info);
+
+  if (loop.status === "running") {
+    const pause = document.createElement("button");
+    pause.type = "button";
+    pause.className = "small ghost";
+    pause.textContent = translate("暫停");
+    pause.title = translate("立刻中止這一輪，保留進度可續跑");
+    pause.addEventListener("click", () => pausePlanLoop(plan.id));
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "small danger ghost";
+    stop.textContent = translate("停止");
+    stop.title = translate("結束多輪，不保留續跑");
+    stop.addEventListener("click", () => stopPlanLoop(plan.id));
+    row.append(pause, stop);
+    return row;
+  }
+  if (loop.status === "paused") {
+    const resume = document.createElement("button");
+    resume.type = "button";
+    resume.className = "small primary";
+    resume.textContent = translate("續跑");
+    resume.disabled = locked || loop.round >= loop.max_rounds;
+    resume.title = resume.disabled ? translate("已用完輪數") : translate("從中斷的下一輪接續");
+    resume.addEventListener("click", () => resumePlanLoop(plan.id));
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.className = "small danger ghost";
+    stop.textContent = translate("停止");
+    stop.addEventListener("click", () => stopPlanLoop(plan.id));
+    row.append(resume, stop);
+  }
+  return row;
+}
+
+function planLoopPath(planID, suffix = "") {
+  const sessionID = state.session?.id;
+  return `/api/v1/sessions/${encodeURIComponent(sessionID)}/plans/${encodeURIComponent(planID)}/loop${suffix}`;
+}
+
+async function callPlanLoop(planID, suffix, options) {
+  if (!state.session?.id) return;
+  try {
+    await request(planLoopPath(planID, suffix), options);
+    await loadPlans();
+    renderPlanDialog();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function startPlanLoop(planID, maxRounds) {
+  // 啟動就會開始自動花錢，先確認。
+  if (!(await confirmAction(`${translate("要讓這個計畫自動執行嗎？")}\n${translate("輪數")}：${maxRounds || 3}`))) return;
+  await callPlanLoop(planID, "", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ max_rounds: maxRounds }),
+  });
+}
+
+async function pausePlanLoop(planID) {
+  await callPlanLoop(planID, "/pause", { method: "POST" });
+}
+
+async function resumePlanLoop(planID) {
+  await callPlanLoop(planID, "/resume", { method: "POST" });
+}
+
+async function stopPlanLoop(planID) {
+  if (!(await confirmAction(translate("停止後不能續跑，確定嗎？")))) return;
+  await callPlanLoop(planID, "", { method: "DELETE" });
 }
 
 function renderPlanStep(step) {
@@ -4330,6 +4540,34 @@ function syncRunActionButton() {
   syncNativeConversationActivity();
 }
 
+// setContextCompactionReason 說明這次壓縮是哪一道閘門觸發的。
+//
+// 兩道閘門用的數字完全不同：只轉圈圈不說原因時，使用者對著一個「目前輸入 -」
+// 的面板會以為系統在沒有數據的情況下亂壓——實際回報過這個困惑。
+function setContextCompactionReason(payload) {
+  const label = $("contextCompactionReason");
+  if (!label) return;
+  const characters = Number(payload?.history_characters) || 0;
+  const maxCharacters = Number(payload?.max_history_characters) || 0;
+  const trigger = payload?.trigger;
+  if (trigger === "history_characters" && maxCharacters > 0) {
+    // 寫成句子而不是「280,665 / 262,144」這種裸分數：旁邊就是以 token 計的
+    // 上下文用量，裸分數會讓人以為這是同一個指標的另一個讀數。
+    label.textContent = `${translate("對話歷史")} ${characters.toLocaleString("en-US")} ${translate("字元，超過上限")} ${maxCharacters.toLocaleString("en-US")}`;
+    label.title = translate("這是對話歷史的字元數，與以 token 計的上下文用量是同一批內容的兩種量法；字元上限是 token 估算失準時的防線，可在 Provider 設定調整");
+    return;
+  }
+  const trigger_tokens = Number(payload?.trigger_tokens) || 0;
+  const budget = Number(payload?.budget_tokens) || 0;
+  if (trigger_tokens > 0 && budget > 0) {
+    label.textContent = `${translate("估算輸入")} ${trigger_tokens.toLocaleString("en-US")} ${translate("token，接近預算")} ${budget.toLocaleString("en-US")}`;
+    label.title = translate("估算的輸入量接近可用預算");
+    return;
+  }
+  label.textContent = "";
+  label.removeAttribute("title");
+}
+
 function setContextCompactionState(sessionID, active) {
   if (active) {
     state.contextCompactionSessions.add(sessionID);
@@ -4978,6 +5216,7 @@ function handleEvent(event, sessionID) {
   if (!runState || runState.terminalHandled) return;
   if (event.run_id) runState.runId = String(event.run_id);
 	if (event.type === "context.compaction.started") {
+	  setContextCompactionReason(event.payload);
 	  setContextCompactionState(sessionID, true);
 	} else if (["context.compacted", "context.compaction.failed"].includes(event.type)) {
 	  setContextCompactionState(sessionID, false);
@@ -6940,6 +7179,7 @@ function newProviderSetting() {
       response_header_timeout_seconds: 120,
       context_window: 0,
       max_output_tokens: 0,
+      max_history_characters: 0,
     },
   };
 }
@@ -7029,8 +7269,9 @@ function renderProviderSettings() {
   $("providerSettingTimeout").value = settings.timeout_seconds || 1800;
   $("providerSettingConnectTimeout").value = settings.connect_timeout_seconds || 20;
   $("providerSettingHeaderTimeout").value = settings.response_header_timeout_seconds || 120;
-  $("providerSettingContextWindow").value = settings.context_window || 0;
-  $("providerSettingMaxOutputTokens").value = settings.max_output_tokens || 0;
+  fillCapacityOptions("providerSettingContextWindow", settings.context_window || 0);
+  fillCapacityOptions("providerSettingMaxOutputTokens", settings.max_output_tokens || 0, outputScaleOptions);
+  fillCapacityOptions("providerSettingMaxHistoryCharacters", settings.max_history_characters || 0, capacityScaleOptions, translate("字元"));
   // 這兩欄是「人工覆寫」，不是實際生效的值。只顯示 0 會讓人以為什麼都沒讀到，
   // 但 Provider 自己回報的限制其實已經在用了——把它顯示出來。
   void renderProviderLimitsHint(isNew ? "" : selected.id, settings.model || "");
@@ -7046,7 +7287,7 @@ function renderProviderSettings() {
 async function renderProviderLimitsHint(providerID, model) {
 	const hint = $("providerSettingLimitsHint");
 	if (!hint) return;
-	const fallback = translate("填 0 表示採用 Provider 自己回報的值。");
+	const fallback = translate("選「自動」表示採用 Provider 自己回報的值。");
 	hint.textContent = fallback;
 	if (!providerID) return;
 	try {
@@ -7197,6 +7438,7 @@ function providerSettingFormValue() {
     response_header_timeout_seconds: Number($("providerSettingHeaderTimeout").value),
     context_window: Number($("providerSettingContextWindow").value) || 0,
     max_output_tokens: Number($("providerSettingMaxOutputTokens").value) || 0,
+    max_history_characters: Number($("providerSettingMaxHistoryCharacters").value) || 0,
   };
   const provider = {
     id: $("providerSettingID").value.trim(),
@@ -7389,19 +7631,28 @@ function updateProviderOAuthStatusUI(status = {}) {
 }
 
 // hideProviderResetRateLimit 收起重置入口。切換 Provider 或斷線時一定要收，
-// 否則會把上一個帳號的可用次數顯示在這一個上。
+// 否則會把上一個帳號的額度顯示在這一個上。
 function hideProviderResetRateLimit() {
-	const button = $("providerResetRateLimit");
-	$("providerResetRateLimitField").classList.add("hidden");
-	button.disabled = false;
-	delete button.dataset.count;
-	delete button.dataset.expiresAt;
-	$("providerResetRateLimitHint").textContent = translate("用量上限");
+	$("providerResetRateLimitPanel").classList.add("hidden");
+	$("providerResetRateLimitCount").textContent = "";
+	$("providerResetRateLimitList").replaceChildren();
 }
 
-// loadProviderResetRateLimit 讀取該帳號可用的「用量上限重置」次數。
+// formatResetCreditExpiry 格式化額度到期時間。
+// 刻意不顯示時區：使用者看的是自己機器的當地時間，附上 GMT 位移只是雜訊。
+function formatResetCreditExpiry(value) {
+	const date = new Date(value || "");
+	if (Number.isNaN(date.getTime())) return translate("上游未提供");
+	const language = window.NRInternI18n?.language || "zh-TW";
+	return new Intl.DateTimeFormat(language, {
+		year: "numeric", month: "2-digit", day: "2-digit",
+		hour: "2-digit", minute: "2-digit", second: "2-digit",
+	}).format(date);
+}
+
+// loadProviderResetRateLimit 讀取該帳號可用的「用量上限重置」額度並逐筆列出。
 //
-// 上游沒有回報這個欄位時完全不顯示入口——顯示成「0 次」會讓使用者以為自己用完了，
+// 上游沒有回報這項功能時完全不顯示面板——顯示成「0 次」會讓使用者以為自己用完了，
 // 而實際上是這條路線沒有這項功能。
 async function loadProviderResetRateLimit(providerID) {
 	hideProviderResetRateLimit();
@@ -7412,19 +7663,73 @@ async function loadProviderResetRateLimit(providerID) {
 		const credits = usage?.reset_credits;
 		if (!credits?.available) return;
 		if (state.selectedProviderSettingsID !== providerID) return;
-		const count = Number(credits.count) || 0;
-		const button = $("providerResetRateLimit");
-		const hint = $("providerResetRateLimitHint");
-		button.dataset.count = String(count);
-		button.dataset.expiresAt = String(credits.next_expires_at || "");
-		button.disabled = count <= 0;
-		$("providerResetRateLimitField").classList.remove("hidden");
-		// 數字擺在可翻譯句子之後，不把句子拆成片段——拆開的話其他語言語序會壞掉。
-		hint.textContent = count > 0
-			? `${translate("用量上限")} · ${translate("可用重置次數")}：${count}`
-			: `${translate("用量上限")} · ${translate("目前沒有可用的重置次數")}`;
+		renderProviderResetCredits(providerID, credits);
 	} catch (_) {
 		// 讀不到額度不該影響其他設定，安靜略過即可。
+	}
+}
+
+function renderProviderResetCredits(providerID, credits) {
+	const items = Array.isArray(credits.items) ? credits.items : [];
+	const count = Number(credits.count) || 0;
+	$("providerResetRateLimitCount").textContent = `${translate("可用重置次數")}：${count}`;
+	const list = $("providerResetRateLimitList");
+	list.replaceChildren();
+	if (items.length === 0) {
+		const empty = document.createElement("div");
+		empty.className = "provider-reset-empty";
+		// 有次數卻列不出明細，代表明細端點讀不到——講明白比留空白好。
+		empty.textContent = count > 0 ? translate("上游未提供") : translate("目前沒有可用的重置次數");
+		list.append(empty);
+		$("providerResetRateLimitPanel").classList.remove("hidden");
+		return;
+	}
+	for (const item of items) {
+		const row = document.createElement("div");
+		row.className = "provider-reset-item";
+		const info = document.createElement("div");
+		const title = document.createElement("div");
+		title.className = "provider-reset-item-title";
+		title.textContent = translate("完整重置");
+		const expiry = document.createElement("div");
+		expiry.className = "provider-reset-item-expiry";
+		expiry.textContent = `${translate("到期時間")}：${formatResetCreditExpiry(item.expires_at)}`;
+		info.append(title, expiry);
+		const button = document.createElement("button");
+		button.type = "button";
+		button.className = "primary";
+		button.textContent = translate("使用重置");
+		button.onclick = () => redeemProviderResetCredit(providerID, item, button);
+		row.append(info, button);
+		list.append(row);
+	}
+	$("providerResetRateLimitPanel").classList.remove("hidden");
+}
+
+// redeemProviderResetCredit 兌換指定的一筆額度。
+// 消耗的是帳號有限且不可還原的資源，所以一定先確認，並在確認訊息裡寫明是哪一筆。
+async function redeemProviderResetCredit(providerID, item, button) {
+	const message = [
+		translate("確定要使用 1 次用量上限重置嗎？此操作無法復原。"),
+		`${translate("到期時間")}：${formatResetCreditExpiry(item.expires_at)}`,
+	].join("\n");
+	if (!(await confirmAction(message))) return;
+	// 同一次嘗試沿用同一把鑰匙：連線中斷後重送才不會扣掉兩次額度。
+	if (!button.dataset.key) button.dataset.key = `reset-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	button.disabled = true;
+	try {
+		const result = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage/reset`, {
+			method: "POST",
+			headers: { "Idempotency-Key": button.dataset.key, "Content-Type": "application/json" },
+			body: JSON.stringify({ credit_id: String(item.id || "") }),
+			reconnects: 0,
+		});
+		delete button.dataset.key;
+		toast(providerResetOutcomeMessage(result));
+	} catch (error) {
+		toast(error.message);
+	} finally {
+		await loadProviderResetRateLimit(providerID);
 	}
 }
 
@@ -9172,6 +9477,7 @@ $("providerSettingType").addEventListener("change", (event) => {
     response_header_timeout_seconds: 120,
     context_window: 0,
     max_output_tokens: 0,
+    max_history_characters: 0,
   };
   $("providerSettingBaseURL").value = settings.base_url || "";
   $("providerSettingAPIKey").value = "";
@@ -9185,8 +9491,11 @@ $("providerSettingType").addEventListener("change", (event) => {
   $("providerSettingTimeout").value = settings.timeout_seconds;
   $("providerSettingConnectTimeout").value = settings.connect_timeout_seconds;
   $("providerSettingHeaderTimeout").value = settings.response_header_timeout_seconds;
-  $("providerSettingContextWindow").value = settings.context_window;
-  $("providerSettingMaxOutputTokens").value = settings.max_output_tokens;
+  // 這幾個是下拉選單：直接設 value 而選項不存在時會靜靜失敗，
+  // 必須重建選項，否則切換 Provider 類型後值會憑空消失。
+  fillCapacityOptions("providerSettingContextWindow", settings.context_window);
+  fillCapacityOptions("providerSettingMaxOutputTokens", settings.max_output_tokens, outputScaleOptions);
+  fillCapacityOptions("providerSettingMaxHistoryCharacters", settings.max_history_characters, capacityScaleOptions, translate("字元"));
   renderProviderTypeFields(event.target.value, settings, Boolean(state.providerSettingsDraft), state.selectedProviderSettingsID);
   renderProviderModelOptions("");
 });
@@ -9206,39 +9515,6 @@ $("providerSettingModelCatalog").addEventListener("change", (event) => {
     return;
   }
   $("providerSettingModel").value = event.target.value;
-});
-// 兌換會消耗 ChatGPT 帳號的有限額度且無法還原，所以一定先確認。
-$("providerResetRateLimit").addEventListener("click", async () => {
-  const providerID = state.selectedProviderSettingsID;
-  if (!providerID) return;
-  const button = $("providerResetRateLimit");
-  const count = Number(button.dataset.count) || 0;
-  // 到期時間要揭露：額度會過期，使用者需要據此判斷「現在用」還是「留著」。
-  const expiry = button.dataset.expiresAt
-    ? formatProviderUsageReset(button.dataset.expiresAt, true)
-    : translate("上游未提供");
-  const message = [
-    translate("確定要使用 1 次用量上限重置嗎？此操作無法復原。"),
-    `${translate("目前可用")}：${count}`,
-    `${translate("最早到期")}：${expiry === "-" ? translate("上游未提供") : expiry}`,
-  ].join("\n");
-  if (!(await confirmAction(message))) return;
-  // 同一次嘗試沿用同一把鑰匙：連線中斷後重送才不會扣掉兩次額度。
-  if (!button.dataset.key) button.dataset.key = `reset-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  button.disabled = true;
-  try {
-    const result = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage/reset`, {
-      method: "POST",
-      headers: { "Idempotency-Key": button.dataset.key },
-      reconnects: 0,
-    });
-    delete button.dataset.key;
-    toast(providerResetOutcomeMessage(result));
-  } catch (error) {
-    toast(error.message);
-  } finally {
-    await loadProviderResetRateLimit(providerID);
-  }
 });
 $("providerSettingAPIKey").addEventListener("input", (event) => {
   if (event.target.value) $("providerSettingClearKey").setAttribute("aria-pressed", "false");

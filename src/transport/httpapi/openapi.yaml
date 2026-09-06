@@ -445,6 +445,55 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ModelCapabilitiesEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plans/{plan_id}/loop:
+    parameters:
+      - { in: path, name: session_id, required: true, schema: { type: string } }
+      - { in: path, name: plan_id, required: true, schema: { type: string } }
+    post:
+      summary: 啟動計畫多輪執行
+      description: >
+        讓計畫自動跑多輪，每一輪都由後端從儲存重新組裝輸入，把 Agent 錨回同一個任務。
+        只有使用者能啟動：允許 Agent 自行啟動等於讓它決定開始無人看管地花錢。
+        max_rounds 省略時使用預設 3，超過硬上限 20 會被拒絕。鎖定計畫的 Session 不能啟動。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_rounds: { type: integer, minimum: 1, maximum: 20 }
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+    delete:
+      summary: 終結計畫多輪執行
+      description: 停止且不保留檢查點，與 pause 不同，之後無法續跑。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plans/{plan_id}/loop/pause:
+    parameters:
+      - { in: path, name: session_id, required: true, schema: { type: string } }
+      - { in: path, name: plan_id, required: true, schema: { type: string } }
+    post:
+      summary: 中止當前輪並保留檢查點
+      description: >
+        立刻取消正在跑的那一輪，並記下輪次與進行中的步驟，之後可以續跑。
+        Agent 走的是 plan_loop_interrupt 工具，會額外留下交接內容。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/sessions/{session_id}/plans/{plan_id}/loop/resume:
+    parameters:
+      - { in: path, name: session_id, required: true, schema: { type: string } }
+      - { in: path, name: plan_id, required: true, schema: { type: string } }
+    post:
+      summary: 從檢查點的下一輪續跑
+      description: 輪數不歸零——歸零等於讓中斷成為繞過輪數上限的後門。
+      responses:
+        "200": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/providers/{provider_id}/usage:
     parameters:
       - in: path
@@ -479,6 +528,14 @@ paths:
           name: Idempotency-Key
           required: false
           schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                credit_id: { type: string, description: 要用掉哪一筆額度；省略時由後端挑最早到期的。 }
       responses:
         "200":
           description: 兌換結果
@@ -1779,6 +1836,7 @@ components:
         response_header_timeout_seconds: { type: integer, minimum: 1 }
         context_window: { type: integer, minimum: 0 }
         max_output_tokens: { type: integer, minimum: 0 }
+        max_history_characters: { type: integer, minimum: 0, description: "覆寫全域的歷史字元上限；0 沿用全域。全域預設為本機模型的 prefill 時間而訂，視窗大的雲端 Provider 可調高。" }
     OpenAICodexResponsesProviderSetting:
       type: object
       required: [model, max_attempts]
@@ -1791,6 +1849,7 @@ components:
         response_header_timeout_seconds: { type: integer, minimum: 1 }
         context_window: { type: integer, minimum: 0 }
         max_output_tokens: { type: integer, minimum: 0 }
+        max_history_characters: { type: integer, minimum: 0, description: "覆寫全域的歷史字元上限；0 沿用全域。全域預設為本機模型的 prefill 時間而訂，視窗大的雲端 Provider 可調高。" }
     Usage:
       type: object
       properties:
@@ -1833,6 +1892,7 @@ components:
       properties:
         context_window: { type: integer, minimum: 0 }
         max_output_tokens: { type: integer, minimum: 0 }
+        max_history_characters: { type: integer, minimum: 0, description: "覆寫全域的歷史字元上限；0 表示採用該類型的預設（Codex 為 200,000，其餘沿用全域）。管理介面以 128K～2M 的級距呈現（輸出上限另用 4K～512K），不在級距上的既有值會保留。" }
         supports_tools: { type: boolean }
         streaming: { type: boolean }
     ProviderModels:
@@ -1868,6 +1928,16 @@ components:
         available: { type: boolean, description: 上游是否回報這項功能。false 代表這條路線沒有重置額度，與「剩下 0 次」不同。 }
         count: { type: integer, format: int64 }
         next_expires_at: { type: string, format: date-time, description: 最早到期的可用額度；已兌換或已過期的不列入。上游未提供明細時為空字串。 }
+        items:
+          type: array
+          description: 逐筆列出可用額度，依到期時間由近到遠排序。每筆到期時間不同，介面據此讓使用者自行選擇要用掉哪一筆。
+          items: { $ref: "#/components/schemas/ProviderResetCredit" }
+    ProviderResetCredit:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        expires_at: { type: string, format: date-time }
     ProviderResetResult:
       type: object
       required: [provider_id, outcome, windows_reset]

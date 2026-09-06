@@ -44,6 +44,7 @@ type OpenAICompatibleProviderSetting struct {
 	ResponseHeaderTimeoutSeconds int     `json:"response_header_timeout_seconds"`
 	ContextWindow                int     `json:"context_window,omitempty"`
 	MaxOutputTokens              int     `json:"max_output_tokens,omitempty"`
+	MaxHistoryCharacters         int     `json:"max_history_characters,omitempty"`
 }
 
 // OpenAICodexResponsesProviderSetting 使用 ChatGPT/Codex OAuth 與固定的
@@ -57,6 +58,7 @@ type OpenAICodexResponsesProviderSetting struct {
 	ResponseHeaderTimeoutSeconds int    `json:"response_header_timeout_seconds"`
 	ContextWindow                int    `json:"context_window,omitempty"`
 	MaxOutputTokens              int    `json:"max_output_tokens,omitempty"`
+	MaxHistoryCharacters         int    `json:"max_history_characters,omitempty"`
 }
 
 // ProviderOAuthStartResult 僅包含啟動互動驗證所需的公開資料。
@@ -115,6 +117,15 @@ type ProviderResetCredits struct {
 	Available     bool   `json:"available"`
 	Count         int64  `json:"count"`
 	NextExpiresAt string `json:"next_expires_at,omitempty"`
+	// Items 逐筆列出可用額度，讓使用者自己挑要用掉哪一筆。
+	// 每筆的到期時間不同，只給總數的話使用者無從判斷該先用哪一個。
+	Items []ProviderResetCredit `json:"items,omitempty"`
+}
+
+// ProviderResetCredit 是單一筆可用的重置額度。
+type ProviderResetCredit struct {
+	ID        string `json:"id"`
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // ProviderResetResult 是一次重置兌換的結果。

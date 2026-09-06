@@ -43,6 +43,10 @@ Authorization: Bearer <token>
 | GET | `/api/v1/providers` | 已註冊 Provider adapter 清單 |
 | GET | `/api/v1/providers/{provider_id}/capabilities` | 讀取 Provider／Model 的 Context 與輸出限制 |
 | GET | `/api/v1/providers/{provider_id}/usage` | 讀取最近一次 5 小時／7 天用量視窗；無資料時標記 unavailable |
+| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 啟動計畫多輪執行（僅使用者可啟動） |
+| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/resume` | 從檢查點的下一輪續跑 |
+| POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/pause` | 立刻中止當前輪並保留檢查點 |
+| DELETE | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 終結多輪，不留續跑餘地 |
 | POST | `/api/v1/providers/{provider_id}/usage/reset` | 兌換一次用量上限重置（僅 ChatGPT／Codex OAuth）；消耗帳號有限額度且不可還原 |
 | GET | `/api/v1/memories` | 搜尋長期記憶（`scope`、`q`、`kinds`、`tags`、`limit`） |
 | POST | `/api/v1/memories` | 由使用者寫入長期記憶 |
@@ -187,7 +191,9 @@ ChatGPT／Codex OAuth 登入的 Provider。這會消耗該帳號有限的重置�
 額度不足（`no_credit`）或先前已兌換（`already_redeemed`）都以 200 加上對應的 `outcome` 回覆，
 不算錯誤。可用次數在 `GET .../usage` 的 `reset_credits` 中回報；`available=false` 代表這條路線
 沒有這項功能，與「剩下 0 次」是不同的狀態，介面不應把它顯示成 0。`next_expires_at` 是最早
-到期的**可用**額度（已兌換或過期的不列入），上游未提供明細時為空字串。
+到期的**可用**額度（已兌換或過期的不列入），上游未提供明細時為空字串；`items` 逐筆列出可用
+額度並依到期時間排序，讓介面能讓使用者自行選擇。兌換時以 request body 的 `credit_id` 指定
+要用掉哪一筆，省略則由後端挑最早到期的。
 
 手動設定模型名稱。`GET /api/v1/providers/{provider_id}/usage` 的 5 小時／7 天視窗若沒有上游資料，
 `available=false`，呼叫端不得推測為 100%。

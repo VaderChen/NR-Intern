@@ -446,3 +446,30 @@ func TestEnforceHistoryCharacterLimitLeavesNormalHistoryAlone(t *testing.T) {
 		t.Fatalf("normal history was trimmed: %d of %d messages kept", len(got), len(messages))
 	}
 }
+
+// Provider 宣告了自己的歷史字元上限就以它為準。
+//
+// 全域預設是為本機模型的 prefill 時間訂的：262K 視窗的雲端 Provider 沿用它，
+// 會在約 25% 使用率就被字元閘門壓縮，而使用者從介面完全看不出原因。
+func TestMaxHistoryCharactersPrefersProviderDeclaration(t *testing.T) {
+	config := normalizeContextConfig(ContextConfig{MaxHistoryCharacters: 60_000})
+
+	declared := &ContextManager{Capabilities: &fakeCapabilities{
+		capabilities: domain.ModelCapabilities{MaxHistoryCharacters: 400_000},
+	}}
+	if got := declared.maxHistoryCharacters(config, testSession()); got != 400_000 {
+		t.Fatalf("Provider 宣告值應優先，得到 %d", got)
+	}
+
+	// 沒宣告（0）就沿用全域，維持既有行為。
+	silent := &ContextManager{Capabilities: &fakeCapabilities{}}
+	if got := silent.maxHistoryCharacters(config, testSession()); got != 60_000 {
+		t.Fatalf("未宣告時應沿用全域值，得到 %d", got)
+	}
+
+	// 沒有能力來源時也要有可用的值，不能回 0——0 會讓每一輪都判定超標。
+	none := &ContextManager{}
+	if got := none.maxHistoryCharacters(config, testSession()); got != 60_000 {
+		t.Fatalf("沒有能力來源時應沿用全域值，得到 %d", got)
+	}
+}

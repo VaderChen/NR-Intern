@@ -51,7 +51,7 @@ type Handler struct {
 	stopReverseProxy        func(context.Context) (domain.ReverseProxyStatus, error)
 	providerModels          func(context.Context, string) (domain.ProviderModels, error)
 	providerUsage           func(context.Context, string) (domain.ProviderUsage, error)
-	providerRateLimitReset  func(context.Context, string, string) (domain.ProviderResetResult, error)
+	providerRateLimitReset  func(context.Context, string, string, string) (domain.ProviderResetResult, error)
 	testProvider            func(context.Context, string) (domain.ProviderTestResult, error)
 	startProviderOAuth      func(context.Context, string) (domain.ProviderOAuthStartResult, error)
 	providerOAuthStatus     func(context.Context, string) (domain.ProviderOAuthStatus, error)
@@ -194,6 +194,10 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session_id}/plans/order", h.reorderPlans)
 	h.mux.HandleFunc("PUT /api/v1/sessions/{session_id}/plans/{plan_id}", h.updatePlan)
 	h.mux.HandleFunc("DELETE /api/v1/sessions/{session_id}/plans/{plan_id}", h.deletePlanByID)
+	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/plans/{plan_id}/loop", h.startPlanLoop)
+	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/plans/{plan_id}/loop/resume", h.resumePlanLoop)
+	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/plans/{plan_id}/loop/pause", h.pausePlanLoop)
+	h.mux.HandleFunc("DELETE /api/v1/sessions/{session_id}/plans/{plan_id}/loop", h.stopPlanLoop)
 	h.mux.HandleFunc("GET /api/v1/sessions/{session_id}/messages", h.listMessages)
 	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/messages/{message_id}/retract", h.retractMessages)
 	h.mux.HandleFunc("POST /api/v1/sessions/{session_id}/attachments", h.uploadSessionAttachments)
@@ -768,11 +772,23 @@ func (h *Handler) consumeProviderRateLimitReset(writer http.ResponseWriter, requ
 		writeProblem(writer, request, fmt.Errorf("%w: provider rate limit reset is unavailable", errUnavailable))
 		return
 	}
+	// credit_id 指定要用掉哪一筆額度；省略時由後端挑最早到期的。
+	// 每筆到期時間不同，替使用者決定等於幫他丟掉一個他可能想留的額度。
+	payload := struct {
+		CreditID string `json:"credit_id"`
+	}{}
+	if request.ContentLength != 0 {
+		if err := h.decodeJSON(writer, request, &payload); err != nil {
+			writeProblem(writer, request, err)
+			return
+		}
+	}
 	// 沿用本 API 既有的 Idempotency-Key 標頭慣例，不另立 body 欄位。
 	value, err := h.providerRateLimitReset(
 		request.Context(),
 		request.PathValue("provider_id"),
 		request.Header.Get("Idempotency-Key"),
+		payload.CreditID,
 	)
 	if err != nil {
 		writeProblem(writer, request, err)

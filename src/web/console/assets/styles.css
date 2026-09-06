@@ -666,13 +666,37 @@ summary { cursor: pointer; color: var(--muted); }
 .screen-capture-toggle .toggle-switch { order: 2; }
 .provider-field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 12px; }
 .provider-field-grid > label { display: grid; gap: 5px; margin: 8px 0; color: var(--muted); }
-/* 與同列的 label 完全同形：兩列（標題＋控制項）、同樣的 gap 與 margin。
-   多一列就會把整個 grid row 撐高，同列 label 的兩列跟著被拉開，旁邊的輸入框
-   會被往下推——看起來像按鈕沒對齊，其實是輸入框被擠下去了。可用次數因此併進
-   標題那一行，而不是另外開一列。 */
-.provider-reset-field { display: grid; gap: 5px; margin: 8px 0; color: var(--muted); }
-/* 填滿整格並與旁邊的輸入框同高，讓它讀起來是這一列的控制項而不是附註。 */
-.provider-reset-field > button { justify-self: stretch; height: 42px; }
+/* 每筆額度的到期時間都不同，所以逐筆列出讓使用者自己挑；只給一顆按鈕的話
+   等於替他決定用掉哪一個。整列寬度而非欄位格：一格塞不下多筆。 */
+/* 多輪執行的狀態與控制。輪次徽章放在卡片標頭：自動消耗成本的功能，
+   進度必須一眼看得到，否則使用者只會看到帳單。 */
+.context-compaction-reason { color: var(--muted); font-size: 11px; }
+
+.plan-loop-badge { flex: none; padding: 1px 7px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 800; }
+.plan-loop-badge[data-state="paused"] { background: var(--panel-3); color: var(--muted); }
+.plan-loop-badge[data-state="stopped"] { background: var(--panel-3); color: var(--muted); }
+.plan-loop-controls { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+/* 交接內容可能有多行，要保留換行才讀得懂。 */
+.plan-loop-info { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; white-space: pre-line; overflow-wrap: anywhere; }
+.plan-loop-rounds { flex: none; width: 64px; }
+.plan-loop-controls > button { flex: none; }
+
+.provider-reset-panel { margin-top: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+.provider-reset-panel > summary { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer; list-style: none; }
+.provider-reset-panel > summary::-webkit-details-marker { display: none; }
+/* 自製箭頭：預設 marker 在各平台長得不一樣，也無法放到右側。 */
+.provider-reset-panel > summary::after { margin-left: auto; color: var(--muted); content: "\25be"; transition: transform .15s ease; }
+.provider-reset-panel[open] > summary::after { transform: rotate(180deg); }
+.provider-reset-title { font-weight: 650; }
+.provider-reset-count { padding: 1px 7px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700; }
+.provider-reset-list { border-top: 1px solid var(--line); }
+.provider-reset-item { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+.provider-reset-item + .provider-reset-item { border-top: 1px solid var(--line); }
+.provider-reset-item > div { min-width: 0; }
+.provider-reset-item-title { font-weight: 650; }
+.provider-reset-item-expiry { margin-top: 2px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.provider-reset-item > button { flex: none; margin-left: auto; }
+.provider-reset-empty { padding: 10px 12px; color: var(--muted); font-size: 12px; }
 .provider-field-grid input:not([type="checkbox"]), .provider-field-grid select { height: 42px; min-height: 42px; padding: 9px 10px; border-radius: 9px; font-size: 14px; line-height: 1.4; }
 .provider-field-grid textarea { width: 100%; min-height: 70px; padding: 9px 10px; resize: vertical; border-radius: 9px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .provider-field-full { grid-column: 1 / -1; }

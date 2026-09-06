@@ -42,7 +42,7 @@ type codexResetConsumeResponse struct {
 // 時無法分辨「沒送出」與「送出了但沒收到回應」，重送同一把鑰匙才不會扣兩次。
 //
 // 先讀一次額度明細，指定最早到期的那筆；上游只給總數時不指定，交由它自己挑。
-func (m *Model) ConsumeRateLimitReset(ctx context.Context, idempotencyKey string) (domain.ProviderResetResult, error) {
+func (m *Model) ConsumeRateLimitReset(ctx context.Context, idempotencyKey, creditID string) (domain.ProviderResetResult, error) {
 	if m == nil {
 		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider is unavailable", domain.ErrNotFound)
 	}
@@ -54,7 +54,13 @@ func (m *Model) ConsumeRateLimitReset(ctx context.Context, idempotencyKey string
 		return domain.ProviderResetResult{}, fmt.Errorf("%w: idempotency key is required", domain.ErrInvalidInput)
 	}
 
-	creditID, _ := m.fetchEarliestResetCredit(ctx)
+	// 使用者在介面上挑了哪一筆就用哪一筆；沒指定才自己挑最早到期的。
+	// 每筆到期時間不同，替使用者決定等於幫他丟掉一個他可能想留的額度。
+	if creditID = strings.TrimSpace(creditID); creditID == "" {
+		if available := m.fetchAvailableResetCredits(ctx); len(available) > 0 {
+			creditID = available[0].ID
+		}
+	}
 	body, err := json.Marshal(codexResetConsumeRequest{
 		RedeemRequestID: idempotencyKey,
 		CreditID:        creditID,
@@ -83,31 +89,34 @@ func (m *Model) ConsumeRateLimitReset(ctx context.Context, idempotencyKey string
 	}
 }
 
-// fetchEarliestResetCredit 向明細端點取最早到期的可用額度。
+// fetchAvailableResetCredits 向明細端點取可用額度清單。
 //
-// 這是取得到期時間的唯一來源：/wham/usage 只給總數。讀不到就回空字串——
-// 顯示端會標示「上游未提供」，兌換端則不指定 credit_id 交由上游自己挑。
-func (m *Model) fetchEarliestResetCredit(ctx context.Context) (id string, expiresAt string) {
+// 這是取得每筆到期時間的唯一來源：/wham/usage 只給總數。讀不到就回空清單——
+// 介面不會列出任何可兌換項目，兌換端則不指定 credit_id 交由上游自己挑。
+func (m *Model) fetchAvailableResetCredits(ctx context.Context) []domain.ProviderResetCredit {
 	// 只有 ChatGPT／Codex 帳號有這項額度；其他路線連問都不必問。
 	if m == nil || m.authMode != "oauth" || m.client == nil {
-		return "", ""
+		return nil
 	}
 	raw, err := m.requestCodexAccountAPI(ctx, http.MethodGet, codexResetCreditsEndpoint, nil, codexResetReadTimeout)
 	if err != nil {
-		return "", ""
+		return nil
 	}
 	var payload codexResetCreditsPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", ""
+		return nil
 	}
-	id, expiresAt = earliestResetCredit(payload.Credits)
-	// 到期時間曾經取錯過（誤用 usage 的摘要），留下可核對的紀錄：
-	// 候選筆數與選中的那一筆，出問題時不必再靠猜。
+	values := availableResetCredits(payload.Credits)
+	// 到期時間曾經取錯過（誤用 usage 的摘要），留下可核對的紀錄。
 	if m.logger != nil {
-		m.logger.Debug("codex reset credit selected",
-			"candidates", len(payload.Credits), "credit_id", id, "expires_at", expiresAt)
+		earliest := ""
+		if len(values) > 0 {
+			earliest = values[0].ExpiresAt
+		}
+		m.logger.Debug("codex reset credits read",
+			"candidates", len(payload.Credits), "available", len(values), "earliest_expires_at", earliest)
 	}
-	return id, expiresAt
+	return values
 }
 
 // requestCodexAccountAPI 送出帶 OAuth 授權的帳號 API 請求。

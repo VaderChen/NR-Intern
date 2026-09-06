@@ -108,7 +108,7 @@ func (r *Router) HasProvider(providerID string) bool {
 //
 // 不支援這項功能的 Provider 回 ErrConflict 而不是靜默成功：使用者按了按鈕就會
 // 期待有事發生，回報「這條路線沒有這功能」才是誠實的。
-func (r *Router) ConsumeRateLimitReset(ctx context.Context, providerID, idempotencyKey string) (domain.ProviderResetResult, error) {
+func (r *Router) ConsumeRateLimitReset(ctx context.Context, providerID, idempotencyKey, creditID string) (domain.ProviderResetResult, error) {
 	if r == nil {
 		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider router is unavailable", domain.ErrNotFound)
 	}
@@ -126,7 +126,7 @@ func (r *Router) ConsumeRateLimitReset(ctx context.Context, providerID, idempote
 	if !ok {
 		return domain.ProviderResetResult{}, fmt.Errorf("%w: provider %q 不支援用量上限重置", domain.ErrConflict, providerID)
 	}
-	result, err := resetter.ConsumeRateLimitReset(ctx, idempotencyKey)
+	result, err := resetter.ConsumeRateLimitReset(ctx, idempotencyKey, creditID)
 	if err != nil {
 		return domain.ProviderResetResult{}, err
 	}

@@ -31,6 +31,11 @@ type ContextConfig struct {
 	MaxSummaryCharacters    int `json:"max_summary_characters"`
 	// MaxHistoryCharacters 是送進模型的對話歷史字元上限，超過就強制壓縮。
 	//
+	// 它與 token 預算量的是**同一批內容的兩種量法**，不是兩個獨立的指標：
+	// token 預算涵蓋 system prompt、工具定義與訊息並以 token 計；這一項只涵蓋
+	// 訊息（工具結果先截到 MaxToolResultCharacters）並以字元計。介面上兩者
+	// 並排時要標明單位，否則會被讀成同一個指標的兩個讀數。
+	//
 	// token 估算會失準：工具結果多半是 JSON、代碼與識別碼，ASCII 權重（每 4 字元
 	// 1 token）對這種內容大約低估一半以上。實測一次卡住的請求帶了 131,861 字歷史，
 	// 估算只有約 3.5 萬 token、佔預算 31%，因此永遠不會觸發壓縮，而本機模型光是
@@ -49,13 +54,29 @@ const (
 	DefaultMaxEstimatedTokens   = 256 * 1024
 )
 
+// ContextCompactionStatus 說明這次壓縮的依據。
+//
+// Trigger 是最重要的欄位：兩道閘門用的數字完全不同，只回報 token 而實際上是
+// 字元閘門觸發的話，使用者會對著一個離上限還很遠的 token 數字困惑——
+// 實際回報過「面板一排 -，卻在壓縮」正是這個情況。
 type ContextCompactionStatus struct {
+	// Trigger 為 context_budget（token 閘門）或 history_characters（字元閘門）。
+	Trigger             string
 	EstimatedTokens     int
 	ReportedInputTokens int
 	TriggerTokens       int
 	Budget              int
 	TriggerRatio        float64
+	// 字元閘門的兩個值。即使是 token 閘門觸發也一併回報，
+	// 讓使用者看得到另一道閘門離上限還有多遠。
+	HistoryCharacters    int
+	MaxHistoryCharacters int
 }
+
+const (
+	ContextCompactionTriggerBudget     = "context_budget"
+	ContextCompactionTriggerCharacters = "history_characters"
+)
 
 type ContextCompactionObserver func(ContextCompactionStatus) error
 
@@ -86,6 +107,21 @@ type ContextManager struct {
 // budget 依當次實際使用的模型推導 context 預算。
 // Workspace、Session 與 Run 都能覆寫 model，因此把預算綁在單一全域設定值會在
 // 不同 context window 的模型之間失準一個數量級。
+// maxHistoryCharacters 回傳這個 Session 適用的歷史字元上限。
+//
+// Provider 有宣告就以它為準：全域預設是為本機模型的 prefill 時間訂的，
+// 對大視窗的雲端 Provider 太保守——262K 視窗的 Provider 會在約 25% 使用率
+// 就被字元閘門壓縮，而使用者從介面上完全看不出原因。
+func (m *ContextManager) maxHistoryCharacters(config ContextConfig, session domain.Session) int {
+	if m == nil || m.Capabilities == nil {
+		return config.MaxHistoryCharacters
+	}
+	if declared := m.Capabilities.Capabilities(session.ProviderID, session.Model).MaxHistoryCharacters; declared > 0 {
+		return declared
+	}
+	return config.MaxHistoryCharacters
+}
+
 func (m *ContextManager) budget(config ContextConfig, session domain.Session) int {
 	if m == nil || m.Capabilities == nil {
 		return config.MaxEstimatedTokens
@@ -160,14 +196,22 @@ func (m *ContextManager) BuildObserved(
 	compacted := false
 	compactionConfig := config
 	thresholdReached := triggerTokens >= int(float64(budget)*softCompactionRatio)
+	trigger := ""
+	if thresholdReached {
+		trigger = ContextCompactionTriggerBudget
+	}
 	older, _ := splitForCompaction(messages, compactionConfig.RetainMessages)
+	historyCharacters := shapedCharacters(messages, config.MaxToolResultCharacters)
+	maxHistoryCharacters := m.maxHistoryCharacters(config, session)
 	// 字元上限與 token 估算是兩道獨立的閘門。估算低估時（工具結果的 JSON 與代碼
 	// 最容易低估），這一道仍會把歷史壓下來，並把保留則數收到真的裝得下的數量。
 	// 以「整形後」的字數判斷：單一超大工具結果會先被 shapeToolResults 截到上限，
 	// 用原始長度判斷會把只有一則大結果的正常情況也判成需要壓縮。
-	if historyCharacters := shapedCharacters(messages, config.MaxToolResultCharacters); historyCharacters > config.MaxHistoryCharacters {
+	if historyCharacters > maxHistoryCharacters {
 		thresholdReached = true
-		if fitted := retainCountWithinCharacters(messages, config.MaxHistoryCharacters); fitted < compactionConfig.RetainMessages {
+		// 兩道都超標時記字元閘門：它是先觸發的那一道，也是使用者比較意外的那一道。
+		trigger = ContextCompactionTriggerCharacters
+		if fitted := retainCountWithinCharacters(messages, maxHistoryCharacters); fitted < compactionConfig.RetainMessages {
 			compactionConfig.RetainMessages = fitted
 			older, _ = splitForCompaction(messages, compactionConfig.RetainMessages)
 		}
@@ -181,11 +225,14 @@ func (m *ContextManager) BuildObserved(
 	if thresholdReached && len(older) > 0 {
 		if onCompactionStart != nil {
 			if err := onCompactionStart(ContextCompactionStatus{
-				EstimatedTokens:     estimated,
-				ReportedInputTokens: reportedInputTokens,
-				TriggerTokens:       triggerTokens,
-				Budget:              budget,
-				TriggerRatio:        softCompactionRatio,
+				Trigger:              trigger,
+				EstimatedTokens:      estimated,
+				ReportedInputTokens:  reportedInputTokens,
+				TriggerTokens:        triggerTokens,
+				Budget:               budget,
+				TriggerRatio:         softCompactionRatio,
+				HistoryCharacters:    historyCharacters,
+				MaxHistoryCharacters: maxHistoryCharacters,
 			}); err != nil {
 				return ContextWindow{}, err
 			}

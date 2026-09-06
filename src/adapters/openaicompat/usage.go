@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -118,16 +119,19 @@ func (m *Model) storeResetCredits(ctx context.Context, payload *codexResetCredit
 	if payload != nil && payload.AvailableCount != nil && *payload.AvailableCount >= 0 {
 		credits.Available = true
 		credits.Count = *payload.AvailableCount
-		// 到期時間**一律以明細端點為準**。/wham/usage 的 credits 欄位不完整——
+		// 明細**一律以明細端點為準**。/wham/usage 的 credits 欄位不完整——
 		// 有時整個缺席，有時只帶一筆摘要；拿它當主要來源會顯示成比實際更晚的
 		// 到期時間，而且看起來完全正常，不會有任何錯誤。
 		// 沒有額度就不必問——沒有東西會到期。
 		if credits.Count > 0 {
-			_, credits.NextExpiresAt = m.fetchEarliestResetCredit(ctx)
+			credits.Items = m.fetchAvailableResetCredits(ctx)
 		}
 		// 明細端點讀不到時才退回 usage 帶的那份。
-		if credits.NextExpiresAt == "" {
-			_, credits.NextExpiresAt = earliestResetCredit(payload.Credits)
+		if len(credits.Items) == 0 {
+			credits.Items = availableResetCredits(payload.Credits)
+		}
+		if len(credits.Items) > 0 {
+			credits.NextExpiresAt = credits.Items[0].ExpiresAt
 		}
 	}
 	m.usageMu.Lock()
@@ -135,12 +139,16 @@ func (m *Model) storeResetCredits(ctx context.Context, payload *codexResetCredit
 	m.usageMu.Unlock()
 }
 
-// earliestResetCredit 回傳最早到期的「可用」額度的 ID 與到期時間。
+// availableResetCredits 取出可用的額度，依到期時間由近到遠排序。
 //
-// 已兌換或已過期的額度即使到期更早也不算：拿它去顯示會讓使用者以為快過期了，
-// 拿它去兌換則會失敗。
-func earliestResetCredit(credits []codexResetCredit) (id string, expiresAt string) {
-	var earliest time.Time
+// 已兌換或已過期的即使到期更早也排除：列出來會讓使用者以為還能用，
+// 挑到它去兌換則會失敗。排序讓「快到期的先用掉」成為介面上的預設順序。
+func availableResetCredits(credits []codexResetCredit) []domain.ProviderResetCredit {
+	type entry struct {
+		value   domain.ProviderResetCredit
+		expires time.Time
+	}
+	entries := make([]entry, 0, len(credits))
 	for _, credit := range credits {
 		if !strings.EqualFold(strings.TrimSpace(credit.Status), "available") || credit.ExpiresAt == nil {
 			continue
@@ -150,11 +158,19 @@ func earliestResetCredit(credits []codexResetCredit) (id string, expiresAt strin
 		if err != nil {
 			continue
 		}
-		if expiresAt == "" || parsed.Before(earliest) {
-			id, expiresAt, earliest = strings.TrimSpace(credit.ID), value, parsed
-		}
+		entries = append(entries, entry{
+			value:   domain.ProviderResetCredit{ID: strings.TrimSpace(credit.ID), ExpiresAt: value},
+			expires: parsed,
+		})
 	}
-	return id, expiresAt
+	sort.SliceStable(entries, func(first, second int) bool {
+		return entries[first].expires.Before(entries[second].expires)
+	})
+	values := make([]domain.ProviderResetCredit, 0, len(entries))
+	for _, item := range entries {
+		values = append(values, item.value)
+	}
+	return values
 }
 
 func (m *Model) clearProviderUsage() {

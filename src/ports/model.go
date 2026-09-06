@@ -24,7 +24,8 @@ type ProviderUsageSource interface {
 // 兌換會消耗帳號層級的有限額度且不可還原，所以只在使用者明確要求時呼叫，
 // 絕不放進任何自動排程。
 type ProviderRateLimitResetter interface {
-	ConsumeRateLimitReset(ctx context.Context, idempotencyKey string) (domain.ProviderResetResult, error)
+	// creditID 空白時由 adapter 自行挑最早到期的一筆。
+	ConsumeRateLimitReset(ctx context.Context, idempotencyKey, creditID string) (domain.ProviderResetResult, error)
 }
 
 // ProviderUsageRefresher 由能主動查詢上游配額的 adapter 實作。

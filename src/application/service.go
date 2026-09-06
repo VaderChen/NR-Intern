@@ -1349,6 +1349,9 @@ func approvalRequestFromPayload(payload map[string]any) (domain.ToolApprovalRequ
 func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, session domain.Session, input domain.RunInput, run domain.Run) {
 	sequence := int64(0)
 	defer s.wg.Done()
+	// 排在 clearActive 之前註冊，因此執行順序在它之後：下一輪要通過
+	// hasActiveSession 的檢查，前一輪必須已經從 active 移除。
+	defer s.advancePlanLoop(run.ID)
 	defer s.clearActive(run.ID)
 	defer func() {
 		if recovered := recover(); recovered != nil {

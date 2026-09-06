@@ -284,10 +284,13 @@ func Build(config Config) (*Runtime, error) {
 	if err := validateStoredStructure(context.Background(), sessions, projects, workspaces, model); err != nil {
 		return nil, err
 	}
+	// Service 要等後面才建得出來，先給工具一個之後填上的間接層。
+	planLoops := &planLoopBinding{}
 	nativeToolValues := []tools.NativeTool{
 		nativeplans.NewGetTool(plans),
-		nativeplans.NewCreateTool(plans),
+		&nativeplans.CreateTool{Repository: plans, Loops: planLoops},
 		nativeplans.NewUpdateStepTool(plans),
+		nativeplans.NewInterruptTool(planLoops),
 		nativefiles.NewDirectoryListTool(config.MaxToolOutputBytes, 10_000),
 		nativefiles.NewDirectoryCreateTool(),
 		nativefiles.NewReadTool(config.MaxToolOutputBytes),
@@ -444,6 +447,8 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 工具在 Service 之前就組好了，這裡才把控制器填上。
+	planLoops.bind(service)
 	runtime := &Runtime{
 		Config:        config,
 		Application:   service,
@@ -535,7 +540,7 @@ func (r *Runtime) ProviderUsage(ctx context.Context, providerID string) (domain.
 //
 // 這會消耗使用者 ChatGPT 帳號的有限額度且無法還原，因此只由明確的 API 呼叫觸發，
 // 不掛任何排程；idempotencyKey 空白時由後端補一組，讓單次點擊仍有重試保護。
-func (r *Runtime) ConsumeProviderRateLimitReset(ctx context.Context, providerID, idempotencyKey string) (domain.ProviderResetResult, error) {
+func (r *Runtime) ConsumeProviderRateLimitReset(ctx context.Context, providerID, idempotencyKey, creditID string) (domain.ProviderResetResult, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.ProviderResetResult{}, err
 	}
@@ -545,7 +550,7 @@ func (r *Runtime) ConsumeProviderRateLimitReset(ctx context.Context, providerID,
 	if strings.TrimSpace(idempotencyKey) == "" {
 		idempotencyKey = domain.NewID("reset")
 	}
-	return r.Model.ConsumeRateLimitReset(ctx, providerID, idempotencyKey)
+	return r.Model.ConsumeRateLimitReset(ctx, providerID, idempotencyKey, creditID)
 }
 
 func (r *Runtime) ServiceSettings(ctx context.Context) (domain.ServiceSettings, error) {
@@ -1180,6 +1185,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			settings.ResponseHeaderTimeoutSeconds = provided.ResponseHeaderTimeoutSeconds
 			settings.ContextWindow = provided.ContextWindow
 			settings.MaxOutputTokens = provided.MaxOutputTokens
+			settings.MaxHistoryCharacters = provided.MaxHistoryCharacters
 			if provided.APIKey != nil {
 				settings.APIKey = strings.TrimSpace(*provided.APIKey)
 			}
@@ -1202,6 +1208,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			settings.ResponseHeaderTimeoutSeconds = provided.ResponseHeaderTimeoutSeconds
 			settings.ContextWindow = provided.ContextWindow
 			settings.MaxOutputTokens = provided.MaxOutputTokens
+			settings.MaxHistoryCharacters = provided.MaxHistoryCharacters
 			applyOpenAICodexResponsesDefaults(&settings)
 			candidate.Providers[id] = ProviderConfig{Type: typeName, DisplayName: displayName, Enabled: boolPointer(enabled), OpenAICodexResponses: &settings}
 		default:
@@ -1301,6 +1308,7 @@ func providerSettingsView(config Config, providerAuth *providerauth.Manager) dom
 				ResponseHeaderTimeoutSeconds: settings.ResponseHeaderTimeoutSeconds,
 				ContextWindow:                settings.ContextWindow,
 				MaxOutputTokens:              settings.MaxOutputTokens,
+				MaxHistoryCharacters:         settings.MaxHistoryCharacters,
 			}
 		case "openai-codex-responses":
 			if provider.OpenAICodexResponses == nil {
@@ -1316,6 +1324,7 @@ func providerSettingsView(config Config, providerAuth *providerauth.Manager) dom
 				ResponseHeaderTimeoutSeconds: settings.ResponseHeaderTimeoutSeconds,
 				ContextWindow:                settings.ContextWindow,
 				MaxOutputTokens:              settings.MaxOutputTokens,
+				MaxHistoryCharacters:         settings.MaxHistoryCharacters,
 			}
 		}
 		values = append(values, value)
@@ -1363,6 +1372,17 @@ func applyOpenAICompatibleDefaults(settings *openaicompat.Config) {
 	}
 }
 
+// codexMaxHistoryCharacters 是 Codex Responses 的歷史字元上限預設。
+//
+// 全域的 60,000 是為**本機模型的 prefill 時間**訂的（實測一次 131,861 字的請求
+// 讓本機模型 prefill 二十分鐘）。Codex Responses 一定走雲端、視窗以 20 萬 token
+// 起跳，沿用全域會在約 25% 使用率就被字元閘門壓縮，而使用者從介面上完全看不出
+// 原因——實際回報過這個困惑。
+//
+// 20 萬字約當中文 20 萬 token、英文 5 萬 token：對 262K 視窗仍留有餘裕，
+// 也保住了「token 估算失準時的最後一道防線」這個原始用途。
+const codexMaxHistoryCharacters = 200_000
+
 func applyOpenAICodexResponsesDefaults(settings *openaicompat.Config) {
 	settings.AuthMode = "oauth"
 	settings.OAuth = providerauth.DefaultConfig()
@@ -1376,6 +1396,11 @@ func applyOpenAICodexResponsesDefaults(settings *openaicompat.Config) {
 	}
 	if settings.MaxAttempts == 0 {
 		settings.MaxAttempts = 3
+	}
+	// 0 代表「用這個類型的預設」，對 Codex 不是沿用全域——全域那個值
+	// 是為本機模型訂的，Codex 永遠不是本機模型。
+	if settings.MaxHistoryCharacters <= 0 {
+		settings.MaxHistoryCharacters = codexMaxHistoryCharacters
 	}
 	if settings.TimeoutSeconds <= 0 {
 		settings.TimeoutSeconds = 1800

@@ -431,18 +431,26 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				compactionStarted = true
 				logger.Info("session context compaction started",
 					"turn", turn,
+					"trigger", status.Trigger,
 					"estimated_tokens", status.EstimatedTokens,
 					"reported_input_tokens", status.ReportedInputTokens,
 					"trigger_tokens", status.TriggerTokens,
 					"budget_tokens", status.Budget,
 					"trigger_ratio", status.TriggerRatio,
+					"history_characters", status.HistoryCharacters,
+					"max_history_characters", status.MaxHistoryCharacters,
 				)
+				// trigger 讓介面說得出「為什麼壓縮」。少了它，使用者看到的就只是
+				// 一個轉圈圈，而兩道閘門用的數字完全不同，猜不出是哪一道。
 				return emitEvent(emit, "context.compaction.started", map[string]any{
-					"estimated_tokens":      status.EstimatedTokens,
-					"reported_input_tokens": status.ReportedInputTokens,
-					"trigger_tokens":        status.TriggerTokens,
-					"budget_tokens":         status.Budget,
-					"trigger_ratio":         status.TriggerRatio,
+					"trigger":                status.Trigger,
+					"estimated_tokens":       status.EstimatedTokens,
+					"reported_input_tokens":  status.ReportedInputTokens,
+					"trigger_tokens":         status.TriggerTokens,
+					"budget_tokens":          status.Budget,
+					"trigger_ratio":          status.TriggerRatio,
+					"history_characters":     status.HistoryCharacters,
+					"max_history_characters": status.MaxHistoryCharacters,
 				})
 			})
 			if contextErr != nil {

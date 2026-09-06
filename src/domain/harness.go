@@ -200,6 +200,12 @@ type ModelCapabilities struct {
 	MaxOutputTokens int  `json:"max_output_tokens,omitempty"`
 	SupportsTools   bool `json:"supports_tools"`
 	Streaming       bool `json:"streaming"`
+	// MaxHistoryCharacters 覆寫全域的歷史字元上限（0 代表沿用全域值）。
+	//
+	// 全域預設是為本機模型的 prefill 時間訂的，對大視窗的雲端 Provider 太保守：
+	// 262K 視窗的 Provider 會在約 25% 使用率就被壓縮。這個欄位讓每個 Provider
+	// 各自決定，而不是用一個值同時服務兩種差異極大的情況。
+	MaxHistoryCharacters int `json:"max_history_characters,omitempty"`
 }
 
 // UnresolvedToolFailure 是一次工具失敗，且同名工具在之後沒有成功執行過。

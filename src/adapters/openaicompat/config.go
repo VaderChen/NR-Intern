@@ -47,6 +47,9 @@ type Config struct {
 	// 留空代表未知，context 預算會退回 context.max_estimated_tokens。
 	ContextWindow   int `json:"context_window,omitempty"`
 	MaxOutputTokens int `json:"max_output_tokens,omitempty"`
+	// MaxHistoryCharacters 覆寫全域的歷史字元上限（0 代表沿用全域值）。
+	// 全域預設是為本機模型的 prefill 時間訂的，大視窗的雲端 Provider 可以放寬。
+	MaxHistoryCharacters int `json:"max_history_characters,omitempty"`
 	// ModelLimits 覆寫個別模型的限制。Workspace、Session 與 Run 都能改用同一 Provider 的其他模型，
 	// 只有 Provider 層級的宣告會在這種情況下失準。
 	ModelLimits map[string]ModelLimits `json:"model_limits,omitempty"`
@@ -71,26 +74,27 @@ type Diagnostics struct {
 }
 
 type Model struct {
-	endpoint            string
-	apiKey              string
-	authMode            string
-	tokenSource         func(context.Context) (string, error)
-	defaultModel        string
-	instructionRole     string
-	extraHeaders        map[string]string
-	disableStreaming    bool
-	streamIncludeUsage  bool
-	omitToolChoice      bool
-	maxAttempts         int
-	contextWindow       int
-	maxOutputTokens     int
-	modelLimits         map[string]ModelLimits
-	limitsMu            sync.RWMutex
-	reportedModelLimits map[string]ModelLimits
-	logger              *slog.Logger
-	client              *http.Client
-	usageMu             sync.RWMutex
-	providerUsage       domain.ProviderUsage
+	endpoint             string
+	apiKey               string
+	authMode             string
+	tokenSource          func(context.Context) (string, error)
+	defaultModel         string
+	instructionRole      string
+	extraHeaders         map[string]string
+	disableStreaming     bool
+	streamIncludeUsage   bool
+	omitToolChoice       bool
+	maxAttempts          int
+	contextWindow        int
+	maxOutputTokens      int
+	maxHistoryCharacters int
+	modelLimits          map[string]ModelLimits
+	limitsMu             sync.RWMutex
+	reportedModelLimits  map[string]ModelLimits
+	logger               *slog.Logger
+	client               *http.Client
+	usageMu              sync.RWMutex
+	providerUsage        domain.ProviderUsage
 }
 
 func New(config Config) (*Model, error) {
@@ -161,22 +165,23 @@ func New(config Config) (*Model, error) {
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	return &Model{
-		endpoint:           endpoint,
-		apiKey:             strings.TrimSpace(config.APIKey),
-		authMode:           authMode,
-		tokenSource:        config.TokenSource,
-		defaultModel:       strings.TrimSpace(config.Model),
-		instructionRole:    role,
-		extraHeaders:       headers,
-		disableStreaming:   config.DisableStreaming && authMode != "oauth",
-		streamIncludeUsage: config.StreamIncludeUsage,
-		omitToolChoice:     config.OmitToolChoice,
-		maxAttempts:        maxAttempts,
-		contextWindow:      config.ContextWindow,
-		maxOutputTokens:    config.MaxOutputTokens,
-		modelLimits:        cloneModelLimits(config.ModelLimits),
-		logger:             logging.Or(config.Logger),
-		client:             &http.Client{Timeout: timeout, Transport: transport},
+		endpoint:             endpoint,
+		apiKey:               strings.TrimSpace(config.APIKey),
+		authMode:             authMode,
+		tokenSource:          config.TokenSource,
+		defaultModel:         strings.TrimSpace(config.Model),
+		instructionRole:      role,
+		extraHeaders:         headers,
+		disableStreaming:     config.DisableStreaming && authMode != "oauth",
+		streamIncludeUsage:   config.StreamIncludeUsage,
+		omitToolChoice:       config.OmitToolChoice,
+		maxAttempts:          maxAttempts,
+		contextWindow:        config.ContextWindow,
+		maxOutputTokens:      config.MaxOutputTokens,
+		maxHistoryCharacters: config.MaxHistoryCharacters,
+		modelLimits:          cloneModelLimits(config.ModelLimits),
+		logger:               logging.Or(config.Logger),
+		client:               &http.Client{Timeout: timeout, Transport: transport},
 	}, nil
 }
 
@@ -237,10 +242,11 @@ func (m *Model) Capabilities(model string) domain.ModelCapabilities {
 		model = m.defaultModel
 	}
 	capabilities := domain.ModelCapabilities{
-		ContextWindow:   m.contextWindow,
-		MaxOutputTokens: m.maxOutputTokens,
-		SupportsTools:   true,
-		Streaming:       m.authMode == "oauth" || !m.disableStreaming,
+		ContextWindow:        m.contextWindow,
+		MaxOutputTokens:      m.maxOutputTokens,
+		MaxHistoryCharacters: m.maxHistoryCharacters,
+		SupportsTools:        true,
+		Streaming:            m.authMode == "oauth" || !m.disableStreaming,
 	}
 	if limits, exists := m.modelLimits[model]; exists {
 		if limits.ContextWindow > 0 {

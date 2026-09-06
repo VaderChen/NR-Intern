@@ -2,6 +2,7 @@ package domain
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -46,6 +47,10 @@ type Plan struct {
 	CreatedAt     time.Time  `json:"created_at"`
 	UpdatedAt     time.Time  `json:"updated_at"`
 	Position      int        `json:"position"`
+	// Loop 是多輪執行狀態，nil 代表沒有啟用。放在 Plan 上而不另開儲存：
+	// PlanRepository 已接上 ProjectRoots，狀態因此自動跟著記憶體隔離專案的
+	// RAM disk 走，不必再處理一次分流。
+	Loop *PlanLoop `json:"loop,omitempty"`
 }
 
 type PlanStep struct {
@@ -115,6 +120,18 @@ func NewPlan(sessionID string, input CreatePlanInput, now time.Time) (Plan, erro
 		verification := strings.TrimSpace(inputStep.Verification)
 		if title == "" || verification == "" {
 			return Plan{}, fmt.Errorf("%w: step %d requires title and verification criteria", ErrInvalidInput, index+1)
+		}
+		// 把步驟命名為「第 N 輪」是實際觀察到的誤解：Agent 把計畫的步驟當成
+		// 多輪執行的回合。兩者無關——輪是「再推進一次」的機會，步驟是任務本身
+		// 的結構，一輪可能只推進半個步驟，也可能一次做完好幾個。
+		//
+		// 只擋 Agent 建立的計畫：使用者要怎麼命名是他的自由，這裡要修正的是
+		// Agent 的概念混淆。也只在工具說明之外多一道強制——這個功能其他地方
+		// （完成必須有證據）都是強制的，唯獨這裡靠自律就等於沒做。
+		if input.CreatedBy == PlanCreatedByAgent && StepTitleLooksLikeRound(title) {
+			return Plan{}, fmt.Errorf("%w: step %d 不要命名為「第 N 輪」。步驟是這個任務要依序完成的幾件事，"+
+				"每件事有自己的產出與驗證條件；重複執行同一個計畫是另一個機制（多輪執行），由使用者啟動、與步驟數無關。"+
+				"請改用描述該步驟實際要做什麼的名稱", ErrInvalidInput, index+1)
 		}
 		plan.Steps = append(plan.Steps, PlanStep{
 			ID:           NewID("step"),
@@ -217,6 +234,17 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 		plan.Status = PlanStatusCompleted
 	}
 	return plan, nil
+}
+
+// roundStyleStepTitle 比對「第 N 輪」「第N次」「Round N」這類把步驟當回合的命名。
+//
+// 只比對開頭：步驟內容裡出現「輪詢」「第二輪審查」這種真實工作不該被誤擋，
+// 會出問題的是拿它當標題前綴、把整個計畫切成 N 輪的那種寫法。
+var roundStyleStepTitle = regexp.MustCompile(`^\s*(第\s*[0-9０-９一二三四五六七八九十]+\s*[輪回次]|round\s*[0-9]+|第\s*[0-9０-９一二三四五六七八九十]+\s*(轮|回合))`)
+
+// StepTitleLooksLikeRound 回報這個步驟標題是不是把步驟當成執行回合。
+func StepTitleLooksLikeRound(title string) bool {
+	return roundStyleStepTitle.MatchString(strings.ToLower(strings.TrimSpace(title)))
 }
 
 func ValidatePlan(plan Plan) error {

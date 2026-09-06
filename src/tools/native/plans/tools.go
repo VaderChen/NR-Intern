@@ -12,7 +12,12 @@ import (
 )
 
 type GetTool struct{ Repository ports.PlanRepository }
-type CreateTool struct{ Repository ports.PlanRepository }
+type CreateTool struct {
+	Repository ports.PlanRepository
+	// Loops 用來擋下多輪執行期間的換計畫。nil 時不做這項檢查，
+	// 讓沒有多輪功能的組裝方式維持原本行為。
+	Loops ports.PlanLoopController
+}
 type UpdateStepTool struct{ Repository ports.PlanRepository }
 
 func NewGetTool(repository ports.PlanRepository) *GetTool { return &GetTool{Repository: repository} }
@@ -50,8 +55,12 @@ func (t *GetTool) Execute(ctx context.Context, invocation tools.Invocation, _ po
 func (t *CreateTool) Definition() domain.ToolDefinition {
 	return domain.ToolDefinition{
 		Name: "plan_create", Label: "建立工作計畫", Version: "1.0.0", Category: "planning",
-		Description: "把獨立的長任務新增到計畫佇列尾端，並拆成可依序執行與驗證的步驟。每一步都必須提供可由工具確認的驗證條件；不要為同一任務重複建立計畫。",
-		Platforms:   []string{"darwin", "linux", "windows"}, Capabilities: []string{"planning", "decomposition", "verification-contract"},
+		Description: "把獨立的長任務新增到計畫佇列尾端，並拆成可依序執行與驗證的步驟。每一步都必須提供可由工具確認的驗證條件；不要為同一任務重複建立計畫。" +
+			"步驟是「這個任務要依序完成的幾件事」，每件事都有各自的產出與驗證條件。" +
+			"不要把步驟當成執行的回合，也不要命名為「第 N 輪」「第 N 次嘗試」之類——" +
+			"重複執行同一個計畫是另一個獨立機制（多輪執行），由使用者啟動、與步驟數無關；" +
+			"一輪可能只推進半個步驟，也可能一次做完好幾個。",
+		Platforms: []string{"darwin", "linux", "windows"}, Capabilities: []string{"planning", "decomposition", "verification-contract"},
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -77,6 +86,14 @@ func (t *CreateTool) Definition() domain.ToolDefinition {
 func (t *CreateTool) Execute(ctx context.Context, invocation tools.Invocation, _ ports.ToolUpdateSink) (domain.ToolExecution, error) {
 	if t == nil || t.Repository == nil {
 		return failure(invocation.Call, "plan repository is unavailable"), nil
+	}
+	// 多輪執行期間不准換計畫。這是走鐘最直接的路徑：覺得原計畫不順就開一個新的，
+	// 多輪機制會很開心地繼續跑，跑的卻已經是另一個任務，而且輪數還在算。
+	if t.Loops != nil {
+		if active, running := t.Loops.ActivePlanLoop(ctx, invocation.Session.ID); running {
+			return failure(invocation.Call, "「"+active.Title+"」正在多輪執行中，不能新建計畫。"+
+				"要調整做法請用 plan_step_update 改步驟；真的要換任務，先用 plan_loop_interrupt 中止並說明原因，由使用者決定。"), nil
+		}
 	}
 	if _, err := t.Repository.Reconcile(ctx, invocation.Session.ID, invocation.Session.LockPlans); err != nil {
 		return failure(invocation.Call, err.Error()), nil
