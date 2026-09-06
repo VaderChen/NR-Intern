@@ -91,3 +91,28 @@ func TestReadToolRejectsWorkspaceTraversal(t *testing.T) {
 		t.Fatalf("traversal result = %+v", result)
 	}
 }
+
+// 模型把 end_line 當成「要讀幾行」是實測到的行為（連續三次 start_line=400、
+// end_line=170）。錯誤訊息要說出正確的意思與這次該填什麼，否則只能猜著重試——
+// 每次工具呼叫都要先失敗一輪。
+func TestFileReadRejectsLineRangeWithActionableMessage(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "sample.txt"), []byte("a\nb\nc\n"), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	result, err := NewReadTool(64*1024).Execute(context.Background(), fileInvocation(root, "file_read", map[string]any{
+		"path": "sample.txt", "start_line": 400, "end_line": 170,
+	}), nil)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("end_line 小於 start_line 應該失敗")
+	}
+	// 收到什麼、正確的意思是什麼、這次該填什麼——三件事都要在訊息裡。
+	for _, want := range []string{"400", "170", "絕對行號", "end_line=569"} {
+		if !strings.Contains(result.Content, want) {
+			t.Fatalf("錯誤訊息應包含 %q 讓模型能直接改正：%s", want, result.Content)
+		}
+	}
+}

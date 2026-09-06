@@ -37,8 +37,9 @@ func (t *ReadTool) Definition() domain.ToolDefinition {
 			"type": "object",
 			"properties": map[string]any{
 				"path":       map[string]any{"type": "string", "description": "Sandbox 內的相對或絕對檔案路徑"},
-				"start_line": map[string]any{"type": "integer", "minimum": 1, "default": 1},
-				"end_line":   map[string]any{"type": "integer", "minimum": 1, "description": "包含此行；省略表示讀到輸出上限"},
+				"start_line": map[string]any{"type": "integer", "minimum": 1, "default": 1, "description": "起始行號（從 1 起算，包含此行）"},
+				"end_line": map[string]any{"type": "integer", "minimum": 1,
+					"description": "結束行號，**絕對行號、不是行數**，且包含此行。要讀第 400 行起的 170 行，填 start_line=400、end_line=569。省略表示讀到輸出上限"},
 			},
 			"required": []string{"path"},
 		},
@@ -71,7 +72,13 @@ func (t *ReadTool) Execute(ctx context.Context, invocation tools.Invocation, _ p
 	startLine := toolutil.Int(invocation.Call.Arguments, "start_line", 1, 1, 10_000_000)
 	endLine := toolutil.Int(invocation.Call.Arguments, "end_line", 0, 0, 10_000_000)
 	if endLine > 0 && endLine < startLine {
-		return fileFailure(invocation.Call, "end_line must be greater than or equal to start_line"), nil
+		// 訊息要說出收到什麼、正確的意思是什麼、以及這次該怎麼填。
+		// 只說「不合法」的話，模型只能猜著重試——實測連續三次都把 end_line
+		// 當成「要讀幾行」，每次都要先失敗一輪。
+		return fileFailure(invocation.Call, fmt.Sprintf(
+			"end_line (%d) must be greater than or equal to start_line (%d). "+
+				"end_line 是絕對行號，不是要讀的行數；若想從第 %d 行起讀 %d 行，請用 end_line=%d",
+			endLine, startLine, startLine, endLine, startLine+endLine-1)), nil
 	}
 	var output strings.Builder
 	scanner := bufio.NewScanner(file)

@@ -79,6 +79,12 @@ Project 的 `sandbox_roots` 可以經由 `POST /api/v1/projects` 與 `PATCH /api
 系統上逐層只會找到完全相同的名稱，結果與修改前一致。對齊只在第一次比對失敗時
 執行——每一層都要讀一次目錄，放在正常路徑上太貴。
 
+多根沙箱的失敗**要回報真正的原因**。`ResolvePathInRoots` 過去把所有失敗都換成
+「不在沙箱內」，包括「檔案不存在」。實測後果：Agent 拿到錯的原因，就一再改寫路徑的
+大小寫與前綴去修正一個根本不存在的問題，每次工具呼叫都要先失敗一輪。現在只有
+「超出範圍」才靜默換下一個根重試，其餘原因原樣回傳。這不影響邊界本身——
+真正在所有根之外時仍然回報 `path is outside the project sandbox`。
+
 排程（Schedule）保存自己的 `sandbox_roots`，套用與 Project 完全相同的寫入前驗證。排程建立的
 Session 不屬於任何 Project，沙箱只來自該排程；路徑經 `RunInput.SandboxRoots` 這個 `json:"-"`
 的後端專用欄位傳入，HTTP 呼叫端無法自行帶入或擴權。後端重新啟動時，儲存的沙箱目錄若已不存在，

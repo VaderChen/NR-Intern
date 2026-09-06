@@ -134,13 +134,44 @@ func ResolvePathInRoots(workspaceRoots []string, requested string, mustExist boo
 	if requested == "" || !filepath.IsAbs(requested) {
 		return ResolvePath(roots[0], requested, mustExist)
 	}
+	// 逐一嘗試各個根目錄。全部失敗時要回報**真正的原因**，不能一律說成
+	// 「不在沙箱內」——實測過：路徑其實只是不存在，Agent 卻被告知是沙箱問題，
+	// 於是一再改寫路徑大小寫與前綴去「修正」一個根本不存在的問題。
+	// 錯誤訊息把它導向錯的方向，比沒有訊息更糟。
+	var outsideCount int
+	var firstOther error
 	for _, root := range roots {
 		path, err := ResolvePath(root, requested, mustExist)
 		if err == nil {
 			return path, nil
 		}
+		if isOutsideSandbox(err) {
+			outsideCount++
+			continue
+		}
+		if firstOther == nil {
+			firstOther = err
+		}
 	}
+	// 只要有任何一個根目錄涵蓋了這個路徑（失敗原因不是「超出範圍」），
+	// 那就不是沙箱問題，回報那個原因。
+	if firstOther != nil {
+		return "", firstOther
+	}
+	_ = outsideCount
 	return "", fmt.Errorf("path is outside the project sandbox")
+}
+
+// isOutsideSandbox 判斷這個錯誤是不是「路徑不在這個根目錄範圍內」。
+//
+// 只有這一類適合在多根情境下靜靜換下一個根重試；其他原因（不存在、
+// symlink 逃逸、無法解析）都是該原樣回報給呼叫端的事實。
+func isOutsideSandbox(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := err.Error()
+	return strings.Contains(message, "escapes the sandbox")
 }
 
 // resolveExistingPath 會解析最深的既有父路徑，再接回尚未建立的部分。

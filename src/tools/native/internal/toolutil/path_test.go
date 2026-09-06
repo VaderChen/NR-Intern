@@ -244,3 +244,44 @@ func TestAlignPathCaseLeavesExactPathsUnchanged(t *testing.T) {
 		t.Fatalf("不存在的路徑段應原樣保留：%q -> %q", pending, got)
 	}
 }
+
+// 多根沙箱下，「路徑不存在」不能被回報成「不在沙箱內」。
+//
+// 實測過的後果：Agent 拿到錯的原因，就一再改寫路徑的大小寫與前綴去修正一個
+// 根本不存在的問題，每次工具呼叫都要失敗一輪才走對。
+func TestResolvePathInRootsReportsTheRealReason(t *testing.T) {
+	base := t.TempDir()
+	first := filepath.Join(base, "first")
+	second := filepath.Join(base, "second")
+	for _, directory := range []string{first, second} {
+		if err := os.MkdirAll(directory, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	roots := []string{first, second}
+
+	// 落在某個根之內、但檔案不存在：要說不存在。
+	_, err := ResolvePathInRoots(roots, filepath.Join(second, "missing.txt"), true)
+	if err == nil {
+		t.Fatal("不存在的路徑應該失敗")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("應回報真正的原因（不存在），得到：%v", err)
+	}
+
+	// 真的在所有根之外：才說不在沙箱內。
+	outside := filepath.Join(base, "outside", "file.txt")
+	if err := os.MkdirAll(filepath.Dir(outside), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(outside, []byte("x"), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_, err = ResolvePathInRoots(roots, outside, true)
+	if err == nil {
+		t.Fatal("沙箱外的路徑應該失敗")
+	}
+	if !strings.Contains(err.Error(), "outside the project sandbox") {
+		t.Fatalf("真正在沙箱外時才該這樣說，得到：%v", err)
+	}
+}
