@@ -672,6 +672,14 @@ summary { cursor: pointer; color: var(--muted); }
    進度必須一眼看得到，否則使用者只會看到帳單。 */
 .context-compaction-reason { color: var(--muted); font-size: 11px; }
 
+/* 訊息時間戳：貼齊訊息右緣、比內文小一級、用 muted 色，讀訊息時不該搶注意力。
+   tabular-nums 讓連續訊息的時間對齊，不會因為數字寬度不同而跳動。 */
+.message-timestamp { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.4; text-align: right; font-variant-numeric: tabular-nums; }
+/* 思考區塊自己不是一則回答，跟著它的答案下方已經有一個時間了；兩個疊在一起
+   只會變成雜訊。用 CSS 而不是建立節點時判斷，是因為 reasoning-only 這個
+   class 在串流過程中會被反覆切換。 */
+.message.reasoning-only > .message-timestamp { display: none; }
+
 .plan-loop-badge { flex: none; padding: 1px 7px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 800; }
 .plan-loop-badge[data-state="paused"] { background: var(--panel-3); color: var(--muted); }
 .plan-loop-badge[data-state="stopped"] { background: var(--panel-3); color: var(--muted); }

@@ -3644,6 +3644,7 @@ async function loadMessages() {
           id: operationID,
           status: entry.data.status,
           error: entry.data.error,
+          createdAt: entry.created_at,
         })) visibleEntries += 1;
       }
     }
@@ -3897,6 +3898,7 @@ function appendMessage(message, options = {}) {
       indicator.append(dot);
     }
     article.append(indicator);
+    article.append(messageTimestampNode(message.created_at));
   } else {
     article.append(content);
   }
@@ -3905,6 +3907,35 @@ function appendMessage(message, options = {}) {
     return mergeReasoningIntoPrevious(article, options.operationId || "");
   }
   return article;
+}
+
+// messageTimestampNode 是訊息右下角那個不顯眼的時間。
+//
+// 精細度依「是不是當天」決定：當天只給時分秒，日期是多餘的雜訊；跨日才補上
+// 日期，並省略秒——隔天之後回頭看，精確到秒沒有意義。完整時間放在 title，
+// 需要時滑過去就有。
+function messageTimestampNode(createdAt) {
+  const node = document.createElement("time");
+  node.className = "message-timestamp";
+  const date = createdAt ? new Date(createdAt) : new Date();
+  if (Number.isNaN(date.getTime())) return node;
+  node.dateTime = date.toISOString();
+  node.textContent = formatMessageTimestamp(date);
+  node.title = date.toLocaleString();
+  return node;
+}
+
+function formatMessageTimestamp(date) {
+  const pad = (value) => String(value).padStart(2, "0");
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  if (sameDay) {
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  }
+  return `${pad(date.getFullYear() % 100)}/${pad(date.getMonth() + 1)}/${pad(date.getDate())}`
+    + ` ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function appendMessageAttachments(container, attachments) {
@@ -4298,6 +4329,9 @@ function appendRunOutcome(outcome) {
   return appendMessage({
     id: outcomeID,
     role: "assistant",
+    // 這則提示沒有對應的後端訊息，時間得由呼叫端給。重新載入舊對話時若讓它
+    // 退回「現在」，昨天的失敗會標上今天的時間。
+    created_at: outcome.createdAt,
     variant: canceled ? "run-canceled" : "run-failed",
     content: canceled
       ? (detail || "此 Run 已取消，未產生回答。")
