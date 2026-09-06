@@ -217,6 +217,13 @@ Console 的待送訊息使用目前 Browser／WebView profile 的 IndexedDB Dura
 縮寫顯示，提示保留精確值；未設定模型價格時隱藏金額。用量包含已消耗的歷史 Run，重新提問
 不會扣回 token，也不等於當前送往模型的上下文大小。
 
+每則回答右下角有時間戳：當天只顯示 `HH:MM:SS`，跨日改顯示 `YY/MM/DD HH:mm`——隔天之後回頭
+看，精確到秒沒有意義。完整時間放在 tooltip。思考區塊不重複顯示時間，它底下的回答已經有了。
+
+開發時要注意上面提到的單一實例行為會蓋掉重新建置：port 已被佔用時新程序只會叫回舊視窗然後
+退出，日誌留下一行 `existing desktop UI restored`，畫面跳出來、跑的卻仍是舊版。`run.command`
+會在啟動前先停掉執行中的實例；手動 `go run` 時請自行確認沒有舊程序還在。
+
 ## 匯出設定
 
 管理介面「系統工具 → 下載設定包」透過 `GET /api/v1/admin/config-bundle` 下載

@@ -162,6 +162,40 @@ if [[ ! -x "$DESKTOP_BINARY" ]]; then
 	exit 1
 fi
 
+# 重新建置後必須先換掉正在跑的實例。
+#
+# App 發現 UI 埠已被佔用時，會把既有視窗叫到前景然後自己退出（單一實例行為，
+# 對雙擊開啟是正確的）。但這個腳本剛剛才建置完新版，若不先停掉舊的，畫面會跳
+# 出來、日誌只留下一行「existing desktop UI restored」，跑的卻仍是舊程序——
+# 實測踩過：clean、build、run 都做了，修正看起來完全沒生效，查了好幾輪才發現
+# 根本沒換版本。
+instance_pids() {
+	{
+		/usr/bin/pgrep -f "NR-Intern\.app/Contents/MacOS/NR-Intern" 2>/dev/null || true
+		/usr/bin/pgrep -f "$DESKTOP_BINARY" 2>/dev/null || true
+	} | /usr/bin/sort -u
+}
+
+stop_running_instance() {
+	local -a pids
+	pids=(${(f)"$(instance_pids)"})
+	(( ${#pids[@]} == 0 )) && return 0
+	print "停止執行中的實例（PID ${pids[*]}）…"
+	/bin/kill -TERM ${pids[@]} 2>/dev/null || true
+	local waited=0
+	while (( waited < 100 )); do
+		pids=(${(f)"$(instance_pids)"})
+		(( ${#pids[@]} == 0 )) && return 0
+		/bin/sleep 0.1
+		(( waited += 1 ))
+	done
+	print -u2 "警告：既有實例未在 10 秒內結束（PID ${pids[*]}）。"
+	print -u2 "      繼續啟動的話會退回舊視窗，看起來像新版沒生效。"
+	return 1
+}
+
+stop_running_instance || true
+
 cd "$PROJECT_ROOT"
 print "啟動 NR-Intern 桌面 Console..."
 print "設定檔：$CONFIG_PATH"
