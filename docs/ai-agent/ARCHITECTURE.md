@@ -472,6 +472,13 @@ tool result；沒有對應 tool call 的 tool 訊息會被丟棄。中斷、當�
 不合法的狀態，而 OpenAI-compatible Provider 會直接拒絕整段對話，使該 session 從此無法再使用。
 原始 `entries.jsonl` 不受影響，修復只作用於送進模型的檢視。
 
+**空的工具結果也要有內容。** 工具正常完成卻沒有輸出是常態（讀到空檔案、搜尋沒有命中），但
+兩種協定的組裝器都會把空結果代換成明確的文字再送出，不送空字串。理由是實際事故：一則 0 byte
+檔案的 `file_read` 結果進入保留窗口後，中間的相容代理用 `omitempty` 重組請求，空字串讓必填的
+`output` 欄位整個消失，上游回 `400 Missing required parameter: 'input[N].output'`，該 session
+的每一輪從此都送不出去。送出端無從得知對面經過幾層轉換，只能確保自己送出的每則工具結果都
+有可辨識的內容；順帶讓模型看得出「這個工具沒有輸出」，而不是收到一段空白自己揣測。
+
 ### Provider 串流事件
 
 `ports.Model` 的 `domain.ModelEvent` 是有型別的事件，不是單純的 `{type, text}`：
@@ -929,7 +936,7 @@ OpenAI-compatible adapter 行為如下：
 - system/developer、user、assistant、tool message。
 - function tools schema。
 - assistant `tool_calls`。
-- tool result `tool_call_id`。
+- tool result `tool_call_id`；空的工具結果代換成明確文字後才送出，見「Tool call 協定不變式」。
 - SSE 文字、refusal 與 tool call arguments 串流累積，支援多行 SSE 與常見 NDJSON 相容輸出。
 - `stream_options.include_usage` 可設定；不支援串流或 `tool_choice` 的相容服務可分別停用。
 - 初始連線、408/409/429 與暫時性 5xx 最多嘗試三次，並遵守 `Retry-After`（上限 30 秒）。一旦已送出模型文字 delta 就不重試，避免重複輸出。

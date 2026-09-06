@@ -7,11 +7,12 @@ import (
 	"testing"
 )
 
-// function_call_output 的 output 是必填，而且「必填」包含不接受空字串。
+// function_call_output 的 output 是必填，而 string + omitempty 會讓空字串
+// 把整個欄位吃掉。
 //
-// 實測兩階段：欄位被 omitempty 拿掉時回 400；改成一定送出但值為 "" 時，
-// **仍然**回 400 Missing required parameter。所以空結果必須代換成明確文字。
-// 這個錯誤要跑到第 40 個項目才炸，前面的工作全部作廢。
+// 這是實際發生過的 400 Missing required parameter: 'input[40].output'，
+// 病灶在中間的相容代理，但同樣的寫法在這裡也成立。除了用指標保住欄位，
+// 空結果一律代換成明確文字：中途任何一層再用 omitempty 重組都不會出事。
 func TestCodexInputKeepsOutputFieldForEmptyToolResult(t *testing.T) {
 	items := codexInput(domain.ModelRequest{
 		History: []domain.Message{

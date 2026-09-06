@@ -134,7 +134,18 @@ func (m *Model) messages(request domain.ModelRequest) []chatMessage {
 		case "assistant":
 			messages = append(messages, chatMessage{Role: "assistant", Content: message.Content, ToolCalls: encodeToolCalls(message.ToolCalls)})
 		case "tool":
-			messages = append(messages, chatMessage{Role: "tool", Content: message.Content, ToolCallID: message.ToolCallID})
+			// 空的工具結果要換成明確的文字。工具正常完成卻沒有輸出是常態
+			// （讀到空檔案、grep 沒有命中），但把空字串原樣送出去，上游或
+			// 中間的相容層很容易把它當成「這個欄位不存在」——實測經由
+			// 代理轉成 Responses 協定時，空的 tool content 讓代理省略了
+			// output 欄位，上游直接回 400 Missing required parameter。
+			// 順帶讓模型看得出「這個工具沒有輸出」，而不是收到一段空白
+			// 自己揣測。與 codexInput 的處理保持一致。
+			content := message.Content
+			if strings.TrimSpace(content) == "" {
+				content = emptyToolResult
+			}
+			messages = append(messages, chatMessage{Role: "tool", Content: content, ToolCallID: message.ToolCallID})
 		}
 	}
 	if prompt := strings.TrimSpace(request.UserPrompt); prompt != "" {

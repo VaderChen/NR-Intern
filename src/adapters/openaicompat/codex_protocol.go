@@ -36,8 +36,10 @@ type codexInputItem struct {
 	// 而 string 搭配 omitempty 會在空字串時讓整個欄位消失。指標讓「空字串」
 	// 與「沒有這個欄位」分得開。
 	//
-	// 但光是分得開還不夠——上游把**空字串也當成缺少參數**，同樣回 400。
-	// 因此空結果一律代換成 emptyToolResult，見 codexInput。
+	// 這個 omitempty 陷阱是實際發生過的事故，只是發生在中間的相容代理上：
+	// 代理用 string + omitempty 重組 input，一則空的工具結果就讓 output 消失，
+	// 上游回 400 Missing required parameter: 'input[N].output'。同樣的寫法在
+	// 這裡也成立，所以一併防掉。
 	Output *string `json:"output,omitempty"`
 }
 
@@ -99,9 +101,11 @@ func codexInstructions(request domain.ModelRequest) string {
 
 // emptyToolResult 代替空的工具結果送給上游。
 //
-// Codex Responses 的 function_call_output.output 是必填，而且「必填」包含
-// 不接受空字串：欄位存在但為空，仍然回 400 Missing required parameter。
-// 沒有輸出的指令、沒有命中的搜尋都會產生空結果，因此這不是罕見情況。
+// 送空字串本身是否會被上游接受並未實測，也不打算賭：中途任何一層用
+// omitempty 重組請求，空字串就會變成「欄位不存在」，而 output 是必填。
+// 沒有輸出的指令、讀到空檔案、沒有命中的搜尋都會產生空結果，這不是罕見情況。
+// 換成一句明確的文字同時也讓模型看得出「這個工具沒有輸出」，而不是收到
+// 一段空白自己揣測。
 const emptyToolResult = "[工具執行完成，但沒有任何輸出。]"
 
 // DescribeCodexInput 回傳 input 陣列的結構摘要，供 4xx 時診斷用。
@@ -180,10 +184,7 @@ func codexInput(request domain.ModelRequest) []codexInputItem {
 			}
 		case "tool":
 			if callID := strings.TrimSpace(message.ToolCallID); callID != "" {
-				// 空結果要換成明確的文字。上游對 output 的要求不只是「欄位存在」，
-				// 空字串一樣會回 400 Missing required parameter——實測用
-				// "output":"" 仍然被拒。順帶讓模型看得出「這個工具沒有輸出」，
-				// 而不是收到一段空白自己揣測。
+				// 空結果要換成明確的文字，理由見 emptyToolResult。
 				output := message.Content
 				if strings.TrimSpace(output) == "" {
 					output = emptyToolResult
