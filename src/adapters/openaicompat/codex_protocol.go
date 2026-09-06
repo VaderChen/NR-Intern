@@ -31,7 +31,12 @@ type codexInputItem struct {
 	CallID    string             `json:"call_id,omitempty"`
 	Name      string             `json:"name,omitempty"`
 	Arguments string             `json:"arguments,omitempty"`
-	Output    string             `json:"output,omitempty"`
+	// Output 用指標而不是 string：function_call_output 的 output 是**必填**，
+	// 但工具結果可能是空字串（沒有輸出的指令、沒有命中的搜尋）。用 string 搭配
+	// omitempty 時整個欄位會消失，上游直接回 400
+	// 「Missing required parameter: 'input[N].output'」，整個 Run 就死在那裡。
+	// 指標讓「空字串」與「沒有這個欄位」分得開。
+	Output *string `json:"output,omitempty"`
 }
 
 type codexContentPart struct {
@@ -124,7 +129,8 @@ func codexInput(request domain.ModelRequest) []codexInputItem {
 			}
 		case "tool":
 			if callID := strings.TrimSpace(message.ToolCallID); callID != "" {
-				items = append(items, codexInputItem{Type: "function_call_output", CallID: callID, Output: message.Content})
+				output := message.Content
+				items = append(items, codexInputItem{Type: "function_call_output", CallID: callID, Output: &output})
 			} else {
 				appendMessage("user", message.Content)
 			}
