@@ -68,6 +68,17 @@ Project 的 `sandbox_roots` 可以經由 `POST /api/v1/projects` 與 `PATCH /api
 否則回報 `path is outside the project sandbox`。每個根各自套用單根的逃逸檢查
 （解析最深既有父路徑與 symlink），多根不會放寬單根的限制。
 
+範圍比對是字串比對（`filepath.Rel`），因此對兩種情況會有**假警報**：呼叫端給的
+大小寫與磁碟不同（macOS 的 APFS 預設不分大小寫，`EvalSymlinks` 會成功但原樣保留
+呼叫端的大小寫），或路徑位於 symlink 之後而沙箱根已被解析過。兩者都是「真的在
+沙箱裡卻被判定逃逸」——實際踩過：沙箱根是 `FastChIME`、工具要求 `FastCHIME`，
+檔案打得開卻拿不到內容。因此比對失敗時會先把候選路徑解析並對齊成磁碟上的真實
+大小寫（`alignPathCase`）再比一次。
+
+**這不會放寬檢查**：重比仍然用 `Within`，真正的逃逸照樣擋下；在分大小寫的檔案
+系統上逐層只會找到完全相同的名稱，結果與修改前一致。對齊只在第一次比對失敗時
+執行——每一層都要讀一次目錄，放在正常路徑上太貴。
+
 排程（Schedule）保存自己的 `sandbox_roots`，套用與 Project 完全相同的寫入前驗證。排程建立的
 Session 不屬於任何 Project，沙箱只來自該排程；路徑經 `RunInput.SandboxRoots` 這個 `json:"-"`
 的後端專用欄位傳入，HTTP 呼叫端無法自行帶入或擴權。後端重新啟動時，儲存的沙箱目錄若已不存在，

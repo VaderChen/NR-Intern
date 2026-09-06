@@ -166,3 +166,81 @@ func TestDisplayPathFallsBackWhenRootCannotBeResolved(t *testing.T) {
 		t.Fatalf("DisplayPath = %q, want %q", got, want)
 	}
 }
+
+// caseInsensitiveFilesystem 探測這個目錄所在的檔案系統分不分大小寫。
+// macOS 的 APFS 預設不分，Linux 的 ext4 分——測試要據此分流，不能假設。
+func caseInsensitiveFilesystem(t *testing.T, directory string) bool {
+	t.Helper()
+	probe := filepath.Join(directory, "CaseProbe")
+	if err := os.Mkdir(probe, 0o750); err != nil {
+		t.Fatalf("mkdir probe: %v", err)
+	}
+	defer os.RemoveAll(probe)
+	_, err := os.Stat(filepath.Join(directory, "caseprobe"))
+	return err == nil
+}
+
+// 沙箱根是 FastChIME、工具要求 FastCHIME 時，檔案打得開卻被判定逃出沙箱。
+// 「檔案存不存在」交給檔案系統（不分大小寫），「在不在沙箱內」卻是字串比對。
+func TestResolvePathAcceptsDifferentCaseWhenFilesystemIsCaseInsensitive(t *testing.T) {
+	base := t.TempDir()
+	if !caseInsensitiveFilesystem(t, base) {
+		t.Skip("檔案系統分大小寫，這個情境不會發生")
+	}
+	root := filepath.Join(base, "FastChIME")
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(base, "FastCHIME", "src")
+
+	resolved, err := ResolvePath(root, target, true)
+	if err != nil {
+		t.Fatalf("大小寫不同但確實在沙箱內的路徑應被接受：%v", err)
+	}
+	// root 可能位於 symlink 之後（macOS 的 /var），比對前要化成同一種形式。
+	evaluatedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(root): %v", err)
+	}
+	if !Within(evaluatedRoot, resolved) {
+		t.Fatalf("回傳的路徑應落在沙箱內，得到 %q", resolved)
+	}
+	// 關鍵：回傳的是磁碟上的真實大小寫，不是呼叫端給的那個。
+	if !strings.Contains(resolved, "FastChIME") || strings.Contains(resolved, "FastCHIME") {
+		t.Fatalf("回傳的路徑應對齊為磁碟上的 FastChIME，得到 %q", resolved)
+	}
+}
+
+// 對齊大小寫不能變成逃逸的後門：沙箱外的路徑照樣要擋。
+func TestResolvePathStillRejectsSiblingDirectory(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "InsideRoot")
+	outside := filepath.Join(base, "OutsideRoot")
+	for _, directory := range []string{root, outside} {
+		if err := os.MkdirAll(directory, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	for _, requested := range []string{outside, filepath.Join(base, "outsideroot"), filepath.Join(base, "OUTSIDEROOT")} {
+		if _, err := ResolvePath(root, requested, false); err == nil {
+			t.Fatalf("沙箱外的路徑 %q 不該被接受", requested)
+		}
+	}
+}
+
+// 在分大小寫的檔案系統上逐層只會找到完全相同的名稱，結果必須不變。
+func TestAlignPathCaseLeavesExactPathsUnchanged(t *testing.T) {
+	base := t.TempDir()
+	exact := filepath.Join(base, "Exact", "Nested")
+	if err := os.MkdirAll(exact, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if got := alignPathCase(exact); got != exact {
+		t.Fatalf("完全相符的路徑不該被改動：%q -> %q", exact, got)
+	}
+	// 尚未建立的尾段原樣保留，讓後續步驟自行處理。
+	pending := filepath.Join(exact, "NotCreatedYet.txt")
+	if got := alignPathCase(pending); got != pending {
+		t.Fatalf("不存在的路徑段應原樣保留：%q -> %q", pending, got)
+	}
+}

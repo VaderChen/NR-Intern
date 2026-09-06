@@ -35,7 +35,22 @@ func ResolvePath(workspaceRoot, requested string, mustExist bool) (string, error
 	}
 	candidate = filepath.Clean(candidate)
 	if !Within(root, candidate) {
-		return "", fmt.Errorf("path escapes the sandbox")
+		// 這道檢查是純字串比對，會有兩種假警報：呼叫端給的大小寫與磁碟不同
+		// （macOS 的 APFS 預設不分大小寫），或路徑位於 symlink 之後而 root
+		// 已經被 EvalSymlinks 解析過（macOS 的 /tmp、/var）。兩者都是「真的在
+		// 沙箱裡卻被判定逃逸」，所以先把候選路徑化成與 root 同一種形式再比一次。
+		//
+		// 只在失敗時做：解析與逐層對齊都要碰檔案系統，放在正常路徑上太貴。
+		// 重比仍然用 Within，真正的逃逸照樣擋得住。
+		aligned := candidate
+		if resolvedCandidate, _, resolveErr := resolveExistingPath(candidate); resolveErr == nil {
+			aligned = resolvedCandidate
+		}
+		aligned = alignPathCase(aligned)
+		if !Within(alignPathCase(root), aligned) {
+			return "", fmt.Errorf("path escapes the sandbox")
+		}
+		root, candidate = alignPathCase(root), aligned
 	}
 	resolved, exists, err := resolveExistingPath(candidate)
 	if err != nil {
@@ -46,9 +61,62 @@ func ResolvePath(workspaceRoot, requested string, mustExist bool) (string, error
 	}
 	candidate = resolved
 	if !Within(root, candidate) {
-		return "", fmt.Errorf("symlink target escapes the sandbox")
+		if aligned := alignPathCase(candidate); Within(root, aligned) {
+			candidate = aligned
+		} else {
+			return "", fmt.Errorf("symlink target escapes the sandbox")
+		}
 	}
 	return candidate, nil
+}
+
+// alignPathCase 回傳路徑在磁碟上的真實大小寫。
+//
+// macOS 的 APFS 預設不分大小寫：EvalSymlinks 對「大小寫不同但存在」的路徑會成功，
+// 卻原樣保留呼叫端給的大小寫。於是「檔案打不打得開」與「路徑在不在沙箱內」用了
+// 兩套規則——前者交給檔案系統（不分大小寫），後者是字串比對（分大小寫）——
+// 真實存在、也真的在沙箱裡的路徑因此被判定逃逸。實際踩過：沙箱根是
+// FastChIME，工具要求 FastCHIME，Rel 算出 ../FastCHIME 就被擋下。
+//
+// 只在比對失敗時呼叫：每一層都要讀一次目錄，放在正常路徑上太貴。
+// 在分大小寫的檔案系統上逐層只會找到完全相同的名稱，結果不變——
+// 這不會放寬 Linux 的檢查，只是讓檢查與檔案系統的實際行為一致。
+func alignPathCase(path string) string {
+	path = filepath.Clean(path)
+	volume := filepath.VolumeName(path)
+	rest := strings.TrimPrefix(path, volume)
+	if !strings.HasPrefix(rest, string(filepath.Separator)) {
+		// 相對路徑沒有可靠的起點可以逐層比對，原樣回傳。
+		return path
+	}
+	current := volume + string(filepath.Separator)
+	for _, part := range strings.Split(strings.Trim(rest, string(filepath.Separator)), string(filepath.Separator)) {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, matchDirEntryCase(current, part))
+	}
+	return current
+}
+
+// matchDirEntryCase 在 parent 底下找出與 name 大小寫無關相符的真實名稱。
+// 找不到（例如尚未建立的檔案）就原樣回傳，讓後續步驟自行處理。
+func matchDirEntryCase(parent, name string) string {
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		return name
+	}
+	for _, entry := range entries {
+		if entry.Name() == name {
+			return name
+		}
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(entry.Name(), name) {
+			return entry.Name()
+		}
+	}
+	return name
 }
 
 // ResolvePathInRoots 將絕對路徑限制在任一 Sandbox 根目錄；相對路徑固定以第一個根目錄為基準。
