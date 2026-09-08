@@ -130,9 +130,31 @@ Session 不屬於任何 Project，沙箱只來自該排程；路徑經 `RunInput
 匯出僅讀取 `data_dir` 四種設定檔與產生的 manifest，不遍歷對話資料，也不讀 OAuth token 檔。
 這與安全備份不同：安全備份保留使用者資料；設定包保留 Provider、MCP、NetPass 與服務設定結構。
 
-秘密名稱比對會清除 API Key、token、password 等字串值與字串陣列；Header／environment／env
-物件保留鍵但清空值。數字與布林值不清除，避免誤傷 `max_tokens` 等上限。
-`manifest.json` 只記錄被遮蔽的欄位名稱，不保存其原值。
+預設模式下，秘密名稱比對會清除 API Key、token、password 等字串值與字串陣列；
+Header／environment／env 物件保留鍵但清空值。數字與布林值不清除，避免誤傷 `max_tokens`
+等上限。`manifest.json` 只記錄被遮蔽的欄位名稱，不保存其原值。
+
+`?include_secrets=true` 會改為原樣帶出明文憑證，且**只有這個參數能造成明文外流**——省略、
+空白或任何非 `true` 的值一律走遮蔽路徑。這條路存在的理由是：遮蔽之後收到設定包的人得自己補
+金鑰，而實際需要設定包的人往往正是不知道金鑰是什麼的那一位。代價由匯出者承擔，因此設計上
+把決定權放在按下按鈕的人手裡，而不是預設值：介面要另外勾選、檔名改為
+`nr-intern-config-with-secrets.zip`、`manifest.json` 的 `contains_secrets` 標為 `true`，
+讓收到檔案的人不必逐一開啟每個 JSON 就知道該不該把它當密碼保管。
+
+**帶憑證的設定包等同一組密碼。** 以安全管道傳遞、用完刪除，不要放進版本庫或群組信件；
+配合短期、可撤銷、範圍最小的憑證使用。
+
+### 單一項目匯出
+
+`GET /api/v1/admin/provider-settings/{provider_id}/export` 與
+`GET /api/v1/admin/mcp-settings/{mcp_id}/export` 匯出單一項目，遮蔽規則與設定包**完全一致**：
+預設清除，只有 `include_secrets=true` 能帶出明文，回應的 `contains_secrets` 據實標示。
+
+這兩個端點直接讀 `data_dir` 的設定檔，而不是走管理 API 的記憶體檢視——後者是脫敏過的，
+金鑰不在裡面。因此它們與其他管理 API 一樣屬於受信任管理者權限，不可交給一般使用者。
+
+匯出檔名由 id 產生，只保留英數與 `-`／`_`，其餘一律換成 `-`：id 由使用者自訂，直接放進
+`Content-Disposition` 會讓引號或換行破壞整個標頭。
 
 **設定包不是匿名資料包，也不是任意文字的秘密掃描器。** URL 中的 userinfo／query、帳號、
 本機絕對路徑、command／args、非標準名稱的文字欄位都可能保留。金鑰應使用專用秘密欄位，
@@ -216,23 +238,42 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 
 ## 用量與成本資料
 
+- Codex 帳號額度只經 OAuth 授權的唯讀帳號 API 查詢；不讀本機 Codex 對話日誌，不用推論請求
+  探測，也不自動兌換重置額度。API 使用既有 Token source 與帳號 ID，不另存憑證。
+- 帳號 API 限制請求時間與回應大小且拒絕重新導向；非成功回應只回傳 HTTP 狀態，不外洩可能包含帳號資訊的
+  上游錯誤本文。401／403 會清除快照，一般網路或格式錯誤不把舊資料標記為剛更新。
+
 - Run 的 token 用量只採信後端 Provider adapter 回報的 usage；Application 在單一 Run 收尾時
   保存快照，不從可被 Client 修改的事件或 transcript 反推，避免重播造成重複統計。
 - `model_prices` 是非秘密的後端設定，但只由設定檔載入，Run request 與模型輸出不能自行提供
   價格。成本目前只接受 USD，沒有對應價格時 API 只回傳 token，不假造金額。
 - Session 用量依已保存的 Run 快照即時彙總，不落盤到 `session.json`；取消、失敗與重試都保留
   各自的 Run 紀錄。成本估算不代表 Provider 的帳單，仍應以 Provider 官方帳務為準。
-- Run metadata 受保留規則整理後，Session 用量與匯出僅涵蓋尚存 Run，可能低於曾經顯示的累計值。
-  不得視為不可刪除的帳務或稽核總帳。
+- 精簡用量快照以 Run ID 去重，與 Run 狀態在同一檔案原子替換，不隨明細淘汰而刪除；
+  刪除 Session 才清除其快照。隔離 Session 的用量不落盤，舊版已淘汰資料無法還原。
+  這仍不是不可刪除的帳務或稽核總帳。
 
 ## 本機資料
 
 記憶體隔離 Project 的掛載只接受後端驗證為至少 256 MB、且不超過主機實體記憶體 75% 的容量與程式產生的名稱，不把使用者
 輸入拼成 Shell 指令。每個 Project 使用獨立 RAM disk，不能以共用根目錄讀取其他隔離專案。
-macOS 殘留磁碟、Linux tmpfs 子目錄與 Windows ImDisk 磁碟都必須同時通過固定前綴、專用 JSON
+macOS 殘留磁碟、Linux tmpfs 掛載點與 Windows ImDisk 磁碟都必須同時通過固定前綴、專用 JSON
 標記、平台種類及建立程序存活檢查才會清理；裝置名稱另做格式限制。正常卸載失敗才嘗試強制卸載。
 Windows 找不到 ImDisk 時直接回報相依套件缺失，不以硬碟暫存目錄冒充 RAM disk。ImDisk 的驅動
 安裝、提權方式、現代 Windows 與 ARM64 支援仍待實機驗證，因此目前不屬於已驗證的安全保證。
+
+本程序全部 Project 的配置容量總額不得超過實體記憶體 75%。Linux 使用獨立 tmpfs `size`
+配額並要求掛載權限（CAP_SYS_ADMIN）；失敗不降級，忙碌時不強制刪除掛載內容。
+配額不是實體 RAM 預留或跨程序總額保證，tmpfs 仍可能依主機設定換出至 swap。
+
+Console 的隔離 Session 待送訊息與附件只存記憶體，不寫 IndexedDB；啟動時刪除舊版隔離
+outbox 項目且不恢復它們。邏輯刪除不保證清除檔案系統或瀏覽器先前留下的實體區塊／備份。
+一般專案在 outbox 不可用時拒絕送出，不把未保存的內容當成可恢復資料；交易例外會 abort，
+避免部分刪除／寫入仍被提交。隔離 Session 不受 IndexedDB 是否可用影響。
+Project 強制刪除仍須先通過所有 Session 無 active 工作的檢查；不在 Run 收尾時卸載磁碟。
+刪除 Session 時一併移除通知及已淘汰 Run 留下的可辨識事件；未知或損壞的事件歸屬不猜測。
+執行中的 Run 持有明細保留保護到收尾完成；取消意圖與終態在控制鎖內判斷，晚到的核准／失敗
+不能復活 Run。事件寫入也必須找到所屬 Run，避免刪除後又由舊回呼建立資料。
 
 `ephemeral=true` 時，Run 的 Project Sandbox 會導向 RAM disk，且 API 不接受同時指定主機
 `sandbox_roots`。執行期間 transcript、附件、計畫與 Run 資料仍由既有 Repository 管理；正常關閉
@@ -254,7 +295,7 @@ Windows 找不到 ImDisk 時直接回報相依套件缺失，不以硬碟暫存�
 與所有未終態 Run 的事件檔；孤兒與較舊事件檔永久刪除。非 active 且 UpdatedAt 早於 30 天前
 的記憶也會永久清理，不受回憶空間開關影響。
 
-Session transcript 不因上述維護而刪除，但不能從對話文字完整還原 Run metadata、用量快照
+Session transcript 與精簡用量快照不因上述維護而刪除，但不能從對話文字完整還原 Run metadata
 或 SSE 事件序列。升級前應備份，長期稽核需另存匯出；沒有備份的清理資料無法恢復。
 
 上下文字元限制只縮減模型所見的歷史，不會清除持久化 transcript，也不是資料保留／刪除政策。

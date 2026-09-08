@@ -27,22 +27,24 @@ Authorization: Bearer <token>
 | DELETE | `/api/v1/notifications/read` | 清除已讀通知 |
 | GET | `/api/v1/search` | 搜尋 Workspace、Project、Session、Message、Plan 與 Schedule 的短摘要 |
 | GET／PUT | `/api/v1/admin/service-settings` | 讀取或更新顯示名稱、介面語言、通知中心、Run 上限、工具供應方式與 `http_fetch` 開關 |
-| GET | `/api/v1/admin/config-bundle` | 下載遮蔽秘密欄位的設定 ZIP；不包含對話與附件 |
-| GET／PUT | `/api/v1/admin/provider-settings` | 讀取或完整取代脫敏 Provider 設定 |
+| GET | `/api/v1/admin/config-bundle` | 下載設定包；預設遮蔽憑證，`?include_secrets=true` 才帶明文 |
+| GET／PUT | `/api/v1/admin/provider-settings` | 讀取或完整取代脫敏 Provider 設定；桌面 Console 的「拖入 Provider 設定檔」也走這個 PUT |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/models` | 重新取得模型目錄；沒有目錄時回傳空陣列 |
 | POST | `/api/v1/admin/provider-settings/{provider_id}/test` | 送出最小模型請求並測試工具呼叫 |
+| GET | `/api/v1/admin/provider-settings/{provider_id}/export` | 匯出單一 Provider；格式與拖放匯入相同，預設遮蔽憑證 |
 | POST | `/api/v1/admin/provider-settings/{provider_id}/oauth/start` | 啟動 ChatGPT／Codex OAuth PKCE 驗證 |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/oauth/status` | 讀取脫敏 OAuth 狀態 |
 | DELETE | `/api/v1/admin/provider-settings/{provider_id}/oauth` | 中斷 OAuth 並刪除該 Provider Token |
 | GET／PUT | `/api/v1/admin/mcp-settings` | 讀取或完整取代 MCP Server 設定 |
 | POST | `/api/v1/admin/mcp-settings/{mcp_id}/test` | 重新連線 MCP Server 並刷新工具清單 |
+| GET | `/api/v1/admin/mcp-settings/{mcp_id}/export` | 匯出單一 MCP Server；使用 `mcpServers` 鍵，預設遮蔽憑證 |
 | GET／PUT | `/api/v1/admin/reverse-proxy` | 讀取或更新 NetPass 反向代理設定 |
 | POST | `/api/v1/admin/reverse-proxy/start` | 接受使用政策後啟動 NetPassClient |
 | POST | `/api/v1/admin/reverse-proxy/stop` | 停止 NetPassClient |
 | GET | `/api/v1/tools` | 內建與 MCP 工具定義、allowlist 與目前可用性 |
 | GET | `/api/v1/providers` | 已註冊 Provider adapter 清單 |
 | GET | `/api/v1/providers/{provider_id}/capabilities` | 讀取 Provider／Model 的 Context 與輸出限制 |
-| GET | `/api/v1/providers/{provider_id}/usage` | 讀取最近一次 5 小時／7 天用量視窗；無資料時標記 unavailable |
+| GET | `/api/v1/providers/{provider_id}/usage` | 讀取帳號 API 最近一次 5 小時／7 天用量快照；無資料時標記 unavailable |
 | POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop` | 啟動計畫 LOOP（僅使用者可啟動） |
 | POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/resume` | 從檢查點的下一輪續跑 |
 | POST | `/api/v1/sessions/{session_id}/plans/{plan_id}/loop/pause` | 立刻中止當前這一次並保留檢查點 |
@@ -167,6 +169,10 @@ curl -X POST http://127.0.0.1:8787/api/v1/runs/RUN_ID/retry \
 Token、MCP environment／headers 與 NetPass Key 只回傳是否已設定，永遠不回傳明文。
 
 ### Provider 與 ChatGPT／Codex OAuth
+
+Codex 配額由唯讀 `GET /backend-api/wham/usage` 在後端刷新，不使用推論 Header 或額外生成請求。
+管理端點維持讀取快照，不會每次輪詢就打上游。API 回應須有完整視窗欄位與有效百分比；明確 null
+代表該視窗未知並清除舊值。一般失敗保留原 UpdatedAt，401／403 清除授權失效的配額快照。
 
 `PUT /api/v1/admin/provider-settings` 以完整集合套用設定，支援 `openai-compatible` 與
 `openai-codex-responses`。OpenAI-compatible 的 `api_key` 省略時保留、空字串清除；Codex
@@ -363,7 +369,8 @@ curl -X POST http://127.0.0.1:8787/api/v1/sessions/SESSION_ID/plans \
 不同 Run 平行執行。Console 可收合各計畫，並以拖曳後送出完整 `plan_ids` 調整順序；「清除已完成」
 只會刪除 `completed` 與 `canceled`，不影響未完成計畫。已經開始執行的 active 計畫不能移到其他
 未完成計畫之後。Run 執行期間不能由 HTTP 新增、重建、刪除或排序計畫，
-以免 UI 與 Agent 同時改寫。Agent 使用 `plan_get`、`plan_create`、`plan_step_update` 控制
+以免 UI 與 Agent 同時改寫。Agent 使用 `plan_get`、`plan_create`、`plan_step_update`、
+`plan_loop_interrupt` 控制
 同一個有序佇列；Domain 只接受
 `pending → in_progress → verifying → completed` 的依序流程，且 completed 必須附上
 實際驗證證據。Session 匯出會一併包含全部計畫。舊版單數 `/plan` 端點仍保留相容行為，
@@ -561,8 +568,21 @@ Run metadata 在啟動／Save 時以 500 筆為整理基準，只淘汰最舊範
 事件檔，其餘及孤兒事件檔會清除。舊 Run 被淘汰後查詢可能回傳 404；事件檔被清理後也不能
 要求完整歷史重播。`entries` 仍讀取獨立的 Session transcript，不因事件清理而刪除。
 
-Session 用量、`by_model` 與 export 的 `runs` 只彙總仍存在的 Run，不保證終身累計。
-需要長期成本或稽核資料時，應在整理前另行匯出與備份。
+Session 用量與 `by_model` 改由依 Run ID 去重的精簡快照彙總，不因 Run 明細淘汰而減少；
+export 的 `runs` 仍只包含尚存明細。刪除 Session 會一起刪除其用量；隔離 Session 的用量不落盤。
+升級前已淘汰的用量無法補回，長期稽核仍應匯出與備份。
+
+`DELETE /api/v1/projects/{project_id}?force=true` 只放寬非空專案限制；有排隊、執行或取消收尾
+中的 Session 時回傳 409，且不開始級聯刪除。須先停止工作並等待收尾完成。
+Session 級聯刪除包含計畫、通知、用量與事件；事件依檔案歸屬辨識，不只依尚存 Run 清單。
+遇到無法確認歸屬的損壞事件檔時回傳錯誤，不任意刪除其他 Session 資料。
+取消與 Provider 收尾競爭時，已提交的終態不被晚到的核准或失敗覆寫；最後用量仍可補齊，
+不重複產生終止事件。已回傳終態但仍在收尾的 Run 暫不受明細保留期淘汰。
+終止事件的去重需要讀回 Run 目前狀態；讀不到時跳過去重並記 WARN，不讓事件寫入失敗——
+否則一次暫時性的讀取失敗會連帶終止一個本來健康的 Run。
+
+RAM Disk 容量除單一 Project 上限外，本程序全部已配置 Project 的總額也不得超過實體記憶體
+75%。Linux 使用有容量上限的獨立 tmpfs，缺少掛載權限時建立失敗，不降級成無配額目錄。
 
 ### 狀態恢復
 

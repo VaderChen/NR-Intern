@@ -110,10 +110,15 @@ active 完成或刪除後，Repository 會自動啟用下一份。`lock_plans=fa
 工具的錯誤訊息是模型唯一的回饋來源，因此要同時說出**收到什麼、正確的意思是什麼、
 這次該怎麼填**。只說「不合法」的話，模型只能猜著重試，於是每次呼叫都要先失敗一輪。
 
-兩個實測案例：`ResolvePathInRoots` 把「檔案不存在」回報成「不在沙箱內」，
+三個實測案例：`ResolvePathInRoots` 把「檔案不存在」回報成「不在沙箱內」，
 Agent 因此一再改寫路徑大小寫；`file_read` 的 `end_line` 沒說明是絕對行號，
-模型連續三次把它當成「要讀幾行」（`start_line=400, end_line=170`）。兩者都不是
-模型的理解力問題，是訊息把它導向錯的方向。
+模型連續三次把它當成「要讀幾行」（`start_line=400, end_line=170`）；`plan_step_update`
+的狀態轉移只說「不能從 X 改成 Y」，沒說可以改成什麼，於是模型換一個同樣不通的值
+再試——實測反覆出現 `in_progress → completed`（跳過 verifying）、`pending → verifying`
+（跳過 in_progress）與重送同一個狀態。三者都不是模型的理解力問題，是訊息把它導向錯的方向。
+
+步驟轉移的錯誤現在會附上生命週期與下一步該送什麼。這一則不只是好不好用的問題：
+LOOP 用步驟指紋有沒有變來判斷「這一次有沒有推進」，步驟轉不動就會被判成空轉而提早停止。
 
 ### 計畫 LOOP（重複執行）
 
@@ -122,6 +127,10 @@ LOOP 要解決的是「Agent 跑一半就忘了」，不是自動化便利。反
 就宣告完成。這些看起來都像在工作。因此設計原則是——**任務的真相在計畫裡，不在模型的
 記憶裡**，而每一項限制都指向這句話：
 
+- **`plan_loop_interrupt` 一律保底放進工具集。** LOOP 期間 Agent 唯一能踩的煞車就是它，
+  而使用者的 allowlist 幾乎不會列到。發佈過一版是關著的：LOOP 跑得起來，Agent 卻沒有工具
+  可以中止，「可以隨時打斷」這個前提整個不成立，而輪數還是一輪一輪照花。因此它同時列在
+  精簡集合、預設 allowlist 與 `ensurePlanningTools` 的保底清單裡。
 - **一次 = 一個 Run。** 不做成「一個 Run 內跑很多次」：核准、取消、Context 整理、
   `hasActiveSession` 都以一次 Run 為單位。編排在 application 層，掛在 `executeRun` 的 defer
   上（排在 `clearActive` 之後執行，下一輪才通過 `hasActiveSession`），作法比照排程執行器。
@@ -219,7 +228,7 @@ Harness 會在每輪 Provider 回報 usage 時累加 input、output 與 total to
 Application 保存一次 `Run.Usage` 快照，即使 Run 失敗或取消，也保留錯誤前已收到的用量。
 重試會建立新的 Run 並保留原 Run，因此每個 Run 的統計彼此獨立，不會因重試或重新讀取重複計算。
 
-Session 的 `Usage` 不寫入 `session.json`，而是每次由既有 Run 清單即時彙總，並依
+Session 的 `Usage` 不寫入 `session.json`，而是每次由獨立的精簡用量快照即時彙總，並依
 Provider／Model 提供 `by_model` 明細。`model_prices` 設定以 Provider ID 與模型名稱索引，
 單價單位為每百萬 token 的 USD；沒有對應價格時只回傳 token，不提供估算金額。歷史 Run 的
 估算成本在收尾時保存，日後調整價格表不會改寫既有紀錄。
@@ -227,8 +236,13 @@ Provider／Model 提供 `by_model` 明細。`model_prices` 設定以 Provider ID
 Console 標題列顯示 Session 累計 token，以 K／M 縮寫並在 tooltip 提供精確值；沒有成本時隱藏
 金額與分隔符號。重新提問不退還已消耗的 token，不能用累計用量推算當前上下文占比。
 
-Session 彙總只涵蓋仍保留的 Run。RunRepository 整理掉舊紀錄後，對應用量也會從查詢與匯出
-消失；這不是永久帳務總帳，長期統計應另行保存匯出。
+`runs.json` v2 的 `usage` 以 Run ID 保存 Session 歸屬與 token／成本，不包含提示或結果本文。
+同一 Run 重複 Save 只覆寫快照；明細淘汰不扣除累計值，刪除 Session 才一起移除。
+只更新狀態而省略 usage 時沿用既有快照，Run 的 Session 歸屬不可改寫；取消收尾以 Provider
+最後回傳的用量為準，不因重新讀取較早的狀態而丟失。附件 ID 與時間／結果指標在 Repository
+讀寫邊界複製，避免呼叫端未經 Save 就修改已保存的欄位。
+Run、用量與淘汰清單以同一候選狀態提交，寫入失敗時全部回復。隔離 Session 的用量只留在記憶體。
+升級可遷移仍存在的 Run，但無法補回舊版本已淘汰的用量；估算仍不是 Provider 的帳務總帳。
 
 ### Human-in-the-loop Approval
 
@@ -267,11 +281,15 @@ Run 建立與 HTTP request 生命週期分離：`POST` 先回傳 durable queued 
 
 SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後最多重連三次，每次從最後完整事件補流；三次仍失敗才結束前端連線，後端 Run 本身不受影響。後端重啟時，原本 queued/running/paused/waiting_approval Run 會標記為可重試的 `server_restarted` failure，啟動期也會補齊缺少的 terminal event。
 
-Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。這些訊息會先寫入該 Browser profile
+Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。一般專案訊息會先寫入該 Browser profile
 的 IndexedDB Durable Outbox，內容包含 Session、輸入、附件 File、固定 Idempotency-Key 與目前
 送出狀態；等目前 SSE 收到 terminal event 後依序建立下一個 Run。只有收到 Run terminal event
 才移除 outbox item，網路錯誤、UI 關閉或重新整理都會保留可重試資料；`sending` 狀態在 UI
-重開時會恢復為 `pending`。附件上傳成功後也保存 Attachment ID，避免重送時重複上傳。後端仍
+重開時會恢復為 `pending`。隔離 Session 依 ID 揮發標記改用記憶體佇列，訊息與附件不寫入
+IndexedDB，UI 重新載入即消失；啟動時先刪除舊版留下的隔離 outbox 項目，不恢復或重送。
+一般專案的 outbox 不可用時停止送出並保留輸入，不靜默降級成記憶體佇列；交易操作發生例外
+會中止整筆交易。佇列被 active Session 擋住時等待狀態變更喚醒，不做同步遞迴忙等。
+一般專案附件上傳成功後也保存 Attachment ID，避免重送時重複上傳。後端仍
 以 Session single-writer gate 最後保護，因此其他 Client 同時送入同一 Session 時也不會交錯寫入
 transcript。
 
@@ -307,6 +325,12 @@ Run 控制提供 `pause`、`resume` 與 `cancel-all`。暫停只設定 durable �
 背景收尾。Run 狀態與控制事件共用序列化鎖，避免 `run.paused`／`run.resumed` 與 terminal event
 使用重複 sequence；取消後的 late event 也不會排在 `run.canceled` 之後。等待人工核准的 Run
 不接受一般 pause，必須核准、拒絕或取消。
+
+那道「不排在終止事件之後」的檢查需要先讀回 Run 目前的狀態，而**讀不到時跳過檢查、記一筆
+WARN，不讓事件寫入失敗**。理由是優先序：去重是盡量不要寫出重複終止事件的保護，不是正確性
+不變量；把它升級成硬失敗，等於讓一次暫時性的讀取失敗殺掉一個本來健康的 Run——事件是診斷
+通道，Run 才是工作本身。曾經改成讀不到就回傳錯誤，結果是 Run 在進到 Engine 之前就被判失敗。
+讀得到而且已終止時，去重照常生效。
 
 ### 診斷、搜尋、備份與權限中心
 
@@ -533,6 +557,12 @@ CJK 字元約 1 token、ASCII 約 0.25 token。以英文為前提的 characters/
 紀錄刻意只包含名稱、狀態、時間與大小，**不包含工具參數、工具輸出或訊息內容**：
 那些可能含有憑證與使用者資料，而且體積會淹沒紀錄。需要完整內容時看 session transcript。
 
+每次送出模型請求時另記一行 `provider request shape`：協定、模型、項目數，以及一份只有形狀
+的摘要——索引、角色或項目型別、截斷過的 call_id，以及每個工具結果是有值還是空的。同樣不含
+任何內容。**不做成「失敗才記」**，因為失敗不一定看得出來：實測遇過中間的相容代理把上游的
+400 包成 200 加一段錯誤文字回傳，Harness 判定為一次成功的回答，事後沒有任何線索可查，而
+上游的錯誤只給得出索引（`input[40].output`），索引本身說不出那一項是什麼。一行約 150 位元組。
+
 主要紀錄點：run 生命週期與 panic（過去 panic 被完全吞掉，只留下一筆沒有原因的 failed run）、
 每次 turn 的 stop reason 與 token 使用量、工具執行結果、context compaction、
 Provider 重試、以及被拒絕的高權限工具呼叫（屬於安全事件）。
@@ -673,6 +703,11 @@ output_schema、read_only、requires_permission）。`platforms` 與 `capabiliti
 `context.max_history_characters`（預設 60,000）。後者用來補足 JSON、代碼與識別碼等內容的
 token 估算誤差；單則工具結果會先套用 `max_tool_result_characters`，避免單一超大結果誤觸發。
 
+字元數包含**工具呼叫的參數**，不只訊息本文。`file_write` 的整份檔案與 `apply_patch` 的整段
+diff 都在 `arguments` 裡，那種 assistant 訊息的 `content` 反而是空的；只算本文的話，一輪寫了
+三個大檔的歷史對每一道閘門都等於零，於是該壓縮的時候看起來還很空。實測整份對話紀錄，
+參數佔全部字元的 12%。工具結果的 `max_tool_result_characters` 上限只作用在本文，不套用在參數。
+
 字元條件超量時會縮小保留訊息數，再依既有摘要流程壓縮。組合 prompt 前的
 `Runner.enforceHistoryCharacterLimit` 再檢查一次，必要時由舊而新移除模型可見的歷史，
 並修補 tool call／result 配對。它不刪除持久化 transcript，也不改變 Run 的累計 token、
@@ -684,6 +719,25 @@ token 估算誤差；單則工具結果會先套用 `max_tool_result_characters`
 每輪送出前的 `model request` 日誌提供 `tools`、`tool_chars`、`steering_chars`、
 `history_messages`、`history_chars`、`user_chars` 與工具名稱，不記錄本文。歷史被最後防線
 裁切時另有 WARN，供區分模型回應慢與請求負載過大。
+
+## 設定的匯出與匯入
+
+設定的搬運是一組對稱的動作，兩端各自有一個預設立場，而且都把狀態講在明面上。
+
+**匯出保守。** 設定包與單一項目匯出預設遮蔽憑證，只有 `include_secrets=true` 能帶出明文；
+帶了之後檔名附加 `-with-secrets`、`manifest.json`／回應的 `contains_secrets` 標為 `true`。
+決定權放在按下按鈕的人手裡，而不是預設值——這是唯一一條能造成明文外流的路徑，要看得見。
+
+**匯入寬鬆。** 檔案帶了憑證就直接採用，不再要求使用者自己補。原本一律清空是為了「設定檔
+不該帶密碼」，但實際要用匯入的人往往連金鑰是什麼都不知道，清空之後他就卡在那一格，功能
+等於不存在。`${VARIABLE}` 佔位符仍然不收：那不是憑證，是一個沒有值的引用。
+
+兩邊格式相同，**匯出的檔案必須匯得回去**。單一項目匯出直接讀 `data_dir` 的設定檔而不是管理
+API 的記憶體檢視——後者是脫敏過的，從那裡匯出永遠拿不到明文。
+
+這組設計服務的是一種具體情境：設定的人與使用的人不是同一位，而使用的人不熟電腦。他要做的
+只有兩件事——把檔案拖進來、按確認。代價由匯出的人承擔，因此代價要在匯出那一端講清楚：
+**帶憑證的設定檔本身就是一份活的憑證**。
 
 ## 工具呼叫相容性
 
@@ -738,8 +792,14 @@ Run，未終態一律保留，所以不是硬性上限。Runtime 啟動後及每
 50 筆 Run 與所有未終態 Run 的事件，其餘及孤兒事件檔移除。非 active 且 UpdatedAt 早於
 30 天前的記憶也會永久移除，與回憶空間開關無關。
 
-這些固定保留值目前不接受配置。Session transcript 不因維護而刪除，但舊 Run API、用量
-快照、事件重播與失效記憶稽核資料可能不再可用；升級前須備份，長期稽核另存匯出。
+這些固定保留值目前不接受配置。Session transcript 與精簡用量快照不因維護而刪除，但舊 Run
+API、事件重播與失效記憶稽核資料可能不再可用；升級前須備份，長期稽核另存匯出。
+事件清理在 Application 的准入鎖內重新核對 Run 與 active 執行緒；新建 Run、未終態與取消收尾
+中的工作不清理，快照之後才建立的 Run 留待下一輪計算。
+Run 從建立到執行緒與計畫接續判斷結束，都持有 Repository 保留保護；即使已寫成 canceled／
+completed，也不會在收尾尚需讀取它時遭淘汰。取消、暫停與恢復的控制請求也受准入鎖協調。
+核准回呼重新檢查取消意圖與終態；終態競爭只有首次保存成功者發送終止事件，晚到的失敗不改寫
+已取消／完成狀態，僅補上不倒退的最後用量。找不到 Run 的事件寫入直接拒絕，避免重建孤兒事件。
 
 ## 完成度判定
 
@@ -939,15 +999,22 @@ OpenAI-compatible adapter 行為如下：
 - tool result `tool_call_id`；空的工具結果代換成明確文字後才送出，見「Tool call 協定不變式」。
 - SSE 文字、refusal 與 tool call arguments 串流累積，支援多行 SSE 與常見 NDJSON 相容輸出。
 - `stream_options.include_usage` 可設定；不支援串流或 `tool_choice` 的相容服務可分別停用。
-- 初始連線、408/409/429 與暫時性 5xx 最多嘗試三次，並遵守 `Retry-After`（上限 30 秒）。一旦已送出模型文字 delta 就不重試，避免重複輸出。
+- 初始連線（包含 connection refused）、408/409/429 與暫時性 5xx 依 `max_attempts` 最多嘗試三次；未提供有效 `Retry-After` 時，分別等待 10、20 秒再重連，讓上游有時間恢復。有效 `Retry-After` 優先使用，上限 30 秒；Chat 與 Codex Responses 共用退避規則。等待期間透過既有 `agent.progress` 顯示重試狀態，可由停止操作或 Run 時間預算中止，不重新建立 Run 或重跑先前工具。一旦已送出文字、思考或工具呼叫 delta 就不自動重送，避免重複輸出；次數耗盡後回報失敗。
 - 每次請求送出 `X-Client-Request-Id`，並將 Provider 回傳的 `x-request-id` 保存於 assistant message 與 turn record；API key 不會出現在診斷資料。
 - Provider HTTP 錯誤解析為 status、code、request ID、可重試狀態與受限長度訊息。
+- 串流錯誤同樣辨識暫時過載與服務不可用；Responses 失敗會讀取 `response.error`，而非將整個事件當成錯誤文字。相容舊代理時，以代理模型與保留的 refusal response ID 識別「成功封包內的上游失敗」，在送出回答 delta 前轉為 Provider 錯誤；不以一般回答中的文字判定失敗。可重試錯誤沿用次數上限與退避，其他拒絕直接結束 Run，不進入空回答補問流程。
 
 Codex Responses adapter 將 Responses 的 message、reasoning 與 function call item 轉成相同的
 Harness 事件與 transcript 結構，工具結果也會在下一輪完整回送。它不依賴 `/models` 目錄；管理
-介面無法取得清單時顯示 `-`，仍允許使用者指定模型名稱。上游回應若帶有 primary／secondary
-rate-limit 視窗，Provider 用量介面會顯示 5 小時與 7 天的剩餘比例；沒有資料時顯示 `-`，不推測
-為 100%。後端啟動時立即刷新一次，之後每 3 分鐘背景更新；Provider 設定異動後也會要求刷新。
+介面無法取得清單時顯示 `-`，仍允許使用者指定模型名稱。Codex 額度只讀取帳號 API
+`GET https://chatgpt.com/backend-api/wham/usage`，沿用 OAuth Bearer Token 與 ChatGPT-Account-Id；
+不發送模型探測請求，也不再從推論回應的 Header 更新帳號配額。解析方式參考 LoadBalanceProvider
+的帳號用量實作：要求兩個視窗欄位（允許其中一個明確為 null），百分比必須介於 0 與 100，
+零用量是有效值。已知的五小時／七天視窗按實際時長歸位，不假設 primary 永遠是五小時。
+完整驗證後同時替換兩個視窗；null 會清除舊值。一般查詢失敗保留舊快照與原 UpdatedAt，
+授權失效則清除快照。沒有資料顯示 `-`，不推測為 100%。後端啟動時立即刷新一次，之後每
+3 分鐘背景更新；Provider 設定異動後也會要求刷新，同一 Model 的刷新序列化。
+這是目前 ChatGPT 帳號後端的相容整合，不宣稱為 OpenAI Platform 公開且穩定的帳務 API。
 
 同一份用量回應也帶有帳號可用的「用量上限重置」次數（`reset_credits.count`）。但**到期時間
 一律以 `/wham/rate-limit-reset-credits` 明細端點為準**：用量回應的 `credits` 欄位不完整，有時
@@ -984,18 +1051,30 @@ OpenAI 官方協定參考：[Chat Completions API](https://developers.openai.com
 
 Project 建立時可設定不可變更的 `ephemeral=true` 與 `ram_disk_size_mb`。`bootstrap.RAMDiskPool`
 以 Project ID 建立互不共用的揮發性工作空間；Application 在 Run 開始前取得該 Project 的可信任
-根目錄並放在 Sandbox 第一順位。Project 刪除時立即卸載，`Runtime.Close` 則在 Application、MCP
+根目錄並放在 Sandbox 第一順位。Project 刪除前先檢查所有 Session 是否仍有 active 工作，
+即使 force=true 也不繞過此檢查；確認可刪除後共用 Session 的計畫、Run／用量與事件清理流程，
+最後才刪除 Session 與卸載磁碟。建立 Session／Project、啟動 Run 與刪除共用准入鎖。
+事件刪除另依事件檔自身的 Session 歸屬掃描，涵蓋 Run 明細已淘汰的檔案；既有通知也一併刪除。
+事件檔損壞而無法確認歸屬時不猜測刪除，回報錯誤並保留 Session 的重試入口。
+`Runtime.Close` 則在 Application、MCP
 與其他子程序都關閉後清理剩餘磁碟。啟動期間任一步驟失敗也會回滾已建立的磁碟。
 
 - macOS：以參數陣列直接呼叫 `hdiutil attach -nomount` 與 `diskutil eraseVolume`，不經 Shell；
   正常卸載失敗時才使用強制 detach。
-- Linux：確認 `/dev/shm` 確實是 tmpfs 且可用空間不小於設定容量，再建立權限為 `0700` 的子目錄。
+- Linux：在 `/dev/shm` 建立專用掛載點，以獨立 tmpfs 的 `size` 選項強制限制容量，權限 `0700`。
+  需掛載命名空間中的 `CAP_SYS_ADMIN`；缺少權限直接報錯，不退回無配額子目錄。
+  卸載忙碌時保留磁碟供重試，不遞迴刪除仍掛載的內容。tmpfs 仍受主機 swap 政策影響。
+  掛載內容與底層掛載點各有所有權標記，卸載後清理失敗仍能辨識與重試；初始化回滾使用獨立的
+  有期限 context，並回報卸載失敗，不因原請求取消而略過清理。
 - Windows：以 ImDisk 的 `vm` backing store 建立 NTFS RAM disk，自動挑選未使用的磁碟代號；找不到
   `imdisk.exe` 時明確拒絕啟動，不會靜默落到硬碟。此路徑仍標示為待 x64／ARM64 實機驗證。
 - 其他平台：使用可清理的系統暫存目錄，但 `Volatile()` 回報 false，呼叫端不得把它呈現成 RAM disk。
 
 殘留清理由固定名稱前綴、結構化專用標記、平台種類與建立程序 PID 共同判定。仍活著的程序一律略過；
 缺少標記、標記格式不符或裝置名稱不合法時也不處理，以免卸載使用者自行建立的磁碟。
+
+Pool 依配置容量計算本程序所有 Project 的總額，上限為實體記憶體 75%；卸載成功才釋放額度。
+這是容量准入限制，不代表預先保留實體 RAM，也不涵蓋其他程序的用量；配置失敗仍回報平台錯誤。
 
 能不能新建記憶體隔離 Project 由服務設定 `memory_isolated_projects` 控制，**預設開啟**——
 與仍在設計中的實驗性功能不同，這是已完成的能力。關閉只擋新建（回 409）：既有隔離 Project
