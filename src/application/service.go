@@ -161,6 +161,8 @@ func (s *Service) GetAgent(id string) (domain.AgentDescriptor, error) {
 }
 
 func (s *Service) CreateSession(ctx context.Context, agentID string, input domain.CreateSessionInput) (domain.Session, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	engine, err := s.registry.Get(agentID)
 	if err != nil {
 		return domain.Session{}, err
@@ -306,10 +308,42 @@ func (s *Service) DeleteSession(ctx context.Context, sessionID string) error {
 	if s.hasActiveSession(sessionID) {
 		return fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
 	}
-	if err := engine.DeleteSession(ctx, sessionID); err != nil {
+	return s.deleteSessionLocked(ctx, engine, sessionID)
+}
+
+// deleteSessionLocked 共用級聯刪除順序；保留 Session 到最後，失敗時仍有重試入口。
+// 呼叫端必須持有 startMu 並確認沒有執行緒仍在使用此 Session。
+func (s *Service) deleteSessionLocked(ctx context.Context, engine ports.AgentEngine, sessionID string) error {
+	if err := s.plans.DeleteSession(ctx, sessionID); err != nil {
 		return err
 	}
-	return s.plans.DeleteSession(ctx, sessionID)
+	if store, ok := s.notifications.(ports.SessionNotificationDeleter); ok {
+		if err := store.DeleteSession(ctx, sessionID); err != nil {
+			return err
+		}
+	}
+	if events, ok := s.events.(ports.SessionEventDeleter); ok {
+		if err := events.DeleteSession(ctx, sessionID); err != nil {
+			return err
+		}
+	}
+	if store, ok := s.runs.(ports.SessionRunDeleter); ok {
+		values, err := s.runs.List(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		if events, ok := s.events.(ports.RunEventDeleter); ok {
+			for _, run := range values {
+				if err := events.Delete(run.ID); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := store.DeleteSession(ctx, sessionID); err != nil {
+			return err
+		}
+	}
+	return engine.DeleteSession(ctx, sessionID)
 }
 
 func (s *Service) UpdateSession(ctx context.Context, sessionID string, input domain.UpdateSessionInput) (domain.Session, error) {
@@ -379,6 +413,8 @@ func (s *Service) UpdateSession(ctx context.Context, sessionID string, input dom
 }
 
 func (s *Service) CreateProject(ctx context.Context, input domain.CreateProjectInput) (domain.Project, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	input.WorkspaceID = strings.TrimSpace(input.WorkspaceID)
 	if _, err := s.workspaces.Get(ctx, input.WorkspaceID); err != nil {
 		return domain.Project{}, err
@@ -506,6 +542,8 @@ func (s *Service) GetProject(ctx context.Context, projectID string) (domain.Proj
 }
 
 func (s *Service) UpdateProject(ctx context.Context, projectID string, input domain.UpdateProjectInput) (domain.Project, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	return s.projects.Update(ctx, strings.TrimSpace(projectID), input)
 }
 
@@ -516,6 +554,8 @@ func (s *Service) UpdateProject(ctx context.Context, projectID string, input dom
 // 但拒絕之後使用者唯一的出路是手動一則一則刪，對話多的時候等於刪不掉——
 // force 讓他在知道後果的前提下一次完成，而不是提高門檻逼他放棄。
 func (s *Service) DeleteProject(ctx context.Context, projectID string, force bool) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	projectID = strings.TrimSpace(projectID)
 	project, err := s.projects.Get(ctx, projectID)
 	if err != nil {
@@ -538,13 +578,17 @@ func (s *Service) DeleteProject(ctx context.Context, projectID string, force boo
 			if !force {
 				return fmt.Errorf("%w: project still contains sessions", domain.ErrConflict)
 			}
+			// force 只允許級聯刪除，不允許在工作執行中卸載磁碟。
+			if s.hasActiveSession(session.ID) {
+				return fmt.Errorf("%w: project has a queued or running run", domain.ErrConflict)
+			}
 			owned = append(owned, ownedSession{engine: engine, id: session.ID})
 		}
 	}
 	// 對話先刪、專案後刪：反過來的話中途失敗會留下一批指向不存在專案的孤兒對話，
 	// 它們在側邊欄不屬於任何分組，使用者也找不到入口處理。
 	for _, session := range owned {
-		if err := session.engine.DeleteSession(ctx, session.id); err != nil {
+		if err := s.deleteSessionLocked(ctx, session.engine, session.id); err != nil {
 			return fmt.Errorf("刪除專案底下的對話 %s: %w", session.id, err)
 		}
 	}
@@ -797,6 +841,14 @@ func (s *Service) decorateSessionsUsage(ctx context.Context, sessions []domain.S
 }
 
 func (s *Service) decorateSessionUsage(ctx context.Context, session domain.Session) (domain.Session, error) {
+	if reader, ok := s.runs.(ports.SessionRunUsageReader); ok {
+		values, err := reader.ListSessionRunUsage(ctx, session.ID)
+		if err != nil {
+			return domain.Session{}, err
+		}
+		session.Usage = summarizeUsageSnapshots(values)
+		return session, nil
+	}
 	runs, err := s.runs.List(ctx, session.ID)
 	if err != nil {
 		return domain.Session{}, err
@@ -995,7 +1047,13 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 		Metadata:               valueutil.CloneMap(input.Metadata),
 		CreatedAt:              now,
 	}
+	if guard, ok := s.runs.(ports.RunRetentionGuard); ok {
+		guard.ProtectRun(run.ID)
+	}
 	if err := s.runs.Save(ctx, run); err != nil {
+		if guard, ok := s.runs.(ports.RunRetentionGuard); ok {
+			guard.ReleaseRun(run.ID)
+		}
 		return domain.Run{}, err
 	}
 	input.RunID = run.ID
@@ -1138,6 +1196,8 @@ func (s *Service) SubscribeRunEvents(ctx context.Context, runID string) (<-chan 
 }
 
 func (s *Service) CancelRun(ctx context.Context, runID string) (domain.Run, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	run, err := s.runs.Get(ctx, strings.TrimSpace(runID))
 	if err != nil {
 		return domain.Run{}, err
@@ -1166,33 +1226,26 @@ func (s *Service) CancelRun(ctx context.Context, runID string) (domain.Run, erro
 // persistImmediateCancellation 讓控制 API 立即反映使用者的停止意圖，
 // 不把完成時間綁在第三方 Provider 是否正確遵守 context 取消上。
 func (s *Service) persistImmediateCancellation(run domain.Run) (domain.Run, error) {
-	latest, err := s.runs.Get(context.Background(), run.ID)
-	if err != nil {
-		return run, err
-	}
-	if terminalRun(latest.Status) {
-		return latest, nil
-	}
 	completedAt := s.now().UTC()
-	latest.Status = domain.RunStatusCanceled
-	latest.PendingApproval = nil
-	latest.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
-	latest.CompletedAt = &completedAt
-	if err := s.runs.Save(context.Background(), latest); err != nil {
-		return run, err
+	run.Status = domain.RunStatusCanceled
+	run.PendingApproval = nil
+	run.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
+	run.CompletedAt = &completedAt
+	current, changed, err := s.saveTerminalRun(run)
+	if err != nil || !changed {
+		return current, err
 	}
-	payload := map[string]any{"status": latest.Status, "error": latest.Error}
-	if latest.Usage != nil {
-		payload["usage"] = *latest.Usage
+	payload := map[string]any{"status": current.Status, "error": current.Error}
+	if current.Usage != nil {
+		payload["usage"] = *current.Usage
 	}
-	if err := s.appendControlEvent(latest, "run.canceled", payload); err != nil {
-		// Run 狀態已經 durable；事件可由啟動時的 reconcile 補齊，不能讓
-		// 使用者看到取消 API 失敗而重送，造成控制結果更加不確定。
-		s.logger.Error("run cancellation event write failed", "run_id", latest.ID, "error", err)
-		s.notifyRun(latest.ID)
+	if err := s.appendControlEvent(current, "run."+string(current.Status), payload); err != nil {
+		// 狀態已落盤，事件失敗仍保留可診斷資訊，不讓重送取消產生第二個終止事件。
+		s.logger.Error("run cancellation event write failed", "run_id", current.ID, "error", err)
+		s.notifyRun(current.ID)
 	}
-	s.notifyRunFinished(latest)
-	return latest, nil
+	s.notifyRunFinished(current)
+	return current, nil
 }
 
 // AnswerQuestion 把使用者的抉擇送回正在等待的工具。
@@ -1349,6 +1402,9 @@ func approvalRequestFromPayload(payload map[string]any) (domain.ToolApprovalRequ
 func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, session domain.Session, input domain.RunInput, run domain.Run) {
 	sequence := int64(0)
 	defer s.wg.Done()
+	if guard, ok := s.runs.(ports.RunRetentionGuard); ok {
+		defer guard.ReleaseRun(run.ID)
+	}
 	// 排在 clearActive 之前註冊，因此執行順序在它之後：下一輪要通過
 	// hasActiveSession 的檢查，前一輪必須已經從 active 移除。
 	defer s.advancePlanLoop(run.ID)
@@ -1419,7 +1475,7 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 			}
 			run.Status = domain.RunStatusWaitingApproval
 			run.PendingApproval = &request
-			if err := s.runs.Save(context.Background(), run); err != nil {
+			if err := s.saveActiveRun(run); err != nil {
 				return err
 			}
 			if err := s.appendEvent(run, &sequence, event.Type, event.Payload); err != nil {
@@ -1443,7 +1499,7 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 			s.clearSessionPause(session.ID, run.ID)
 			run.Status = domain.RunStatusRunning
 			run.PendingApproval = nil
-			if err := s.runs.Save(context.Background(), run); err != nil {
+			if err := s.saveActiveRun(run); err != nil {
 				return err
 			}
 			return s.appendEvent(run, &sequence, event.Type, event.Payload)
@@ -1491,6 +1547,7 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 		s.mu.Lock()
 		if current, canceled := s.active[run.ID]; canceled && current.cancelRequested {
 			s.mu.Unlock()
+			s.finishCanceled(run, context.Canceled, &sequence)
 			return
 		}
 		if !s.pausedRuns[run.ID] {
@@ -1548,7 +1605,15 @@ func (s *Service) appendControlEvent(run domain.Run, eventType string, payload m
 func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType string, payload map[string]any) error {
 	// 取消會先落盤再寫 terminal event；若底層 Provider 在取消後仍送出回呼，
 	// 不得讓 late event 排到 run.canceled 之後，破壞事件串流的終止語意。
-	if latest, err := s.runs.Get(context.Background(), run.ID); err == nil && terminalRun(latest.Status) && eventType != "run."+string(latest.Status) {
+	//
+	// 讀不到 Run 記錄時跳過這道檢查，而不是讓事件寫入失敗：去重是「盡量不要寫出
+	// 重複的終止事件」的保護，不是正確性不變量。把它升級成硬失敗，等於讓一次暫時性
+	// 的讀取失敗殺掉一個本來健康的 run——事件是診斷通道，run 才是工作本身。
+	// 記一筆 warn，讓「這一輪沒有做去重」看得出來。
+	if latest, err := s.runs.Get(context.Background(), run.ID); err != nil {
+		s.logger.Warn("run record unreadable while appending event; terminal-event dedupe skipped",
+			"run_id", run.ID, "event_type", eventType, "error", err)
+	} else if terminalRun(latest.Status) && eventType != "run."+string(latest.Status) {
 		return fmt.Errorf("%w: cannot append %s after run.%s", domain.ErrConflict, eventType, latest.Status)
 	}
 	if latest := s.eventSequences[run.ID]; latest > *sequence {
@@ -1577,56 +1642,23 @@ func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType s
 
 func (s *Service) finishCanceled(run domain.Run, cause error, sequence *int64) {
 	s.logger.Info("run canceled", "run_id", run.ID, "session_id", run.SessionID, "cause", cause)
-	if latest, err := s.runs.Get(context.Background(), run.ID); err == nil {
-		if latest.Status == domain.RunStatusCanceled {
-			// CancelRun 可能已先把狀態寫成 canceled，而 Provider 稍後才
-			// 回傳取消結果；只補上最後收到的用量，不重複寫 terminal event。
-			if run.Usage != nil {
-				latest.Usage = run.Usage
-				_ = s.runs.Save(context.Background(), latest)
-			}
-			return
-		}
-		if terminalRun(latest.Status) {
-			return
-		}
-		run = latest
-	}
 	completedAt := s.now().UTC()
 	run.Status = domain.RunStatusCanceled
-	run.PendingApproval = nil
 	run.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
 	if cause != nil {
 		run.Error.Message = cause.Error()
 	}
 	run.CompletedAt = &completedAt
-	s.mu.Lock()
-	_ = s.runs.Save(context.Background(), run)
-	s.mu.Unlock()
-	payload := map[string]any{"status": run.Status, "error": run.Error}
-	if run.Usage != nil {
-		payload["usage"] = *run.Usage
-	}
-	_ = s.appendEvent(run, sequence, "run.canceled", payload)
-	s.notifyRunFinished(run)
+	s.finishTerminalRun(run, sequence)
 }
 
 func (s *Service) finishFailed(run domain.Run, code string, cause error, retryable bool, sequence *int64) {
 	s.logger.Error("run failed", "run_id", run.ID, "session_id", run.SessionID, "code", code, "retryable", retryable, "error", cause)
 	completedAt := s.now().UTC()
 	run.Status = domain.RunStatusFailed
-	run.PendingApproval = nil
 	run.Error = &domain.RunError{Code: code, Message: cause.Error(), Retryable: retryable}
 	run.CompletedAt = &completedAt
-	s.mu.Lock()
-	_ = s.runs.Save(context.Background(), run)
-	s.mu.Unlock()
-	payload := map[string]any{"status": run.Status, "error": run.Error}
-	if run.Usage != nil {
-		payload["usage"] = *run.Usage
-	}
-	_ = s.appendEvent(run, sequence, "run.failed", payload)
-	s.notifyRunFinished(run)
+	s.finishTerminalRun(run, sequence)
 }
 
 func (s *Service) resolveSession(ctx context.Context, sessionID string) (ports.AgentEngine, domain.Session, error) {

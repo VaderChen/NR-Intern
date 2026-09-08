@@ -146,6 +146,8 @@ func (s *Service) NotifyUpdateAvailable(status domain.UpdateStatus) {
 // PauseRun 將暫停標記寫入 Run。正在進行中的 Provider HTTP request 不會被強制切斷，
 // 會在下一個安全回合邊界停住，避免留下半截工具／訊息協定。
 func (s *Service) PauseRun(ctx context.Context, runID string) (domain.Run, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	runID = strings.TrimSpace(runID)
 	s.mu.Lock()
 	locked := true
@@ -206,6 +208,8 @@ func (s *Service) PauseRun(ctx context.Context, runID string) (domain.Run, error
 }
 
 func (s *Service) ResumeRun(ctx context.Context, runID string) (domain.Run, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	runID = strings.TrimSpace(runID)
 	s.mu.Lock()
 	run, err := s.runs.Get(ctx, runID)

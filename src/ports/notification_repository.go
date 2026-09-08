@@ -12,3 +12,7 @@ type NotificationRepository interface {
 	MarkAllRead(context.Context) error
 	DeleteRead(context.Context) error
 }
+
+type SessionNotificationDeleter interface {
+	DeleteSession(context.Context, string) error
+}

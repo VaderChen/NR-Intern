@@ -17,22 +17,32 @@ import (
 // defaultRunRetention 是 runs.json 保留的 run 筆數上限。
 //
 // 這個檔案每次 Save 都整份重寫，而一次 run 會 Save 好幾次（啟動、狀態轉換、完成）。
-// 沒有上限時，寫入成本正比於「這台機器跑過的 run 總數」，只會越來越慢也永遠不會
-// 回落。500 筆足夠涵蓋任何實際的回顧需求，完整紀錄仍在各 session 的 transcript 裡。
+// 限制含本文的明細大小，避免大型工具結果不斷拖慢狀態寫入；精簡用量快照另行
+// 保留至 Session 刪除，因此淘汰明細不會讓累計值倒退。
 const defaultRunRetention = 500
 
 type RunRepository struct {
 	mu        sync.RWMutex
 	filePath  string
 	runs      map[string]domain.Run
+	usage     map[string]runUsageSnapshot
 	retention int
+	protected map[string]bool
 	// pruned 記下被淘汰的 run，讓呼叫端有機會清掉對應的事件檔。
 	pruned []string
 }
 
 type runFile struct {
-	Version int                   `json:"version"`
-	Runs    map[string]domain.Run `json:"runs"`
+	Version int                         `json:"version"`
+	Runs    map[string]domain.Run       `json:"runs"`
+	Usage   map[string]runUsageSnapshot `json:"usage,omitempty"`
+}
+
+// 只保留統計所需欄位，不延長提示、工具參數或結果本文的保留期。
+// 用 Run ID 覆寫快照，而不是增量相加，取消收尾或重複 Save 才不會重複計費。
+type runUsageSnapshot struct {
+	SessionID string          `json:"session_id"`
+	Usage     domain.RunUsage `json:"usage"`
 }
 
 func NewRunRepository(dataDir string) (*RunRepository, error) {
@@ -47,7 +57,9 @@ func NewRunRepository(dataDir string) (*RunRepository, error) {
 	repository := &RunRepository{
 		filePath:  filepath.Join(root, "runs.json"),
 		runs:      map[string]domain.Run{},
+		usage:     map[string]runUsageSnapshot{},
 		retention: defaultRunRetention,
+		protected: map[string]bool{},
 	}
 	if err := repository.load(); err != nil {
 		return nil, err
@@ -124,7 +136,7 @@ func (r *RunRepository) pruneGroupLocked(volatile bool) {
 	for index := 0; index < len(ordered)-r.retention; index++ {
 		// 只淘汰已經結束的 run。paused 與 waiting_approval 看起來像停住了，
 		// 其實都還會寫回狀態——用「是否為終態」判斷才不會漏掉。
-		if !terminalRunStatus(ordered[index].Status) {
+		if !terminalRunStatus(ordered[index].Status) || r.protected[ordered[index].ID] {
 			continue
 		}
 		delete(r.runs, ordered[index].ID)
@@ -132,21 +144,64 @@ func (r *RunRepository) pruneGroupLocked(volatile bool) {
 	}
 }
 
-func (r *RunRepository) Save(_ context.Context, run domain.Run) error {
-	if strings.TrimSpace(run.ID) == "" {
+func (r *RunRepository) ProtectRun(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.protected == nil {
+		r.protected = make(map[string]bool)
+	}
+	r.protected[id] = true
+}
+
+func (r *RunRepository) ReleaseRun(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.protected, id)
+	// 留待下一次 Save 整理，釋放生命週期保護本身不觸發不可回報的磁碟寫入。
+}
+
+func (r *RunRepository) Save(ctx context.Context, run domain.Run) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	run.ID = strings.TrimSpace(run.ID)
+	run.SessionID = strings.TrimSpace(run.SessionID)
+	if run.ID == "" {
 		return fmt.Errorf("%w: run id is required", domain.ErrInvalidInput)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	previous, existed := r.runs[run.ID]
+	if previous, ok := r.runs[run.ID]; ok && previous.SessionID != run.SessionID {
+		return fmt.Errorf("%w: run session cannot change", domain.ErrConflict)
+	}
+	if previous, ok := r.usage[run.ID]; ok {
+		if previous.SessionID != run.SessionID {
+			return fmt.Errorf("%w: run usage session cannot change", domain.ErrConflict)
+		}
+		// 狀態更新省略 usage 時仍保留既有快照，避免 Run 與 Session 查詢互相矛盾。
+		if run.Usage == nil {
+			usage := cloneUsage(previous.Usage)
+			run.Usage = &usage
+		}
+	}
+	// 候選狀態與已提交狀態分離；磁碟失敗必須連淘汰清單一起回復。
+	previousRuns, previousUsage, previousPruned := r.runs, r.usage, r.pruned
+	r.runs = make(map[string]domain.Run, len(previousRuns)+1)
+	for id, value := range previousRuns {
+		r.runs[id] = value
+	}
+	r.usage = make(map[string]runUsageSnapshot, len(previousUsage)+1)
+	for id, value := range previousUsage {
+		r.usage[id] = value
+	}
+	r.pruned = append([]string(nil), previousPruned...)
 	r.runs[run.ID] = cloneRun(run)
+	if run.Usage != nil {
+		r.usage[run.ID] = runUsageSnapshot{SessionID: run.SessionID, Usage: cloneUsage(*run.Usage)}
+	}
 	r.pruneLocked()
 	if err := r.persistLocked(); err != nil {
-		if existed {
-			r.runs[run.ID] = previous
-		} else {
-			delete(r.runs, run.ID)
-		}
+		r.runs, r.usage, r.pruned = previousRuns, previousUsage, previousPruned
 		return err
 	}
 	return nil
@@ -176,6 +231,27 @@ func (r *RunRepository) List(_ context.Context, sessionID string) ([]domain.Run,
 	return items, nil
 }
 
+func (r *RunRepository) ListSessionRunUsage(ctx context.Context, sessionID string) ([]domain.RunUsage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	// 固定順序也避免浮點加總因 map 遍歷順序改變而跳動。
+	ids := make([]string, 0)
+	for id, value := range r.usage {
+		if value.SessionID == sessionID {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	values := make([]domain.RunUsage, 0, len(ids))
+	for _, id := range ids {
+		values = append(values, cloneUsage(r.usage[id].Usage))
+	}
+	return values, nil
+}
+
 func (r *RunRepository) FindByIdempotencyKey(_ context.Context, sessionID string, key string) (domain.Run, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -203,6 +279,13 @@ func (r *RunRepository) DeleteSession(ctx context.Context, sessionID string) ([]
 	for id, run := range r.runs {
 		previous[id] = cloneRun(run)
 	}
+	previousUsage := r.usage
+	r.usage = make(map[string]runUsageSnapshot, len(previousUsage))
+	for id, value := range previousUsage {
+		if value.SessionID != sessionID {
+			r.usage[id] = value
+		}
+	}
 	deleted := []string{}
 	for id, run := range r.runs {
 		if run.SessionID != sessionID {
@@ -211,11 +294,12 @@ func (r *RunRepository) DeleteSession(ctx context.Context, sessionID string) ([]
 		deleted = append(deleted, id)
 		delete(r.runs, id)
 	}
-	if len(deleted) == 0 {
+	if len(deleted) == 0 && len(r.usage) == len(previousUsage) {
 		return nil, nil
 	}
 	if err := r.persistLocked(); err != nil {
 		r.runs = previous
+		r.usage = previousUsage
 		return nil, err
 	}
 	sort.Strings(deleted)
@@ -236,6 +320,15 @@ func (r *RunRepository) load() error {
 	}
 	if snapshot.Runs != nil {
 		r.runs = snapshot.Runs
+	}
+	if snapshot.Usage != nil {
+		r.usage = snapshot.Usage
+	}
+	// 舊格式只能遷移尚存的快照，已被舊版本淘汰的 token 不可臆測補回。
+	for id, run := range r.runs {
+		if run.Usage != nil {
+			r.usage[id] = runUsageSnapshot{SessionID: run.SessionID, Usage: cloneUsage(*run.Usage)}
+		}
 	}
 	return nil
 }
@@ -269,7 +362,13 @@ func (r *RunRepository) persistableRunsLocked() map[string]domain.Run {
 }
 
 func (r *RunRepository) persistLocked() error {
-	data, err := json.MarshalIndent(runFile{Version: 1, Runs: r.persistableRunsLocked()}, "", "  ")
+	usage := make(map[string]runUsageSnapshot)
+	for id, value := range r.usage {
+		if domain.EphemeralProjectCodeFromID(value.SessionID) == "" {
+			usage[id] = value
+		}
+	}
+	data, err := json.MarshalIndent(runFile{Version: 2, Runs: r.persistableRunsLocked(), Usage: usage}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode run store: %w", err)
 	}
@@ -302,6 +401,15 @@ func (r *RunRepository) markInterruptedRuns() bool {
 
 func cloneRun(run domain.Run) domain.Run {
 	copyRun := run
+	copyRun.AttachmentIDs = append([]string(nil), run.AttachmentIDs...)
+	if run.StartedAt != nil {
+		value := *run.StartedAt
+		copyRun.StartedAt = &value
+	}
+	if run.CompletedAt != nil {
+		value := *run.CompletedAt
+		copyRun.CompletedAt = &value
+	}
 	if run.Metadata != nil {
 		copyRun.Metadata = make(map[string]any, len(run.Metadata))
 		for key, value := range run.Metadata {
@@ -310,14 +418,23 @@ func cloneRun(run domain.Run) domain.Run {
 	}
 	if run.Result != nil {
 		result := *run.Result
+		if run.Result.BudgetExceeded != nil {
+			value := *run.Result.BudgetExceeded
+			result.BudgetExceeded = &value
+		}
+		if run.Result.Completion != nil {
+			value := *run.Result.Completion
+			value.UnresolvedFailures = append([]domain.UnresolvedToolFailure(nil), value.UnresolvedFailures...)
+			result.Completion = &value
+		}
 		if run.Result.Usage != nil {
-			usage := *run.Result.Usage
+			usage := cloneUsage(*run.Result.Usage)
 			result.Usage = &usage
 		}
 		copyRun.Result = &result
 	}
 	if run.Usage != nil {
-		usage := *run.Usage
+		usage := cloneUsage(*run.Usage)
 		copyRun.Usage = &usage
 	}
 	if run.Error != nil {
@@ -335,4 +452,12 @@ func cloneRun(run domain.Run) domain.Run {
 		copyRun.PendingApproval = &approval
 	}
 	return copyRun
+}
+
+func cloneUsage(value domain.RunUsage) domain.RunUsage {
+	if value.EstimatedCostUSD != nil {
+		cost := *value.EstimatedCostUSD
+		value.EstimatedCostUSD = &cost
+	}
+	return value
 }

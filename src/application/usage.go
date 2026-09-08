@@ -73,16 +73,22 @@ type sessionUsageGroup struct {
 // summarizeSessionUsage 只讀取已保存的 Run 快照，不掃描 transcript 或事件，
 // 因此重新載入 Session、重試同一請求都不會把同一輪 token 再算一次。
 func summarizeSessionUsage(runs []domain.Run) *domain.SessionUsage {
+	values := make([]domain.RunUsage, 0, len(runs))
+	for _, run := range runs {
+		if run.Usage != nil {
+			values = append(values, *run.Usage)
+		}
+	}
+	return summarizeUsageSnapshots(values)
+}
+
+func summarizeUsageSnapshots(values []domain.RunUsage) *domain.SessionUsage {
 	result := &domain.SessionUsage{}
 	groups := map[string]*sessionUsageGroup{}
 	allCostKnown := true
 	hasUsage := false
 	totalCost := float64(0)
-	for _, run := range runs {
-		if run.Usage == nil {
-			continue
-		}
-		usage := *run.Usage
+	for _, usage := range values {
 		if usage.TotalTokens <= 0 {
 			usage.TotalTokens = usage.InputTokens + usage.OutputTokens
 		}

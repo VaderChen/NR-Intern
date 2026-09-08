@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -57,13 +58,13 @@ func (r *Runtime) startStorageMaintenance() {
 func (r *Runtime) sweepStorage(ctx context.Context) {
 	runs, ok := r.Runs.(*filestore.RunRepository)
 	events, eventsOK := r.Events.(*filestore.RunEventRepository)
-	if !ok || !eventsOK {
+	if !ok || !eventsOK || r.Application == nil {
 		return
 	}
 	logger := slog.Default().With("service", r.Config.ServiceName)
 	// 先處理 RunRepository 自己淘汰掉的 run：紀錄沒了，事件檔就沒有讀取路徑。
 	for _, runID := range runs.TakePrunedRunIDs() {
-		if err := events.Delete(runID); err != nil {
+		if _, err := r.Application.PruneRunEvents(ctx, runID); err != nil {
 			logger.Warn("delete events of pruned run failed", "run_id", runID, "error", err)
 		}
 	}
@@ -75,7 +76,9 @@ func (r *Runtime) sweepStorage(ctx context.Context) {
 	// List 已依建立時間新到舊排序。保留最近 runEventRetention 筆，
 	// 以及所有還沒結束的 run——那些正是可能被重連讀取的。
 	keep := map[string]bool{}
+	known := map[string]bool{}
 	for index, run := range values {
+		known[run.ID] = true
 		if index < runEventRetention || !finishedRun(run.Status) {
 			keep[run.ID] = true
 		}
@@ -90,11 +93,20 @@ func (r *Runtime) sweepStorage(ctx context.Context) {
 		if keep[runID] {
 			continue
 		}
-		if err := events.Delete(runID); err != nil {
+		if !known[runID] {
+			// 快照之後才建立的 Run 不參與這輪保留期計算，即使剛好已完成也保留。
+			if _, err := runs.Get(ctx, runID); !errors.Is(err, domain.ErrNotFound) {
+				continue
+			}
+		}
+		deleted, err := r.Application.PruneRunEvents(ctx, runID)
+		if err != nil {
 			logger.Warn("delete run events failed", "run_id", runID, "error", err)
 			continue
 		}
-		removed++
+		if deleted {
+			removed++
+		}
 	}
 	if removed > 0 {
 		logger.Info("run event files pruned", "removed", removed, "retained", len(keep))

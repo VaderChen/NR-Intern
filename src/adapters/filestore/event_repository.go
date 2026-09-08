@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,7 +25,7 @@ type RunEventRepository struct {
 	roots atomic.Pointer[ProjectRoots]
 
 	mu        sync.Mutex
-	locks     map[string]*sync.RWMutex
+	locks     [64]sync.RWMutex
 	sequences map[string]int64
 }
 
@@ -39,7 +40,6 @@ func NewRunEventRepository(dataDir string) (*RunEventRepository, error) {
 	}
 	return &RunEventRepository{
 		root:      root,
-		locks:     map[string]*sync.RWMutex{},
 		sequences: map[string]int64{},
 	}, nil
 }
@@ -217,16 +217,82 @@ func (r *RunEventRepository) Delete(runID string) error {
 	}
 	lock := r.runLock(runID)
 	lock.Lock()
+	defer lock.Unlock()
+	return r.deleteLocked(runID, path)
+}
+
+func (r *RunEventRepository) deleteLocked(runID, path string) error {
 	removeErr := os.Remove(path)
-	lock.Unlock()
-	r.mu.Lock()
-	delete(r.sequences, runID)
-	delete(r.locks, runID)
-	r.mu.Unlock()
 	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 		return fmt.Errorf("delete run events: %w", removeErr)
 	}
+	r.mu.Lock()
+	delete(r.sequences, runID)
+	// 固定分片鎖不隨事件刪除而換身分，也不隨歷史 Run 數量無限成長。
+	r.mu.Unlock()
 	return nil
+}
+
+// DeleteSession 不能只依賴 Run 清單，否則已淘汰明細的事件會留在磁碟上。
+// 第一筆事件就帶有 Session ID；持有同一把事件鎖直到刪除，避免讀取與清理交錯。
+func (r *RunEventRepository) DeleteSession(ctx context.Context, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return fmt.Errorf("%w: session id is required", domain.ErrInvalidInput)
+	}
+	root, err := r.eventRoot(sessionID)
+	if err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			continue
+		}
+		runID := strings.TrimSuffix(entry.Name(), ".jsonl")
+		path := filepath.Join(root, entry.Name())
+		if err := r.deleteSessionEventFile(runID, path, sessionID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *RunEventRepository) deleteSessionEventFile(runID, path, sessionID string) error {
+	lock := r.runLock(runID)
+	lock.Lock()
+	defer lock.Unlock()
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var header struct {
+		SessionID string `json:"session_id"`
+	}
+	decodeErr := json.NewDecoder(bufio.NewReader(file)).Decode(&header)
+	closeErr := file.Close()
+	if decodeErr != nil {
+		return fmt.Errorf("cannot identify session of event file %s: %w", runID, decodeErr)
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if header.SessionID != sessionID {
+		return nil
+	}
+	return r.deleteLocked(runID, path)
 }
 
 func (r *RunEventRepository) eventPath(runID string) (string, error) {
@@ -256,12 +322,7 @@ func (r *RunEventRepository) eventRoot(runID string) (string, error) {
 }
 
 func (r *RunEventRepository) runLock(runID string) *sync.RWMutex {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	lock := r.locks[runID]
-	if lock == nil {
-		lock = &sync.RWMutex{}
-		r.locks[runID] = lock
-	}
-	return lock
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(runID))
+	return &r.locks[hash.Sum32()%uint32(len(r.locks))]
 }
