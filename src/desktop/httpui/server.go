@@ -7,9 +7,11 @@ import (
 	"AgenticService/src/internal/systeminfo"
 	"AgenticService/src/web/console"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"net/http/httputil"
@@ -21,6 +23,13 @@ import (
 )
 
 const controlCookie = "agentic_desktop_control"
+
+// 存檔請求的上限。base64 會把內容放大約三分之一，因此請求上限比內容上限寬。
+// 診斷包與安全備份是這裡最大的兩種檔案。
+const (
+	maxSaveFileBytes        = 64 << 20
+	maxSaveFileRequestBytes = 96 << 20
+)
 
 type Config struct {
 	Supervisor   *supervisor.Supervisor
@@ -96,6 +105,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /desktop/api/folders/pick", s.pickFolders)
 	s.mux.HandleFunc("POST /desktop/api/folders/dropped", s.droppedFolders)
 	s.mux.HandleFunc("POST /desktop/api/mcp/files/dropped", s.droppedMCPFiles)
+	s.mux.HandleFunc("POST /desktop/api/files/save", s.saveFile)
 	s.mux.HandleFunc("POST /desktop/api/screen-capture", s.captureScreen)
 	s.mux.HandleFunc("POST /desktop/api/clipboard/image", s.copyImageToClipboard)
 	s.mux.HandleFunc("POST /desktop/api/resources/open", s.openResource)
@@ -200,6 +210,61 @@ func (s *Server) droppedFolders(writer http.ResponseWriter, request *http.Reques
 	writeData(writer, values)
 }
 
+// saveFile 以原生存檔面板詢問位置後把內容寫進去。
+//
+// 桌面端的 WebView 沒有下載處理，網頁的 <a download> 會被靜默丟掉——按了按鈕
+// 什麼都不會發生。瀏覽器不會走到這裡，那邊的下載本來就正常。
+//
+// 路徑由使用者在系統面板裡選定，後端不自行決定要寫到哪；面板回傳什麼就寫什麼，
+// 這是唯一能讓「存到哪」保持在使用者手上的作法。
+func (s *Server) saveFile(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Name          string `json:"name"`
+		ContentBase64 string `json:"content_base64"`
+	}
+	if err := json.NewDecoder(io.LimitReader(request.Body, maxSaveFileRequestBytes)).Decode(&input); err != nil {
+		writeJSON(writer, http.StatusBadRequest, map[string]any{"error": "invalid save request: " + err.Error()})
+		return
+	}
+	// 名稱會當成原生面板的預設檔名，而它來自使用者自訂的 Provider／MCP id。
+	// "." 與 ".." 通過 filepath.Base 之後仍然是自己，必須另外擋掉。
+	name := strings.TrimSpace(input.Name)
+	if name == "" || name == "." || name == ".." || name != filepath.Base(name) || strings.ContainsAny(name, `/\`) {
+		writeJSON(writer, http.StatusBadRequest, map[string]any{"error": "invalid file name"})
+		return
+	}
+	content, err := base64.StdEncoding.DecodeString(input.ContentBase64)
+	if err != nil {
+		writeJSON(writer, http.StatusBadRequest, map[string]any{"error": "content is not valid base64"})
+		return
+	}
+	if len(content) > maxSaveFileBytes {
+		writeJSON(writer, http.StatusRequestEntityTooLarge, map[string]any{"error": "檔案內容過大"})
+		return
+	}
+	path, err := folderpicker.Save(request.Context(), name)
+	if errors.Is(err, folderpicker.ErrUnavailable) {
+		writeJSON(writer, http.StatusNotImplemented, map[string]any{"error": err.Error()})
+		return
+	}
+	if errors.Is(err, folderpicker.ErrCanceled) {
+		// 取消不是錯誤。前端據此保持安靜，不要再退回瀏覽器下載——
+		// 使用者剛剛才明確表示不想存。
+		writeJSON(writer, http.StatusOK, map[string]any{"data": map[string]any{"canceled": true}})
+		return
+	}
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]any{"error": "choose save location: " + err.Error()})
+		return
+	}
+	// 匯出檔可能含明文憑證，權限比照設定檔而不是一般下載檔。
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]any{"error": "write file: " + err.Error()})
+		return
+	}
+	writeData(writer, map[string]any{"path": path, "canceled": false})
+}
+
 func (s *Server) droppedMCPFiles(writer http.ResponseWriter, request *http.Request) {
 	paths, err := folderpicker.DroppedFiles(request.Context())
 	if errors.Is(err, folderpicker.ErrUnavailable) {
@@ -213,7 +278,7 @@ func (s *Server) droppedMCPFiles(writer http.ResponseWriter, request *http.Reque
 	files := make([]map[string]any, 0, len(paths))
 	for _, path := range paths {
 		extension := strings.ToLower(filepath.Ext(path))
-		if extension != ".mcp" && extension != ".json" {
+		if extension != ".mcp" && extension != ".provider" && extension != ".json" {
 			continue
 		}
 		info, statErr := os.Stat(path)
@@ -221,7 +286,7 @@ func (s *Server) droppedMCPFiles(writer http.ResponseWriter, request *http.Reque
 			continue
 		}
 		if info.Size() > 2*1024*1024 {
-			writeJSON(writer, http.StatusRequestEntityTooLarge, map[string]any{"error": ".mcp 檔案不得超過 2 MB"})
+			writeJSON(writer, http.StatusRequestEntityTooLarge, map[string]any{"error": "設定檔不得超過 2 MB"})
 			return
 		}
 		data, readErr := os.ReadFile(path)

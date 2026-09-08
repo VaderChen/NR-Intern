@@ -463,6 +463,7 @@ details[open] > .reasoning-summary::after { transform: rotate(45deg); }
 .activity-dots { display: none; height: 16px; flex: none; align-items: flex-end; gap: 5px; overflow: visible; padding-bottom: 3px; }
 .activity.processing .activity-dots { display: flex; }
 .activity-dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); opacity: .24; animation: agent-processing-wave 1.15s ease-in-out infinite; }
+.activity.waiting-for-model .activity-dots i { background: var(--danger); }
 .activity-dots i:nth-child(2) { animation-delay: .14s; }
 .activity-dots i:nth-child(3) { animation-delay: .28s; }
 /* 訊息內的動畫改由上面那組取代，保留 class 供狀態判斷使用。 */
@@ -675,10 +676,17 @@ summary { cursor: pointer; color: var(--muted); }
 /* 訊息時間戳：貼齊訊息右緣、比內文小一級、用 muted 色，讀訊息時不該搶注意力。
    tabular-nums 讓連續訊息的時間對齊，不會因為數字寬度不同而跳動。 */
 .message-timestamp { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.4; text-align: right; font-variant-numeric: tabular-nums; }
-/* 思考區塊自己不是一則回答，跟著它的答案下方已經有一個時間了；兩個疊在一起
+.message-footer { display: flex; align-items: center; justify-content: flex-end; gap: 2px; margin-top: 4px; }
+.message-footer > .message-timestamp { margin-top: 0; }
+/* 複製鈕比一般 icon-button 小一圈，跟時間同一個色階：它是這一列的附屬品，
+   不該比旁邊的時間更搶眼。 */
+.message-footer-copy { width: 19px; height: 19px; color: var(--muted); opacity: .68; }
+.message-footer-copy:hover { color: var(--text); opacity: 1; }
+.message-footer-copy .message-action-icon { width: 12px; height: 12px; }
+/* 思考區塊自己不是一則回答，跟著它的答案下方已經有一列了；兩列疊在一起
    只會變成雜訊。用 CSS 而不是建立節點時判斷，是因為 reasoning-only 這個
    class 在串流過程中會被反覆切換。 */
-.message.reasoning-only > .message-timestamp { display: none; }
+.message.reasoning-only > .message-footer { display: none; }
 
 .plan-loop-badge { flex: none; padding: 1px 7px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 800; }
 .plan-loop-badge[data-state="paused"] { background: var(--panel-3); color: var(--muted); }
@@ -721,6 +729,12 @@ summary { cursor: pointer; color: var(--muted); }
 .mcp-import-dialog .dialog-title-row h2 { margin: 0 0 2px; }
 .mcp-import-dialog .dialog-title-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mcp-import-dialog .dialog-title-row .icon-button { flex: none; border: 1px solid var(--line); background: var(--panel); font-size: 19px; }
+/* 匯出對話框只有一個選項，用不到匯入清單那種寬度：760px 會讓一句提示橫跨
+   整個畫面，標籤反而被擠到折行。這裡改成窄版並讓選項與說明上下排。 */
+.setting-export-dialog { width: min(420px, calc(100% - 32px)); }
+.setting-export-dialog .mcp-import-intro { flex-direction: column; align-items: stretch; gap: 6px; }
+.setting-export-dialog .mcp-import-intro > .check-label { white-space: normal; }
+
 .mcp-import-intro { display: flex; min-width: 0; align-items: flex-end; gap: 16px; margin: 0 0 10px; }
 .mcp-import-intro > .hint { min-width: 0; flex: 1 1 auto; margin: 0; }
 .mcp-import-auth-method-bar { width: min(280px, 40%); flex: none; }
@@ -756,7 +770,13 @@ summary { cursor: pointer; color: var(--muted); }
 .mcp-tool-list code { max-width: 100%; padding: 3px 6px; overflow: hidden; border-radius: 6px; background: var(--code-background); color: var(--code-text); text-overflow: ellipsis; white-space: nowrap; }
 .provider-auth-fields { display: grid; gap: 8px; margin: 2px 0 8px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
 .clear-secret-button { justify-self: start; margin: 0 !important; border-color: var(--danger); }
-.clear-secret-button:hover, .clear-secret-button[aria-pressed="true"] { border-color: var(--danger); background: var(--danger-ring); color: var(--danger); }
+.clear-secret-button:hover:not(:disabled) { border-color: var(--danger); background: var(--danger-ring); color: var(--danger); }
+/* 停用時不上警示色：沒有東西可清的按鈕不該看起來像個危險動作。 */
+.clear-secret-button:disabled { border-color: var(--line); background: transparent; color: var(--muted); }
+/* 已標記為清除的樣子要跟 hover 分得開。兩者原本共用同一條規則，滑鼠停在
+   按鈕上時按下去畫面毫無變化——而這個動作會刪掉一把可能拿不回來的金鑰。 */
+.clear-secret-button[aria-pressed="true"] { border-color: transparent; background: var(--danger); color: #fff; font-weight: 700; }
+.clear-secret-button[aria-pressed="true"]:hover { background: var(--danger); color: #fff; }
 .provider-auth-fields > label { display: grid; gap: 5px; color: var(--muted); }
 .provider-auth-fields > small { color: var(--muted); overflow-wrap: anywhere; }
 .reverse-proxy-card { max-width: 820px; margin-inline: auto; }
@@ -786,6 +806,10 @@ summary { cursor: pointer; color: var(--muted); }
 .provider-advanced { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
 .provider-advanced .provider-field-grid { margin-top: 7px; }
 .provider-editor-actions { display: flex; justify-content: space-between; gap: 8px; margin-top: 18px; }
+/* 左側那一組（刪除、匯出）要自己成為一個 flex 項目。
+   直接放三個子元素進 space-between 的話，匯出鈕會被推到整列中央，
+   看起來像是跟右邊的儲存區同一組。 */
+.provider-editor-action-start { display: flex; align-items: center; gap: 8px; }
 .provider-editor-action-group { display: flex; min-width: 0; align-items: center; justify-content: flex-end; gap: 8px; }
 .provider-editor-action-group .hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .provider-settings-empty { grid-column: 2; }

@@ -13,6 +13,9 @@ const state = {
   selectedMCPSettingsID: "",
   mcpSettingsDraft: null,
   mcpImportDraft: null,
+  providerImportDraft: null,
+  pendingImports: null,
+  settingExport: null,
   reverseProxy: null,
   reverseProxyHydrated: false,
   reverseProxyLoading: false,
@@ -1888,6 +1891,14 @@ const capacityScaleOptions = [
   { value: 1536 * 1024, label: "1.5M" },
   { value: 2048 * 1024, label: "2M" },
 ];
+
+// 新 Provider 的容量預設值。刻意不留 0（也就是「自動」）：多數相容服務不回報
+// 限制，自動就會落到後備預估值，而那個估算保守到會提早壓縮，使用者只看到
+// 對話莫名其妙被壓縮，卻不知道要去哪裡調。給一組看得見、也改得動的值。
+// 數值直接對齊下面兩個刻度，選單才會落在既有項目上。
+const defaultProviderContextWindow = 256 * 1024;
+const defaultProviderMaxOutputTokens = 8 * 1024;
+const defaultProviderMaxHistoryCharacters = 512 * 1024;
 
 const outputScaleOptions = [
   { value: 4 * 1024, label: "4K" },
@@ -3898,7 +3909,7 @@ function appendMessage(message, options = {}) {
       indicator.append(dot);
     }
     article.append(indicator);
-    article.append(messageTimestampNode(message.created_at));
+    article.append(messageFooterNode(article, message.created_at));
   } else {
     article.append(content);
   }
@@ -3907,6 +3918,44 @@ function appendMessage(message, options = {}) {
     return mergeReasoningIntoPrevious(article, options.operationId || "");
   }
   return article;
+}
+
+// messageFooterNode 是回答底下那一列：複製鈕貼著時間的左邊。
+//
+// 複製鈕讀的是按下當時的 DOM，不是建立節點時的 message.content——回答是
+// 串流進來的，建立節點時那份內容還是空的。
+function messageFooterNode(article, createdAt) {
+  const footer = document.createElement("div");
+  footer.className = "message-footer";
+  const copy = iconButton(messageCopyIcon(), translate("複製訊息"), () => {
+    const content = article.querySelector(":scope > .content");
+    void copyMessage(content ? stripWrappingCodeFence(richContentSource(content)) : "");
+  });
+  copy.classList.add("message-footer-copy");
+  footer.append(copy, messageTimestampNode(createdAt));
+  return footer;
+}
+
+// stripWrappingCodeFence 拿掉包住整則訊息的那層程式碼圍籬。
+//
+// Agent 交出來的接手 prompt 幾乎都整段包在 ```text 裡，而那層圍籬是給人看
+// 邊界用的，不是內容的一部分；照原樣複製，貼到別處前還得手動刪掉頭尾兩行，
+// 複製鈕的用途正好被抵銷。
+//
+// 只在第一行與最後一行都是圍籬時動手，而且只拿掉這兩行。不改用畫面上的文字
+// 是因為那會連標題與清單符號一起丟掉——prompt 的結構就在那些符號裡，而這種
+// 訊息的巢狀圍籬常常讓 markdown 解析成非預期的樣子，畫面文字並不可靠。
+//
+// 開頭圍籬的語言標註限定在文字類：以程式碼區塊開頭、又以程式碼區塊結尾的
+// 回答（「這是修改後的檔案 …（說明）… 這是測試」）同樣符合頭尾條件，拿掉
+// 兩行會讓中間的圍籬失衡。包裝用的圍籬只會是 text／markdown 或沒有標註。
+const wrappingFencePattern = /^\s*```(?:text|txt|markdown|md|plain|prompt)?\s*$/i;
+
+function stripWrappingCodeFence(source) {
+  const lines = String(source || "").replace(/\s+$/, "").split("\n");
+  if (lines.length < 2) return source;
+  if (!wrappingFencePattern.test(lines[0]) || !/^\s*```\s*$/.test(lines[lines.length - 1])) return source;
+  return lines.slice(1, -1).join("\n");
 }
 
 // messageTimestampNode 是訊息右下角那個不顯眼的時間。
@@ -4408,6 +4457,7 @@ function showActivity(text) {
   // 進度動畫在這一列，因此有動畫時整列就要顯示，即使還沒有任何狀態文字。
   const processing = runIsProcessing();
   $("activity").classList.toggle("processing", processing);
+  $("activity").classList.toggle("waiting-for-model", processing && Boolean(text?.startsWith(waitingForModelPrefix)));
   $("activity").classList.toggle("hidden", !text && !processing);
   const retryVisible = Boolean(state.retryableRunId)
     && Boolean(text)
@@ -4790,21 +4840,23 @@ function outboxTransaction(mode, operation) {
   return openPromptOutbox().then((database) => new Promise((resolve, reject) => {
     const transaction = database.transaction("prompts", mode);
     const store = transaction.objectStore("prompts");
+    let result;
+    transaction.oncomplete = () => resolve(result);
+    transaction.onerror = () => reject(transaction.error || new Error("待送訊息儲存失敗"));
+    transaction.onabort = () => reject(transaction.error || new Error("待送訊息儲存已中止"));
     let request;
     try {
       request = operation(store);
     } catch (error) {
+      // operation 可能已排入部分寫入；只 reject 不 abort 仍會提交半套內容。
+      transaction.abort();
       reject(error);
       return;
     }
-    let result;
     if (request) {
       request.onsuccess = () => { result = request.result; };
       request.onerror = () => reject(request.error || new Error("待送訊息儲存失敗"));
     }
-    transaction.oncomplete = () => resolve(result);
-    transaction.onerror = () => reject(transaction.error || new Error("待送訊息儲存失敗"));
-    transaction.onabort = () => reject(transaction.error || new Error("待送訊息儲存已中止"));
   }));
 }
 
@@ -4828,8 +4880,14 @@ function serializablePromptItem(item) {
   };
 }
 
+// 隔離歸屬編在 Session ID；即使尚未載入專案清單，也不能把內容先寫入磁碟。
+function promptUsesMemoryOnly(item) {
+  return /^session_v[0-9a-f]+_/.test(String(item?.sessionId || "").trim());
+}
+
 async function savePromptOutboxItem(item) {
-  if (!state.outboxAvailable) return;
+  if (promptUsesMemoryOnly(item)) return;
+  if (!state.outboxAvailable) throw new Error(translate("待送訊息儲存不可用，請重新載入後再試。"));
   try {
     await outboxTransaction("readwrite", (store) => store.put(serializablePromptItem(item)));
   } catch (error) {
@@ -4838,8 +4896,9 @@ async function savePromptOutboxItem(item) {
   }
 }
 
-async function deletePromptOutboxItem(id) {
-  if (!state.outboxAvailable) return;
+async function deletePromptOutboxItem(id, item = null) {
+  if (promptUsesMemoryOnly(item)) return;
+  if (!state.outboxAvailable) throw new Error(translate("待送訊息儲存不可用，請重新載入後再試。"));
   try {
     await outboxTransaction("readwrite", (store) => store.delete(id));
   } catch (error) {
@@ -4851,7 +4910,14 @@ async function deletePromptOutboxItem(id) {
 async function loadPromptOutbox() {
   try {
     const items = await outboxTransaction("readonly", (store) => store.getAll());
-    state.promptQueue = (Array.isArray(items) ? items : [])
+    // 清除舊版本留下的隔離訊息與附件，不把它們重新加入可恢復佇列。
+    const savedItems = Array.isArray(items) ? items : [];
+    await outboxTransaction("readwrite", (store) => {
+      for (const item of savedItems) {
+        if (promptUsesMemoryOnly(item)) store.delete(item.id);
+      }
+    });
+    state.promptQueue = savedItems.filter((item) => !promptUsesMemoryOnly(item))
       .map((item) => ({
         ...item,
         status: item.status === "sending" ? "pending" : (item.status || "pending"),
@@ -4936,7 +5002,7 @@ async function removeQueuedPrompt(queueID) {
   if (!item || item.status === "sending") return;
   state.promptQueue = state.promptQueue.filter((value) => value.id !== queueID);
   try {
-    await deletePromptOutboxItem(queueID);
+    await deletePromptOutboxItem(queueID, item);
   } catch (error) {
     state.promptQueue.push(item);
     state.promptQueue.sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
@@ -4958,7 +5024,15 @@ async function retryQueuedPrompt(queueID) {
   if (!item || item.status !== "failed") return;
   item.status = "pending";
   item.error = "";
-  await savePromptOutboxItem(item).catch((error) => toast(error.message));
+  try {
+    await savePromptOutboxItem(item);
+  } catch (error) {
+    item.status = "failed";
+    item.error = error.message;
+    renderPromptQueue();
+    toast(error.message);
+    return;
+  }
   renderPromptQueue();
   void drainPromptQueue();
 }
@@ -5029,7 +5103,7 @@ async function drainPromptQueue() {
         const completed = await executePrompt(item);
         if (completed) {
           state.promptQueue = state.promptQueue.filter((value) => value.id !== item.id);
-          await deletePromptOutboxItem(item.id).catch((error) => toast(error.message));
+          await deletePromptOutboxItem(item.id, item).catch((error) => toast(error.message));
         }
         renderPromptQueue();
         void drainPromptQueue();
@@ -5039,7 +5113,8 @@ async function drainPromptQueue() {
     state.queueDraining = false;
     renderPromptQueue();
     syncRunActionButton();
-    if (hasLaunchablePromptQueue()) void drainPromptQueue();
+    // pending 可能全被同一 Session 的 active Run 擋住；在這裡遞迴會阻塞事件迴圈。
+    // 由 Run 結束、使用者重試或重新連線的狀態變更再次喚醒佇列。
   }
 }
 
@@ -7063,15 +7138,123 @@ function renderGlobalSearchResults() {
   }
 }
 
+// setClearSecretPressed 讓「清除已儲存的憑證」這種按鈕按得出結果。
+//
+// 這幾個按鈕只是把「儲存時要清掉」記下來，真正的清除發生在按下儲存之後。
+// 原本按下去只改 aria-pressed，而 pressed 的樣式與 :hover 共用同一條 CSS——
+// 滑鼠還停在按鈕上時畫面一點變化都沒有，使用者只能猜自己有沒有按到，
+// 而這個動作的後果是刪掉一把他可能拿不回來的金鑰。
+//
+// 因此連文字一起換，並且說清楚「還沒清除，儲存後才會」，以及怎麼反悔。
+function setClearSecretPressed(button, pressed) {
+  if (!button.dataset.idleLabel) button.dataset.idleLabel = button.textContent;
+  button.setAttribute("aria-pressed", String(pressed));
+  button.textContent = pressed ? translate("儲存後會清除（再按一次取消）") : button.dataset.idleLabel;
+}
+
+// toggleClearSecret 切換狀態，並在標記清除時把對應欄位一起清空——
+// 欄位裡還留著剛輸入的值，卻標著「會清除」，是自相矛盾的畫面。
+function toggleClearSecret(button, fieldIDs) {
+  const pressed = button.getAttribute("aria-pressed") !== "true";
+  setClearSecretPressed(button, pressed);
+  if (!pressed) return;
+  for (const id of fieldIDs) $(id).value = "";
+}
+
+// insideDesktopApp 判斷目前是不是跑在 App 自己的 WebView 裡。
+//
+// nrInternSetConversationActive 由原生層無條件綁定，瀏覽器開同一個網址不會有。
+// 這個區分是必要的：桌面端要跳原生存檔面板，瀏覽器走它自己的下載，而兩者可能
+// 連到同一個 8790——用伺服器端判斷會讓遠端瀏覽器在主機上彈出面板。
+function insideDesktopApp() {
+  return typeof window.nrInternSetConversationActive === "function";
+}
+
+// saveThroughDesktop 走原生存檔面板。回傳 "saved"、"canceled" 或 "unavailable"，
+// 呼叫端只在 unavailable 時才退回瀏覽器下載——使用者按了取消就是不想存，
+// 這時再默默下載一份到下載資料夾是最糟的結果。
+async function saveThroughDesktop(filename, blob) {
+  if (!insideDesktopApp()) return "unavailable";
+  try {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    // 分段轉換：一次把整個陣列展開成參數會在大檔上炸掉呼叫堆疊。
+    for (let index = 0; index < bytes.length; index += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+    }
+    const result = await desktop("files/save", {
+      method: "POST",
+      body: JSON.stringify({ name: filename, content_base64: btoa(binary) }),
+    });
+    return result?.canceled ? "canceled" : "saved";
+  } catch (_) {
+    return "unavailable";
+  }
+}
+
+// downloadAdminFile 取回檔案並交給瀏覽器儲存。
+//
+// anchor 必須先掛進文件再點：WebKit 對沒有掛進 DOM 的 <a download> 不保證會有
+// 動作，而失敗是靜默的——使用者按了按鈕，畫面上什麼都沒發生。
+//
+// 成功與否都要說一聲，理由同上：這件事沒有任何其他可見結果，沒有回饋就無從
+// 判斷是還在下載、下載到哪裡去了，還是根本沒動。
 async function downloadAdminFile(path, filename) {
   try {
     const response = await fetch("/backend" + path);
     if (!response.ok) throw new Error(response.statusText);
     const blob = await response.blob();
+    const saved = await saveThroughDesktop(filename, blob);
+    if (saved === "canceled") return false;
+    if (saved === "saved") {
+      toast(`${translate("已儲存")}：${filename}`);
+      return true;
+    }
     const url = URL.createObjectURL(blob);
-    const link = document.createElement("a"); link.href = url; link.download = filename; link.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  } catch (error) { toast(error.message); }
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.rel = "noopener";
+    link.style.display = "none";
+    document.body.append(link);
+    link.click();
+    setTimeout(() => {
+      link.remove();
+      URL.revokeObjectURL(url);
+    }, 1000);
+    toast(`${translate("已儲存")}：${filename}`);
+    return true;
+  } catch (error) {
+    toast(`${translate("下載失敗")}：${error.message}`);
+    return false;
+  }
+}
+
+// 單一項目的匯出。按下按鈕先問一次要不要帶金鑰——這個決定不能有預設答案，
+// 因為兩種輸出的性質完全不同：一份是設定，一份是密碼。
+function openSettingExportDialog(kind, id) {
+  if (!id) return;
+  state.settingExport = { kind, id };
+  $("settingExportTitle").textContent = kind === "provider"
+    ? translate("匯出 Provider") : translate("匯出 MCP Server");
+  $("settingExportSubject").textContent = id;
+  $("settingExportIncludeSecrets").checked = false;
+  if (!$("settingExportDialog").open) $("settingExportDialog").showModal();
+}
+
+async function downloadSettingExport() {
+  const target = state.settingExport;
+  if (!target) return;
+  const includeSecrets = $("settingExportIncludeSecrets").checked;
+  const base = target.kind === "provider"
+    ? `/api/v1/admin/provider-settings/${encodeURIComponent(target.id)}/export`
+    : `/api/v1/admin/mcp-settings/${encodeURIComponent(target.id)}/export`;
+  const extension = target.kind === "provider" ? "provider" : "mcp";
+  const suffix = includeSecrets ? "-with-secrets" : "";
+  state.settingExport = null;
+  if ($("settingExportDialog").open) $("settingExportDialog").close();
+  await downloadAdminFile(includeSecrets ? `${base}?include_secrets=true` : base,
+    `${target.id}${suffix}.${extension}`);
 }
 
 async function loadUpdateStatus() {
@@ -7210,9 +7393,9 @@ function newProviderSetting() {
       timeout_seconds: 1800,
       connect_timeout_seconds: 20,
       response_header_timeout_seconds: 120,
-      context_window: 0,
-      max_output_tokens: 0,
-      max_history_characters: 0,
+      context_window: defaultProviderContextWindow,
+      max_output_tokens: defaultProviderMaxOutputTokens,
+      max_history_characters: defaultProviderMaxHistoryCharacters,
     },
   };
 }
@@ -7287,8 +7470,10 @@ function renderProviderSettings() {
   $("providerSettingAPIKey").value = "";
   $("providerSettingAPIKey").placeholder = settings.has_api_key ? "已設定；留空表示保留" : "尚未設定";
   $("providerSettingAPIKeyState").textContent = settings.has_api_key ? "API Key 已安全儲存，畫面不會顯示明文。" : "目前未設定 API Key；本機服務可保持空白。";
-  $("providerSettingClearKey").classList.toggle("hidden", !settings.has_api_key || isNew);
-  $("providerSettingClearKey").setAttribute("aria-pressed", "false");
+  // 沒有已儲存的金鑰時保持可見但停用：藏起來會讓使用者以為這個功能不存在，
+  // 灰著至少說得出「這裡可以清除，只是現在沒有東西可清」。
+  $("providerSettingClearKey").disabled = !settings.has_api_key || isNew;
+  setClearSecretPressed($("providerSettingClearKey"), false);
   $("providerSettingModel").value = settings.model || "";
 	$("providerSettingModel").dataset.configuredModel = settings.model || "";
   $("refreshProviderModels").disabled = isNew;
@@ -7309,6 +7494,7 @@ function renderProviderSettings() {
   // 但 Provider 自己回報的限制其實已經在用了——把它顯示出來。
   void renderProviderLimitsHint(isNew ? "" : selected.id, settings.model || "");
   $("deleteProviderSetting").classList.toggle("hidden", isNew);
+  $("exportProviderSetting").classList.toggle("hidden", isNew);
 	renderProviderTypeFields(providerType, settings, isNew, selected.id || "");
 }
 
@@ -7915,33 +8101,33 @@ function renderMCPTransportFields(transport) {
   $("mcpSettingURL").required = !stdio;
 }
 
-function isMCPImportObject(value) {
+function isImportObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function mcpImportSensitiveName(value) {
+function importSensitiveName(value) {
   return /(authorization|api[-_]?key|access[-_]?token|refresh[-_]?token|token|secret|password|credential|username|user_name|account)/i.test(String(value || ""));
 }
 
-function mcpImportVariable(value) {
+function importVariable(value) {
   return /\$\{[^}]+\}/.test(String(value || ""));
 }
 
-function mcpImportSourceValue(source, names) {
+function importSourceValue(source, names) {
   for (const name of names) {
     if (source[name] !== undefined && source[name] !== null) return source[name];
   }
   return undefined;
 }
 
-function mcpImportStringMap(value, preserveSensitiveNames = false) {
+function importStringMap(value, preserveSensitiveNames = false) {
   const result = {};
   let removedSensitive = false;
-  if (!isMCPImportObject(value)) return { value: result, removedSensitive };
+  if (!isImportObject(value)) return { value: result, removedSensitive };
   for (const [key, raw] of Object.entries(value)) {
     if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") continue;
     const text = String(raw);
-    if (mcpImportSensitiveName(key) || mcpImportVariable(text) || /^(?:bearer|basic)\s+/i.test(text)) {
+    if (importSensitiveName(key) || importVariable(text) || /^(?:bearer|basic)\s+/i.test(text)) {
       removedSensitive = true;
       if (preserveSensitiveNames && String(key).trim()) result[key] = "";
       continue;
@@ -7974,16 +8160,16 @@ function mcpImportAuthMethods(source, rawAuth, rawHeaders, apiKey, authUsername,
     const method = mcpImportAuthMethodValue(value);
     if (method) methods.add(method);
   };
-  const declared = mcpImportSourceValue(source, ["auth_methods", "authMethods", "authentication_methods", "authenticationMethods"])
-    ?? (isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["methods", "supported_methods", "supportedMethods"]) : undefined);
+  const declared = importSourceValue(source, ["auth_methods", "authMethods", "authentication_methods", "authenticationMethods"])
+    ?? (isImportObject(rawAuth) ? importSourceValue(rawAuth, ["methods", "supported_methods", "supportedMethods"]) : undefined);
   if (Array.isArray(declared)) declared.forEach(add);
   else if (declared !== undefined) add(declared);
-  const rawAuthType = isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["type", "method"]) : rawAuth;
-  add(mcpImportSourceValue(source, ["auth_method", "authMethod", "authentication_type", "authenticationType"]));
+  const rawAuthType = isImportObject(rawAuth) ? importSourceValue(rawAuth, ["type", "method"]) : rawAuth;
+  add(importSourceValue(source, ["auth_method", "authMethod", "authentication_type", "authenticationType"]));
   add(rawAuthType);
   if (typeof apiKey === "string" && apiKey.trim()) add("bearer");
   if ((typeof authUsername === "string" && authUsername.trim()) || (typeof authPassword === "string" && authPassword)) add("basic");
-  if (isMCPImportObject(rawHeaders) && Object.keys(rawHeaders).length > 0) add("headers");
+  if (isImportObject(rawHeaders) && Object.keys(rawHeaders).length > 0) add("headers");
   if (!methods.size) methods.add("none");
   if (methods.size > 1) methods.delete("none");
   return ["none", "bearer", "basic", "headers"].filter((method) => methods.has(method));
@@ -7999,7 +8185,7 @@ function mcpImportAuthOptions(methods = ["none", "bearer", "basic", "headers"]) 
   ].filter((option) => allowed.has(option.value));
 }
 
-function mcpImportID(value, fallback, used) {
+function importID(value, fallback, used) {
   let id = String(value || fallback || "mcp-server")
     .trim()
     .replace(/[^A-Za-z0-9_-]+/g, "-")
@@ -8018,11 +8204,11 @@ function mcpImportID(value, fallback, used) {
 
 function mcpImportEntries(root, fileName) {
   if (Array.isArray(root)) return root.map((value, index) => [value?.id || value?.name || `mcp-server-${index + 1}`, value]);
-  if (!isMCPImportObject(root)) throw new Error(".mcp 檔案的根內容必須是 JSON 物件");
-  if (isMCPImportObject(root.mcpServers)) return Object.entries(root.mcpServers);
+  if (!isImportObject(root)) throw new Error(".mcp 檔案的根內容必須是 JSON 物件");
+  if (isImportObject(root.mcpServers)) return Object.entries(root.mcpServers);
   if (Array.isArray(root.servers)) return root.servers.map((value, index) => [value?.id || value?.name || `mcp-server-${index + 1}`, value]);
-  if (isMCPImportObject(root.servers)) return Object.entries(root.servers);
-  if (isMCPImportObject(root.server)) return [[root.server.id || root.server.name || "mcp-server", root.server]];
+  if (isImportObject(root.servers)) return Object.entries(root.servers);
+  if (isImportObject(root.server)) return [[root.server.id || root.server.name || "mcp-server", root.server]];
   if (["command", "url", "server_url", "endpoint", "args"].some((key) => root[key] !== undefined)) {
     const fallback = String(fileName || "mcp-server").replace(/\.[^.]+$/, "");
     return [[root.id || root.name || fallback, root]];
@@ -8035,33 +8221,41 @@ function normalizeMCPImport(root, fileName) {
   if (!entries.length) throw new Error(".mcp 檔案沒有可匯入的 MCP Server");
   const usedIDs = new Set();
   return entries.map(([entryID, raw], index) => {
-    const source = isMCPImportObject(raw) ? raw : {};
-    const id = mcpImportID(source.id || entryID, `mcp-server-${index + 1}`, usedIDs);
+    const source = isImportObject(raw) ? raw : {};
+    const id = importID(source.id || entryID, `mcp-server-${index + 1}`, usedIDs);
     const displayName = String(source.display_name || source.displayName || source.name || entryID || id).trim().slice(0, 80);
-    const rawURL = mcpImportSourceValue(source, ["url", "server_url", "serverUrl", "endpoint", "base_url", "baseUrl"]);
-    const url = typeof rawURL === "string" && !mcpImportVariable(rawURL) ? rawURL.trim() : "";
+    const rawURL = importSourceValue(source, ["url", "server_url", "serverUrl", "endpoint", "base_url", "baseUrl"]);
+    const url = typeof rawURL === "string" && !importVariable(rawURL) ? rawURL.trim() : "";
     const explicitTransport = String(source.transport || source.type || "").trim().toLowerCase();
     const transport = explicitTransport === "stdio" || source.command || source.executable
       ? "stdio"
       : mcpTransportValue(explicitTransport, "streamable-http");
-    const rawEnvironment = mcpImportSourceValue(source, ["environment", "env"]);
-    const environment = mcpImportStringMap(rawEnvironment, true);
-    const rawHeaders = mcpImportSourceValue(source, ["headers", "http_headers", "httpHeaders"]);
-    const headers = mcpImportStringMap(rawHeaders, true);
+    const rawEnvironment = importSourceValue(source, ["environment", "env"]);
+    const environment = importStringMap(rawEnvironment, true);
+    const rawHeaders = importSourceValue(source, ["headers", "http_headers", "httpHeaders"]);
+    const headers = importStringMap(rawHeaders, true);
     let removedSensitive = environment.removedSensitive || headers.removedSensitive;
-    const apiKey = mcpImportSourceValue(source, ["api_key", "apiKey", "access_token", "accessToken", "bearer_token", "bearerToken", "token"]);
-    if (typeof apiKey === "string" && apiKey.trim()) removedSensitive = true;
-    const rawAuth = mcpImportSourceValue(source, ["basic_auth", "basicAuth", "authentication", "auth"]);
-    const authUsername = mcpImportSourceValue(source, ["username", "user_name", "account"])
-      ?? (isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["username", "user_name", "account"]) : undefined);
-    const authPassword = mcpImportSourceValue(source, ["password", "pass"])
-      ?? (isMCPImportObject(rawAuth) ? mcpImportSourceValue(rawAuth, ["password", "pass"]) : undefined);
-    if ((typeof authUsername === "string" && authUsername.trim()) || (typeof authPassword === "string" && authPassword)) {
-      removedSensitive = true;
-    }
-    if (typeof rawURL === "string" && mcpImportVariable(rawURL)) removedSensitive = true;
+    // 憑證照收。原本一律清空是為了「檔案不該帶密碼」，但實際要用這個匯入的人
+    // 往往連金鑰是什麼都不知道，清空之後他就卡在那一格，功能等於不存在。
+    // 代價是這份檔案本身成為一份活的憑證，對話框會明說，發檔案的人要當密碼保管。
+    // ${VAR} 佔位符仍然不收：那不是憑證，是一個沒有值的引用。
+    const importedText = (value) => typeof value === "string" && !importVariable(value) ? value.trim() : "";
+    const apiKey = importSourceValue(source, ["api_key", "apiKey", "access_token", "accessToken", "bearer_token", "bearerToken", "token"]);
+    const rawAuth = importSourceValue(source, ["basic_auth", "basicAuth", "authentication", "auth"]);
+    const authUsername = importSourceValue(source, ["username", "user_name", "account"])
+      ?? (isImportObject(rawAuth) ? importSourceValue(rawAuth, ["username", "user_name", "account"]) : undefined);
+    const authPassword = importSourceValue(source, ["password", "pass"])
+      ?? (isImportObject(rawAuth) ? importSourceValue(rawAuth, ["password", "pass"]) : undefined);
+    const importedKey = importedText(apiKey);
+    const importedUsername = importedText(authUsername);
+    const importedPassword = importedText(authPassword);
+    const carriesSecret = Boolean(importedKey || importedPassword);
+    // 只剩「有名字沒有值」的佔位符才算被拿掉，使用者才知道那幾格要自己填。
+    if (typeof apiKey === "string" && importVariable(apiKey)) removedSensitive = true;
+    if (typeof authPassword === "string" && importVariable(authPassword)) removedSensitive = true;
+    if (typeof rawURL === "string" && importVariable(rawURL)) removedSensitive = true;
     const authMethods = transport === "stdio" ? ["none"] : mcpImportAuthMethods(source, rawAuth, rawHeaders, apiKey, authUsername, authPassword);
-    const rawArgs = mcpImportSourceValue(source, ["args", "arguments"]);
+    const rawArgs = importSourceValue(source, ["args", "arguments"]);
     const args = Array.isArray(rawArgs) ? rawArgs.filter((value) => typeof value === "string") : [];
     const timeout = Number(source.startup_timeout_seconds ?? source.startupTimeoutSeconds);
     const callTimeout = Number(source.call_timeout_seconds ?? source.callTimeoutSeconds);
@@ -8074,7 +8268,10 @@ function normalizeMCPImport(root, fileName) {
       args,
       work_dir: String(source.work_dir || source.workDir || source.cwd || "").trim(),
       url,
-      api_key: "",
+      api_key: importedKey,
+      username: importedUsername,
+      password: importedPassword,
+      carriesSecret,
       auth_methods: authMethods,
       auth_method: authMethods[0],
       headers: headers.value,
@@ -8089,7 +8286,7 @@ function normalizeMCPImport(root, fileName) {
   });
 }
 
-function mcpImportTextField(labelText, field, value, options = {}) {
+function importTextField(labelText, field, value, options = {}) {
   const label = document.createElement("label");
   if (options.full) label.classList.add("provider-field-full");
   label.append(document.createTextNode(labelText));
@@ -8117,7 +8314,7 @@ function mcpImportTextField(labelText, field, value, options = {}) {
   return label;
 }
 
-function mcpImportSelectField(labelText, field, value, options = {}) {
+function importSelectField(labelText, field, value, options = {}) {
   const label = document.createElement("label");
   if (options.full) label.classList.add("provider-field-full");
   label.append(document.createTextNode(labelText));
@@ -8134,7 +8331,7 @@ function mcpImportSelectField(labelText, field, value, options = {}) {
   return label;
 }
 
-function mcpImportCheckField(labelText, field, checked, full = false) {
+function importCheckField(labelText, field, checked, full = false) {
   const label = document.createElement("label");
   label.className = "check-label";
   if (full) label.classList.add("provider-field-full");
@@ -8185,7 +8382,9 @@ function renderMCPImportDialog() {
   const draft = state.mcpImportDraft;
   if (!draft) return;
   $("mcpImportFileName").textContent = `${draft.fileName} · ${draft.servers.length} 個 Server`;
-  $("mcpImportHint").textContent = draft.servers.some((server) => server.removedSensitive || server.missingURL)
+  $("mcpImportHint").textContent = draft.servers.some((server) => server.carriesSecret)
+    ? translate("這份檔案帶有憑證，會一併匯入，按下確認就可以使用。請把這個檔案當成密碼保管，不要轉寄。")
+    : draft.servers.some((server) => server.removedSensitive || server.missingURL)
     ? "請補填必要連線資訊；檔案中的金鑰、Token、Authorization 與變數值已清空。"
     : "請確認連線資訊；匯入只會在按下確認後安裝。";
   $("mcpImportOverwrite").checked = false;
@@ -8212,14 +8411,14 @@ function renderMCPImportDialog() {
     const grid = document.createElement("div");
     grid.className = "provider-field-grid";
     grid.append(
-      mcpImportTextField("MCP ID", "id", server.id, { required: true, maxLength: 80, pattern: "[A-Za-z0-9_-]+" }),
-      mcpImportTextField("顯示名稱", "display_name", server.display_name, { maxLength: 80 }),
-      mcpImportSelectField("傳輸方式", "transport", server.transport, { options: [
+      importTextField("MCP ID", "id", server.id, { required: true, maxLength: 80, pattern: "[A-Za-z0-9_-]+" }),
+      importTextField("顯示名稱", "display_name", server.display_name, { maxLength: 80 }),
+      importSelectField("傳輸方式", "transport", server.transport, { options: [
         { value: "stdio", label: "Stdio" },
         { value: "sse", label: "SSE（舊版）" },
         { value: "streamable-http", label: "Streamable HTTP" },
       ] }),
-      mcpImportCheckField("啟用這個 MCP Server", "enabled", server.enabled, true),
+      importCheckField("啟用這個 MCP Server", "enabled", server.enabled, true),
     );
     const transportSelect = grid.querySelector('[data-import-field="transport"]');
     const stdioAdvanced = document.createElement("details");
@@ -8233,23 +8432,23 @@ function renderMCPImportDialog() {
     stdioFields.className = "provider-field-grid mcp-import-transport-fields";
     stdioFields.dataset.importStdio = "true";
     stdioFields.append(
-      mcpImportTextField("啟動命令", "command", server.command, { full: true, required: true, placeholder: "npx" }),
-      mcpImportTextField("參數（JSON 陣列）", "args", JSON.stringify(server.args, null, 2), { full: true, textarea: true, rows: 3 }),
-      mcpImportTextField("工作目錄", "work_dir", server.work_dir, { full: true, placeholder: "留空使用 APP 工作目錄" }),
-      mcpImportTextField("環境變數（JSON 物件）", "environment", JSON.stringify(server.environment, null, 2), { full: true, textarea: true, rows: 3, hint: "敏感環境變數的名稱會保留，但值已清空。" }),
+      importTextField("啟動命令", "command", server.command, { full: true, required: true, placeholder: "npx" }),
+      importTextField("參數（JSON 陣列）", "args", JSON.stringify(server.args, null, 2), { full: true, textarea: true, rows: 3 }),
+      importTextField("工作目錄", "work_dir", server.work_dir, { full: true, placeholder: "留空使用 APP 工作目錄" }),
+      importTextField("環境變數（JSON 物件）", "environment", JSON.stringify(server.environment, null, 2), { full: true, textarea: true, rows: 3, hint: "敏感環境變數的名稱會保留，但值已清空。" }),
     );
     stdioAdvanced.append(stdioFields);
     const httpFields = document.createElement("div");
     httpFields.className = "provider-field-full provider-field-grid mcp-import-transport-fields";
     httpFields.dataset.importHttp = "true";
     httpFields.append(
-      mcpImportTextField("Server URL", "url", server.url, { full: true, type: "url", required: true, placeholder: "https://example.com/mcp" }),
-      mcpImportTextField("金鑰（Bearer Token）", "api_key", "", { full: true, type: "password", placeholder: "輸入 MCP Server 金鑰", hint: "留空代表不使用 Bearer Token。" }),
-      mcpImportTextField("帳號", "username", "", { full: true, autocomplete: "username", placeholder: "輸入 MCP Server 帳號" }),
-      mcpImportTextField("密碼", "password", "", { full: true, type: "password", autocomplete: "current-password", placeholder: "輸入 MCP Server 密碼", hint: "留空代表不使用 Basic Auth。" }),
-      mcpImportTextField("HTTP Headers（JSON 物件）", "headers", JSON.stringify(server.headers, null, 2), { full: true, textarea: true, rows: 3, hint: "Authorization 等敏感標頭不會直接匯入。" }),
+      importTextField("Server URL", "url", server.url, { full: true, type: "url", required: true, placeholder: "https://example.com/mcp" }),
+      importTextField("金鑰（Bearer Token）", "api_key", server.api_key, { full: true, type: "password", placeholder: "輸入 MCP Server 金鑰", hint: server.carriesSecret ? "已從檔案帶入，直接按確認即可。" : "留空代表不使用 Bearer Token。" }),
+      importTextField("帳號", "username", server.username, { full: true, autocomplete: "username", placeholder: "輸入 MCP Server 帳號" }),
+      importTextField("密碼", "password", server.password, { full: true, type: "password", autocomplete: "current-password", placeholder: "輸入 MCP Server 密碼", hint: server.carriesSecret ? "已從檔案帶入，直接按確認即可。" : "留空代表不使用 Basic Auth。" }),
+      importTextField("HTTP Headers（JSON 物件）", "headers", JSON.stringify(server.headers, null, 2), { full: true, textarea: true, rows: 3, hint: "Authorization 等敏感標頭不會直接匯入。" }),
     );
-    const authMethod = mcpImportSelectField("驗證方式", "auth_method", server.auth_method || "none", { options: mcpImportAuthOptions(server.auth_methods) });
+    const authMethod = importSelectField("驗證方式", "auth_method", server.auth_method || "none", { options: mcpImportAuthOptions(server.auth_methods) });
     authMethod.classList.add("mcp-import-auth-method");
     authMethod.querySelector("select").dataset.importServerField = String(index);
     stdioAdvanced.append(httpFields);
@@ -8350,7 +8549,7 @@ async function installMCPImport(event) {
     });
     const selectedID = imported[0]?.id || "";
     state.mcpImportDraft = null;
-    $("mcpImportDialog").close();
+    closeImportDialog("mcpImportDialog");
     state.selectedMCPSettingsID = selectedID;
     await loadMCPSettings(selectedID);
     await loadTools();
@@ -8362,49 +8561,377 @@ async function installMCPImport(event) {
   }
 }
 
-async function handleMCPImportContent(fileName, size, content) {
-  if (Number(size) > 2 * 1024 * 1024) {
-    toast(".mcp 檔案不得超過 2 MB");
-    return;
+// ---- Provider 設定匯入 ----
+//
+// 比照 MCP：拖一個檔案進來就設定好，機密一律不從檔案吃。目的是讓不熟電腦的
+// 使用者只需要做兩件事——把檔案拖進來、把密碼打進去；位址、模型與容量這些
+// 他無從判斷的欄位由發檔案的人決定。
+
+// providerImportEntries 盡量認得出「一份 Provider 設定」的各種寫法。
+//
+// 對面可能是 NR-Intern 自己的匯出、AgenticService 的 /api/provider/list，
+// 或某人手寫的一份 JSON。與其要求一種格式，不如把常見的幾種都認出來——
+// 認不出來的代價是使用者拿到一個看不懂的錯誤，而他無從修起。
+function providerImportEntries(root) {
+  const container = isImportObject(root) && (root.providers ?? root.provider_settings ?? root.llm_providers);
+  const source = container ?? root;
+  if (Array.isArray(source)) {
+    return source.filter(isImportObject).map((value, index) => [String(value.id || value.name || index + 1), value]);
   }
-  const root = JSON.parse(content);
-  const servers = normalizeMCPImport(root, fileName);
-  if (!state.mcpSettings) await loadMCPSettings();
-  if (!state.mcpSettings) throw new Error("MCP 設定尚未載入，請確認後端連線");
-  state.mcpImportDraft = { fileName, servers };
-  renderMCPImportDialog();
-  if (!$("mcpImportDialog").open) $("mcpImportDialog").showModal();
+  if (!isImportObject(source)) return [];
+  // 單一 Provider 直接寫在最外層時，它自己就是唯一一筆。
+  if (source.base_url || source.host || source.openai_compatible || source.openai_codex_responses) {
+    return [[String(source.id || source.name || "provider"), source]];
+  }
+  return Object.entries(source).filter(([, value]) => isImportObject(value));
 }
 
-async function handleMCPImportFile(file) {
-  if (!file) return;
+function providerImportType(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (text.includes("codex") || text.includes("responses")) return "openai-codex-responses";
+  return "openai-compatible";
+}
+
+// providerImportCapacity 只接受落在下拉選單刻度上的值。
+//
+// 檔案給 130000 這種數字時，選單會顯示不出來，使用者也看不出現在是多少。
+// 與其硬塞，不如退回預設值——那是一個他改得動、也看得見的狀態。
+function providerImportCapacity(value, scale, fallback) {
+  const number = Number(value) || 0;
+  if (number <= 0) return fallback;
+  return scale.some((option) => option.value === number) ? number : fallback;
+}
+
+function normalizeProviderImport(root, fileName) {
+  const entries = providerImportEntries(root);
+  if (entries.length === 0) throw new Error("檔案裡沒有可匯入的 Provider 設定");
+  const usedIDs = new Set();
+  return entries.map(([entryID, raw], index) => {
+    // 巢狀寫法（NR-Intern 匯出）與扁平寫法（其他來源）都要讀得到。
+    const nested = isImportObject(raw.openai_compatible) ? raw.openai_compatible
+      : isImportObject(raw.openai_codex_responses) ? raw.openai_codex_responses
+      : {};
+    const source = { ...nested, ...raw };
+    const id = importID(raw.id || entryID, `provider-${index + 1}`, usedIDs);
+    const rawBaseURL = importSourceValue(source, ["base_url", "baseUrl", "host", "url", "endpoint"]);
+    const baseURL = typeof rawBaseURL === "string" && !importVariable(rawBaseURL) ? rawBaseURL.trim() : "";
+    const apiKey = importSourceValue(source, ["api_key", "apiKey", "token", "access_token", "accessToken"]);
+    const type = providerImportType(raw.openai_codex_responses ? "codex"
+      : importSourceValue(source, ["type", "provider", "kind"]));
+    return {
+      id,
+      display_name: String(importSourceValue(source, ["display_name", "displayName", "name", "label"]) || "").trim(),
+      type,
+      enabled: source.enabled !== false,
+      base_url: baseURL,
+      model: String(importSourceValue(source, ["model", "default_model", "defaultModel"]) || "").trim(),
+      instruction_role: String(importSourceValue(source, ["instruction_role", "instructionRole"]) || "system").trim(),
+      context_window: providerImportCapacity(
+        importSourceValue(source, ["context_window", "contextWindow", "max_input_tokens", "maxInputTokens"]),
+        capacityScaleOptions, defaultProviderContextWindow),
+      max_output_tokens: providerImportCapacity(
+        importSourceValue(source, ["max_output_tokens", "maxOutputTokens"]),
+        outputScaleOptions, defaultProviderMaxOutputTokens),
+      max_history_characters: providerImportCapacity(
+        importSourceValue(source, ["max_history_characters", "maxHistoryCharacters"]),
+        capacityScaleOptions, defaultProviderMaxHistoryCharacters),
+      // 金鑰照收。目標使用者連金鑰是什麼都不知道，要他自己補等於這個功能沒有用；
+      // 代價是這份檔案本身就是一份活的憑證，發檔案的人必須當密碼看待。
+      // ${VAR} 佔位符仍然不收——那不是金鑰，是一個沒有值的引用。
+      apiKey: typeof apiKey === "string" && !importVariable(apiKey) ? apiKey.trim() : "",
+      carriesSecret: typeof apiKey === "string" && !importVariable(apiKey) && apiKey.trim() !== "",
+      removedSensitive: (typeof rawBaseURL === "string" && importVariable(rawBaseURL))
+        || (typeof apiKey === "string" && importVariable(apiKey)),
+      missingBaseURL: type === "openai-compatible" && baseURL === "",
+      fileName,
+    };
+  });
+}
+
+function renderProviderImportDialog() {
+  const draft = state.providerImportDraft;
+  if (!draft) return;
+  $("providerImportFileName").textContent = `${draft.fileName} · ${draft.providers.length} 個 Provider`;
+  $("providerImportHint").textContent = draft.providers.some((item) => item.carriesSecret)
+    ? translate("這份檔案帶有金鑰，會一併匯入，按下確認就可以使用。請把這個檔案當成密碼保管，不要轉寄。")
+    : translate("請確認連線資訊。沒有金鑰的欄位可以留空，本機服務通常不需要。");
+  $("providerImportOverwrite").checked = false;
+  const list = $("providerImportProviderList");
+  list.replaceChildren();
+  draft.providers.forEach((item, index) => {
+    const fieldset = document.createElement("fieldset");
+    fieldset.className = "mcp-import-server";
+    fieldset.dataset.importProvider = String(index);
+    const legend = document.createElement("legend");
+    legend.textContent = item.display_name || item.id;
+    const grid = document.createElement("div");
+    grid.className = "provider-field-grid";
+    const isCodex = item.type === "openai-codex-responses";
+    grid.append(
+      importTextField(translate("Provider ID"), "id", item.id, { required: true, maxLength: 80, pattern: "[A-Za-z0-9_-]+" }),
+      importTextField(translate("顯示名稱"), "display_name", item.display_name, { maxLength: 80 }),
+      importSelectField(translate("類型"), "type", item.type, { options: [
+        { value: "openai-compatible", label: "OpenAI-compatible" },
+        { value: "openai-codex-responses", label: "OpenAI Codex Responses" },
+      ] }),
+      importTextField(translate("模型"), "model", item.model, { required: true, placeholder: "gpt-4o-mini" }),
+      importTextField(translate("Base URL"), "base_url", item.base_url, {
+        full: true, type: "url", required: !isCodex, placeholder: "https://example.com/v1",
+      }),
+      importTextField(translate("API Key"), "api_key", item.apiKey, {
+        full: true, type: "password", autocomplete: "current-password",
+        placeholder: translate("輸入這個 Provider 的金鑰"),
+        hint: item.carriesSecret
+          ? translate("已從檔案帶入，直接按確認即可；要換一把就覆蓋它。")
+          : translate("留空代表不使用金鑰；本機服務通常不需要。"),
+      }),
+      importCheckField(translate("啟用這個 Provider"), "enabled", item.enabled, true),
+    );
+    fieldset.append(legend, grid);
+    list.append(fieldset);
+  });
+}
+
+function providerImportFormValue() {
+  const draft = state.providerImportDraft;
+  if (!draft) return null;
+  const form = $("providerImportForm");
+  if (!form.checkValidity()) {
+    form.reportValidity();
+    return null;
+  }
+  const values = [];
+  const ids = new Set();
   try {
-    await handleMCPImportContent(file.name, file.size, await file.text());
+    for (const fieldset of $("providerImportProviderList").querySelectorAll("[data-import-provider]")) {
+      const read = (field) => fieldset.querySelector(`[data-import-field="${field}"]`);
+      const index = Number(fieldset.dataset.importProvider);
+      const item = draft.providers[index];
+      const id = read("id").value.trim();
+      if (ids.has(id)) throw new Error(`Provider ID ${id} 在匯入檔中重複`);
+      ids.add(id);
+      const type = providerImportType(read("type").value);
+      const common = {
+        model: read("model").value.trim(),
+        max_attempts: 3,
+        timeout_seconds: 1800,
+        connect_timeout_seconds: 20,
+        response_header_timeout_seconds: 120,
+        context_window: item.context_window,
+        max_output_tokens: item.max_output_tokens,
+        max_history_characters: item.max_history_characters,
+      };
+      const provider = {
+        id,
+        display_name: read("display_name").value.trim(),
+        type,
+        enabled: read("enabled").checked,
+      };
+      const apiKey = read("api_key").value.trim();
+      if (type === "openai-codex-responses") {
+        provider.openai_codex_responses = common;
+      } else {
+        provider.openai_compatible = {
+          base_url: read("base_url").value.trim(),
+          ...common,
+          instruction_role: item.instruction_role || "system",
+          stream_include_usage: true,
+        };
+        if (apiKey) provider.openai_compatible.api_key = apiKey;
+      }
+      values.push(provider);
+    }
   } catch (error) {
-    toast(`無法讀取 .mcp 檔案：${error.message}`);
+    toast(error.message);
+    return null;
   }
+  return values;
 }
 
-function mcpImportDroppedFile(dataTransfer) {
-  return [...(dataTransfer?.files || [])].find((file) => /\.(?:mcp|json)$/i.test(file.name || ""));
-}
-
-async function handleMCPImportDrop(dataTransfer) {
-  const browserFile = mcpImportDroppedFile(dataTransfer);
-  if (browserFile) {
-    await handleMCPImportFile(browserFile);
+async function installProviderImport(event) {
+  event.preventDefault();
+  const imported = providerImportFormValue();
+  if (!imported || !state.providerSettings) return;
+  const existing = state.providerSettings.providers || [];
+  const existingIDs = new Set(existing.map((item) => item.id));
+  const conflicts = imported.filter((item) => existingIDs.has(item.id)).map((item) => item.id);
+  const overwrite = $("providerImportOverwrite").checked;
+  if (conflicts.length && !overwrite) {
+    toast(`Provider ID 已存在：${conflicts.join("、")}；請勾選覆蓋既有設定`);
     return;
   }
+  const importedIDs = new Set(imported.map((item) => item.id));
+  const merged = [...(overwrite ? existing.filter((item) => !importedIDs.has(item.id)) : existing), ...imported];
+  $("installProviderImport").disabled = true;
+  try {
+    state.providerSettings = await request("/api/v1/admin/provider-settings", {
+      method: "PUT",
+      body: JSON.stringify(providerSettingsPayload(merged, state.providerSettings.default_provider_id)),
+    });
+    const selectedID = imported[0]?.id || "";
+    state.providerImportDraft = null;
+    closeImportDialog("providerImportDialog");
+    state.contextCapabilities = null;
+    state.contextCapabilityCache = {};
+    await refreshProviderCatalog();
+    await loadProviderSettings(selectedID);
+    toast(`已匯入 ${imported.length} 個 Provider`);
+  } catch (error) {
+    toast(`Provider 匯入失敗：${error.message}`);
+  } finally {
+    $("installProviderImport").disabled = false;
+  }
+}
+
+// ---- 共用的檔案分派 ----
+//
+// 一次拖進來的可能是好幾個檔案，而使用者不會知道哪個要拖到哪一區。
+// 兩個拖放區因此共用同一個分派器：先依副檔名分類，`.json` 沒有線索就看內容。
+// 同一類的多個檔案合併成一份草稿，一個對話框看完；兩類都有就排隊，
+// 前一個關掉再開下一個——同時彈兩個對話框只會讓人不知道自己在看哪一個。
+
+const importFileExtensionPattern = /\.(?:mcp|provider|json)$/i;
+
+function importFileKind(fileName, root) {
+  const lower = String(fileName || "").toLowerCase();
+  if (lower.endsWith(".mcp")) return "mcp";
+  if (lower.endsWith(".provider")) return "provider";
+  if (!isImportObject(root)) return "";
+  // 副檔名是 .json 時只能看內容。先看容器欄位，再看單一設定會有的欄位。
+  if (root.mcpServers || root.mcp_servers || root.servers) return "mcp";
+  if (root.providers || root.provider_settings || root.llm_providers) return "provider";
+  if (root.openai_compatible || root.openai_codex_responses || root.base_url || root.host) return "provider";
+  if (root.command || root.transport || root.url) return "mcp";
+  return "";
+}
+
+async function handleImportFiles(files) {
+  const groups = { mcp: [], provider: [] };
+  const rejected = [];
+  for (const file of files) {
+    if (Number(file.size) > 2 * 1024 * 1024) {
+      rejected.push(`${file.name}（超過 2 MB）`);
+      continue;
+    }
+    let root = null;
+    try {
+      root = JSON.parse(file.content);
+    } catch (error) {
+      rejected.push(`${file.name}（不是有效的 JSON）`);
+      continue;
+    }
+    const kind = importFileKind(file.name, root);
+    if (!kind) {
+      rejected.push(`${file.name}（看不出是 MCP 還是 Provider 設定）`);
+      continue;
+    }
+    groups[kind].push({ fileName: file.name, root });
+  }
+  if (rejected.length) toast(`這些檔案沒有匯入：${rejected.join("、")}`);
+  if (!groups.mcp.length && !groups.provider.length) return;
+
+  const pending = {};
+  try {
+    if (groups.mcp.length) {
+      if (!state.mcpSettings) await loadMCPSettings();
+      if (!state.mcpSettings) throw new Error("MCP 設定尚未載入，請確認後端連線");
+      pending.mcp = {
+        fileName: importDraftFileName(groups.mcp),
+        servers: groups.mcp.flatMap((item) => normalizeMCPImport(item.root, item.fileName)),
+      };
+    }
+    if (groups.provider.length) {
+      if (!state.providerSettings) await loadProviderSettings();
+      if (!state.providerSettings) throw new Error("Provider 設定尚未載入，請確認後端連線");
+      pending.provider = {
+        fileName: importDraftFileName(groups.provider),
+        providers: groups.provider.flatMap((item) => normalizeProviderImport(item.root, item.fileName)),
+      };
+    }
+  } catch (error) {
+    toast(`無法讀取設定檔：${error.message}`);
+    return;
+  }
+  state.pendingImports = pending;
+  openNextImportDialog();
+}
+
+function importDraftFileName(items) {
+  return items.length === 1 ? items[0].fileName : `${items[0].fileName} 等 ${items.length} 個檔案`;
+}
+
+// openNextImportDialog 一次只開一個，由安裝完成與取消／關閉按鈕推進。
+//
+// 刻意不靠 <dialog> 的 close 事件：實測桌面端用的 WebKit 不會送出那個事件
+// （連全新建立的 dialog 都不會），靠它排隊的話第二個對話框永遠不會出現。
+// close 監聽器仍然留著清草稿，有送到就當作額外保險。
+function openNextImportDialog() {
+  const pending = state.pendingImports;
+  if (!pending) return;
+  if (pending.mcp && !$("mcpImportDialog").open && !$("providerImportDialog").open) {
+    const draft = pending.mcp;
+    delete pending.mcp;
+    state.mcpImportDraft = draft;
+    renderMCPImportDialog();
+    $("mcpImportDialog").showModal();
+    return;
+  }
+  if (pending.provider && !$("mcpImportDialog").open && !$("providerImportDialog").open) {
+    const draft = pending.provider;
+    delete pending.provider;
+    state.providerImportDraft = draft;
+    renderProviderImportDialog();
+    $("providerImportDialog").showModal();
+    return;
+  }
+  if (!pending.mcp && !pending.provider) state.pendingImports = null;
+}
+
+// closeImportDialog 關掉一個匯入對話框並接手排隊中的下一個。
+// 所有關閉路徑都走這裡，佇列才不會停在半路。
+function closeImportDialog(dialogID) {
+  const dialog = $(dialogID);
+  if (dialog.open) dialog.close();
+  if (dialogID === "mcpImportDialog") state.mcpImportDraft = null;
+  if (dialogID === "providerImportDialog") state.providerImportDraft = null;
+  openNextImportDialog();
+}
+
+async function readImportFiles(fileList) {
+  const files = [...(fileList || [])].filter((file) => importFileExtensionPattern.test(file.name || ""));
+  const read = [];
+  for (const file of files) {
+    read.push({ name: file.name, size: file.size, content: await file.text() });
+  }
+  return read;
+}
+
+async function handleImportDrop(dataTransfer) {
+  const browserFiles = await readImportFiles(dataTransfer?.files);
+  if (browserFiles.length) {
+    await handleImportFiles(browserFiles);
+    return;
+  }
+  // 桌面端的原生拖放走系統通道；那個端點只是把檔案內容讀回來，不解析內容，
+  // 所以兩種設定共用同一個端點沒有問題。
   try {
     const dropped = await desktop("mcp/files/dropped", { method: "POST", body: "{}" });
-    const file = Array.isArray(dropped) ? dropped[0] : null;
-    if (!file?.name || typeof file.content !== "string") {
-      throw new Error("系統沒有提供可讀取的 .mcp 檔案");
-    }
-    await handleMCPImportContent(file.name, file.size, file.content);
+    const list = (Array.isArray(dropped) ? dropped : [])
+      .filter((file) => file?.name && typeof file.content === "string");
+    if (!list.length) throw new Error("系統沒有提供可讀取的設定檔");
+    await handleImportFiles(list);
   } catch (error) {
-    toast(`無法讀取系統拖入的 .mcp 檔案：${error.message}`);
+    toast(`無法讀取系統拖入的設定檔：${error.message}`);
   }
+}
+
+async function handleImportFileInput(fileList) {
+  const files = await readImportFiles(fileList);
+  if (!files.length) {
+    toast("請選擇 .mcp、.provider 或 .json 設定檔");
+    return;
+  }
+  await handleImportFiles(files);
 }
 
 function renderMCPSettings() {
@@ -8449,15 +8976,15 @@ function renderMCPSettings() {
   $("mcpSettingWorkDir").value = selected.work_dir || "";
   $("mcpSettingURL").value = selected.url || "";
   $("mcpSettingAPIKey").value = "";
-  $("mcpSettingClearKey").setAttribute("aria-pressed", "false");
-  $("mcpSettingClearKey").classList.toggle("hidden", !selected.has_api_key);
+  setClearSecretPressed($("mcpSettingClearKey"), false);
+  $("mcpSettingClearKey").disabled = !selected.has_api_key;
   $("mcpAPIKeyState").textContent = selected.has_api_key
     ? "已儲存 MCP 金鑰；留空會保留，按下方按鈕可清除。"
     : "尚未儲存 MCP 金鑰；金鑰不會從後端讀回。";
   $("mcpSettingUsername").value = "";
   $("mcpSettingPassword").value = "";
-  $("mcpSettingClearBasicAuth").setAttribute("aria-pressed", "false");
-  $("mcpSettingClearBasicAuth").classList.toggle("hidden", !selected.has_basic_auth);
+  setClearSecretPressed($("mcpSettingClearBasicAuth"), false);
+  $("mcpSettingClearBasicAuth").disabled = !selected.has_basic_auth;
   $("mcpBasicAuthState").textContent = selected.has_basic_auth
     ? "已儲存帳號密碼；留空會保留，按下方按鈕可清除。"
     : "尚未儲存帳號密碼；帳密不會從後端讀回。";
@@ -8483,6 +9010,7 @@ function renderMCPSettings() {
   $("mcpSettingsState").textContent = "";
   $("mcpTestState").textContent = "";
   $("deleteMCPSetting").classList.toggle("hidden", isNew);
+  $("exportMCPSetting").classList.toggle("hidden", isNew);
   const toolList = $("mcpToolList");
   const exposed = Array.isArray(selected.tools) ? selected.tools : [];
   const available = Array.isArray(selected.available_tools) && selected.available_tools.length
@@ -8734,11 +9262,11 @@ function renderReverseProxyStatus({ hydrate = false } = {}) {
     $("reverseProxyEndpoint").value = status.endpoint || "https://netpass.mars-cloud.com";
     $("reverseProxyName").value = status.name || "";
     $("reverseProxyAPIKey").value = "";
-    $("reverseProxyClearKey").setAttribute("aria-pressed", "false");
+    setClearSecretPressed($("reverseProxyClearKey"), false);
     state.reverseProxyHydrated = true;
   }
   $("reverseProxyTargetPort").value = status.target_port || "—";
-  $("reverseProxyClearKey").classList.toggle("hidden", !status.api_key_set);
+  $("reverseProxyClearKey").disabled = !status.api_key_set;
   $("reverseProxyAPIKeyState").textContent = status.api_key_set
     ? "已儲存 NetPass API Key；留空會保留，按下方按鈕可清除。"
     : "尚未儲存 NetPass API Key；API Key 不會從後端讀回。";
@@ -8757,9 +9285,12 @@ function renderReverseProxyStatus({ hydrate = false } = {}) {
   $("reverseProxyError").textContent = status.last_error || "";
   $("reverseProxyError").classList.toggle("hidden", !status.last_error);
 
-  for (const id of ["reverseProxyEndpoint", "reverseProxyAPIKey", "reverseProxyClearKey", "reverseProxyName"]) {
+  for (const id of ["reverseProxyEndpoint", "reverseProxyAPIKey", "reverseProxyName"]) {
     $(id).disabled = running;
   }
+  // 清除鈕多一個條件：沒有已儲存的金鑰就沒有東西可清。這一行必須在這裡而不是
+  // 只在渲染時設定，否則會被上面這輪統一指派覆寫掉。
+  $("reverseProxyClearKey").disabled = running || !status.api_key_set;
   $("saveReverseProxy").disabled = running || state.reverseProxyLoading;
   $("startReverseProxy").disabled = running || !available || !(status.api_key_set || apiKeyEntered) || !policyAccepted;
   $("startReverseProxy").classList.toggle("hidden", running);
@@ -9365,7 +9896,20 @@ $("closeManagement").addEventListener("click", closeManagement);
 for (const button of document.querySelectorAll(".panel-tab")) button.addEventListener("click", () => activatePanel(button.dataset.panel));
 $("refreshDiagnostics").addEventListener("click", loadDiagnostics);
 $("exportDiagnostics").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/diagnostics/export", "nr-intern-diagnostics.json"));
-$("downloadConfigBundle").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/config-bundle", "nr-intern-config.zip"));
+$("exportProviderSetting").addEventListener("click", () => openSettingExportDialog("provider", state.selectedProviderSettingsID));
+$("exportMCPSetting").addEventListener("click", () => openSettingExportDialog("mcp", state.selectedMCPSettingsID));
+$("settingExportForm").addEventListener("submit", (event) => { event.preventDefault(); void downloadSettingExport(); });
+$("closeSettingExport").addEventListener("click", () => { state.settingExport = null; $("settingExportDialog").close(); });
+$("cancelSettingExport").addEventListener("click", () => { state.settingExport = null; $("settingExportDialog").close(); });
+
+$("downloadConfigBundle").addEventListener("click", () => {
+  // 帶明文憑證是使用者主動勾選的動作，所以檔名也要不一樣——兩個檔案混在
+  // 下載資料夾裡時，看檔名就分得出哪一個要當密碼保管。
+  const includeSecrets = $("configBundleIncludeSecrets").checked;
+  const path = includeSecrets ? "/api/v1/admin/config-bundle?include_secrets=true" : "/api/v1/admin/config-bundle";
+  const name = includeSecrets ? "nr-intern-config-with-secrets.zip" : "nr-intern-config.zip";
+  void downloadAdminFile(path, name);
+});
 $("downloadBackup").addEventListener("click", () => void downloadAdminFile("/api/v1/admin/backup", "nr-intern-backup.zip"));
 $("checkForUpdates").addEventListener("click", () => void checkForUpdates());
 $("openLatestRelease").addEventListener("click", () => {
@@ -9407,28 +9951,51 @@ $("mcpToolListToggle").addEventListener("click", () => {
 });
 $("mcpSettingTransport").addEventListener("change", (event) => renderMCPTransportFields(event.target.value));
 $("mcpSettingAPIKey").addEventListener("input", (event) => {
-  if (event.target.value) $("mcpSettingClearKey").setAttribute("aria-pressed", "false");
+  if (event.target.value) setClearSecretPressed($("mcpSettingClearKey"), false);
 });
 $("mcpSettingClearKey").addEventListener("click", (event) => {
-  const button = event.currentTarget;
-  const clear = button.getAttribute("aria-pressed") !== "true";
-  button.setAttribute("aria-pressed", String(clear));
-  if (clear) $("mcpSettingAPIKey").value = "";
+  toggleClearSecret(event.currentTarget, ["mcpSettingAPIKey"]);
 });
 for (const id of ["mcpSettingUsername", "mcpSettingPassword"]) {
   $(id).addEventListener("input", (event) => {
-    if (event.target.value) $("mcpSettingClearBasicAuth").setAttribute("aria-pressed", "false");
+    if (event.target.value) setClearSecretPressed($("mcpSettingClearBasicAuth"), false);
   });
 }
 $("mcpSettingClearBasicAuth").addEventListener("click", (event) => {
-  const button = event.currentTarget;
-  const clear = button.getAttribute("aria-pressed") !== "true";
-  button.setAttribute("aria-pressed", String(clear));
-  if (clear) {
-    $("mcpSettingUsername").value = "";
-    $("mcpSettingPassword").value = "";
-  }
+  toggleClearSecret(event.currentTarget, ["mcpSettingUsername", "mcpSettingPassword"]);
 });
+$("providerImportDropzone").addEventListener("click", () => $("providerImportFile").click());
+$("providerImportDropzone").addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  $("providerImportFile").click();
+});
+$("providerImportDropzone").addEventListener("dragenter", (event) => {
+  event.preventDefault();
+  $("providerImportDropzone").classList.add("drag-over");
+});
+$("providerImportDropzone").addEventListener("dragover", (event) => {
+  event.preventDefault();
+  $("providerImportDropzone").classList.add("drag-over");
+});
+$("providerImportDropzone").addEventListener("dragleave", (event) => {
+  if (event.relatedTarget && $("providerImportDropzone").contains(event.relatedTarget)) return;
+  $("providerImportDropzone").classList.remove("drag-over");
+});
+$("providerImportDropzone").addEventListener("drop", (event) => {
+  event.preventDefault();
+  $("providerImportDropzone").classList.remove("drag-over");
+  void handleImportDrop(event.dataTransfer);
+});
+$("providerImportFile").addEventListener("change", (event) => {
+  const files = event.target.files;
+  void handleImportFileInput(files).finally(() => { event.target.value = ""; });
+});
+$("providerImportForm").addEventListener("submit", (event) => { void installProviderImport(event); });
+$("closeProviderImport").addEventListener("click", () => closeImportDialog("providerImportDialog"));
+$("cancelProviderImport").addEventListener("click", () => closeImportDialog("providerImportDialog"));
+$("providerImportDialog").addEventListener("close", () => { state.providerImportDraft = null; openNextImportDialog(); });
+
 $("mcpImportDropzone").addEventListener("click", () => $("mcpImportFile").click());
 $("mcpImportDropzone").addEventListener("keydown", (event) => {
   if (event.key !== "Enter" && event.key !== " ") return;
@@ -9453,30 +10020,26 @@ $("mcpImportDropzone").addEventListener("dragleave", (event) => {
 $("mcpImportDropzone").addEventListener("drop", (event) => {
   event.preventDefault();
   $("mcpImportDropzone").classList.remove("drag-over");
-  void handleMCPImportDrop(event.dataTransfer);
+  void handleImportDrop(event.dataTransfer);
 });
 $("mcpImportFile").addEventListener("change", (event) => {
-  const file = event.target.files?.[0];
-  event.target.value = "";
-  if (file) void handleMCPImportFile(file);
+  const files = event.target.files;
+  void handleImportFileInput(files).finally(() => { event.target.value = ""; });
 });
 $("mcpImportForm").addEventListener("submit", (event) => { void installMCPImport(event); });
-$("closeMCPImport").addEventListener("click", () => $("mcpImportDialog").close());
-$("cancelMCPImport").addEventListener("click", () => $("mcpImportDialog").close());
-$("mcpImportDialog").addEventListener("close", () => { state.mcpImportDraft = null; });
+$("closeMCPImport").addEventListener("click", () => closeImportDialog("mcpImportDialog"));
+$("cancelMCPImport").addEventListener("click", () => closeImportDialog("mcpImportDialog"));
+$("mcpImportDialog").addEventListener("close", () => { state.mcpImportDraft = null; openNextImportDialog(); });
 $("reverseProxySettingsForm").addEventListener("submit", saveReverseProxySettings);
 $("startReverseProxy").addEventListener("click", startReverseProxy);
 $("stopReverseProxy").addEventListener("click", stopReverseProxy);
 $("refreshReverseProxy").addEventListener("click", () => loadReverseProxyStatus());
 $("reverseProxyAPIKey").addEventListener("input", (event) => {
-  if (event.target.value) $("reverseProxyClearKey").setAttribute("aria-pressed", "false");
+  if (event.target.value) setClearSecretPressed($("reverseProxyClearKey"), false);
   refreshReverseProxyControls();
 });
 $("reverseProxyClearKey").addEventListener("click", (event) => {
-  const button = event.currentTarget;
-  const clear = button.getAttribute("aria-pressed") !== "true";
-  button.setAttribute("aria-pressed", String(clear));
-  if (clear) $("reverseProxyAPIKey").value = "";
+  toggleClearSecret(event.currentTarget, ["reverseProxyAPIKey"]);
   refreshReverseProxyControls();
 });
 $("reverseProxyAcceptPolicy").addEventListener("change", refreshReverseProxyControls);
@@ -9494,8 +10057,9 @@ $("providerSettingType").addEventListener("change", (event) => {
     timeout_seconds: 1800,
     connect_timeout_seconds: 20,
     response_header_timeout_seconds: 120,
-    context_window: 0,
-    max_output_tokens: 0,
+    context_window: defaultProviderContextWindow,
+    max_output_tokens: defaultProviderMaxOutputTokens,
+    max_history_characters: defaultProviderMaxHistoryCharacters,
   } : {
     base_url: "https://api.openai.com/v1",
     has_api_key: false,
@@ -9508,9 +10072,9 @@ $("providerSettingType").addEventListener("change", (event) => {
     timeout_seconds: 1800,
     connect_timeout_seconds: 20,
     response_header_timeout_seconds: 120,
-    context_window: 0,
-    max_output_tokens: 0,
-    max_history_characters: 0,
+    context_window: defaultProviderContextWindow,
+    max_output_tokens: defaultProviderMaxOutputTokens,
+    max_history_characters: defaultProviderMaxHistoryCharacters,
   };
   $("providerSettingBaseURL").value = settings.base_url || "";
   $("providerSettingAPIKey").value = "";
@@ -9550,13 +10114,10 @@ $("providerSettingModelCatalog").addEventListener("change", (event) => {
   $("providerSettingModel").value = event.target.value;
 });
 $("providerSettingAPIKey").addEventListener("input", (event) => {
-  if (event.target.value) $("providerSettingClearKey").setAttribute("aria-pressed", "false");
+  if (event.target.value) setClearSecretPressed($("providerSettingClearKey"), false);
 });
 $("providerSettingClearKey").addEventListener("click", (event) => {
-  const button = event.currentTarget;
-  const clear = button.getAttribute("aria-pressed") !== "true";
-  button.setAttribute("aria-pressed", String(clear));
-  if (clear) $("providerSettingAPIKey").value = "";
+  toggleClearSecret(event.currentTarget, ["providerSettingAPIKey"]);
 });
 $("refreshTools").addEventListener("click", loadTools);
 $("refreshAudit").addEventListener("click", () => loadAudit(true));

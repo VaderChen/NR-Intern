@@ -67,7 +67,7 @@ func TestConfigBundleCarriesSettingsWithoutSecretsOrConversations(t *testing.T) 
 	writeBundleFixture(t, dataDir, filepath.Join("sessions", "session_1.jsonl"), `{"secret":"conversation"}`)
 
 	runtime := &Runtime{Config: Config{DataDir: dataDir}}
-	data, err := runtime.ConfigBundle(context.Background())
+	data, err := runtime.ConfigBundle(context.Background(), false)
 	if err != nil {
 		t.Fatalf("ConfigBundle: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestConfigBundleSkipsMissingFiles(t *testing.T) {
 	dataDir := t.TempDir()
 	writeBundleFixture(t, dataDir, serviceSettingsFilename, `{"service_name":"nr-intern"}`)
 	runtime := &Runtime{Config: Config{DataDir: dataDir}}
-	data, err := runtime.ConfigBundle(context.Background())
+	data, err := runtime.ConfigBundle(context.Background(), false)
 	if err != nil {
 		t.Fatalf("ConfigBundle: %v", err)
 	}
@@ -150,4 +150,66 @@ func valuesOf(values map[string]string) []string {
 		result = append(result, value)
 	}
 	return result
+}
+
+// 使用者明確選擇時要帶得出明文，否則收到設定包的人得自己補金鑰——而實際需要
+// 這個設定包的人，往往正是不知道金鑰是什麼的那一位。
+//
+// 同時要求設定包自己說得出它帶不帶憑證：收到檔案的人不必逐一開啟每個 JSON
+// 才知道該不該把它當密碼保管。
+func TestConfigBundleCarriesSecretsWhenExplicitlyRequested(t *testing.T) {
+	dataDir := t.TempDir()
+	writeBundleFixture(t, dataDir, providerSettingsFilename, `{
+      "providers": {"mars": {"id": "mars", "base_url": "https://llm.example.com/v1", "api_key": "sk-super-secret"}}
+    }`)
+	writeBundleFixture(t, dataDir, mcpSettingsFilename, `{
+      "servers": {"mes": {"id": "mes", "url": "https://mcp.example.com/mcp", "password": "hunter2",
+        "headers": {"Authorization": "Bearer carried"}}}
+    }`)
+
+	runtime := &Runtime{Config: Config{DataDir: dataDir}}
+	data, err := runtime.ConfigBundle(context.Background(), true)
+	if err != nil {
+		t.Fatalf("ConfigBundle: %v", err)
+	}
+	files := readBundle(t, data)
+	for _, secret := range []string{"sk-super-secret", "hunter2", "Bearer carried"} {
+		if !strings.Contains(files[providerSettingsFilename]+files[mcpSettingsFilename], secret) {
+			t.Fatalf("使用者要求帶出憑證時 %q 應保留：%s %s", secret, files[providerSettingsFilename], files[mcpSettingsFilename])
+		}
+	}
+	var manifest configBundleManifest
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if !manifest.ContainsSecrets {
+		t.Fatal("manifest 必須標明這個設定包帶有明文憑證")
+	}
+	if len(manifest.Redacted) != 0 {
+		t.Fatalf("沒有遮蔽任何東西時不該列出遮蔽欄位：%v", manifest.Redacted)
+	}
+}
+
+// 沒有指定就是遮蔽。帶明文必須是按下按鈕的人明確要求的，不是漏填參數的後果。
+func TestConfigBundleRedactsByDefault(t *testing.T) {
+	dataDir := t.TempDir()
+	writeBundleFixture(t, dataDir, providerSettingsFilename,
+		`{"providers": {"mars": {"id": "mars", "api_key": "sk-super-secret"}}}`)
+
+	runtime := &Runtime{Config: Config{DataDir: dataDir}}
+	data, err := runtime.ConfigBundle(context.Background(), false)
+	if err != nil {
+		t.Fatalf("ConfigBundle: %v", err)
+	}
+	files := readBundle(t, data)
+	if strings.Contains(files[providerSettingsFilename], "sk-super-secret") {
+		t.Fatalf("預設不得帶出明文金鑰：%s", files[providerSettingsFilename])
+	}
+	var manifest configBundleManifest
+	if err := json.Unmarshal([]byte(files["manifest.json"]), &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if manifest.ContainsSecrets {
+		t.Fatal("預設的設定包不該標成含有憑證")
+	}
 }

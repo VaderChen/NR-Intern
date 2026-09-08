@@ -37,21 +37,28 @@ var secretFieldHints = []string{
 var secretContainerFields = []string{"headers", "environment", "env"}
 
 type configBundleManifest struct {
-	Format    string   `json:"format"`
-	Version   int      `json:"version"`
-	CreatedAt string   `json:"created_at"`
-	Included  []string `json:"included"`
-	Excluded  []string `json:"excluded"`
-	Redacted  []string `json:"redacted"`
-	Note      string   `json:"note"`
+	Format    string `json:"format"`
+	Version   int    `json:"version"`
+	CreatedAt string `json:"created_at"`
+	// ContainsSecrets 讓設定包自己說得出它帶不帶明文憑證。收到檔案的人不必
+	// 逐一開啟每個 JSON 才知道該不該把它當密碼保管。
+	ContainsSecrets bool     `json:"contains_secrets"`
+	Included        []string `json:"included"`
+	Excluded        []string `json:"excluded"`
+	Redacted        []string `json:"redacted"`
+	Note            string   `json:"note"`
 }
 
-// ConfigBundle 匯出 Provider、MCP 與服務設定，金鑰一律遮蔽。
+// ConfigBundle 匯出 Provider、MCP 與服務設定。
 //
-// 這個產品的每一處都把憑證當成不離開後端的東西：管理 API 只回傳「有沒有設定」
-// 的布林值，安全備份也刻意排除這幾個檔案。一鍵下載明文金鑰會推翻上述所有決定，
-// 而下載檔會留在下載資料夾、被同步、被轉寄。因此設定包只帶結構，金鑰另外補。
-func (r *Runtime) ConfigBundle(ctx context.Context) ([]byte, error) {
+// includeSecrets 預設為 false，金鑰一律遮蔽——這個產品的每一處都把憑證當成不離開
+// 後端的東西：管理 API 只回傳「有沒有設定」的布林值，安全備份也刻意排除這幾個檔案。
+// 下載檔會留在下載資料夾、被同步、被轉寄，所以預設不能帶明文。
+//
+// 但遮蔽之後，收到設定包的人得自己補金鑰，而實際要用這個包的人往往正是不知道
+// 金鑰是什麼的人。因此開放由使用者明確選擇帶出來——選了之後這個 zip 就是一份
+// 活的憑證，manifest 會標明，介面也會講清楚。決定權在按下按鈕的人，不在預設值。
+func (r *Runtime) ConfigBundle(ctx context.Context, includeSecrets bool) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -64,12 +71,17 @@ func (r *Runtime) ConfigBundle(ctx context.Context) ([]byte, error) {
 
 	var buffer bytes.Buffer
 	archive := zip.NewWriter(&buffer)
+	note := "只含 Provider、MCP、反向代理與服務設定。金鑰、Token、密碼與 Header／環境變數的值一律遮蔽為空字串，還原後需要重新輸入。"
+	if includeSecrets {
+		note = "只含 Provider、MCP、反向代理與服務設定，並且**包含金鑰、Token 與密碼的明文**。這個檔案等同一組密碼：請以安全管道傳遞、用完刪除，不要放進版本庫或群組信件。"
+	}
 	manifest := configBundleManifest{
-		Format:    "nr-intern-config-bundle",
-		Version:   1,
-		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		Excluded:  []string{"workspaces", "projects", "sessions", "runs", "events", "plans", "attachments", "memories", "notifications"},
-		Note:      "只含 Provider、MCP、反向代理與服務設定。金鑰、Token、密碼與 Header／環境變數的值一律遮蔽為空字串，還原後需要重新輸入。",
+		Format:          "nr-intern-config-bundle",
+		Version:         1,
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339Nano),
+		ContainsSecrets: includeSecrets,
+		Excluded:        []string{"workspaces", "projects", "sessions", "runs", "events", "plans", "attachments", "memories", "notifications"},
+		Note:            note,
 	}
 	redacted := map[string]bool{}
 	for _, name := range configBundleFiles {
@@ -91,13 +103,17 @@ func (r *Runtime) ConfigBundle(ctx context.Context) ([]byte, error) {
 			_ = archive.Close()
 			return nil, fmt.Errorf("read %s: %w", name, err)
 		}
-		cleaned, fields, err := redactSecrets(content)
-		if err != nil {
-			_ = archive.Close()
-			return nil, fmt.Errorf("redact %s: %w", name, err)
-		}
-		for _, field := range fields {
-			redacted[name+":"+field] = true
+		cleaned := content
+		if !includeSecrets {
+			var fields []string
+			cleaned, fields, err = redactSecrets(content)
+			if err != nil {
+				_ = archive.Close()
+				return nil, fmt.Errorf("redact %s: %w", name, err)
+			}
+			for _, field := range fields {
+				redacted[name+":"+field] = true
+			}
 		}
 		header := &zip.FileHeader{Name: name, Method: zip.Deflate}
 		header.SetMode(0o600)

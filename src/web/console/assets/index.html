@@ -414,7 +414,9 @@
         </section>
         <section class="management-section">
           <div class="section-head"><h2>系統工具</h2><span id="adminDataState" class="save-state"></span></div>
-          <p class="hint">診斷包與備份不包含 Provider、MCP、OAuth 或 NetPass 金鑰。還原使用者資料後需要重新啟動後端。設定包只含 Provider、MCP、反向代理與服務設定，不含 Workspace、專案與對話紀錄；金鑰同樣不會匯出，換一台機器後要重新輸入。</p>
+          <p class="hint">診斷包與備份不包含 Provider、MCP、OAuth 或 NetPass 金鑰。還原使用者資料後需要重新啟動後端。設定包只含 Provider、MCP、反向代理與服務設定，不含 Workspace、專案與對話紀錄。</p>
+          <label class="check-label plain-check"><input id="configBundleIncludeSecrets" type="checkbox">設定包包含金鑰與密碼的明文</label>
+          <p id="configBundleSecretHint" class="hint">預設不含金鑰，換一台機器後要重新輸入。勾選後這個檔案等同一組密碼：請以安全管道傳遞、用完刪除，不要放進版本庫或群組信件。</p>
           <div class="management-form-actions admin-data-actions">
             <button id="exportDiagnostics" class="ghost" type="button">下載診斷包</button>
             <button id="downloadConfigBundle" class="ghost" type="button">下載設定包</button>
@@ -432,6 +434,11 @@
               <div><h2>Provider 清單</h2><p class="hint">可建立多個 Provider，並由 Workspace 選擇使用。</p></div>
               <button id="addProviderSetting" class="icon-button" type="button" title="新增 Provider" aria-label="新增 Provider">＋</button>
             </div>
+            <button id="providerImportDropzone" class="mcp-import-dropzone" type="button" aria-controls="providerImportFile">
+              <span class="mcp-import-icon" aria-hidden="true">⇩</span>
+              <span><strong>拖入 Provider 設定檔</strong><small>可一次拖多個；依副檔名自動分類</small></span>
+            </button>
+            <input id="providerImportFile" class="hidden" type="file" multiple accept=".mcp,.provider,.json,application/json">
             <div id="providerSettingsList" class="provider-settings-list"></div>
           </section>
 
@@ -460,7 +467,7 @@
                   <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
                   <small id="providerSettingAPIKeyState"></small>
                 </label>
-                <button id="providerSettingClearKey" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 API Key</button>
+                <button id="providerSettingClearKey" class="clear-secret-button small danger ghost" type="button" aria-pressed="false">清除目前已儲存的 API Key</button>
               </div>
               <div id="providerOAuthFields" class="provider-field-full provider-auth-fields hidden">
                 <small>將開啟 ChatGPT 登入頁，登入與帳號選擇都在瀏覽器中完成。</small>
@@ -512,7 +519,10 @@
               <p class="hint">歷史字元上限管的是<strong>對話歷史的字元數</strong>，與上面以 token 計的 Context window 是同一批內容的兩種量法——token 估算對 JSON 與代碼容易低估一半以上，這道字元閘門是估算失準時的最後防線，超過就強制壓縮。全域預設 60,000 是為本機模型的 prefill 時間而訂；視窗大的 Provider 可在這裡調高。選「自動」表示採用該類型的預設值（Codex 為 200,000，其餘沿用全域）。</p>
             </details>
             <div class="provider-editor-actions">
-              <button id="deleteProviderSetting" class="danger ghost" type="button">刪除 Provider</button>
+              <div class="provider-editor-action-start">
+                <button id="deleteProviderSetting" class="danger ghost" type="button">刪除 Provider</button>
+                <button id="exportProviderSetting" class="ghost" type="button">匯出 Provider</button>
+              </div>
               <div class="provider-editor-action-group">
                 <span id="providerTestState" class="hint"></span>
                 <button id="testProviderSetting" class="ghost" type="button">測試連線</button>
@@ -525,6 +535,47 @@
         </div>
       </div>
 
+      <dialog id="settingExportDialog" class="mcp-import-dialog setting-export-dialog">
+        <form id="settingExportForm" method="dialog">
+          <div class="dialog-title-row">
+            <div>
+              <h2 id="settingExportTitle">匯出設定</h2>
+              <small id="settingExportSubject" class="quiet"></small>
+            </div>
+            <button id="closeSettingExport" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+          </div>
+          <div class="mcp-import-intro">
+            <label class="check-label plain-check"><input id="settingExportIncludeSecrets" type="checkbox">包含金鑰與密碼的明文</label>
+            <p class="hint">預設不含金鑰，對方需要自己輸入。勾選後這個檔案等同一組密碼：請以安全管道傳遞、用完刪除，不要放進版本庫或群組信件。</p>
+          </div>
+          <div class="dialog-actions">
+            <button id="cancelSettingExport" class="ghost" type="button">取消</button>
+            <button id="confirmSettingExport" class="primary" type="submit">下載</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog id="providerImportDialog" class="mcp-import-dialog">
+        <form id="providerImportForm">
+          <div class="dialog-title-row">
+            <div>
+              <h2>匯入 Provider 設定</h2>
+              <small id="providerImportFileName" class="quiet"></small>
+            </div>
+            <button id="closeProviderImport" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
+          </div>
+          <div class="mcp-import-intro">
+            <p id="providerImportHint" class="hint"></p>
+          </div>
+          <div id="providerImportProviderList" class="mcp-import-server-list"></div>
+          <label class="check-label plain-check mcp-import-overwrite"><input id="providerImportOverwrite" type="checkbox">覆蓋相同 Provider ID 的既有設定</label>
+          <div class="dialog-actions">
+            <button id="cancelProviderImport" class="ghost" type="button">取消</button>
+            <button id="installProviderImport" class="primary" type="submit">確認並匯入</button>
+          </div>
+        </form>
+      </dialog>
+
       <div id="mcpPanel" class="panel-content hidden" role="tabpanel" aria-labelledby="mcpManagementTab">
         <div class="provider-settings-layout">
           <section class="management-section provider-settings-sidebar">
@@ -534,9 +585,9 @@
             </div>
             <button id="mcpImportDropzone" class="mcp-import-dropzone" type="button" aria-controls="mcpImportFile">
               <span class="mcp-import-icon" aria-hidden="true">⇩</span>
-              <span><strong>拖入 .mcp 設定檔</strong><small>或按一下選取 JSON 設定</small></span>
+              <span><strong>拖入 .mcp 設定檔</strong><small>可一次拖多個；依副檔名自動分類</small></span>
             </button>
-            <input id="mcpImportFile" class="hidden" type="file" accept=".mcp,.json,application/json">
+            <input id="mcpImportFile" class="hidden" type="file" multiple accept=".mcp,.provider,.json,application/json">
             <div id="mcpSettingsList" class="provider-settings-list"></div>
           </section>
 
@@ -576,7 +627,7 @@
                     <input id="mcpSettingAPIKey" type="password" autocomplete="new-password" placeholder="輸入 MCP Server 金鑰">
                     <small id="mcpAPIKeyState">金鑰不會從後端讀回；留空會保留目前設定。</small>
                   </label>
-                  <button id="mcpSettingClearKey" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 MCP 金鑰</button>
+                  <button id="mcpSettingClearKey" class="clear-secret-button small danger ghost" type="button" aria-pressed="false">清除目前已儲存的 MCP 金鑰</button>
                   <label>帳號
                     <input id="mcpSettingUsername" autocomplete="username" placeholder="輸入 MCP Server 帳號">
                     <small id="mcpBasicAuthState">帳號密碼不會從後端讀回；留空會保留目前設定。</small>
@@ -584,7 +635,7 @@
                   <label>密碼
                     <input id="mcpSettingPassword" type="password" autocomplete="current-password" placeholder="輸入 MCP Server 密碼">
                   </label>
-                  <button id="mcpSettingClearBasicAuth" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的帳號密碼</button>
+                  <button id="mcpSettingClearBasicAuth" class="clear-secret-button small danger ghost" type="button" aria-pressed="false">清除目前已儲存的帳號密碼</button>
                 </div>
                 <label class="provider-field-full">HTTP Headers（JSON 物件）
                   <textarea id="mcpSettingHeaders" rows="3" spellcheck="false" placeholder='{"Authorization":"Bearer ..."}'></textarea>
@@ -609,7 +660,10 @@
               <div id="mcpToolList" class="mcp-tool-list hidden"></div>
             </section>
             <div class="provider-editor-actions">
-              <button id="deleteMCPSetting" class="danger ghost" type="button">刪除 MCP Server</button>
+              <div class="provider-editor-action-start">
+                <button id="deleteMCPSetting" class="danger ghost" type="button">刪除 MCP Server</button>
+                <button id="exportMCPSetting" class="ghost" type="button">匯出 MCP Server</button>
+              </div>
               <div class="provider-editor-action-group">
                 <span id="mcpTestState" class="hint"></span>
                 <button id="testMCPSetting" class="ghost" type="button">測試連線</button>
@@ -632,7 +686,7 @@
             <button id="closeMCPImport" class="icon-button" type="button" title="關閉" aria-label="關閉">×</button>
           </div>
           <div class="mcp-import-intro">
-            <p id="mcpImportHint" class="hint">請確認連線資訊；檔案中的金鑰與其他敏感值不會直接匯入。</p>
+            <p id="mcpImportHint" class="hint">請確認連線資訊；匯入只會在按下確認後安裝。</p>
             <div id="mcpImportAuthMethodBar" class="mcp-import-auth-method-bar"></div>
           </div>
           <div id="mcpImportServerList" class="mcp-import-server-list"></div>
@@ -663,7 +717,7 @@
                 <input id="reverseProxyAPIKey" type="password" autocomplete="new-password" placeholder="輸入 NetPass API Key">
                 <small id="reverseProxyAPIKeyState">API Key 不會從後端讀回；留空會保留目前設定。</small>
               </label>
-              <button id="reverseProxyClearKey" class="clear-secret-button small danger ghost hidden" type="button" aria-pressed="false">清除目前已儲存的 NetPass API Key</button>
+              <button id="reverseProxyClearKey" class="clear-secret-button small danger ghost" type="button" aria-pressed="false">清除目前已儲存的 NetPass API Key</button>
             </div>
             <label>裝置名稱（選填）
               <input id="reverseProxyName" maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]{1,62}[A-Za-z0-9]" autocomplete="off" placeholder="nr-intern">

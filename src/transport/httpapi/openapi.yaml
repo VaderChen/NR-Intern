@@ -67,15 +67,84 @@ paths:
           content:
             application/zip: { schema: { type: string, format: binary } }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/export:
+    get:
+      summary: 匯出單一 Provider 設定
+      description: >-
+        輸出格式與桌面 Console 的拖放匯入相同（providers 物件對映，id 同時寫進物件裡），
+        因此匯出的檔案可以直接拖回任何一台 NR-Intern。
+        預設遮蔽金鑰、Token 與密碼；include_secrets=true 才帶明文，
+        此時回應的 contains_secrets 為 true，檔名附加 -with-secrets，該檔案等同一組密碼。
+      parameters:
+        - name: provider_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: include_secrets
+          in: query
+          required: false
+          description: 帶出金鑰與密碼的明文。省略或非 true 時一律遮蔽。
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: 單一 Provider 的設定 JSON。
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          description: 沒有這個 Provider。
+  /api/v1/admin/mcp-settings/{mcp_id}/export:
+    get:
+      summary: 匯出單一 MCP Server 設定
+      description: >-
+        輸出使用 mcpServers 這個 MCP 生態共通的鍵，與桌面 Console 的拖放匯入相容。
+        預設遮蔽金鑰與密碼；include_secrets=true 才帶明文，
+        此時回應的 contains_secrets 為 true，檔名附加 -with-secrets。
+      parameters:
+        - name: mcp_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: include_secrets
+          in: query
+          required: false
+          description: 帶出金鑰與密碼的明文。省略或非 true 時一律遮蔽。
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: 單一 MCP Server 的設定 JSON。
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          description: 沒有這個 MCP Server。
   /api/v1/admin/config-bundle:
     get:
       summary: 下載設定包（Provider、MCP、反向代理與服務設定）
       description: >-
         只收錄 data_dir 已存在的 providers.json、mcp-servers.json、netpass.json、service-settings.json
         與產生的 manifest.json，不含對話、附件、OAuth token 檔或環境變數。
-        依秘密欄位名稱清除字串或字串陣列，Header／environment／env 物件的值清為空字串；
-        manifest.json 列出被遮蔽的欄位。URL、帳號、路徑與命令列參數仍可能含敏感資料，分享前須人工檢查。
+        預設依秘密欄位名稱清除字串或字串陣列，Header／environment／env 物件的值清為空字串；
+        manifest.json 列出被遮蔽的欄位。include_secrets=true 時改為原樣帶出明文憑證，
+        manifest.json 的 contains_secrets 會標示為 true，該檔案等同一組密碼。
+        URL、帳號、路徑與命令列參數仍可能含敏感資料，分享前須人工檢查。
         此端點只有匯出，不可交給安全備份還原端點匯入。
+      parameters:
+        - name: include_secrets
+          in: query
+          required: false
+          description: 帶出金鑰、Token 與密碼的明文。省略或非 true 時一律遮蔽。
+          schema:
+            type: boolean
+            default: false
       responses:
         "200":
           description: 設定 ZIP 壓縮檔；即使沒有設定檔仍含 manifest.json。
@@ -502,7 +571,10 @@ paths:
         schema: { type: string }
     get:
       summary: 取得 Provider 最近一次配額快照
-      description: 僅回傳上游實際提供的 5 小時與 7 天視窗；available=false 代表沒有資料。
+      description: >-
+        回傳唯讀帳號 API 最近一次驗證成功的 5 小時與 7 天快照，不從推論 Header 取值。
+        available=false 代表未知；明確 null 視窗會清除舊值。一般刷新失敗保留原 UpdatedAt，
+        授權失效清除快照。此端點只讀取快取，不觸發推論或兌換重置額度。
       responses:
         "200":
           description: Provider 用量快照
@@ -651,6 +723,8 @@ paths:
         預設只刪空的 Project：仍有 Session 時回傳 409，不會隱含級聯刪除——那些 Session 是使用者的
         工作紀錄，不該因為刪一個分類就一起消失。force=true 才連同底下的 Session 一起永久刪除，
         供管理介面的「強制刪除」使用。只有字面上的 true 會級聯，其餘值（含 1、yes、空字串）一律視為未指定。
+        即使 force=true，只要任何 Session 仍有排隊、執行或取消收尾中的 Run，都回傳 409 且不開始刪除。
+        級聯範圍包含計畫、Run／用量、通知與可確認 Session 歸屬的事件；損壞事件無法辨識時回傳錯誤。
       parameters:
         - name: force
           in: query
@@ -1875,7 +1949,10 @@ components:
         currency: { type: string, enum: [USD] }
     SessionUsage:
       type: object
-      description: 由目前保留的 Run 用量快照彙總，非終身帳務紀錄；舊 Run 被清理後不再計入。
+      description: >-
+        依 Run ID 去重的用量快照彙總；Run 明細淘汰不扣除累計值，刪除 Session 才移除其快照。
+        取消收尾可補齊較完整的用量，但不改寫既有終態或重複累加。
+        未設定價格時不推估金額。升級前已被舊版本淘汰的用量無法補回；隔離 Session 的快照不落盤。
       required: [input_tokens, output_tokens, total_tokens]
       properties:
         input_tokens: { type: integer, minimum: 0 }

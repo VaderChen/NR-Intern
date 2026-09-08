@@ -33,7 +33,9 @@ type Handler struct {
 	diagnostics             func(context.Context) (any, error)
 	diagnosticsExport       func(context.Context) ([]byte, error)
 	backup                  func(context.Context) ([]byte, error)
-	configBundle            func(context.Context) ([]byte, error)
+	configBundle            func(context.Context, bool) ([]byte, error)
+	exportProviderSetting   func(context.Context, string, bool) ([]byte, error)
+	exportMCPSetting        func(context.Context, string, bool) ([]byte, error)
 	restore                 func(context.Context, []byte) (domain.RestoreResult, error)
 	permissions             func(context.Context) (domain.PermissionCenter, error)
 	updateStatus            func(context.Context) (domain.UpdateStatus, error)
@@ -86,6 +88,8 @@ func New(service *application.Service, config Config) (*Handler, error) {
 		diagnosticsExport:       config.DiagnosticsExport,
 		backup:                  config.Backup,
 		configBundle:            config.ConfigBundle,
+		exportProviderSetting:   config.ExportProviderSetting,
+		exportMCPSetting:        config.ExportMCPSetting,
 		restore:                 config.Restore,
 		permissions:             config.Permissions,
 		updateStatus:            config.UpdateStatus,
@@ -127,6 +131,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/admin/diagnostics/export", h.exportDiagnostics)
 	h.mux.HandleFunc("GET /api/v1/admin/backup", h.downloadBackup)
 	h.mux.HandleFunc("GET /api/v1/admin/config-bundle", h.downloadConfigBundle)
+	h.mux.HandleFunc("GET /api/v1/admin/provider-settings/{provider_id}/export", h.exportProviderSettingFile)
 	h.mux.HandleFunc("POST /api/v1/admin/restore", h.restoreBackup)
 	h.mux.HandleFunc("GET /api/v1/admin/permissions", h.getPermissions)
 	h.mux.HandleFunc("GET /api/v1/admin/update", h.getUpdateStatus)
@@ -148,6 +153,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/admin/mcp-settings", h.getMCPSettings)
 	h.mux.HandleFunc("PUT /api/v1/admin/mcp-settings", h.putMCPSettings)
 	h.mux.HandleFunc("POST /api/v1/admin/mcp-settings/{mcp_id}/test", h.postMCPTest)
+	h.mux.HandleFunc("GET /api/v1/admin/mcp-settings/{mcp_id}/export", h.exportMCPSettingFile)
 	h.mux.HandleFunc("GET /api/v1/admin/reverse-proxy", h.getReverseProxy)
 	h.mux.HandleFunc("PUT /api/v1/admin/reverse-proxy", h.putReverseProxy)
 	h.mux.HandleFunc("POST /api/v1/admin/reverse-proxy/start", h.postReverseProxyStart)
@@ -280,14 +286,17 @@ func (h *Handler) downloadBackup(writer http.ResponseWriter, request *http.Reque
 	_, _ = writer.Write(value)
 }
 
-// downloadConfigBundle 匯出 Provider、MCP 與服務設定，金鑰一律遮蔽。
+// downloadConfigBundle 匯出 Provider、MCP 與服務設定。
+// include_secrets=true 才會帶明文憑證；沒有這個參數一律遮蔽。
 // 不含 Workspace、Project 與對話紀錄——那些由「安全備份」負責。
 func (h *Handler) downloadConfigBundle(writer http.ResponseWriter, request *http.Request) {
 	if h.configBundle == nil {
 		writeProblem(writer, request, fmt.Errorf("%w: config bundle is unavailable", errUnavailable))
 		return
 	}
-	value, err := h.configBundle(request.Context())
+	// 預設遮蔽。帶明文憑證必須是呼叫端明確要求的動作，不是漏填參數的後果。
+	includeSecrets := strings.EqualFold(strings.TrimSpace(request.URL.Query().Get("include_secrets")), "true")
+	value, err := h.configBundle(request.Context(), includeSecrets)
 	if err != nil {
 		writeProblem(writer, request, err)
 		return
@@ -296,6 +305,64 @@ func (h *Handler) downloadConfigBundle(writer http.ResponseWriter, request *http
 	writer.Header().Set("Content-Disposition", `attachment; filename="nr-intern-config.zip"`)
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(value)
+}
+
+// 單一項目的匯出。格式就是拖放匯入吃的格式，兩邊是同一份契約。
+// include_secrets 的規則與設定包一致：省略或非 true 一律遮蔽。
+func (h *Handler) exportProviderSettingFile(writer http.ResponseWriter, request *http.Request) {
+	h.writeSettingExport(writer, request, h.exportProviderSetting,
+		request.PathValue("provider_id"), "provider")
+}
+
+func (h *Handler) exportMCPSettingFile(writer http.ResponseWriter, request *http.Request) {
+	h.writeSettingExport(writer, request, h.exportMCPSetting,
+		request.PathValue("mcp_id"), "mcp")
+}
+
+func (h *Handler) writeSettingExport(writer http.ResponseWriter, request *http.Request,
+	export func(context.Context, string, bool) ([]byte, error), id, extension string) {
+	if export == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: settings export is unavailable", errUnavailable))
+		return
+	}
+	includeSecrets := strings.EqualFold(strings.TrimSpace(request.URL.Query().Get("include_secrets")), "true")
+	value, err := export(request.Context(), id, includeSecrets)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	// 檔名帶上是否含憑證：兩個檔案混在下載資料夾時，看檔名就分得出
+	// 哪一個要當密碼保管。
+	suffix := ""
+	if includeSecrets {
+		suffix = "-with-secrets"
+	}
+	name := exportFileName(id) + suffix + "." + extension
+	writer.Header().Set("Content-Type", "application/json")
+	writer.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(value)
+}
+
+// exportFileName 只留檔名安全的字元。id 由使用者自訂，直接放進
+// Content-Disposition 會讓引號或換行破壞整個標頭。
+func exportFileName(id string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, strings.TrimSpace(id))
+	cleaned = strings.Trim(cleaned, "-")
+	if cleaned == "" {
+		return "export"
+	}
+	if len(cleaned) > 60 {
+		cleaned = cleaned[:60]
+	}
+	return cleaned
 }
 
 func (h *Handler) restoreBackup(writer http.ResponseWriter, request *http.Request) {
