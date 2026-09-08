@@ -121,6 +121,9 @@ func (m *Model) fetchAvailableResetCredits(ctx context.Context) []domain.Provide
 
 // requestCodexAccountAPI 送出帶 OAuth 授權的帳號 API 請求。
 func (m *Model) requestCodexAccountAPI(ctx context.Context, method, target string, body []byte, timeout time.Duration) ([]byte, error) {
+	if m == nil || m.client == nil || m.authMode != "oauth" {
+		return nil, fmt.Errorf("Codex account API is unavailable")
+	}
 	requestCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var reader io.Reader
@@ -138,26 +141,32 @@ func (m *Model) requestCodexAccountAPI(ctx context.Context, method, target strin
 	}
 	// applyAuthorization 會一併帶上 chatgpt-account-id，帳號 API 少了它會被拒。
 	if err := m.applyAuthorization(requestCtx, request); err != nil {
+		if requestCtx.Err() == nil {
+			m.clearProviderUsage()
+		}
 		return nil, err
 	}
-	response, err := m.client.Do(request)
+	// 帳號端點固定，不跟隨重新導向，避免帳號 ID 或授權被轉送至其他站台。
+	client := *m.client
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			m.clearProviderUsage()
+		}
+		// 錯誤本文可能包含帳號資訊或驗證細節，不回傳給管理 API 或寫進日誌。
+		return nil, fmt.Errorf("Codex account API returned status %d", response.StatusCode)
+	}
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxCodexResetResponseByte+1))
 	if err != nil {
 		return nil, fmt.Errorf("read Codex account API response: %w", err)
 	}
 	if len(raw) > maxCodexResetResponseByte {
 		return nil, fmt.Errorf("Codex account API response exceeds %d bytes", maxCodexResetResponseByte)
-	}
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		message := strings.TrimSpace(string(raw))
-		if message == "" {
-			message = http.StatusText(response.StatusCode)
-		}
-		return nil, fmt.Errorf("Codex account API returned status %d: %s", response.StatusCode, message)
 	}
 	return raw, nil
 }

@@ -56,6 +56,7 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 	eventName := ""
 	sawEvent := false
 	sawTerminal := false
+	responseID, responseModel := "", ""
 
 	consume := func(name, data string) error {
 		data = strings.TrimSpace(data)
@@ -73,8 +74,16 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		sawEvent = true
 		eventType := firstText(stringValue(event["type"]), name)
 		switch eventType {
+		case "response.created":
+			response, _ := event["response"].(map[string]any)
+			responseID = stringValue(response["id"])
+			responseModel = stringValue(response["model"])
+			return nil
 		case "response.output_text.delta":
 			delta := stringValue(event["delta"])
+			if err := proxyTerminalError(responseModel, responseID, delta, requestID, clientRequestID); err != nil {
+				return err
+			}
 			content.WriteString(delta)
 			return emitModelDelta(sink, domain.ModelEventTextDelta, delta)
 		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
@@ -100,6 +109,13 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 				}
 				if completed.Model != "" {
 					result.Model = completed.Model
+				}
+				for _, item := range completed.Output {
+					for _, part := range item.Content {
+						if err := proxyTerminalError(completed.Model, completed.ID, part.Text, requestID, clientRequestID); err != nil {
+							return err
+						}
+					}
 				}
 				if err := consumeCodexCompleted(completed, &content, &state, sink); err != nil {
 					return err
@@ -293,6 +309,10 @@ func emitUsage(sink ports.ModelEventSink, usage domain.Usage) error {
 }
 
 func codexStreamError(eventType string, event map[string]any, requestID, clientRequestID string) error {
+	// Responses 的失敗原因位於 response.error，不是事件頂層。
+	if response, ok := event["response"].(map[string]any); ok {
+		event = response
+	}
 	message := strings.TrimSpace(stringValue(event["message"]))
 	code := strings.TrimSpace(stringValue(event["code"]))
 	if nested, ok := event["error"].(map[string]any); ok {
@@ -303,7 +323,7 @@ func codexStreamError(eventType string, event map[string]any, requestID, clientR
 		encoded, _ := json.Marshal(event)
 		message = string(encoded)
 	}
-	return &ProviderError{Operation: "Codex stream", Code: firstText(code, eventType), Message: message, RequestID: requestID, ClientRequestID: clientRequestID, Retryable: eventType == "response.incomplete"}
+	return &ProviderError{Operation: "Codex stream", Code: firstText(code, eventType), Message: message, RequestID: requestID, ClientRequestID: clientRequestID, Retryable: eventType == "response.incomplete" || retryableStreamError(code, message)}
 }
 
 func codexCallKey(event, item map[string]any) string {

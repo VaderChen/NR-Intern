@@ -94,6 +94,7 @@ type Model struct {
 	logger               *slog.Logger
 	client               *http.Client
 	usageMu              sync.RWMutex
+	usageRefreshMu       sync.Mutex
 	providerUsage        domain.ProviderUsage
 }
 

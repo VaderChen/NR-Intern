@@ -92,6 +92,27 @@ func providerHTTPError(response *http.Response, clientRequestID string) (*Provid
 	}, parseRetryAfter(response.Header.Get("Retry-After"))
 }
 
+// 僅對錯誤封包使用文字判斷，不能把正常回答中的「過載」當成失敗。
+func retryableStreamError(code, message string) bool {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "server_error", "internal_server_error", "overloaded_error", "rate_limit_exceeded", "rate_limit_error", "service_unavailable":
+		return true
+	case "invalid_api_key", "authentication_error", "permission_denied", "insufficient_quota", "invalid_request_error":
+		return false
+	}
+	text := strings.ToLower(message)
+	return strings.Contains(text, "servers are currently overloaded") || strings.Contains(text, "temporarily unavailable")
+}
+
+// 舊代理把失敗偽裝為成功訊息；以代理模型與保留 ID 辨識封包，
+// 不掃描一般模型文字，以免引用錯誤訊息的正常回答被誤判。
+func proxyTerminalError(model, id, message, requestID, clientRequestID string) error {
+	if model != "load-balance-provider" || (!strings.HasPrefix(id, "chatcmpl-refusal-") && !strings.HasPrefix(id, "resp_refusal_")) {
+		return nil
+	}
+	return &ProviderError{Operation: "upstream rejection", Message: message, RequestID: requestID, ClientRequestID: clientRequestID, Retryable: retryableStreamError("", message)}
+}
+
 func retryableStatus(status int) bool {
 	switch status {
 	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests,
@@ -100,6 +121,20 @@ func retryableStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+// 上游重啟或暫時離線需要恢復時間，毫秒級重試會在服務恢復前耗盡次數。
+// 兩種模型協定共用退避規則，等待仍由呼叫端的 context 控制，不延長 Run 預算。
+func providerRetryDelay(attempt int, retryAfter time.Duration) time.Duration {
+	const maximum = 30 * time.Second
+	if retryAfter > 0 {
+		return min(retryAfter, maximum)
+	}
+	delay := 10 * time.Second
+	for i := 1; i < attempt && delay < maximum; i++ {
+		delay *= 2
+	}
+	return min(delay, maximum)
 }
 
 func parseRetryAfter(value string) time.Duration {

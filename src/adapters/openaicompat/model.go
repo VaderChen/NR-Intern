@@ -54,6 +54,16 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 	if err != nil {
 		return domain.ModelResponse{}, fmt.Errorf("encode chat completion request: %w", err)
 	}
+	// 每一次請求都留下結構摘要（只有形狀，沒有內容）。不做成「失敗才記」，
+	// 是因為失敗不一定看得出來：實測遇過中間的相容代理把上游的 400 包成
+	// 200 加一段錯誤文字，Harness 判定為一次成功的回答，事後也就沒有任何
+	// 線索可查。一行約 150 位元組，日誌緩衝有 512KB，代價可以忽略。
+	m.logger.Info("provider request shape",
+		"protocol", "chat",
+		"model", modelName,
+		"session_id", request.SessionID,
+		"messages", len(payload.Messages),
+		"shape", DescribeChatMessages(payload.Messages))
 
 	var lastErr error
 	for attempt := 1; attempt <= m.maxAttempts; attempt++ {
@@ -87,12 +97,7 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 				return domain.ModelResponse{}, err
 			}
 		}
-		if retryAfter <= 0 {
-			retryAfter = time.Duration(400*(1<<(attempt-1))) * time.Millisecond
-		}
-		if retryAfter > 30*time.Second {
-			retryAfter = 30 * time.Second
-		}
+		retryAfter = providerRetryDelay(attempt, retryAfter)
 		m.logger.Warn("retrying provider request",
 			"attempt", attempt,
 			"max_attempts", m.maxAttempts,

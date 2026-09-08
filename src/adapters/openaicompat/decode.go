@@ -44,7 +44,7 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 				Message:         chunk.Error.Message,
 				RequestID:       requestID,
 				ClientRequestID: clientRequestID,
-				Retryable:       chunk.Error.Type == "server_error",
+				Retryable:       retryableStreamError(firstText(chunk.Error.Code, chunk.Error.Type), chunk.Error.Message),
 			}
 		}
 		if chunk.Model != "" {
@@ -57,6 +57,9 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 				delta = choice.Delta.Refusal
 			}
 			if delta != "" {
+				if err := proxyTerminalError(chunk.Model, chunk.ID, delta, requestID, clientRequestID); err != nil {
+					return err
+				}
 				content.WriteString(delta)
 				if sink != nil {
 					for _, fragment := range taggedStream.Push(delta, false) {
@@ -196,7 +199,7 @@ func decodeJSONResponse(reader io.Reader, fallbackModel, requestID, clientReques
 			Message:         response.Error.Message,
 			RequestID:       requestID,
 			ClientRequestID: clientRequestID,
-			Retryable:       response.Error.Type == "server_error",
+			Retryable:       retryableStreamError(firstText(response.Error.Code, response.Error.Type), response.Error.Message),
 		}
 	}
 	if len(response.Choices) == 0 {
@@ -208,6 +211,9 @@ func decodeJSONResponse(reader io.Reader, fallbackModel, requestID, clientReques
 		rawContent = choice.Message.Refusal
 	}
 	content, taggedReasoning, _ := splitTaggedThinking(rawContent)
+	if err := proxyTerminalError(response.Model, response.ID, rawContent, requestID, clientRequestID); err != nil {
+		return domain.ModelResponse{}, err
+	}
 	reasoning := mergeReasoning(firstText(choice.Message.ReasoningContent, choice.Message.Reasoning), taggedReasoning)
 	if sink != nil && reasoning != "" {
 		if err := sink(domain.ModelEvent{Type: domain.ModelEventThinkingDelta, Delta: reasoning}); err != nil {

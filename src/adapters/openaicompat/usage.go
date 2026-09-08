@@ -5,16 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
 
-const maxCodexUsageResponseBytes = 2 * 1024 * 1024
+const codexUsageReadTimeout = 30 * time.Second
 
 type codexUsageResponse struct {
 	RateLimit    *codexUsageRateLimit      `json:"rate_limit"`
@@ -33,8 +31,8 @@ type codexResetCredit struct {
 }
 
 type codexUsageRateLimit struct {
-	PrimaryWindow   *codexUsageAPIWindow `json:"primary_window"`
-	SecondaryWindow *codexUsageAPIWindow `json:"secondary_window"`
+	PrimaryWindow   json.RawMessage `json:"primary_window"`
+	SecondaryWindow json.RawMessage `json:"secondary_window"`
 }
 
 type codexUsageAPIWindow struct {
@@ -51,7 +49,9 @@ func (m *Model) ProviderUsage() domain.ProviderUsage {
 	}
 	m.usageMu.RLock()
 	defer m.usageMu.RUnlock()
-	return m.providerUsage
+	usage := m.providerUsage
+	usage.ResetCredits.Items = append([]domain.ProviderResetCredit(nil), usage.ResetCredits.Items...)
+	return usage
 }
 
 // RefreshProviderUsage 使用 ChatGPT/Codex OAuth 的唯讀用量端點更新快照，
@@ -60,50 +60,28 @@ func (m *Model) RefreshProviderUsage(ctx context.Context) error {
 	if m == nil || m.authMode != "oauth" {
 		return nil
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, CodexUsageEndpoint, nil)
-	if err != nil {
+	// 手動刷新、背景輪詢與額度重置後刷新共用一條寫入順序。
+	m.usageRefreshMu.Lock()
+	defer m.usageRefreshMu.Unlock()
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("User-Agent", "NR-Intern/codex")
-	if err := m.applyAuthorization(ctx, request); err != nil {
-		m.clearProviderUsage()
-		return err
-	}
-	response, err := m.client.Do(request)
+	data, err := m.requestCodexAccountAPI(ctx, http.MethodGet, CodexUsageEndpoint, nil, codexUsageReadTimeout)
 	if err != nil {
 		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-			m.clearProviderUsage()
-		}
-		return fmt.Errorf("Codex usage endpoint returned status %d", response.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxCodexUsageResponseBytes+1))
-	if err != nil {
-		return fmt.Errorf("read Codex usage response: %w", err)
-	}
-	if len(data) > maxCodexUsageResponseBytes {
-		return fmt.Errorf("Codex usage response exceeds %d bytes", maxCodexUsageResponseBytes)
 	}
 	var payload codexUsageResponse
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return fmt.Errorf("decode Codex usage response: %w", err)
 	}
 	now := time.Now().UTC()
-	// 重置額度與配額視窗來自同一份回應，但要分開存：只有額度、沒有視窗的回應
-	// 仍然有意義，而 storeProviderUsage 在兩個視窗都不可用時會直接跳過。
-	m.storeResetCredits(ctx, payload.ResetCredits)
-	if payload.RateLimit == nil {
-		return nil
+	windows, err := codexAccountUsageWindows(payload.RateLimit, now)
+	if err != nil {
+		return err
 	}
-	m.storeProviderUsage(
-		codexAPIUsageWindow(payload.RateLimit.PrimaryWindow, now),
-		codexAPIUsageWindow(payload.RateLimit.SecondaryWindow, now),
-		now,
-	)
+	// 全部驗證成功才替換；暫時失敗不更新時間，也不把未知視窗假裝成滿額。
+	m.storeProviderUsage(windows[0], windows[1], now)
+	m.storeResetCredits(ctx, payload.ResetCredits)
 	return nil
 }
 
@@ -182,106 +160,73 @@ func (m *Model) clearProviderUsage() {
 	m.usageMu.Unlock()
 }
 
-func (m *Model) recordProviderUsage(headers http.Header) {
-	if m == nil {
-		return
-	}
-	now := time.Now().UTC()
-	fiveHour := codexUsageWindow(headers, "primary", now)
-	sevenDay := codexUsageWindow(headers, "secondary", now)
-	m.storeProviderUsage(fiveHour, sevenDay, now)
-}
-
+// storeProviderUsage 以完整 API 快照替換兩個視窗；明確的 null 必須清掉舊值。
 func (m *Model) storeProviderUsage(fiveHour, sevenDay domain.ProviderUsageWindow, now time.Time) {
 	if m == nil {
 		return
 	}
-	if !fiveHour.Available && !sevenDay.Available {
-		return
-	}
-
 	m.usageMu.Lock()
-	if fiveHour.Available {
-		m.providerUsage.FiveHour = fiveHour
-	}
-	if sevenDay.Available {
-		m.providerUsage.SevenDay = sevenDay
-	}
+	m.providerUsage.FiveHour = fiveHour
+	m.providerUsage.SevenDay = sevenDay
 	m.providerUsage.UpdatedAt = now.Format(time.RFC3339)
 	m.usageMu.Unlock()
 }
 
+// codexAccountUsageWindows 比照帳號 API 的完整視窗契約，區分欄位缺漏與明確 null。
+func codexAccountUsageWindows(rateLimit *codexUsageRateLimit, now time.Time) ([2]domain.ProviderUsageWindow, error) {
+	var windows [2]domain.ProviderUsageWindow
+	if rateLimit == nil || len(rateLimit.PrimaryWindow) == 0 || len(rateLimit.SecondaryWindow) == 0 {
+		return windows, fmt.Errorf("Codex usage response is missing complete rate-limit windows")
+	}
+	for index, raw := range []json.RawMessage{rateLimit.PrimaryWindow, rateLimit.SecondaryWindow} {
+		var value *codexUsageAPIWindow
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return windows, fmt.Errorf("decode Codex usage window: %w", err)
+		}
+		if value == nil {
+			continue
+		}
+		window := codexAPIUsageWindow(value, now)
+		if !window.Available {
+			return windows, fmt.Errorf("Codex usage window has invalid used_percent")
+		}
+		// primary 不一定是五小時；只有週額度的帳號也可能把它放在 primary。
+		switch window.WindowMinutes {
+		case 300:
+			index = 0
+		case 10080:
+			index = 1
+		}
+		if windows[index].Available {
+			return windows, fmt.Errorf("Codex usage response contains conflicting windows")
+		}
+		windows[index] = window
+	}
+	if !windows[0].Available && !windows[1].Available {
+		return windows, fmt.Errorf("Codex usage response has no available windows")
+	}
+	return windows, nil
+}
+
 func codexAPIUsageWindow(value *codexUsageAPIWindow, now time.Time) domain.ProviderUsageWindow {
-	if value == nil || value.UsedPercent == nil || math.IsNaN(*value.UsedPercent) || math.IsInf(*value.UsedPercent, 0) {
+	if value == nil || value.UsedPercent == nil || math.IsNaN(*value.UsedPercent) || math.IsInf(*value.UsedPercent, 0) ||
+		*value.UsedPercent < 0 || *value.UsedPercent > 100 {
 		return domain.ProviderUsageWindow{}
 	}
 	window := domain.ProviderUsageWindow{
 		Available:        true,
-		RemainingPercent: clampPercent(100 - *value.UsedPercent),
+		RemainingPercent: 100 - *value.UsedPercent,
 	}
 	if value.LimitWindowSeconds != nil && *value.LimitWindowSeconds > 0 {
 		window.WindowMinutes = *value.LimitWindowSeconds / 60
 	}
-	if value.ResetAfterSeconds != nil && *value.ResetAfterSeconds >= 0 && !math.IsNaN(*value.ResetAfterSeconds) && !math.IsInf(*value.ResetAfterSeconds, 0) {
-		window.ResetAt = now.Add(time.Duration(*value.ResetAfterSeconds * float64(time.Second))).Format(time.RFC3339)
-	} else if value.ResetAt != nil && *value.ResetAt > 0 {
+	// 優先使用上游絕對時間，避免刷新延遲讓倒數時間逐次往後偏移。
+	if value.ResetAt != nil && *value.ResetAt > 0 && *value.ResetAt <= 253402300799 {
 		window.ResetAt = time.Unix(*value.ResetAt, 0).UTC().Format(time.RFC3339)
+	} else if value.ResetAfterSeconds != nil && *value.ResetAfterSeconds >= 0 &&
+		*value.ResetAfterSeconds < float64(math.MaxInt64/int64(time.Second)) &&
+		!math.IsNaN(*value.ResetAfterSeconds) && !math.IsInf(*value.ResetAfterSeconds, 0) {
+		window.ResetAt = now.Add(time.Duration(*value.ResetAfterSeconds * float64(time.Second))).Format(time.RFC3339)
 	}
 	return window
-}
-
-func codexUsageWindow(headers http.Header, prefix string, now time.Time) domain.ProviderUsageWindow {
-	remaining, available := percentHeader(headers, "X-Codex-"+prefix+"-Remaining-Percent")
-	if !available {
-		if used, ok := percentHeader(headers, "X-Codex-"+prefix+"-Used-Percent"); ok {
-			remaining, available = clampPercent(100-used), true
-		}
-	}
-	if !available {
-		return domain.ProviderUsageWindow{}
-	}
-
-	window := domain.ProviderUsageWindow{
-		Available:        true,
-		RemainingPercent: remaining,
-	}
-	if minutes, ok := numberHeader(headers, "X-Codex-"+prefix+"-Window-Minutes"); ok && minutes > 0 {
-		window.WindowMinutes = int(minutes)
-	}
-	if seconds, ok := numberHeader(headers, "X-Codex-"+prefix+"-Reset-After-Seconds"); ok && seconds >= 0 {
-		window.ResetAt = now.Add(time.Duration(seconds * float64(time.Second))).Format(time.RFC3339)
-	} else if epoch, ok := numberHeader(headers, "X-Codex-"+prefix+"-Reset-At"); ok && epoch > 0 {
-		window.ResetAt = time.Unix(int64(epoch), 0).UTC().Format(time.RFC3339)
-	}
-	return window
-}
-
-func percentHeader(headers http.Header, name string) (float64, bool) {
-	value, ok := numberHeader(headers, name)
-	if !ok {
-		return 0, false
-	}
-	return clampPercent(value), true
-}
-
-func numberHeader(headers http.Header, name string) (float64, bool) {
-	text := strings.TrimSpace(strings.TrimSuffix(headers.Get(name), "%"))
-	if text == "" {
-		return 0, false
-	}
-	value, err := strconv.ParseFloat(text, 64)
-	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0, false
-	}
-	return value, true
-}
-
-func clampPercent(value float64) float64 {
-	if value < 0 {
-		return 0
-	}
-	if value > 100 {
-		return 100
-	}
-	return value
 }

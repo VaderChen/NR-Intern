@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -57,6 +58,7 @@ type functionCall struct {
 }
 
 type streamChunk struct {
+	ID      string         `json:"id,omitempty"`
 	Model   string         `json:"model,omitempty"`
 	Choices []streamChoice `json:"choices,omitempty"`
 	Usage   usagePayload   `json:"usage,omitempty"`
@@ -85,6 +87,7 @@ type streamDelta struct {
 }
 
 type jsonResponse struct {
+	ID      string         `json:"id,omitempty"`
 	Model   string         `json:"model,omitempty"`
 	Choices []jsonChoice   `json:"choices"`
 	Usage   usagePayload   `json:"usage,omitempty"`
@@ -152,6 +155,43 @@ func (m *Model) messages(request domain.ModelRequest) []chatMessage {
 		messages = append(messages, chatMessage{Role: "user", Content: prompt})
 	}
 	return messages
+}
+
+// DescribeChatMessages 回傳訊息序列的結構摘要，供事後診斷用。
+//
+// 這一版存在的理由很具體：上游拒收時回報的是索引（例如 input[40].output），
+// 而索引本身說不出那一項是什麼。更麻煩的是中間如果有相容代理，失敗可能根本
+// 不是 4xx——實測遇過代理把 400 包成 200 加一段錯誤文字送回來，Harness 全程
+// 看不出有任何異常，於是連「該去看什麼」都無從得知。
+//
+// 只記結構，不記內容：需要回答的問題是形狀，而把整段對話抄進日誌檔的診斷
+// 不值得擁有。工具結果額外標出空與非空——空值被中途某一層的 omitempty
+// 吃掉，正是實際發生過的事故。
+func DescribeChatMessages(messages []chatMessage) string {
+	var builder strings.Builder
+	for index, message := range messages {
+		if index > 0 {
+			builder.WriteString(" ")
+		}
+		builder.WriteString(strconv.Itoa(index))
+		builder.WriteString(":")
+		switch {
+		case message.ToolCallID != "":
+			state := "set"
+			if text, ok := message.Content.(string); !ok || strings.TrimSpace(text) == "" {
+				state = "empty"
+			}
+			builder.WriteString("out/" + shortCallID(message.ToolCallID) + "/" + state)
+		case len(message.ToolCalls) > 0:
+			builder.WriteString(message.Role + "/calls:" + strconv.Itoa(len(message.ToolCalls)))
+			for _, call := range message.ToolCalls {
+				builder.WriteString("/" + shortCallID(call.ID))
+			}
+		default:
+			builder.WriteString(message.Role)
+		}
+	}
+	return builder.String()
 }
 
 func functionTools(definitions []domain.ToolDefinition) []functionTool {

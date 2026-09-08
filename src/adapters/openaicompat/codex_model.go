@@ -29,6 +29,13 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 		return domain.ModelResponse{}, fmt.Errorf("encode Codex Responses request: %w", err)
 	}
 	inputShape := DescribeCodexInput(payload.Input)
+	// 理由同 Chat 路徑：失敗不一定以 4xx 的形式出現，所以不等失敗才記。
+	m.logger.Info("provider request shape",
+		"protocol", "codex-responses",
+		"model", modelName,
+		"session_id", request.SessionID,
+		"items", len(payload.Input),
+		"shape", inputShape)
 
 	var lastErr error
 	for attempt := 1; attempt <= m.maxAttempts; attempt++ {
@@ -62,12 +69,7 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 				return domain.ModelResponse{}, err
 			}
 		}
-		if retryAfter <= 0 {
-			retryAfter = time.Duration(400*(1<<(attempt-1))) * time.Millisecond
-		}
-		if retryAfter > 30*time.Second {
-			retryAfter = 30 * time.Second
-		}
+		retryAfter = providerRetryDelay(attempt, retryAfter)
 		m.logger.Warn("retrying Codex provider request",
 			"attempt", attempt,
 			"max_attempts", m.maxAttempts,
@@ -128,7 +130,7 @@ func (m *Model) executeCodexAttempt(ctx context.Context, body []byte, modelName,
 		}
 	}
 	defer response.Body.Close()
-	m.recordProviderUsage(response.Header)
+	// 帳號配額只採用專用唯讀 API，避免不同模型回應的 Header 覆寫帳號快照。
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		providerErr, retryAfter := providerHTTPError(response, clientRequestID)
 		// 4xx 多半是請求本體的結構問題，而上游只回報索引（input[40].output）。
