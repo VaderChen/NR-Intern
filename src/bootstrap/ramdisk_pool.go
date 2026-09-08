@@ -83,10 +83,11 @@ func (pool *RAMDiskPool) Prepare(ctx context.Context, projectID string, sizeMB i
 	if projectID == "" {
 		return "", fmt.Errorf("project id is required")
 	}
-	maximumSizeMB := maxRAMDiskSizeMB
-	if totalBytes, err := systeminfo.TotalMemoryBytes(); err == nil && totalBytes > 0 {
-		maximumSizeMB = int((totalBytes * 3 / 4) / (1024 * 1024))
+	totalBytes, err := systeminfo.TotalMemoryBytes()
+	if err != nil || totalBytes == 0 {
+		return "", fmt.Errorf("cannot determine physical memory for RAM disk capacity: %v", err)
 	}
+	maximumSizeMB := int((totalBytes * 3 / 4) / (1024 * 1024))
 	if sizeMB < minRAMDiskSizeMB || sizeMB > maximumSizeMB {
 		return "", fmt.Errorf("RAM disk size must be between %d and %d MB", minRAMDiskSizeMB, maximumSizeMB)
 	}
@@ -94,6 +95,18 @@ func (pool *RAMDiskPool) Prepare(ctx context.Context, projectID string, sizeMB i
 	defer pool.mu.Unlock()
 	if disk := pool.disks[projectID]; disk != nil {
 		return disk.WorkspaceRoot(), nil
+	}
+	// 計算配置額度而非目前寫入量；同一程序的專案不能各自用掉主機 75%。
+	requestedBytes := int64(sizeMB) * 1024 * 1024
+	allocatedBytes := int64(0)
+	for _, disk := range pool.disks {
+		if disk != nil {
+			allocatedBytes += disk.sizeBytes
+		}
+	}
+	limitBytes := int64(maximumSizeMB) * 1024 * 1024
+	if requestedBytes > limitBytes-allocatedBytes {
+		return "", fmt.Errorf("RAM disk total capacity exceeds 75%% of physical memory: allocated %d MB, requested %d MB, limit %d MB", allocatedBytes/(1024*1024), sizeMB, maximumSizeMB)
 	}
 	disk, err := newRAMDisk(ctx, RAMDiskConfig{Enabled: true, SizeMB: sizeMB}, projectID, pool.logger.With("project_id", projectID))
 	if err != nil {

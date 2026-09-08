@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -36,6 +37,7 @@ type RAMDiskConfig struct {
 // 的 Windows 都會回報 Volatile=true；未知平台才退回可清理的暫存目錄。
 type RAMDisk struct {
 	root       string
+	sizeBytes  int64
 	mode       string
 	volatile   bool
 	closeFn    func(context.Context) error
@@ -74,14 +76,17 @@ func newRAMDisk(ctx context.Context, config RAMDiskConfig, ownerID string, logge
 		return nil, err
 	}
 	disk := &RAMDisk{
-		root:     value.root,
-		mode:     value.mode,
-		volatile: value.volatile,
-		closeFn:  value.close,
+		root:      value.root,
+		sizeBytes: sizeBytes,
+		mode:      value.mode,
+		volatile:  value.volatile,
+		closeFn:   value.close,
 	}
 	if err := disk.prepareLayout(); err != nil {
-		_ = disk.Close(ctx)
-		return nil, err
+		// 原請求可能已取消，但剛建立的磁碟仍須回滾；清理錯誤也必須保留供診斷。
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		return nil, errors.Join(err, disk.Close(cleanupCtx))
 	}
 	return disk, nil
 }
