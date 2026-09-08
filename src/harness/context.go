@@ -7,6 +7,7 @@ import (
 	"AgenticService/src/ports"
 	"AgenticService/src/tokens"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -968,7 +969,30 @@ func shapedCharacters(messages []sequencedMessage, maxToolResultCharacters int) 
 		if strings.EqualFold(message.Message.Role, "tool") && length > maxToolResultCharacters {
 			length = maxToolResultCharacters
 		}
-		total += length
+		total += length + toolCallCharacters(message.Message.ToolCalls)
+	}
+	return total
+}
+
+// toolCallCharacters 算工具呼叫參數的字數。
+//
+// 這些字元一樣會送進模型，而且經常是最大的一塊：file_write 的整份檔案、
+// apply_patch 的整段 diff 都在 arguments 裡，那種訊息的 Content 反而是空的。
+// 只算 Content 的話，一輪寫了三個大檔的歷史對每一道字元閘門都等於零，
+// 於是該壓縮的時候看起來還很空。
+//
+// 用 json.Marshal 而不是估算：送出去的就是這份 JSON，兩邊的協定組裝器
+// 都是這樣序列化的，算的是真的字數而不是另一套近似。
+func toolCallCharacters(calls []domain.ToolCall) int {
+	total := 0
+	for _, call := range calls {
+		total += utf8.RuneCountInString(call.Name)
+		if len(call.Arguments) == 0 {
+			continue
+		}
+		if encoded, err := json.Marshal(call.Arguments); err == nil {
+			total += utf8.RuneCount(encoded)
+		}
 	}
 	return total
 }
@@ -979,7 +1003,8 @@ func retainCountWithinCharacters(messages []sequencedMessage, limit int) int {
 	total := 0
 	count := 0
 	for index := len(messages) - 1; index >= 0; index-- {
-		total += utf8.RuneCountInString(messages[index].Message.Content)
+		total += utf8.RuneCountInString(messages[index].Message.Content) +
+			toolCallCharacters(messages[index].Message.ToolCalls)
 		if total > limit && count > 0 {
 			break
 		}

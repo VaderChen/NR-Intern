@@ -1735,7 +1735,8 @@ func (r *Runner) enforceHistoryCharacterLimit(messages []domain.Message, logger 
 func historyCharacters(messages []domain.Message) int {
 	total := 0
 	for _, message := range messages {
-		total += utf8.RuneCountInString(message.Content) + utf8.RuneCountInString(message.Reasoning)
+		total += utf8.RuneCountInString(message.Content) + utf8.RuneCountInString(message.Reasoning) +
+			toolCallCharacters(message.ToolCalls)
 	}
 	return total
 }
