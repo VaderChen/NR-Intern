@@ -489,6 +489,8 @@ func Build(config Config) (*Runtime, error) {
 		DiagnosticsExport:       runtime.DiagnosticsExport,
 		Backup:                  runtime.Backup,
 		ConfigBundle:            runtime.ConfigBundle,
+		ExportProviderSetting:   runtime.ExportProviderSetting,
+		ExportMCPSetting:        runtime.ExportMCPSetting,
 		Restore:                 runtime.Restore,
 		Permissions:             runtime.Permissions,
 		UpdateStatus:            runtime.UpdateStatus,
@@ -525,7 +527,7 @@ func Build(config Config) (*Runtime, error) {
 	return runtime, nil
 }
 
-// ProviderUsage 回傳指定 Provider 最近一次由上游回應標頭提供的配額快照。
+// ProviderUsage 回傳指定 Provider 最近一次由唯讀帳號 API 提供的配額快照。
 func (r *Runtime) ProviderUsage(ctx context.Context, providerID string) (domain.ProviderUsage, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.ProviderUsage{}, err
@@ -699,7 +701,9 @@ func ensurePlanningTools(values []string) []string {
 		return nil
 	}
 	result := append([]string(nil), values...)
-	for _, required := range []string{"plan_get", "plan_create", "plan_step_update"} {
+	// plan_loop_interrupt 一併保底：使用者的 allowlist 幾乎不會列到它，
+	// 少了它 LOOP 就沒有煞車，而 LOOP 是使用者自己啟動的。
+	for _, required := range []string{"plan_get", "plan_create", "plan_step_update", "plan_loop_interrupt"} {
 		if !containsString(result, required) {
 			result = append(result, required)
 		}

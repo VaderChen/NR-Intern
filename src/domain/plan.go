@@ -271,8 +271,33 @@ func PlanIsTerminal(plan Plan) bool {
 	return plan.Status == PlanStatusCompleted || plan.Status == PlanStatusCanceled
 }
 
+// invalidPlanTransition 要把「現在在哪、下一步能往哪走」一次講完。
+//
+// 實測反覆出現的三種寫法：in_progress → completed（跳過 verifying）、
+// pending → verifying（跳過 in_progress）、verifying → verifying。舊訊息只說
+// 這條路不通，模型無從得知該送什麼，於是換一個同樣不通的值再試一次——
+// 一個步驟要耗掉兩三個回合才走得動，而 LOOP 的推進判定又看步驟有沒有變。
 func invalidPlanTransition(from, to PlanStepStatus) error {
-	return fmt.Errorf("%w: plan step cannot transition from %s to %s", ErrConflict, from, to)
+	return fmt.Errorf("%w: plan step cannot transition from %s to %s. %s",
+		ErrConflict, from, to, planStepNextMove(from))
+}
+
+// planStepNextMove 說明從目前狀態能往哪裡走，以及那一步需要什麼。
+func planStepNextMove(from PlanStepStatus) string {
+	const lifecycle = "步驟生命週期是 pending → in_progress → verifying → completed，一次只走一格"
+	switch from {
+	case PlanStepStatusPending:
+		return lifecycle + "：請先送 in_progress 開始執行；確定不做這一步則送 skipped"
+	case PlanStepStatusInProgress:
+		return lifecycle + "：請先送 verifying 表示開始查證，查證通過後再送一次 completed 並附上 evidence；卡住則送 blocked 並把阻礙寫進 evidence"
+	case PlanStepStatusVerifying:
+		return "下一步只有 completed（附上查證得到的 evidence）或 blocked（把阻礙寫進 evidence）；重送 verifying 不會有任何變化"
+	case PlanStepStatusBlocked:
+		return lifecycle + "：阻礙排除後請先送 in_progress 重新開始"
+	case PlanStepStatusCompleted, PlanStepStatusSkipped:
+		return "這個步驟已經結束，狀態不會再變；要往下推進請改下一個步驟"
+	}
+	return ""
 }
 
 func timePointer(value time.Time) *time.Time {

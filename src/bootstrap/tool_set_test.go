@@ -11,7 +11,7 @@ import (
 // 之間挑選既慢又容易挑錯。需要完整能力時才由管理介面打開。
 func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 	config := Config{AllowedTools: []string{
-		"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create",
+		"plan_get", "plan_create", "plan_step_update", "plan_loop_interrupt", "directory_list", "directory_create",
 		"file_read", "file_search", "file_compare", "file_write", "file_edit",
 		"document_inspect", "document_read", "document_create", "document_convert",
 		"document_edit", "http_fetch", "shell_exec", "ssh_exec",
@@ -32,6 +32,11 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 	// 模型就只能自己猜，或把選擇題寫進最終答案要使用者再開一輪。
 	if !strings.Contains(strings.Join(lean, ","), "ask_user") {
 		t.Fatalf("ask_user must stay in the lean set: %v", lean)
+	}
+	// LOOP 的煞車。發佈過一版是關著的：LOOP 跑得起來，Agent 卻沒有工具可以
+	// 中止，而「可以隨時打斷」是這個功能的前提之一。
+	if !strings.Contains(strings.Join(lean, ","), "plan_loop_interrupt") {
+		t.Fatalf("plan_loop_interrupt must stay in the lean set: %v", lean)
 	}
 	for _, name := range []string{"file_write", "file_edit", "ssh_exec", "document_edit", "memory_remember", "http_fetch"} {
 		if strings.Contains(strings.Join(lean, ","), name) {
@@ -102,5 +107,20 @@ func TestToolRetrievalDefaultsToOnAndSurvivesLegacySettings(t *testing.T) {
 	}
 	if reloaded.ToolRetrieval {
 		t.Fatal("an explicit off was not persisted")
+	}
+}
+
+// 使用者自訂 allowlist 幾乎不會列到計畫工具，但少了它們 Agent 就無法回報進度、
+// 也無法中止 LOOP。這幾個一律保底補上。
+func TestEnsurePlanningToolsKeepsTheLoopBrake(t *testing.T) {
+	augmented := ensurePlanningTools([]string{"file_read"})
+	for _, required := range []string{"plan_get", "plan_create", "plan_step_update", "plan_loop_interrupt"} {
+		if !strings.Contains(strings.Join(augmented, ","), required) {
+			t.Fatalf("%q 應被保底補上：%v", required, augmented)
+		}
+	}
+	// 空的 allowlist 代表「不設限」，這時不該憑空生出一份清單把其他工具關掉。
+	if result := ensurePlanningTools(nil); result != nil {
+		t.Fatalf("空 allowlist 應維持不設限，得到 %v", result)
 	}
 }

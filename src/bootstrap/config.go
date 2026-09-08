@@ -119,7 +119,7 @@ func DefaultConfig() Config {
 			Enabled: true,
 			SizeMB:  DefaultRAMDiskSizeMB,
 		},
-		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "document_compare", "document_validate", "document_fonts", "document_create", "document_edit", "document_convert", "pdf_pages", "document_render", "http_fetch", "shell_exec", "wait_for", "ssh_exec", "ssh_wait", "memory_search", "memory_remember", "memory_forget"},
+		AllowedTools:           []string{"plan_get", "plan_create", "plan_step_update", "plan_loop_interrupt", "directory_list", "directory_create", "file_read", "file_search", "file_compare", "file_write", "file_edit", "document_inspect", "document_read", "document_compare", "document_validate", "document_fonts", "document_create", "document_edit", "document_convert", "pdf_pages", "document_render", "http_fetch", "shell_exec", "wait_for", "ssh_exec", "ssh_wait", "memory_search", "memory_remember", "memory_forget"},
 		AllowElevatedTools:     true,
 		MaxTurns:               harness.DefaultMaxTurns,
 		MaxAutonomousToolTurns: harness.DefaultMaxAutonomousToolTurns,
@@ -575,6 +575,10 @@ var LeanToolNames = []string{
 	"plan_get",
 	"plan_create",
 	"plan_step_update",
+	// plan_loop_interrupt 必須跟著 LOOP 一起存在：LOOP 期間 Agent 唯一能踩的
+	// 煞車就是它，關掉它等於「可以隨時打斷」這件事不成立，而 LOOP 還是會
+	// 一輪一輪把預算花完。schema 也只有兩個字串欄位，不構成成本。
+	"plan_loop_interrupt",
 }
 
 // EffectiveAllowedTools 依「擴充工具集」開關計算本次實際公開的原生工具集合。
