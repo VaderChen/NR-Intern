@@ -372,7 +372,11 @@ App 選單（⌘Q 結束、⌘H 隱藏、⌥⌘H 隱藏其他）、編輯選單�
 與 Linux 瀏覽器由各自引擎處理 Ctrl 快捷鍵。
 
 桌面生命週期方面，macOS 使用原生 status item；Windows 使用 Win32 Notify Icon，啟動就建立
-Tray，左鍵開啟 UI、右鍵選單提供開啟與結束。Windows 沒有可用原生視窗時，Tray 仍持有桌面
+Tray，左鍵開啟 UI、右鍵選單提供開啟與結束。通知區域的事件以 `NOTIFYICON_VERSION_4` 回報，
+`lParam` 的低位字才是事件、高位字是圖示 UID——不遮蔽就永遠比不中，左右鍵都會失效。圖示以
+`LoadIconW(GetModuleHandle(NULL), 1)` 從執行檔資源載入（`app_icon_windows_*.syso`），
+取不到才退回系統通用圖示；Explorer 重啟時廣播的 `TaskbarCreated` 也會重新掛回圖示。
+Windows 沒有可用原生視窗時，Tray 仍持有桌面
 程序與 Browser fallback 的生命週期；再次啟動會對既有 UI listener 發送 restore，不建立第二個
 桌面程序。
 
@@ -999,7 +1003,10 @@ OpenAI-compatible adapter 行為如下：
 - tool result `tool_call_id`；空的工具結果代換成明確文字後才送出，見「Tool call 協定不變式」。
 - SSE 文字、refusal 與 tool call arguments 串流累積，支援多行 SSE 與常見 NDJSON 相容輸出。
 - `stream_options.include_usage` 可設定；不支援串流或 `tool_choice` 的相容服務可分別停用。
-- 初始連線（包含 connection refused）、408/409/429 與暫時性 5xx 依 `max_attempts` 最多嘗試三次；未提供有效 `Retry-After` 時，分別等待 10、20 秒再重連，讓上游有時間恢復。有效 `Retry-After` 優先使用，上限 30 秒；Chat 與 Codex Responses 共用退避規則。等待期間透過既有 `agent.progress` 顯示重試狀態，可由停止操作或 Run 時間預算中止，不重新建立 Run 或重跑先前工具。一旦已送出文字、思考或工具呼叫 delta 就不自動重送，避免重複輸出；次數耗盡後回報失敗。
+- 初始連線（包含 connection refused）、408/409/429 與暫時性 5xx 依 `max_attempts` 最多嘗試三次；未提供有效 `Retry-After` 時，分別等待 10、20 秒再重連，讓上游有時間恢復。有效 `Retry-After` 優先使用，上限 30 秒；Chat 與 Codex Responses 共用退避規則。等待期間透過既有 `agent.progress` 顯示重試狀態，可由停止操作或 Run 時間預算中止，不重新建立 Run 或重跑先前工具。已送出**回答文字或工具呼叫 delta** 就不自動重送——那是這一輪真正的產出，重來一次會變成兩份；次數耗盡後回報失敗。
+
+  **思考 delta 不阻擋重試。** 它曾經也算在內，理由是 durable event log 會出現無法去重的重複片段；但代價是一次跑了一分多鐘的推理遇到上游暫時性錯誤就整個作廢、連重試都不會發生，使用者什麼都拿不到。重試前本來就會送出 `agent.progress`（「準備第 N/M 次嘗試」）並寫進 event log，兩段思考在紀錄上有明確分界。
+- 串流中的錯誤封包若含上游自己的重試建議（`you can retry your request`）或通用暫時性錯誤措辭，視為可重試。上游對這次失敗性質的宣告比從訊息文字猜測可靠，而金鑰錯誤、額度用盡、權限不足這類永久性失敗不會這樣寫。
 - 每次請求送出 `X-Client-Request-Id`，並將 Provider 回傳的 `x-request-id` 保存於 assistant message 與 turn record；API key 不會出現在診斷資料。
 - Provider HTTP 錯誤解析為 status、code、request ID、可重試狀態與受限長度訊息。
 - 串流錯誤同樣辨識暫時過載與服務不可用；Responses 失敗會讀取 `response.error`，而非將整個事件當成錯誤文字。相容舊代理時，以代理模型與保留的 refusal response ID 識別「成功封包內的上游失敗」，在送出回答 delta 前轉為 Provider 錯誤；不以一般回答中的文字判定失敗。可重試錯誤沿用次數上限與退避，其他拒絕直接結束 Run，不進入空回答補問流程。

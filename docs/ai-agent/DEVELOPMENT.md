@@ -212,6 +212,13 @@ go run -buildvcs=false ./src/cmd/server -config ./configs/ai-agent/config.exampl
 go run -buildvcs=false ./src/cmd/desktop -config ./configs/ai-agent/config.example.json
 ```
 
+`data_dir` 預設是相對路徑（`data/ai-agent`），相對於**工作目錄**解析。從 Finder、Dock 或開始
+選單啟動時工作目錄是根目錄，那在 macOS 上是唯讀的——後端建不出資料夾就直接退出，畫面只會
+顯示「後端未啟動」。因此沒有指定 `-working-dir` 時，桌面程式會先實際測試目前工作目錄能不能
+寫入，不行才改用使用者資料夾（macOS 為 `~/Library/Application Support/NR-Intern`）。
+用寫入測試而不是比對路徑，才涵蓋得到唯讀磁碟與無權限目錄。從專案目錄直接執行時工作目錄
+可寫，行為不變，仍使用該目錄下的 `data/ai-agent`。
+
 桌面 UI 預設使用 `http://127.0.0.1:8790`，後端使用 `http://127.0.0.1:8787`。如果後端已存在，桌面只連接；否則桌面會啟動自己的 backend child。
 
 連接其他已啟動後端：
@@ -222,6 +229,13 @@ go run -buildvcs=false ./src/cmd/desktop \
   -backend-url http://127.0.0.1:9000 \
   -backend-token YOUR_TOKEN
 ```
+
+Windows 版也有原生視窗：與 macOS 共用 `webview_go`，在 Windows 上走 WebView2，
+因此 Console 注入的三個回呼名稱兩邊一致，前端不必分平台判斷。這需要 cgo，而從 macOS
+交叉編譯需要 MinGW——`x86_64`／`aarch64-w64-mingw32-gcc`，PATH 找不到時退回可攜式
+LLVM-MinGW（預設 `~/.local/share/yourdesk/toolchains/llvm-mingw`，可用 `NR_INTERN_LLVM_MINGW`
+指定）。找不到該架構的編譯器就退回無視窗版本：那個版本仍然可用，只是啟動時開的是預設瀏覽器。
+目標機器需要 WebView2 Runtime；Win11 內建，Win10 可能要另外安裝。
 
 macOS 版啟動時就建立狀態列項目；Windows 版啟動時就建立 Tray Icon。對話進行中關閉主視窗可
 選擇只隱藏 UI，Run 會繼續由後端執行；狀態列／Tray 選單可顯示、隱藏或真正結束程式。若再次
@@ -284,8 +298,16 @@ macOS 以 `osascript` 的 `choose file name` 實作，與資料夾選擇同一�
 8790 不會有它。用它而不是伺服器端判斷，是因為遠端瀏覽器連進來時，伺服器端判斷會讓存檔面板
 彈在**主機**的螢幕上。使用者在面板按取消時前端保持安靜，不會再默默下載一份到下載資料夾。
 
-macOS 以外沒有原生面板實作，會回 `501` 並退回瀏覽器下載；Windows 的 WebView2 有內建下載處理，
-但這條路未在 Windows 上實測。
+Windows 的原生對話框（存檔面板、Sandbox 目錄選擇器）透過 PowerShell 叫用系統元件，與 macOS
+走 `osascript` 是同一個形狀——用系統自己的腳本宿主，不必為了兩個對話框引入 COM 綁定。桌面版是
+GUI subsystem 程式、本身沒有 console，因此這些子程序與 `shell_exec` 都要帶 `CREATE_NO_WINDOW`
+與 `HideWindow`，否則每次執行都會閃過一個黑框。
+
+**拖放目錄取得路徑只有 macOS 做得到。** macOS 的拖放剪貼簿（`NSPasteboardNameDrag`）在放開之後
+仍然存在，原生層可以事後讀回路徑；Windows 的 OLE 拖放資料只在拖放進行中存在，而且直接交給
+WebView 自己的放置目標。要攔截就得對 WebView 子視窗 `RevokeDragDrop` 再註冊自己的 `IDropTarget`，
+那會連帶接管整個視窗的拖放、破壞聊天輸入區的附件拖放。因此取不到路徑時直接開啟目錄選擇器並
+說明原因——使用者要的只是把目錄加進來，不該停在一句錯誤上。
 
 URL、帳號、路徑、command／args 等即使在遮蔽模式下仍可能含敏感內容，分享前務必人工檢查，
 完整限制見 [安全設計](SECURITY.md)。
@@ -338,6 +360,11 @@ go test -buildvcs=false ./src/...
 ## 跨平台發行
 
 專案支援 Windows x64、Windows ARM64 與 macOS ARM64。發行封裝、版本產生、安裝檔建立、完整性清單與簽章均由維護者的內部流程處理；公開文件不提供封裝命令、參數、工具位置或簽章設定。
+
+Windows 的安裝檔是 `setup.exe`（先前為 `.msi`）。改用 NSIS 的理由是跨平台建置：MSI 需要只跑在
+Windows 的 WiX，或 msitools 的 wixl——後者對 ARM64 的支援要靠事後改寫 Summary Template 才勉強
+成立。安裝為**每位使用者**，裝在 `%LOCALAPPDATA%\Programs\NR-Intern`，不需要系統管理員、
+不跳 UAC，並在「應用程式與功能」中提供移除項目。
 
 發行產物不得內嵌實際設定、Provider API Key、SSH 憑證或開發者電腦的絕對路徑。部署時應另外提供受保護的本機設定，並在發布前檢查產物與版本庫是否含有敏感資訊。
 
