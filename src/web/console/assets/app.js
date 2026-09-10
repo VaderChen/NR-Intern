@@ -6541,14 +6541,18 @@ async function handleProjectFolderDrop(event, mode) {
   try {
     const nativeRoots = await desktop("folders/dropped", { method: "POST", body: "{}" });
     if (nativeRoots) roots.push(...nativeRoots);
-  } catch (error) {
-    if (roots.length === 0) {
-      toast(error.message);
-      return;
-    }
+  } catch (_) {
+    // 錯誤本身不重要，拿不到路徑才重要；下面統一處理。
   }
   if (roots.length === 0) {
-    toast("系統未提供拖入目錄的絕對路徑，請改用目錄選擇器");
+    // 不是每個系統都取得回拖放的路徑。macOS 的拖放剪貼簿在放開之後仍然存在，
+    // 原生層可以事後讀回來；Windows 的拖放資料只在拖放進行中存在，而且直接
+    // 交給 WebView 自己的放置目標，事後無從取得。
+    //
+    // 與其讓使用者停在一句錯誤訊息上——他要的只是把一個目錄加進來——
+    // 直接把目錄選擇器打開，把失敗的拖放接成他本來就要做的那個動作。
+    toast(translate("這個系統無法從拖放取得目錄路徑，已為你開啟目錄選擇器"));
+    await pickProjectSandboxRoots(mode);
     return;
   }
   addProjectSandboxRoots(mode, [...new Set(roots)]);

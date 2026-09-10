@@ -35,7 +35,14 @@ func (windowsAdapter) ShellCommand(shellName, script string) (*exec.Cmd, error) 
 }
 
 func (windowsAdapter) Prepare(command *exec.Cmd) {
-	command.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NEW_PROCESS_GROUP}
+	// CREATE_NO_WINDOW 與 HideWindow 一起設：桌面版是 GUI subsystem 程式，
+	// 沒有自己的 console，每次執行工具都會另外建立一個並且一閃而過。
+	// 使用者看到的是畫面上不斷閃黑框，而那些視窗沒有任何用途——輸出是用
+	// 管道收的，不靠 console 顯示。
+	command.SysProcAttr = &windows.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW,
+	}
 }
 
 func (windowsAdapter) Attach(command *exec.Cmd) processGroup {
