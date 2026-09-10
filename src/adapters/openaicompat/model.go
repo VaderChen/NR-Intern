@@ -117,9 +117,18 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 	return domain.ModelResponse{}, lastErr
 }
 
+// observableModelOutput 判斷這個事件是否讓重試變得不安全。
+//
+// 規則是「重試會不會產生重複的產出」。回答文字與工具呼叫參數會：那是這一輪
+// 真正的結果，重來一次就是兩份。
+//
+// 思考內容曾經也算在內，理由是 durable event log 會出現無法去重的重複片段。
+// 但代價太大——一次跑了一分多鐘的推理，遇到上游暫時性錯誤就整個作廢、連重試
+// 都不會發生，使用者什麼都拿不到。而且重試前本來就會送出 agent.progress
+// （「準備第 N/M 次嘗試」）寫進 event log，兩段思考在紀錄上有明確分界。
 func observableModelOutput(eventType string) bool {
 	switch eventType {
-	case domain.ModelEventTextDelta, domain.ModelEventThinkingDelta, domain.ModelEventToolCallDelta:
+	case domain.ModelEventTextDelta, domain.ModelEventToolCallDelta:
 		return true
 	default:
 		return false

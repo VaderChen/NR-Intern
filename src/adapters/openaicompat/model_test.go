@@ -76,19 +76,17 @@ func TestMessagesKeepSystemHostToolsPhaseContextHistoryAndUserSeparate(t *testin
 	}
 }
 
-// TestStreamDoesNotRetryAfterObservableStructuredDelta 防止 thinking 或 tool-call
-// 已送到前端後又重試，否則 durable event log 會出現無法去重的重複片段。
+// TestStreamDoesNotRetryAfterObservableStructuredDelta 防止工具呼叫參數已送到
+// 前端後又重試，否則會產生兩份真正的產出。
+//
+// thinking 不在此列：它曾經也算，但一次長推理因為上游暫時性錯誤就整個作廢的
+// 代價太大，而重試前送出的 agent.progress 已經在 event log 留下分界。
 func TestStreamDoesNotRetryAfterObservableStructuredDelta(t *testing.T) {
 	tests := []struct {
 		name  string
 		chunk string
 		type_ string
 	}{
-		{
-			name:  "thinking",
-			chunk: `{"choices":[{"delta":{"reasoning_content":"思考中"}}]}`,
-			type_: domain.ModelEventThinkingDelta,
-		},
 		{
 			name:  "tool call",
 			chunk: `{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"file_read","arguments":"{\\\"path\\\":"}}]}}]}`,

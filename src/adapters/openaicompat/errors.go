@@ -101,7 +101,20 @@ func retryableStreamError(code, message string) bool {
 		return false
 	}
 	text := strings.ToLower(message)
-	return strings.Contains(text, "servers are currently overloaded") || strings.Contains(text, "temporarily unavailable")
+	// 上游自己說可以重試就照做——那是它對這次失敗性質的宣告，比我們從訊息
+	// 猜測可靠。OpenAI 的通用暫時性錯誤就是這個措辭，而金鑰錯誤、額度用盡
+	// 這類永久性失敗不會這樣寫。
+	for _, pattern := range []string{
+		"servers are currently overloaded",
+		"temporarily unavailable",
+		"you can retry your request",
+		"an error occurred while processing your request",
+	} {
+		if strings.Contains(text, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 // 舊代理把失敗偽裝為成功訊息；以代理模型與保留 ID 辨識封包，
