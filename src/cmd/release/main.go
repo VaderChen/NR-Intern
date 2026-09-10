@@ -611,6 +611,14 @@ func buildWindowsInstaller(platformDirectory string, version releaseVersion, val
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	if err := command.Run(); err != nil {
+		// optional 的意思是「安裝檔可有可無」，那就不能只涵蓋「找不到工具」。
+		// 封裝器存在卻失敗同樣是拿不到安裝檔，讓它中止整個流程等於連 macOS
+		// 的 DMG 都發不出來——而 Windows 產物本來就未簽章、不會上 Release。
+		if mode == installerOptional {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: 封裝 %s 安裝檔失敗（%v），已保留 Windows 執行檔並略過安裝檔\n",
+				value.directoryName(), err)
+			return nil
+		}
 		return fmt.Errorf("封裝 %s 安裝檔: %w", value.directoryName(), err)
 	}
 	if err := os.Rename(stagedPath, installerPath); err != nil {
