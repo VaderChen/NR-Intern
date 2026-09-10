@@ -12,8 +12,8 @@ RELEASE_VERSION="${NR_INTERN_VERSION:-}"
 MAC_ICON_PATH="${NR_INTERN_MAC_ICON_PATH:-assets/app-icon.icns}"
 WINDOWS_ICON_PATH="${NR_INTERN_WINDOWS_ICON_PATH:-assets/app-icon.ico}"
 # run.command 會沿用本檔建立本機執行檔，因此開發機未安裝 WiX 時仍須可啟動。
-# 正式發行可設為 required；有 wix 時 optional 仍會正常產生兩種 MSI。
-MSI_MODE="${NR_INTERN_MSI_MODE:-optional}"
+# 正式發行可設為 required；裝了 makensis 時 optional 仍會正常產生兩種安裝檔。
+INSTALLER_MODE="${NR_INTERN_INSTALLER_MODE:-optional}"
 BUILD_STAGE=""
 
 cleanup_stage() {
@@ -119,7 +119,7 @@ release_arguments=(
 	-output "$DIST_OUTPUT_DIR"
 	-targets "$RELEASE_TARGETS"
 	-version "$RELEASE_VERSION"
-	-msi "$MSI_MODE"
+	-installer "$INSTALLER_MODE"
 	-mac-icon "$MAC_ICON_PATH"
 	-windows-icon "$WINDOWS_ICON_PATH"
 )

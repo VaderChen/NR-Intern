@@ -48,17 +48,6 @@ func (value target) directoryName() string {
 	}
 }
 
-func (value target) wixArchitecture() (string, error) {
-	switch value.arch {
-	case "amd64":
-		return "x64", nil
-	case "arm64":
-		return "arm64", nil
-	default:
-		return "", fmt.Errorf("WiX 不支援 %s 架構", value.arch)
-	}
-}
-
 type releaseVersion struct {
 	display        string
 	directory      string
@@ -77,12 +66,12 @@ type releaseAssets struct {
 	windowsIcon string
 }
 
-type msiMode string
+type installerMode string
 
 const (
-	msiRequired msiMode = "required"
-	msiOptional msiMode = "optional"
-	msiSkip     msiMode = "skip"
+	installerRequired installerMode = "required"
+	installerOptional installerMode = "optional"
+	installerSkip     installerMode = "skip"
 )
 
 func main() {
@@ -90,26 +79,26 @@ func main() {
 	version := flag.String("version", defaultVersion, "發行版本，格式為 1.YY.MMDD build HHmm")
 	output := flag.String("output", "dist", "輸出目錄")
 	targets := flag.String("targets", defaultTargets, "逗號分隔 GOOS/GOARCH")
-	msi := flag.String("msi", string(msiRequired), "Windows MSI 模式：required、optional 或 skip")
+	installer := flag.String("installer", string(installerRequired), "Windows 安裝檔模式：required、optional 或 skip")
 	macIcon := flag.String("mac-icon", "", "macOS App 使用的 ICNS 圖示檔")
-	windowsIcon := flag.String("windows-icon", "", "Windows MSI 使用的 ICO 圖示檔")
+	windowsIcon := flag.String("windows-icon", "", "Windows 安裝檔使用的 ICO 圖示檔")
 	flag.Parse()
 	assets := releaseAssets{
 		macIcon:     strings.TrimSpace(*macIcon),
 		windowsIcon: strings.TrimSpace(*windowsIcon),
 	}
-	if err := build(strings.TrimSpace(*version), strings.TrimSpace(*output), *targets, msiMode(strings.TrimSpace(*msi)), assets); err != nil {
+	if err := build(strings.TrimSpace(*version), strings.TrimSpace(*output), *targets, installerMode(strings.TrimSpace(*installer)), assets); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func build(rawVersion, output, rawTargets string, windowsMSI msiMode, assetPaths releaseAssets) error {
+func build(rawVersion, output, rawTargets string, windowsInstaller installerMode, assetPaths releaseAssets) error {
 	version, err := parseReleaseVersion(rawVersion)
 	if err != nil {
 		return err
 	}
-	if err := validateMSIMode(windowsMSI); err != nil {
+	if err := validateInstallerMode(windowsInstaller); err != nil {
 		return err
 	}
 	values, err := parseTargets(rawTargets)
@@ -182,7 +171,7 @@ func build(rawVersion, output, rawTargets string, windowsMSI msiMode, assetPaths
 				return err
 			}
 		case "windows":
-			if err := buildWindowsInstaller(platformDirectory, version, value, windowsMSI, assets); err != nil {
+			if err := buildWindowsInstaller(platformDirectory, version, value, windowsInstaller, assets); err != nil {
 				return err
 			}
 		}
@@ -570,202 +559,148 @@ func macInfoPlist(version releaseVersion) string {
 `, escape(version.display), escape(version.bundleVersion), escape(version.bundleBuild))
 }
 
-func buildWindowsInstaller(platformDirectory string, version releaseVersion, value target, mode msiMode, assets releaseAssets) error {
-	if mode == msiSkip {
+// buildWindowsInstaller 產生 Windows 安裝檔。
+//
+// 用 NSIS 而不是 MSI：MSI 需要 WiX（只跑在 Windows）或 msitools 的 wixl，後者對
+// ARM64 的支援要靠事後改寫 Summary Template 才勉強成立。NSIS 的 makensis 在 macOS
+// 上是一級公民，同一份腳本兩種架構都產得出來，輸出也是使用者預期的 setup.exe。
+//
+// 腳本是靜態檔而不是這裡拼出來的字串：安裝流程有語系、架構檢查與檔案佔用處理，
+// 那些東西寫成 Go 的字串樣板既難讀也難改，用 -D 傳參數就夠了。
+func buildWindowsInstaller(platformDirectory string, version releaseVersion, value target, mode installerMode, assets releaseAssets) error {
+	if mode == installerSkip {
 		return nil
 	}
-	toolKind, toolPath := windowsInstallerTool()
-	if toolPath == "" {
-		message := "找不到 Windows MSI 封裝器；Windows 可安裝 WiX CLI，macOS／Linux 可安裝 msitools（wixl 與 msibuild）"
-		if mode == msiOptional {
-			_, _ = fmt.Fprintf(os.Stderr, "warning: %s，已保留 Windows 執行檔並略過 MSI\n", message)
+	toolPath := windowsInstallerTool()
+	scriptPath, scriptErr := windowsInstallerScriptPath()
+	if toolPath == "" || scriptErr != nil {
+		message := "找不到 Windows 安裝檔封裝器；請安裝 NSIS（macOS 執行 brew install nsis），或以 NR_INTERN_MAKENSIS 指定 makensis"
+		if scriptErr != nil {
+			message = scriptErr.Error()
+		}
+		if mode == installerOptional {
+			_, _ = fmt.Fprintf(os.Stderr, "warning: %s，已保留 Windows 執行檔並略過安裝檔\n", message)
 			return nil
 		}
 		return fmt.Errorf("%s", message)
 	}
-	wixArch, err := value.wixArchitecture()
-	if err != nil {
-		return err
-	}
-	sourcePath := filepath.Join(platformDirectory, ".nr-intern-installer.wxs")
-	source := windowsInstallerSource(platformDirectory, version, value, assets.windowsIcon)
-	if toolKind == "wixl" {
-		source = windowsInstallerSourceWiX3(platformDirectory, version, value, assets.windowsIcon)
-	}
-	if err := os.WriteFile(sourcePath, []byte(source), 0o600); err != nil {
-		return fmt.Errorf("寫入 WiX 安裝描述: %w", err)
-	}
-	defer os.Remove(sourcePath)
-	installerName := fmt.Sprintf("NR-Intern-%s-%s.msi", version.directory, value.directoryName())
+	installerName := fmt.Sprintf("NR-Intern-%s-%s-setup.exe", version.directory, value.directoryName())
 	installerPath := filepath.Join(platformDirectory, installerName)
-	var command *exec.Cmd
-	if toolKind == "wixl" {
-		// msitools 目前以 x64 模式建立所有 64 位元元件；ARM64 的 PE 檔案與
-		// 64-bit Component 屬性相同，完成後再把 MSI Summary Template 正確標為 Arm64。
-		command = exec.Command(toolPath, "-a", "x64", "-o", installerPath, sourcePath)
-	} else {
-		command = exec.Command(toolPath, "build", "-arch", wixArch, "-o", installerPath, sourcePath)
+	// 先產在暫存目錄再搬進來：makensis 中途失敗會留下半個檔案，而發行流程
+	// 只憑檔名存在就認定封裝成功。
+	staging, err := os.MkdirTemp(platformDirectory, ".installer-")
+	if err != nil {
+		return fmt.Errorf("建立安裝檔暫存目錄: %w", err)
 	}
+	defer os.RemoveAll(staging)
+	stagedPath := filepath.Join(staging, installerName)
+
+	arguments := []string{
+		"-V2",
+		"-DPAYLOAD_DIR=" + platformDirectory,
+		"-DOUTPUT_FILE=" + stagedPath,
+		"-DAPP_VERSION=" + version.display,
+		"-DNUMERIC_VERSION=" + version.packageVersion + ".0",
+		"-DAPP_ARCH=" + value.arch,
+		"-DINSTALLER_ICON=" + assets.windowsIcon,
+	}
+	if windowsNetPassPayload(platformDirectory) != "" {
+		arguments = append(arguments, "-DWITH_NETPASS=1")
+	}
+	command := exec.Command(toolPath, append(arguments, scriptPath)...)
 	command.Stdout = os.Stdout
 	command.Stderr = os.Stderr
 	if err := command.Run(); err != nil {
-		return fmt.Errorf("封裝 %s MSI: %w", value.directoryName(), err)
+		return fmt.Errorf("封裝 %s 安裝檔: %w", value.directoryName(), err)
 	}
-	if toolKind == "wixl" && value.arch == "arm64" {
-		msibuild, err := exec.LookPath("msibuild")
-		if err != nil {
-			return fmt.Errorf("ARM64 MSI 需要 msibuild 修正 Summary Template: %w", err)
-		}
-		command = exec.Command(msibuild, installerPath, "-s", "NR-Intern "+version.display, "NR-Intern", "Arm64;1033")
-		command.Stdout = os.Stdout
-		command.Stderr = os.Stderr
-		if err := command.Run(); err != nil {
-			return fmt.Errorf("設定 ARM64 MSI 平台資訊: %w", err)
-		}
+	if err := os.Rename(stagedPath, installerPath); err != nil {
+		return fmt.Errorf("搬移 %s 安裝檔: %w", value.directoryName(), err)
 	}
 	_, _ = fmt.Fprintf(os.Stdout, "packaged %s\n", installerPath)
 	return nil
 }
 
-func windowsInstallerTool() (kind, path string) {
-	if configured := strings.TrimSpace(os.Getenv("NR_INTERN_WIX")); configured != "" {
-		return "wix", configured
+func windowsInstallerTool() string {
+	if configured := strings.TrimSpace(os.Getenv("NR_INTERN_MAKENSIS")); configured != "" {
+		return configured
 	}
-	if configured := strings.TrimSpace(os.Getenv("NR_INTERN_WIXL")); configured != "" {
-		return "wixl", configured
+	if found, err := exec.LookPath("makensis"); err == nil {
+		return found
 	}
-	// 官方 WiX CLI 只支援 Windows；Unix 優先使用專為交叉封裝設計的 msitools。
-	if runtime.GOOS != "windows" {
-		if found, err := exec.LookPath("wixl"); err == nil {
-			return "wixl", found
-		}
-	}
-	if found, err := exec.LookPath("wix"); err == nil {
-		return "wix", found
-	}
-	if found, err := exec.LookPath("wixl"); err == nil {
-		return "wixl", found
-	}
-	return "", ""
+	return ""
 }
 
-func windowsInstallerSource(platformDirectory string, version releaseVersion, value target, iconPath string) string {
-	escape := html.EscapeString
-	netPassDirectory, netPassFeature := windowsNetPassInstallerFragments(platformDirectory, true)
-	upgradeCode := "8BFA111E-7AF2-45CE-A85E-270118822277"
-	if value.arch == "arm64" {
-		upgradeCode = "7F20A37E-76B5-48B4-BD68-F485EC6925B4"
+func windowsInstallerScriptPath() (string, error) {
+	path, err := filepath.Abs(filepath.Join("scripts", "windows-installer.nsi"))
+	if err != nil {
+		return "", fmt.Errorf("解析安裝檔腳本路徑: %w", err)
 	}
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="NR-Intern" Manufacturer="NR-Intern" Version="%s" UpgradeCode="%s" Language="1033" Scope="perMachine" InstallerVersion="500" Compressed="yes">
-    <SummaryInformation Description="NR-Intern %s" Manufacturer="NR-Intern" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of NR-Intern is already installed." />
-    <MediaTemplate EmbedCab="yes" />
-    <Property Id="ARPCOMMENTS" Value="NR-Intern %s" />
-    <Icon Id="ProductIcon" SourceFile="%s" />
-    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
-    <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="NRIntern">
-        <Component Id="DesktopExecutableComponent" Guid="*" Bitness="always64">
-          <File Id="DesktopExecutable" Source="%s" KeyPath="yes" />
-        </Component>
-        <Component Id="ServerExecutableComponent" Guid="*" Bitness="always64">
-          <File Id="ServerExecutable" Source="%s" KeyPath="yes" />
-        </Component>
-%s
-      </Directory>
-    </StandardDirectory>
-    <Feature Id="ProductFeature" Title="NR-Intern" Level="1">
-      <ComponentRef Id="DesktopExecutableComponent" />
-      <ComponentRef Id="ServerExecutableComponent" />
-%s
-    </Feature>
-  </Package>
-</Wix>
-`,
-		escape(version.packageVersion),
-		escape(upgradeCode),
-		escape(version.display),
-		escape(version.display),
-		escape(iconPath),
-		escape(filepath.Join(platformDirectory, "nr-intern-desktop.exe")),
-		escape(filepath.Join(platformDirectory, "nr-intern-server.exe")),
-		netPassDirectory,
-		netPassFeature,
-	)
+	if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+		return "", fmt.Errorf("找不到安裝檔腳本 %s；請從專案根目錄執行", path)
+	}
+	return path, nil
 }
 
-func windowsInstallerSourceWiX3(platformDirectory string, version releaseVersion, value target, iconPath string) string {
-	escape := html.EscapeString
-	netPassDirectory, netPassFeature := windowsNetPassInstallerFragments(platformDirectory, false)
-	upgradeCode := "{8BFA111E-7AF2-45CE-A85E-270118822277}"
-	if value.arch == "arm64" {
-		upgradeCode = "{7F20A37E-76B5-48B4-BD68-F485EC6925B4}"
-	}
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="NR-Intern" Manufacturer="NR-Intern" Version="%s" Language="1033" UpgradeCode="%s">
-    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Description="NR-Intern %s" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of NR-Intern is already installed." />
-    <MediaTemplate EmbedCab="yes" />
-    <Property Id="ARPCOMMENTS" Value="NR-Intern %s" />
-    <Icon Id="ProductIcon" SourceFile="%s" />
-    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
-    <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="NRIntern">
-          <Component Id="DesktopExecutableComponent" Guid="*" Win64="yes">
-            <File Id="DesktopExecutable" Source="%s" KeyPath="yes" />
-          </Component>
-          <Component Id="ServerExecutableComponent" Guid="*" Win64="yes">
-            <File Id="ServerExecutable" Source="%s" KeyPath="yes" />
-          </Component>
-%s
-        </Directory>
-      </Directory>
-    </Directory>
-    <Feature Id="ProductFeature" Title="NR-Intern" Level="1">
-      <ComponentRef Id="DesktopExecutableComponent" />
-      <ComponentRef Id="ServerExecutableComponent" />
-%s
-    </Feature>
-  </Product>
-</Wix>
-`,
-		escape(version.packageVersion),
-		escape(upgradeCode),
-		escape(version.display),
-		escape(version.display),
-		escape(iconPath),
-		escape(filepath.Join(platformDirectory, "nr-intern-desktop.exe")),
-		escape(filepath.Join(platformDirectory, "nr-intern-server.exe")),
-		netPassDirectory,
-		netPassFeature,
-	)
-}
-
-func windowsNetPassInstallerFragments(platformDirectory string, wix4 bool) (directory, feature string) {
+// windowsNetPassPayload 回傳要一併安裝的 NetPass Client；沒有就回空字串。
+func windowsNetPassPayload(platformDirectory string) string {
 	path := filepath.Join(platformDirectory, "netpass-client", "NetPassClient.exe")
 	info, err := os.Stat(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return "", ""
+		return ""
 	}
-	escapedPath := html.EscapeString(path)
-	if wix4 {
-		directory = fmt.Sprintf(`        <Directory Id="NetPassClientDirectory" Name="netpass-client">
-          <Component Id="NetPassClientComponent" Guid="*" Bitness="always64">
-            <File Id="NetPassClientExecutable" Source="%s" KeyPath="yes" />
-          </Component>
-        </Directory>`, escapedPath)
-	} else {
-		directory = fmt.Sprintf(`          <Directory Id="NetPassClientDirectory" Name="netpass-client">
-            <Component Id="NetPassClientComponent" Guid="*" Win64="yes">
-              <File Id="NetPassClientExecutable" Source="%s" KeyPath="yes" />
-            </Component>
-          </Directory>`, escapedPath)
+	return path
+}
+
+// windowsToolchainRoot 是可攜式 LLVM-MinGW 的預設位置。
+//
+// 交叉編譯 Windows 的 cgo 需要 MinGW，而 Homebrew 只提供 x86_64；ARM64 要靠
+// LLVM-MinGW 這種同時涵蓋兩種架構的可攜式工具鏈。路徑只存在於開發機，
+// 不會進入發行套件。
+func windowsToolchainRoot() string {
+	if configured := strings.TrimSpace(os.Getenv("NR_INTERN_LLVM_MINGW")); configured != "" {
+		return configured
 	}
-	return directory, `      <ComponentRef Id="NetPassClientComponent" />`
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "yourdesk", "toolchains", "llvm-mingw")
+}
+
+// windowsTool 找出指定架構的 MinGW 工具；PATH 優先，其次才是可攜式工具鏈。
+func windowsTool(arch, kind string) string {
+	if configured := strings.TrimSpace(os.Getenv(fmt.Sprintf("NR_INTERN_%s_WINDOWS_%s", strings.ToUpper(kind), strings.ToUpper(arch)))); configured != "" {
+		return configured
+	}
+	prefix := "x86_64"
+	if arch == "arm64" {
+		prefix = "aarch64"
+	}
+	suffixes := map[string][]string{
+		"cc":      {"gcc", "clang"},
+		"cxx":     {"g++", "clang++"},
+		"windres": {"windres"},
+	}[strings.ToLower(kind)]
+	names := make([]string, 0, len(suffixes))
+	for _, suffix := range suffixes {
+		names = append(names, fmt.Sprintf("%s-w64-mingw32-%s", prefix, suffix))
+	}
+	for _, name := range names {
+		if found, err := exec.LookPath(name); err == nil {
+			return found
+		}
+	}
+	root := windowsToolchainRoot()
+	if root == "" {
+		return ""
+	}
+	for _, name := range names {
+		candidate := filepath.Join(root, "bin", name)
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func buildEnvironment(value target) []string {
@@ -782,7 +717,18 @@ func buildEnvironment(value target) []string {
 	if nativeWindowSupported(value) {
 		cgo = "1"
 	}
-	return append(environment, "GOOS="+value.os, "GOARCH="+value.arch, "CGO_ENABLED="+cgo)
+	environment = append(environment, "GOOS="+value.os, "GOARCH="+value.arch, "CGO_ENABLED="+cgo)
+	// 交叉編譯 Windows 的 cgo 必須明確指定編譯器；Go 預設會找主機的 gcc，
+	// 那是 macOS 的 clang，產不出 PE 目標檔。
+	if cgo == "1" && value.os == "windows" {
+		if compiler := windowsTool(value.arch, "cc"); compiler != "" {
+			environment = append(environment, "CC="+compiler)
+		}
+		if compiler := windowsTool(value.arch, "cxx"); compiler != "" {
+			environment = append(environment, "CXX="+compiler)
+		}
+	}
+	return environment
 }
 
 // nativeWindowSupported 判斷這個 target 的桌面程式能否內含原生視窗。
@@ -791,7 +737,16 @@ func buildEnvironment(value target) []string {
 // 交叉建置 darwin 目標。若一律使用 CGO_ENABLED=0，發行的 macOS 二進位會永遠
 // 退回開啟瀏覽器——功能只存在於本機建置，這種落差不能靜默發生。
 func nativeWindowSupported(value target) bool {
-	return value.os == "darwin" && runtime.GOOS == "darwin" && value.arch == runtime.GOARCH
+	if value.os == "darwin" {
+		// Cocoa 的 WebKit 綁定只能在 macOS 主機上以相同架構編譯。
+		return runtime.GOOS == "darwin" && value.arch == runtime.GOARCH
+	}
+	if value.os == "windows" {
+		// WebView2 綁定同樣要 cgo，但可以交叉編譯——只要找得到該架構的 MinGW。
+		// 找不到就退回無視窗版本：那個版本仍然可用，只是開的是瀏覽器。
+		return windowsTool(value.arch, "cc") != "" && windowsTool(value.arch, "cxx") != ""
+	}
+	return false
 }
 
 func parseTargets(raw string) ([]target, error) {
@@ -863,12 +818,12 @@ func parseReleaseVersion(value string) (releaseVersion, error) {
 	}, nil
 }
 
-func validateMSIMode(value msiMode) error {
+func validateInstallerMode(value installerMode) error {
 	switch value {
-	case msiRequired, msiOptional, msiSkip:
+	case installerRequired, installerOptional, installerSkip:
 		return nil
 	default:
-		return fmt.Errorf("msi 模式必須是 required、optional 或 skip")
+		return fmt.Errorf("installer 模式必須是 required、optional 或 skip")
 	}
 }
 
