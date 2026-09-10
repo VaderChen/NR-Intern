@@ -62,6 +62,8 @@ func main() {
 		if err := os.Chdir(value.workingDir); err != nil {
 			fatal(fmt.Errorf("切換工作目錄: %w", err))
 		}
+	} else if err := ensureWritableWorkingDirectory(); err != nil {
+		fatal(err)
 	}
 
 	if value.backendChild {
@@ -269,6 +271,45 @@ func writeStartupReady(path string) error {
 		return fmt.Errorf("寫入啟動訊號檔: %w", err)
 	}
 	return nil
+}
+
+// ensureWritableWorkingDirectory 在工作目錄不可寫時改用使用者專屬資料夾。
+//
+// data_dir 預設是相對路徑（data/ai-agent），會相對於工作目錄解析。從 Finder、
+// Dock 或開始選單啟動時工作目錄是根目錄，而 macOS 的根目錄唯讀——後端建不出
+// 資料夾就直接退出，畫面上只會顯示「後端未啟動」，看不出原因。實測是安裝到
+// 另一台 Mac 之後才發現，因為開發機的啟動腳本一直有帶 -working-dir。
+//
+// 只在真的不可寫時才改：從專案目錄直接執行時仍然使用該目錄下的 data/ai-agent，
+// 開發流程不受影響。判斷用實際寫入測試而不是比對路徑字串，那才涵蓋得到
+// 唯讀磁碟、無權限目錄這些同樣會失敗的情況。
+func ensureWritableWorkingDirectory() error {
+	if directoryIsWritable(".") {
+		return nil
+	}
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return fmt.Errorf("找不到使用者資料夾，且目前工作目錄不可寫入: %w", err)
+	}
+	directory := filepath.Join(base, "NR-Intern")
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		return fmt.Errorf("建立資料目錄 %s: %w", directory, err)
+	}
+	if err := os.Chdir(directory); err != nil {
+		return fmt.Errorf("切換到資料目錄 %s: %w", directory, err)
+	}
+	return nil
+}
+
+func directoryIsWritable(path string) bool {
+	file, err := os.CreateTemp(path, ".nr-intern-write-test-*")
+	if err != nil {
+		return false
+	}
+	name := file.Name()
+	_ = file.Close()
+	_ = os.Remove(name)
+	return true
 }
 
 func runBackendChild(value options) {
