@@ -17,6 +17,7 @@ const (
 	wmTrayCallback = wmApp + 1
 	wmLButtonUp    = 0x0202
 	wmRButtonUp    = 0x0205
+	wmContextMenu  = 0x007B
 	wmClose        = 0x0010
 	swHide         = 0
 	mfString       = 0x00000000
@@ -32,6 +33,10 @@ const (
 	nifInfo        = 0x00000010
 	notifyVersion  = 4
 	idiApplication = 32512
+	wmSetIcon      = 0x0080
+	iconSmall      = 0
+	iconBig        = 1
+	appIconResID   = 1
 	openCommand    = 1001
 	quitCommand    = 1002
 )
@@ -86,6 +91,7 @@ type trayController struct {
 	className   *uint16
 	title       string
 	url         string
+	icon        syscall.Handle
 	openOnStart bool
 }
 
@@ -142,7 +148,10 @@ func newTrayController(options Options) (*trayController, error) {
 		controller.title = "NR-Intern"
 	}
 	instance, _, _ := getModuleHandle.Call(0)
-	icon, _, _ := loadIcon.Call(0, idiApplication)
+	// 先載入執行檔內嵌的圖示（資源 ID 1，由建置時的 windres 產生），
+	// 沒有才退回系統通用圖示——那是「看得到但不是我們」的樣子，
+	// 比完全沒有圖示好，但不該是正常情況。
+	icon := loadApplicationIcon()
 	if icon == 0 {
 		return nil, fmt.Errorf("load system tray icon")
 	}
@@ -169,15 +178,11 @@ func newTrayController(options Options) (*trayController, error) {
 	}
 	controller.hwnd = syscall.Handle(hwnd)
 	showWindow.Call(hwnd, swHide)
-	data := notifyIconData{
-		cbSize:          uint32(unsafe.Sizeof(notifyIconData{})),
-		hwnd:            controller.hwnd,
-		uid:             1,
-		flags:           nifMessage | nifIcon | nifTip,
-		callbackMessage: wmTrayCallback,
-		icon:            syscall.Handle(icon),
-	}
-	copy(data.tip[:], syscall.StringToUTF16(controller.title))
+	controller.icon = syscall.Handle(icon)
+	// 視窗本身的圖示也一起設定：Alt-Tab 與工作列會用到它。
+	sendMessage.Call(hwnd, wmSetIcon, iconBig, icon)
+	sendMessage.Call(hwnd, wmSetIcon, iconSmall, icon)
+	data := controller.notifyData()
 	if result, _, callErr := shellNotifyIcon.Call(nimAdd, uintptr(unsafe.Pointer(&data))); result == 0 {
 		destroyWindow.Call(hwnd)
 		if callErr != nil {
@@ -185,21 +190,77 @@ func newTrayController(options Options) (*trayController, error) {
 		}
 		return nil, fmt.Errorf("add system tray icon")
 	}
-	data.flags = nifMessage | nifIcon | nifTip
 	data.timeoutOrVersion = notifyVersion
 	_, _, _ = shellNotifyIcon.Call(nimSetVersion, uintptr(unsafe.Pointer(&data)))
 	return controller, nil
 }
 
+func (c *trayController) notifyData() notifyIconData {
+	data := notifyIconData{
+		cbSize:          uint32(unsafe.Sizeof(notifyIconData{})),
+		hwnd:            c.hwnd,
+		uid:             1,
+		flags:           nifMessage | nifIcon | nifTip,
+		callbackMessage: wmTrayCallback,
+		icon:            c.icon,
+	}
+	copy(data.tip[:], syscall.StringToUTF16(c.title))
+	return data
+}
+
+// addIcon 重新掛上通知區域圖示，供 Explorer 重啟後恢復。
+func (c *trayController) addIcon() {
+	data := c.notifyData()
+	if result, _, _ := shellNotifyIcon.Call(nimAdd, uintptr(unsafe.Pointer(&data))); result == 0 {
+		return
+	}
+	data.timeoutOrVersion = notifyVersion
+	_, _, _ = shellNotifyIcon.Call(nimSetVersion, uintptr(unsafe.Pointer(&data)))
+}
+
+// loadApplicationIcon 取執行檔內嵌的圖示，取不到才退回系統通用圖示。
+//
+// 通知區域是從模組資源載入，不是讀某個路徑的 .ico；因此建置時必須用 windres
+// 把圖示編成 .syso 一起連結進來，見 src/cmd/release 的 embedWindowsIcon。
+func loadApplicationIcon() uintptr {
+	instance, _, _ := getModuleHandle.Call(0)
+	if instance != 0 {
+		if icon, _, _ := loadIcon.Call(instance, appIconResID); icon != 0 {
+			return icon
+		}
+	}
+	icon, _, _ := loadIcon.Call(0, idiApplication)
+	return icon
+}
+
+// taskbarCreatedMessage 是 Explorer 重啟後廣播的訊息。
+// 不處理它的話，工作管理員重開 Explorer 之後圖示就永遠消失了。
+var taskbarCreatedMessage = func() uint32 {
+	name, err := syscall.UTF16PtrFromString("TaskbarCreated")
+	if err != nil {
+		return 0
+	}
+	value, _, _ := registerWindowMsg.Call(uintptr(unsafe.Pointer(name)))
+	return uint32(value)
+}()
+
 func trayWindowProc(hwnd syscall.Handle, message uint32, wParam, lParam uintptr) uintptr {
+	if taskbarCreatedMessage != 0 && message == taskbarCreatedMessage {
+		if currentController != nil {
+			currentController.addIcon()
+		}
+		return 0
+	}
 	switch message {
 	case wmTrayCallback:
-		switch uint32(lParam) {
+		// NOTIFYICON_VERSION_4 的 lParam 低位字才是事件，高位字放的是圖示 UID。
+		// 直接拿整個 lParam 比對永遠比不中，左鍵與右鍵都會失效。
+		switch uint32(lParam) & 0xffff {
 		case wmLButtonUp:
 			if currentController != nil {
 				_ = openURL(currentController.url)
 			}
-		case wmRButtonUp:
+		case wmRButtonUp, wmContextMenu:
 			showTrayMenu(hwnd)
 		}
 	case wmCommand:
@@ -285,6 +346,8 @@ var (
 	trackPopupMenu      = user32.NewProc("TrackPopupMenu")
 	destroyMenu         = user32.NewProc("DestroyMenu")
 	getModuleHandle     = kernel32.NewProc("GetModuleHandleW")
+	sendMessage         = user32.NewProc("SendMessageW")
+	registerWindowMsg   = user32.NewProc("RegisterWindowMessageW")
 	shellNotifyIcon     = shell32.NewProc("Shell_NotifyIconW")
 	shellExecute        = shell32.NewProc("ShellExecuteW")
 )
