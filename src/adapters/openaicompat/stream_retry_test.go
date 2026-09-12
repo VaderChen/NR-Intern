@@ -31,13 +31,9 @@ func TestRetryableStreamErrorStillRejectsPermanentFailures(t *testing.T) {
 	}
 }
 
-// 思考內容不再阻擋重試；回答文字與工具呼叫參數仍要阻擋，那才是重試會真的
-// 變成兩份的東西。
-func TestThinkingDeltaDoesNotBlockRetry(t *testing.T) {
-	if observableModelOutput(domain.ModelEventThinkingDelta) {
-		t.Fatal("思考內容不該阻擋重試")
-	}
-	for _, eventType := range []string{domain.ModelEventTextDelta, domain.ModelEventToolCallDelta} {
+// 所有已送出的模型內容都必須阻擋重試，避免事件紀錄出現重複片段。
+func TestObservableModelOutputBlocksRetry(t *testing.T) {
+	for _, eventType := range []string{domain.ModelEventTextDelta, domain.ModelEventThinkingDelta, domain.ModelEventToolCallDelta} {
 		if !observableModelOutput(eventType) {
 			t.Fatalf("%s 應該阻擋重試", eventType)
 		}

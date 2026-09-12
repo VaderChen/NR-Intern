@@ -32,22 +32,20 @@ func (r ephemeralProjectRoots) AdditionalRoots() []string {
 
 // newEphemeralSessionIDFactory 讓隔離專案的 Session 一建立就帶著歸屬。
 //
-// 查不到 Project、或該 Project 不是隔離的，就回空字串讓 filestore 用預設格式。
-// 查詢失敗同樣退回預設：寧可讓對話落在 dataDir，也不要產生一個解析得出代碼、
-// 卻對應不到任何 RAM disk 的 ID——那種 Session 之後每次存取都會失敗。
+// 只有確認為一般專案才能採用預設格式；查詢失敗必須中止，避免隔離資料落到硬碟。
 func newEphemeralSessionIDFactory(projects ports.ProjectRepository, logger *slog.Logger) filestore.SessionIDFactory {
-	return func(projectID string) string {
+	return func(ctx context.Context, projectID string) (string, error) {
 		if projectID == "" {
-			return ""
+			return "", nil
 		}
-		project, err := projects.Get(context.Background(), projectID)
+		project, err := projects.Get(ctx, projectID)
 		if err != nil {
 			logger.Warn("could not resolve project for session id", "project_id", projectID, "error", err)
-			return ""
+			return "", err
 		}
 		if !project.Ephemeral {
-			return ""
+			return "", nil
 		}
-		return domain.NewEphemeralSessionID(project.ID)
+		return domain.NewEphemeralSessionID(project.ID), nil
 	}
 }

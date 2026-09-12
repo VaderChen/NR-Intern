@@ -36,6 +36,7 @@ type Handler struct {
 	configBundle            func(context.Context, bool) ([]byte, error)
 	exportProviderSetting   func(context.Context, string, bool) ([]byte, error)
 	exportMCPSetting        func(context.Context, string, bool) ([]byte, error)
+	readMCPContract         func(context.Context, string) (any, error)
 	restore                 func(context.Context, []byte) (domain.RestoreResult, error)
 	permissions             func(context.Context) (domain.PermissionCenter, error)
 	updateStatus            func(context.Context) (domain.UpdateStatus, error)
@@ -90,6 +91,7 @@ func New(service *application.Service, config Config) (*Handler, error) {
 		configBundle:            config.ConfigBundle,
 		exportProviderSetting:   config.ExportProviderSetting,
 		exportMCPSetting:        config.ExportMCPSetting,
+		readMCPContract:         config.ReadMCPContract,
 		restore:                 config.Restore,
 		permissions:             config.Permissions,
 		updateStatus:            config.UpdateStatus,
@@ -154,6 +156,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("PUT /api/v1/admin/mcp-settings", h.putMCPSettings)
 	h.mux.HandleFunc("POST /api/v1/admin/mcp-settings/{mcp_id}/test", h.postMCPTest)
 	h.mux.HandleFunc("GET /api/v1/admin/mcp-settings/{mcp_id}/export", h.exportMCPSettingFile)
+	h.mux.HandleFunc("POST /api/v1/admin/mcp-settings/{mcp_id}/contract", h.postMCPContract)
 	h.mux.HandleFunc("GET /api/v1/admin/reverse-proxy", h.getReverseProxy)
 	h.mux.HandleFunc("PUT /api/v1/admin/reverse-proxy", h.putReverseProxy)
 	h.mux.HandleFunc("POST /api/v1/admin/reverse-proxy/start", h.postReverseProxyStart)
@@ -619,6 +622,25 @@ func (h *Handler) postMCPTest(writer http.ResponseWriter, request *http.Request)
 	ctx, cancel := context.WithTimeout(request.Context(), 5*time.Minute)
 	defer cancel()
 	value, err := h.testMCP(ctx, request.PathValue("mcp_id"))
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusOK, value)
+}
+
+// postMCPContract 重新讀取 MCP 契約，交給模型整理後寫入共用記憶。
+//
+// 逾時放得比測試連線更寬：工具數量多時要分批送進模型，而中途放棄會留下
+// 只寫了一半的整理結果。
+func (h *Handler) postMCPContract(writer http.ResponseWriter, request *http.Request) {
+	if h.readMCPContract == nil {
+		writeProblem(writer, request, fmt.Errorf("%w: MCP contract reading is unavailable", errUnavailable))
+		return
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), 15*time.Minute)
+	defer cancel()
+	value, err := h.readMCPContract(ctx, request.PathValue("mcp_id"))
 	if err != nil {
 		writeProblem(writer, request, err)
 		return

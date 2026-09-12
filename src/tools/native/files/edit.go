@@ -8,7 +8,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"os"
 	"strings"
 	"unicode/utf8"
 )
@@ -32,7 +31,7 @@ func (t *EditTool) Definition() domain.ToolDefinition {
 		Category:           "files",
 		Description:        "在 workspace 文字檔中精確替換 old_text。預設只替換第一處，可指定全部替換與預期替換數，寫回時採原子替換。",
 		Platforms:          []string{"darwin", "linux", "windows"},
-		Capabilities:       []string{"exact-replace", "precondition", "atomic-replace", "workspace-sandbox"},
+		Capabilities:       []string{"exact-replace", "precondition", "atomic-replace", "workspace-sandbox", "workspace-contained"},
 		RequiresPermission: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -41,7 +40,8 @@ func (t *EditTool) Definition() domain.ToolDefinition {
 				"old_text":              map[string]any{"type": "string"},
 				"new_text":              map[string]any{"type": "string"},
 				"replace_all":           map[string]any{"type": "boolean", "default": false},
-				"expected_replacements": map[string]any{"type": "integer", "minimum": 1, "maximum": 10000, "description": "可選的 optimistic concurrency 前置條件"},
+				"expected_replacements": map[string]any{"type": "integer", "minimum": 1, "maximum": 10000, "description": "預期替換數，不代表檔案版本；版本檢查請用 expected_sha256"},
+				"expected_sha256":       map[string]any{"type": "string", "description": "可選的完整檔案 SHA-256；與目前內容不同則拒絕修改"},
 			},
 			"required": []string{"path", "old_text", "new_text"},
 		},
@@ -63,42 +63,43 @@ func (t *EditTool) Execute(ctx context.Context, invocation tools.Invocation, _ p
 	if err != nil {
 		return fileFailure(invocation.Call, err.Error()), nil
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return fileFailure(invocation.Call, "path is not a regular file"), nil
-	}
-	if info.Size() > int64(t.MaxFileBytes) {
-		return fileFailure(invocation.Call, fmt.Sprintf("file exceeds %d bytes", t.MaxFileBytes)), nil
-	}
-	data, err := os.ReadFile(path)
+	replacements := 1
+	data, updatedData, err := toolutil.AtomicUpdateFile(path, t.MaxFileBytes, func(data []byte) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if expected, exists := invocation.Call.Arguments["expected_sha256"]; exists {
+			hash, ok := expected.(string)
+			if !ok || !strings.EqualFold(strings.TrimSpace(hash), fmt.Sprintf("%x", sha256.Sum256(data))) {
+				return nil, fmt.Errorf("file version precondition failed; read the current file before editing")
+			}
+		}
+		if !utf8.Valid(data) {
+			return nil, fmt.Errorf("file is not valid UTF-8 text")
+		}
+		content := string(data)
+		occurrences := strings.Count(content, oldText)
+		if occurrences == 0 {
+			return nil, fmt.Errorf("old_text was not found; file was not changed")
+		}
+		if toolutil.Bool(invocation.Call.Arguments, "replace_all", false) {
+			replacements = occurrences
+		}
+		if _, exists := invocation.Call.Arguments["expected_replacements"]; exists {
+			expected := toolutil.Int(invocation.Call.Arguments, "expected_replacements", 1, 1, 10000)
+			if replacements != expected {
+				return nil, fmt.Errorf("replacement precondition failed: expected %d, would replace %d", expected, replacements)
+			}
+		}
+		if growth := len(newText) - len(oldText); growth > 0 && replacements > (t.MaxFileBytes-len(content))/growth {
+			return nil, fmt.Errorf("edited file would exceed %d bytes", t.MaxFileBytes)
+		}
+		return []byte(strings.Replace(content, oldText, newText, replacements)), nil
+	})
 	if err != nil {
 		return fileFailure(invocation.Call, err.Error()), nil
 	}
-	if !utf8.Valid(data) {
-		return fileFailure(invocation.Call, "file is not valid UTF-8 text"), nil
-	}
-	content := string(data)
-	occurrences := strings.Count(content, oldText)
-	if occurrences == 0 {
-		return fileFailure(invocation.Call, "old_text was not found; file was not changed"), nil
-	}
-	replacements := 1
-	if toolutil.Bool(invocation.Call.Arguments, "replace_all", false) {
-		replacements = occurrences
-	}
-	if _, exists := invocation.Call.Arguments["expected_replacements"]; exists {
-		expected := toolutil.Int(invocation.Call.Arguments, "expected_replacements", 1, 1, 10000)
-		if replacements != expected {
-			return fileFailure(invocation.Call, fmt.Sprintf("replacement precondition failed: expected %d, would replace %d", expected, replacements)), nil
-		}
-	}
-	updated := strings.Replace(content, oldText, newText, replacements)
-	if len([]byte(updated)) > t.MaxFileBytes {
-		return fileFailure(invocation.Call, fmt.Sprintf("edited file would exceed %d bytes", t.MaxFileBytes)), nil
-	}
-	if err := toolutil.AtomicWriteFile(path, []byte(updated), info.Mode().Perm(), true); err != nil {
-		return fileFailure(invocation.Call, err.Error()), nil
-	}
+	updated := string(updatedData)
 	updatedBytes := len([]byte(updated))
 	updatedCharacters := utf8.RuneCountInString(updated)
 	updatedLines := 0

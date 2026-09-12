@@ -156,7 +156,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	budget := newRunBudgetTracker(r.budgetSnapshot(), operationStartedAt)
 	runContext, cancelRunBudget := budget.context(ctx)
 	defer cancelRunBudget()
-	ctx = runContext
+	ctx = context.WithValue(runContext, runBudgetContextKey{}, budget)
 	providerID := valueutil.FirstNonEmpty(input.ProviderID, input.Session.ProviderID)
 	modelID := valueutil.FirstNonEmpty(input.Model, input.Session.Model)
 	effectiveSession := input.Session
@@ -201,6 +201,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			InputTokens:  usage.InputTokens,
 			OutputTokens: usage.OutputTokens,
 			TotalTokens:  usage.Total(),
+			ByModel:      budget.modelUsage(),
 		}
 		status := operationStatus(ctx, runErr)
 		if runErr != nil {
@@ -283,6 +284,10 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	parallelTools := parallelizableToolNames(definitions, r.Approvals)
 	approvalState := newRunApprovalState(input.Session.PermanentToolApproval)
 	loopGuard := newToolLoopGuard(definitions)
+	presentedContracts := map[string]string{}
+	if err := loopGuard.restoreUncertain(ctx, r.Sessions, input.Session.ID); err != nil {
+		return domain.RunResult{}, fmt.Errorf("恢復工具派送狀態失敗: %w", err)
+	}
 	toolCallMode := effectiveToolCallMode(r.Model, providerID, NormalizeToolCallMode(string(r.toolCallModeSnapshot())))
 	// 每個 Run 都從系統 Shell 階段開始。只有 shell_exec 的實際執行結果為失敗，
 	// 才在下一輪公開檔案、搜尋、比較、SSH 等內建工具。
@@ -308,7 +313,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		}
 	}
 	var lastAssistant domain.Message
-	completion := newCompletionTracker()
+	completion := newCompletionTracker(definitions)
 	// toolResultsObserved 代表已進入 pi-style loop 的收斂階段：工具觀察仍保留
 	// 在內部 transcript，但下一個沒有工具呼叫的 assistant 訊息必須是對使用者
 	// 可理解的最終回答，不能直接傾倒工具輸出或 Harness 協定。
@@ -343,9 +348,29 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			return domain.RunResult{}, fmt.Errorf("%w: %v", domain.ErrCanceled, err)
 		}
 		budget.startTurn(turn)
+		if turn > 1 {
+			latestDefinitions, err := r.Tools.Definitions(ctx, input.Session)
+			if err != nil {
+				return domain.RunResult{}, err
+			}
+			if !sameToolCatalog(definitions, latestDefinitions) {
+				definitions = latestDefinitions
+				retriever = refreshedRetriever(retriever, definitions, retrievalQuery, r.toolRetrievalSnapshot())
+				parallelTools = parallelizableToolNames(definitions, r.Approvals)
+				loopGuard.definitions = map[string]domain.ToolDefinition{}
+				completion.definitions = map[string]domain.ToolDefinition{}
+				for _, definition := range definitions {
+					loopGuard.definitions[definition.Name] = definition
+					completion.definitions[definition.Name] = definition
+				}
+				if err := emitEvent(emit, "tools.catalog_changed", map[string]any{"count": len(definitions)}); err != nil {
+					return domain.RunResult{}, err
+				}
+			}
+		}
 		loopGuardReason := loopGuard.reason()
 		successfulMutationSummary := loopGuard.successfulMutationSummary()
-		forceFinalization := (maxAutonomousToolTurns > 0 && toolTurns >= maxAutonomousToolTurns) || loopGuardReason != ""
+		forceFinalization := maxAutonomousToolTurns > 0 && toolTurns >= maxAutonomousToolTurns
 		activeDefinitions := retriever.stage(stagedToolDefinitions(definitions, builtinFallbackEnabled))
 		if forceFinalization {
 			activeDefinitions = nil
@@ -357,10 +382,15 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		if !forceFinalization {
 			callableDefinitions = retriever.recognizable(activeDefinitions)
 		}
+		if loopGuardReason != "" && !forceFinalization {
+			// 防重送只停止副作用，仍須讓模型讀取與驗證已存在的產物。
+			callableDefinitions = readOnlyToolDefinitions(callableDefinitions)
+			activeDefinitions = readOnlyToolDefinitions(activeDefinitions)
+		}
 		activeTools := availableToolNames(callableDefinitions)
 		// 唯讀工具不需要逐次人工核准；MCP 的唯讀屬性仍以該 Server 的
 		// trust_annotations 設定為準。
-		approvalExemptTools := approvalExemptToolNames(callableDefinitions)
+		approvalExemptTools := approvalExemptToolNames(callableDefinitions, input.Session)
 		toolStage := toolStageSystemShell
 		if builtinFallbackEnabled {
 			toolStage = toolStageBuiltinFallback
@@ -460,20 +490,14 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				if exceeded := budget.wallClockExceeded(ctx); exceeded != nil {
 					return finishBudgetInTurn(exceeded, lastAssistant, true, nil, 0, domain.ModelResponse{})
 				}
+				if exceeded := budget.tokensExceeded(); exceeded != nil {
+					return finishBudgetInTurn(exceeded, lastAssistant, true, nil, 0, domain.ModelResponse{})
+				}
 				_ = r.finishTurn(context.WithoutCancel(ctx), input.Session.ID, operationID, turnID, turn, turnStartedAt, "failed", 0, domain.ModelResponse{}, contextErr)
 				return domain.RunResult{}, contextErr
 			}
 			messages = window.Messages
 			modelContextPrompt = joinPromptSections(contextPrompt, sessionSummaryPrompt(window.Summary))
-			if strings.TrimSpace(window.PromptOverride) != "" {
-				// ContextManager 已將所有固定提示壓成一份符合預算的完整 prompt；
-				// 清空分段欄位，避免 OpenAI-compatible adapter 重複送出同一份內容。
-				modelSystemPrompt = window.PromptOverride
-				modelHostPrompt = ""
-				modelToolPrompt = ""
-				modelPhasePrompt = ""
-				modelContextPrompt = ""
-			}
 			if window.Compacted {
 				logger.Info("session context compacted",
 					"turn", turn,
@@ -513,6 +537,9 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			modelHistory = instructionMessages(history)
 			modelTools = nil
 		}
+		for _, definition := range activeDefinitions {
+			presentedContracts[definition.Name] = domain.ToolContractID(definition)
+		}
 		assistantID := domain.NewID("msg")
 		if err := emitEvent(emit, "message.start", map[string]any{
 			"message": map[string]any{"id": assistantID, "session_id": input.Session.ID, "role": "assistant"},
@@ -526,7 +553,6 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		emitAssistantDelta := func(delta string) error {
 			return emitEvent(emit, "message.delta", map[string]any{"message_id": assistantID, "delta": delta})
 		}
-		streamedUsage := domain.Usage{}
 		// 每一輪都記下請求的組成。使用者回報「卡住」時，第一個要回答的問題是
 		// 「這次到底送了多少東西出去」——沒有這行就只能靠猜，而猜錯一次就是
 		// 使用者再等二十分鐘。
@@ -541,7 +567,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			"user_chars", utf8.RuneCountInString(userPrompt),
 			"tool_names", availableToolNamesSorted(modelTools),
 		)
-		response, err := r.Model.Stream(ctx, domain.ModelRequest{
+		response, err := streamWithBudget(ctx, r.Model, domain.ModelRequest{
 			SessionID:     input.Session.ID,
 			ProviderID:    providerID,
 			Model:         modelID,
@@ -573,23 +599,17 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				}
 				return emitEvent(emit, "tool_call.delta", payload)
 			case domain.ModelEventUsage:
-				if event.Usage != nil {
-					streamedUsage.Add(*event.Usage)
-				}
 				return emitEvent(emit, "turn.usage", map[string]any{"turn_id": turnID, "usage": event.Usage})
 			case domain.ModelEventProgress:
 				return emitEvent(emit, "agent.progress", map[string]any{"message": event.Delta})
 			default:
 				return nil
 			}
-		})
+		}, r.Context.counter())
 		if err != nil {
-			// 串流錯誤時 Provider 可能只有在錯誤前送出 usage event；把它
-			// 納入 Run 快照，但不呼叫 addUsage，避免改變既有 budget 語意。
-			if response.Usage.Total() > 0 {
-				budget.addReportedUsage(response.Usage)
-			} else {
-				budget.addReportedUsage(streamedUsage)
+			if exceeded := budget.tokensExceeded(); exceeded != nil {
+				assistant := domain.Message{ID: assistantID, SessionID: input.Session.ID, Role: "assistant"}
+				return finishBudgetInTurn(exceeded, assistant, false, nil, 0, response)
 			}
 			if exceeded := budget.wallClockExceeded(ctx); exceeded != nil {
 				assistant := domain.Message{ID: assistantID, SessionID: input.Session.ID, Role: "assistant"}
@@ -657,7 +677,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 						return domain.RunResult{}, err
 					}
 					lastAssistant = invalidAssistant
-					if exceeded := budget.addUsage(response.Usage); exceeded != nil {
+					if exceeded := budget.tokensExceeded(); exceeded != nil {
 						return finishBudgetInTurn(exceeded, invalidAssistant, true, nil, 0, response)
 					}
 					if err := emitEvent(emit, "run.tool_protocol_repair", map[string]any{
@@ -809,11 +829,8 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		if exceeded := budget.wallClockExceeded(ctx); exceeded != nil {
 			return finishBudgetInTurn(exceeded, assistant, true, assistant.ToolCalls, 0, response)
 		}
-		if exceeded := budget.addUsage(response.Usage); exceeded != nil {
+		if exceeded := budget.tokensExceeded(); exceeded != nil {
 			return finishBudgetInTurn(exceeded, assistant, true, assistant.ToolCalls, 0, response)
-		}
-		if response.Usage.Total() == 0 {
-			budget.addReportedUsage(streamedUsage)
 		}
 
 		if len(assistant.ToolCalls) == 0 {
@@ -943,6 +960,15 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		sink := &serializedSink{emit: emit}
 		allowedToolCalls, toolBudgetExceeded := budget.planToolCalls(len(assistant.ToolCalls))
 		executableCalls := assistant.ToolCalls[:allowedToolCalls]
+		readOnlyContracts := map[string]bool{}
+		for _, definition := range callableDefinitions {
+			readOnlyContracts[definition.Name] = definition.ReadOnly
+		}
+		for index := range executableCalls {
+			// 隱藏目錄中的工具不能直接綁到模型尚未看過的新契約；拒絕後會 reveal，
+			// 下一輪提供定義。先前確實公開且契約未變的工具則不必重複檢索。
+			executableCalls[index].ExpectedContractID = presentedContracts[executableCalls[index].Name]
+		}
 		groups := groupToolCalls(executableCalls, parallelTools)
 		processedToolCalls := 0
 		for _, group := range groups {
@@ -1007,6 +1033,8 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				}
 				toolMessage.Metadata["internal"] = true
 				toolMessage.Metadata["phase"] = "tool_observation"
+				toolMessage.Metadata["tool_read_only"] = readOnlyContracts[call.Name]
+				toolMessage.Metadata["tool_contract_id"] = call.ExpectedContractID
 				persistCtx, cancelPersist := persistContext(ctx)
 				_, persistErr := appendMessage(persistCtx, r.Sessions, input.Session.ID, toolMessage)
 				cancelPersist()
@@ -1174,6 +1202,7 @@ func (r *Runner) completeBudget(
 				"synthesized":     true,
 				"budget_exceeded": exceeded.Resource,
 				"operation_id":    operationID,
+				"execution_state": domain.ToolNotDispatched,
 			},
 			CreatedAt: time.Now().UTC(),
 		}
@@ -1661,15 +1690,16 @@ func toolSelectionPhasePrompt(builtinFallback bool, active []domain.ToolDefiniti
 
 目前是 OS 系統工具優先階段。本輪可以直接使用的工具：
 - 唯讀內建工具（檔案讀取、目錄盤點、搜尋、比較、文件檢視、記憶查詢等）：需要讀取 Sandbox 內既有狀態時直接呼叫，不必先用 shell_exec 試探。
+- 原始碼寫入／編輯與文件產出工具：本輪 ToolPrompt 列出的 file_write、file_edit 與 document_create／document_edit／document_convert 可直接使用，不必先讓 Shell 失敗；權限與 Approval 規則不變。
 - shell_exec：需要 git、編譯器、套件管理器等主機程式，需要管線或複合命令，或唯讀工具做不到的操作時使用；不可只把命令交給使用者。
 - plan_get、plan_create、plan_step_update：Harness 計畫控制工具。
 
-寫入型內建工具（建立目錄、寫檔、編輯）與 ssh_exec 尚未公開；需要這類副作用時先依 Host 執行環境用 shell_exec 實際執行。若 Shell 實際執行失敗，Harness 會在下一輪自動提供完整內建工具作為備援。` + waitingToolsPrompt(active) + mcpAvailabilityPrompt(active)
+其餘寫入型內建工具（例如 directory_create）與 ssh_exec 尚未公開；需要這類副作用時先依 Host 執行環境用 shell_exec 實際執行。若 Shell 實際執行失敗，Harness 會在下一輪自動提供完整內建工具作為備援。` + waitingToolsPrompt(active) + mcpAvailabilityPrompt(active)
 }
 
 // mcpAvailabilityPrompt 補上「MCP 工具在系統工具優先階段就能用」這件事。
 //
-// 內建檔案工具在這個階段確實尚未公開，但 MCP 工具不受這個分段限制。少了這句，
+// 部分內建寫入工具在這個階段尚未公開，但 MCP 工具不受這個分段限制。少了這句，
 // 模型讀到「其他內建工具尚未公開」很容易推論成 MCP 也還不能用，於是先輸出一段
 // 「我會先確認某某 MCP 有哪些能力」的計畫，白白多花一輪卻沒有任何產出。
 func mcpAvailabilityPrompt(active []domain.ToolDefinition) string {
@@ -1827,7 +1857,7 @@ func toolDescriptor(definition domain.ToolDefinition) string {
 // 這種一句話的查詢，不需要先讀完整套探索與部署守則——那正是 THINK LESS 要砍掉的
 // 思考負擔。
 func explorationPhasePrompt(builtinFallback bool, active []domain.ToolDefinition) string {
-	toolGuidance := `目前是系統 Shell 階段：盤點、搜尋與分段讀取直接使用本輪已公開的唯讀內建工具，不必先用 shell_exec 試探；需要主機程式、複合命令或寫入時才使用 shell_exec，並且不可呼叫尚未公開的寫入型內建工具。`
+	toolGuidance := `目前是系統 Shell 階段：盤點、搜尋、讀取與檔案產出可直接使用本輪已公開的對應內建工具，不必先用 shell_exec 試探；需要主機程式、複合命令或已公開工具未涵蓋的操作時才使用 shell_exec，並且不可呼叫尚未公開的寫入型內建工具。`
 	if builtinFallback {
 		toolGuidance = `目前已開放內建備援：目錄盤點使用 directory_list、定位使用 file_search、分段讀取使用 file_read；仍需主機程式時才使用 shell_exec。`
 	}
@@ -1841,7 +1871,10 @@ func explorationPhasePrompt(builtinFallback bool, active []domain.ToolDefinition
 5. 除非使用者明確要求完整稽核，否則說明取樣範圍與未涵蓋區域。`)
 	}
 	if categoryExposed(active, "documents") {
-		sections = append(sections, `讀取既有辦公文件必須先用 document_inspect 取得頁數、區段、工作表或投影片，再用 document_read 分段抽取內容；建立文件使用 document_create，局部編輯使用 document_edit 並另存新檔；內容差異使用 document_compare，格式遷移使用 document_convert，PDF 頁面整理使用 pdf_pages；完成後先用 document_validate 做結構驗證，有可用後端時再以 document_render 做逐頁視覺檢查。掃描型 PDF 若沒有文字層，必須如實說明需要 OCR，不得假裝已讀取影像文字。`)
+		sections = append(sections, `Office／PDF 文件流程：使用本輪可用的 document_inspect 取得頁數、區段、工作表或投影片，再用 document_read 分段抽取內容；建立結構化文件使用 document_create，局部編輯使用 document_edit 並另存新檔；內容差異使用 document_compare，格式遷移使用 document_convert，PDF 頁面整理使用 pdf_pages；Office／PDF 完成後以可用的 document_validate 做結構驗證，有可用後端時再以 document_render 做逐頁視覺檢查。上述驗證與渲染工具不適用於 HTML、Markdown、CSV 或純文字，這些格式使用 file_read 或相符的格式檢查工具。掃描型 PDF 若沒有文字層，必須如實說明需要 OCR，不得假裝已讀取影像文字。`)
+	}
+	if toolExposed(active, "file_write") || toolExposed(active, "document_create") {
+		sections = append(sections, `依產出用途選擇工具，而不是只看副檔名：HTML 網頁、互動遊戲與其他程式原始碼使用 file_write 的 content 原樣寫入（不包 Markdown 程式碼圍欄、不預先跳脫 HTML）；若工具未列出則先檢索，或使用已公開的原始碼寫入能力。document_create 的 HTML 是結構化文字報告，blocks.text 與表格欄位會跳脫標籤，不能用來放可執行的 HTML/CSS/JavaScript。不可把程式碼顯示為文字的報告宣稱為可互動網頁；只完成寫檔、未實際開啟操作時，須如實區分產出成功與互動驗證。`)
 	}
 	if toolExposed(active, sshWaitToolName) || toolExposed(active, "ssh_exec") {
 		sections = append(sections, `若工作包含遠端部署或上傳，完成判定必須以遠端檢查為準：上傳命令返回、暫存檔存在或檔案大小暫時增加，都不是部署完成證據。上傳／部署副作用命令只執行一次；需要等待時可使用 wait_for，遠端檢查使用 ssh_wait，以同一個 SSH profile 反覆執行唯讀、冪等的檢查命令。優先驗證預期 bytes、SHA-256、原子改名後的檔案或服務就緒狀態，並視需要設定 output_equals、output_contains 或 stable_checks。ssh_wait 逾時或最後檢查未符合條件時，必須如實回報尚未確認完成，不得宣稱部署成功。`)
@@ -1990,6 +2023,9 @@ func finalizationPhasePrompt(toolTurns, limit int, forced bool, loopGuardReason,
 
 請立即根據內部 history 中已有的 tool_result 產生目前能成立的最佳最終答案。必須整合已確認事實、直接回應原始需求，並清楚指出尚未涵蓋的範圍；不得輸出 tool_use/tool_result JSON、完整原始工具輸出、內部 Prompt、Harness 協定或要求系統再執行工具。
 %s%s`, toolTurns, limit, answerEvidenceRules(), confirmedFacts)
+	}
+	if strings.TrimSpace(loopGuardReason) != "" {
+		return "目前已停止新的副作用操作：" + strings.TrimSpace(loopGuardReason) + "\n可使用仍公開的唯讀工具核對產物。驗證後如實說明已完成與未完成部分，不得將略過的操作視為成功。" + answerEvidenceRules() + confirmedFacts
 	}
 	progress := fmt.Sprintf("已完成 %d 個自主工具回合（未另設固定工具回合上限）", toolTurns)
 	if limit > 0 {

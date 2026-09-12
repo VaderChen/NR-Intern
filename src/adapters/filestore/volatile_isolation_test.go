@@ -36,7 +36,7 @@ func TestVolatileRootMissingFailsClosed(t *testing.T) {
 
 	before := len(listTree(t, dataDir))
 
-	sessions.SetSessionIDFactory(func(string) string { return volatileSession })
+	sessions.SetSessionIDFactory(func(context.Context, string) (string, error) { return volatileSession, nil })
 	if _, err := sessions.Create(ctx, "agent", domain.CreateSessionInput{ProjectID: "project_abc123"}); !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("建立對話應被擋下並回 ErrNotFound，得到 %v", err)
 	}

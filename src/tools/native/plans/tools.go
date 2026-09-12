@@ -18,14 +18,21 @@ type CreateTool struct {
 	// 讓沒有多輪功能的組裝方式維持原本行為。
 	Loops ports.PlanLoopController
 }
-type UpdateStepTool struct{ Repository ports.PlanRepository }
+type UpdateStepTool struct {
+	Repository ports.PlanRepository
+	Sessions   ports.SessionRepository
+}
 
 func NewGetTool(repository ports.PlanRepository) *GetTool { return &GetTool{Repository: repository} }
 func NewCreateTool(repository ports.PlanRepository) *CreateTool {
 	return &CreateTool{Repository: repository}
 }
-func NewUpdateStepTool(repository ports.PlanRepository) *UpdateStepTool {
-	return &UpdateStepTool{Repository: repository}
+func NewUpdateStepTool(repository ports.PlanRepository, sessions ...ports.SessionRepository) *UpdateStepTool {
+	tool := &UpdateStepTool{Repository: repository}
+	if len(sessions) > 0 {
+		tool.Sessions = sessions[0]
+	}
+	return tool
 }
 
 func (t *GetTool) Definition() domain.ToolDefinition {
@@ -145,10 +152,11 @@ func (t *UpdateStepTool) Definition() domain.ToolDefinition {
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"plan_id":  map[string]any{"type": "string", "description": "目標計畫 ID；省略時使用 current_plan"},
-				"step_id":  map[string]any{"type": "string"},
-				"status":   map[string]any{"type": "string", "enum": []string{"in_progress", "verifying", "completed", "blocked", "skipped"}},
-				"evidence": map[string]any{"type": "string", "description": "completed 時填入工具驗證結果；blocked/skipped 時填入原因"},
+				"plan_id":                map[string]any{"type": "string", "description": "目標計畫 ID；省略時使用 current_plan"},
+				"step_id":                map[string]any{"type": "string"},
+				"status":                 map[string]any{"type": "string", "enum": []string{"in_progress", "verifying", "completed", "blocked", "skipped"}},
+				"evidence":               map[string]any{"type": "string", "description": "completed 時填入工具驗證結果；blocked/skipped 時填入原因"},
+				"evidence_tool_call_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 32, "description": "completed 必填：進入 verifying 後實際成功的驗證工具 call ID；不能引用計畫工具或未知結果"},
 			},
 			"required": []string{"step_id", "status"},
 		},
@@ -171,17 +179,20 @@ func (t *UpdateStepTool) Execute(ctx context.Context, invocation tools.Invocatio
 		}
 		planID = current.ID
 	}
-	value, err := t.Repository.Get(ctx, invocation.Session.ID, planID)
-	if err != nil {
-		return failure(invocation.Call, err.Error()), nil
-	}
-	value, err = domain.TransitionPlanStep(value, stringArgument(invocation.Call.Arguments, "step_id"), domain.UpdatePlanStepInput{
-		Status: domain.PlanStepStatus(stringArgument(invocation.Call.Arguments, "status")), Evidence: stringArgument(invocation.Call.Arguments, "evidence"),
-	}, time.Now())
-	if err != nil {
-		return failure(invocation.Call, err.Error()), nil
-	}
-	value, err = t.Repository.Update(ctx, value)
+	value, err := t.Repository.Mutate(ctx, invocation.Session.ID, planID, func(value domain.Plan) (domain.Plan, error) {
+		var proofs []domain.PlanEvidence
+		if stringArgument(invocation.Call.Arguments, "status") == string(domain.PlanStepStatusCompleted) {
+			var err error
+			proofs, err = t.verifyEvidence(ctx, invocation, value)
+			if err != nil {
+				return domain.Plan{}, err
+			}
+		}
+		return domain.TransitionPlanStep(value, stringArgument(invocation.Call.Arguments, "step_id"), domain.UpdatePlanStepInput{
+			Status: domain.PlanStepStatus(stringArgument(invocation.Call.Arguments, "status")), Evidence: stringArgument(invocation.Call.Arguments, "evidence"),
+			VerifiedEvidence: proofs,
+		}, time.Now())
+	})
 	if err != nil {
 		return failure(invocation.Call, err.Error()), nil
 	}

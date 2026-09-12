@@ -48,8 +48,8 @@ type ProjectRoots interface {
 //
 // 記憶體隔離專案要把歸屬編進 ID，而判斷「這個 Project 是不是隔離的」需要查
 // Project 儲存——那是 filestore 不該知道的事，所以做成注入點。
-// 回傳空字串代表使用預設格式。
-type SessionIDFactory func(projectID string) string
+// 成功且回傳空字串代表使用預設格式；失敗不得降級到一般磁碟儲存。
+type SessionIDFactory func(context.Context, string) (string, error)
 
 type SessionRepository struct {
 	root string
@@ -90,13 +90,17 @@ func (r *SessionRepository) SetSessionIDFactory(factory SessionIDFactory) {
 }
 
 // newSessionID 產生新的 Session ID。
-func (r *SessionRepository) newSessionID(projectID string) string {
+func (r *SessionRepository) newSessionID(ctx context.Context, projectID string) (string, error) {
 	if factory := r.idFactory.Load(); factory != nil {
-		if id := strings.TrimSpace((*factory)(projectID)); id != "" {
-			return id
+		id, err := (*factory)(ctx, projectID)
+		if err != nil {
+			return "", err
+		}
+		if id = strings.TrimSpace(id); id != "" {
+			return id, nil
 		}
 	}
-	return domain.NewID("session")
+	return domain.NewID("session"), nil
 }
 
 // resolveVolatileRoot 解析 ID 應該使用的根目錄，供本套件各儲存共用。
@@ -109,11 +113,10 @@ func (r *SessionRepository) newSessionID(projectID string) string {
 // 資料不存在。
 func resolveVolatileRoot(roots *atomic.Pointer[ProjectRoots], id, fallback string) (root string, routed bool, err error) {
 	loaded := roots.Load()
-	if loaded == nil {
-		return fallback, false, nil
-	}
-	if resolved := strings.TrimSpace((*loaded).RootFor(id)); resolved != "" {
-		return resolved, true, nil
+	if loaded != nil {
+		if resolved := strings.TrimSpace((*loaded).RootFor(id)); resolved != "" {
+			return resolved, true, nil
+		}
 	}
 	if domain.EphemeralProjectCodeFromID(id) != "" {
 		return "", false, fmt.Errorf("%w: %q 所屬記憶體隔離專案的 RAM disk 未掛載", domain.ErrNotFound, id)
@@ -183,7 +186,10 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 	localNow := time.Now()
 	now := localNow.UTC()
 	// ID 決定目錄落在哪個根，所以要在建立目錄之前產生。
-	sessionID := r.newSessionID(projectID)
+	sessionID, err := r.newSessionID(ctx, projectID)
+	if err != nil {
+		return domain.Session{}, fmt.Errorf("resolve session storage: %w", err)
+	}
 	directory, err := r.sessionDir(sessionID)
 	if err != nil {
 		return domain.Session{}, err

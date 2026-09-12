@@ -455,6 +455,14 @@ func cloneRun(run domain.Run) domain.Run {
 }
 
 func cloneUsage(value domain.RunUsage) domain.RunUsage {
+	if len(value.ByModel) > 0 {
+		parts := make([]domain.RunUsage, 0, len(value.ByModel))
+		for _, part := range value.ByModel {
+			part.ByModel = nil
+			parts = append(parts, cloneUsage(part))
+		}
+		value.ByModel = parts
+	}
 	if value.EstimatedCostUSD != nil {
 		cost := *value.EstimatedCostUSD
 		value.EstimatedCostUSD = &cost

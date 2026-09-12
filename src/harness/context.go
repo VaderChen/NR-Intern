@@ -17,7 +17,7 @@ import (
 )
 
 // interruptedToolResult 是補寫給沒有結果的 tool_call 的合成結果內容。
-const interruptedToolResult = "[工具執行沒有留下結果：run 在寫入結果前被取消或中斷。這個工具呼叫並未完成，必要時請重新執行。]"
+const interruptedToolResult = "[工具結果未知：Run 在保存結果前被取消或中斷。操作可能已經產生副作用，不能假定未執行。請先用唯讀方式查證；未取得可確認未派送或可安全重送的證據前，不得重新執行有副作用的操作。]"
 
 type ContextConfig struct {
 	// MaxEstimatedTokens 是模型 context window 未宣告時的後備預算。
@@ -89,9 +89,7 @@ type ContextWindow struct {
 	// Budget 是本次實際套用的 token 預算，來自模型宣告的 context window 或設定的後備值。
 	Budget    int
 	Compacted bool
-	// PromptOverride 是固定提示本身已超過小型 context window 時的預算版完整提示。
-	// 一般情況留空，Runner 仍以分段欄位送出提示；只有需要縮短固定提示時才改用
-	// 這個欄位，避免同一段提示在 System/Host/Tool/Phase 欄位重複傳送。
+	// PromptOverride 僅保留結構相容；不再產生合併提示，避免改變資料的信任層級。
 	PromptOverride string
 }
 
@@ -188,6 +186,9 @@ func (m *ContextManager) BuildObserved(
 	if budget <= 0 {
 		return ContextWindow{}, fmt.Errorf("%w: model context window leaves no input budget after output reservation", domain.ErrInvalidInput)
 	}
+	if estimateContextTokens(counter, baseSystemPrompt, nil, definitions) > budget {
+		return ContextWindow{}, fmt.Errorf("%w: 固定指示與工具契約超過模型 Context 預算；請縮小工具範圍或選用較大視窗，不能裁掉任務約束", domain.ErrInvalidInput)
+	}
 	estimated := estimateContextTokens(counter, withSummary(baseSystemPrompt, summary), messages, definitions)
 	reportedInputTokens := latestReportedInputTokens(messages, compactionSequence)
 	triggerTokens := estimated
@@ -255,6 +256,9 @@ func (m *ContextManager) BuildObserved(
 	effectiveSystemPrompt, effectiveSummary, effectiveMessages, promptOverride, finalEstimated := fitContextToBudget(
 		counter, baseSystemPrompt, summary, contextMessages, definitions, budget,
 	)
+	if finalEstimated > budget {
+		return ContextWindow{}, fmt.Errorf("%w: 壓縮後仍超過 Context 預算（估計 %d，上限 %d）；保留完整指示與目前訊息，請縮小工作範圍", domain.ErrInvalidInput, finalEstimated, budget)
+	}
 	return ContextWindow{
 		SystemPrompt:    effectiveSystemPrompt,
 		Messages:        effectiveMessages,
@@ -358,9 +362,7 @@ func fitSummaryToBudget(counter ports.TokenCounter, systemPrompt, summary string
 }
 
 // fitContextToBudget 將最後送出的 prompt 與 transcript 對齊到同一個預算。
-// 正常模型的 context window 足夠大時不做任何改動；只有固定提示已佔滿小型
-// window 時，才先縮短摘要，再以 head/tail 保留策略縮短固定提示。這比讓一次
-// context compaction 被誤報成 Run 失敗更可恢復，也保留系統提示的開頭與收尾。
+// 只允許縮短歷史摘要。固定指示與目前訊息不可裁切；仍超限由呼叫端明確拒絕。
 func fitContextToBudget(
 	counter ports.TokenCounter,
 	baseSystemPrompt string,
@@ -387,28 +389,7 @@ func fitContextToBudget(
 		return effective, effectiveSummary, effectiveMessages, "", estimated
 	}
 
-	// 固定提示若太大，先縮短固定提示；這樣能保留最新 user／assistant 內容，
-	// 不會為了容納提示而把使用者剛送出的要求裁成空字串。
-	effectiveBase = fitPromptText(counter, effectiveBase, effectiveSummary, messageItems, definitions, budget)
-	effective = withSummary(effectiveBase, effectiveSummary)
-	estimated = estimateContextTokens(counter, effective, messageItems, definitions)
-	if estimated <= budget {
-		return effective, effectiveSummary, effectiveMessages, effective, estimated
-	}
-
-	// 若保留完整最新訊息仍超標，才移除最舊訊息；只剩最新訊息仍超標時
-	// 才縮短其內容。這個順序讓歷史細節與提示較早讓位給目前工作要求。
-	effectiveMessages = fitMessagesToBudget(counter, effective, effectiveMessages, definitions, budget)
-	messageItems = messagesFromDomain(effectiveMessages)
-	effectiveBase = fitPromptText(counter, effectiveBase, effectiveSummary, messageItems, definitions, budget)
-	effective = withSummary(effectiveBase, effectiveSummary)
-	estimated = estimateContextTokens(counter, effective, messageItems, definitions)
-	if estimated > budget {
-		// wrapper 與摘要可能仍佔用少量額度，最後再對完整提示做保守裁切。
-		effective = fitCompletePrompt(counter, effective, effectiveMessages, definitions, budget)
-		estimated = estimateContextTokens(counter, effective, messageItems, definitions)
-	}
-	return effective, effectiveSummary, effectiveMessages, effective, estimated
+	return effective, effectiveSummary, effectiveMessages, "", estimated
 }
 
 func cloneMessages(messages []domain.Message) []domain.Message {
@@ -417,94 +398,6 @@ func cloneMessages(messages []domain.Message) []domain.Message {
 		result[index] = cloneMessage(message)
 	}
 	return result
-}
-
-func fitMessagesToBudget(counter ports.TokenCounter, prompt string, messages []domain.Message, definitions []domain.ToolDefinition, budget int) []domain.Message {
-	result := cloneMessages(messages)
-	for len(result) > 1 && estimateContextTokens(counter, prompt, messagesFromDomain(result), definitions) > budget {
-		result = repairMessages(result[1:])
-	}
-	if len(result) == 0 || estimateContextTokens(counter, prompt, messagesFromDomain(result), definitions) <= budget {
-		return result
-	}
-
-	// 最新 user／assistant 內容仍保留，只縮短文字內容；tool call arguments 屬於
-	// 協定資料，不能任意刪除，若它本身超過窗口則交由上游模型回報不可行。
-	last := len(result) - 1
-	original := result[last].Content
-	runes := []rune(original)
-	low, high := 0, len(runes)
-	best := ""
-	for low <= high {
-		middle := low + (high-low)/2
-		candidate := ""
-		if middle > 0 {
-			candidate = truncateMiddle(original, middle)
-		}
-		candidateMessages := cloneMessages(result)
-		candidateMessages[last].Content = candidate
-		if estimateContextTokens(counter, prompt, messagesFromDomain(candidateMessages), definitions) <= budget {
-			best = candidate
-			low = middle + 1
-		} else {
-			high = middle - 1
-		}
-	}
-	result[last].Content = best
-	return result
-}
-
-func fitPromptText(
-	counter ports.TokenCounter,
-	baseSystemPrompt string,
-	summary string,
-	messages []sequencedMessage,
-	definitions []domain.ToolDefinition,
-	maxTokens int,
-) string {
-	runes := []rune(baseSystemPrompt)
-	low, high := 0, len(runes)
-	best := ""
-	for low <= high {
-		middle := low + (high-low)/2
-		candidate := ""
-		if middle > 0 {
-			candidate = truncateMiddle(baseSystemPrompt, middle)
-		}
-		if estimateContextTokens(counter, withSummary(candidate, summary), messages, definitions) <= maxTokens {
-			best = candidate
-			low = middle + 1
-		} else {
-			high = middle - 1
-		}
-	}
-	return best
-}
-
-func fitCompletePrompt(counter ports.TokenCounter, prompt string, messages []domain.Message, definitions []domain.ToolDefinition, budget int) string {
-	messageTokens := counter.EstimateMessages(messages)
-	toolTokens := counter.EstimateTools(definitions)
-	available := budget - messageTokens - toolTokens
-	if available <= 0 {
-		return ""
-	}
-	runes := []rune(prompt)
-	low, high := 0, len(runes)
-	best := ""
-	for low <= high {
-		middle := low + (high-low)/2
-		candidate := ""
-		if middle > 0 {
-			candidate = truncateMiddle(prompt, middle)
-		}
-		if counter.EstimateText(candidate) <= available {
-			best = candidate
-			low = middle + 1
-		} else {
-			high = middle - 1
-		}
-	}
-	return best
 }
 
 func sequencedToMessages(messages []sequencedMessage) []domain.Message {
@@ -525,7 +418,7 @@ func (m *ContextManager) summarize(ctx context.Context, session domain.Session, 
 	routes := contextSummaryRoutes(session, config)
 	failures := make([]error, 0, len(routes))
 	for _, route := range routes {
-		response, err := m.Model.Stream(ctx, domain.ModelRequest{
+		response, err := streamWithBudget(ctx, m.Model, domain.ModelRequest{
 			SessionID:    session.ID,
 			ProviderID:   route.ProviderID,
 			Model:        route.Model,
@@ -534,7 +427,16 @@ func (m *ContextManager) summarize(ctx context.Context, session domain.Session, 
 			Metadata: map[string]any{
 				"phase": "context_compaction",
 			},
-		}, nil)
+		}, nil, m.counter())
+		if errors.Is(err, errRunBudgetTokens) {
+			return "", err
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if tracker, _ := ctx.Value(runBudgetContextKey{}).(*runBudgetTracker); tracker != nil && tracker.tokensExceeded() != nil {
+			return "", errRunBudgetTokens
+		}
 		if err == nil && len(response.ToolCalls) > 0 {
 			err = errors.New("model unexpectedly requested tools")
 		}
@@ -751,7 +653,7 @@ func repairToolCallPairs(messages []sequencedMessage) []sequencedMessage {
 					ToolCallID: call.ID,
 					ToolName:   call.Name,
 					IsError:    true,
-					Metadata:   map[string]any{"synthesized": true, "reason": "missing_tool_result"},
+					Metadata:   map[string]any{"synthesized": true, "reason": "missing_tool_result", "execution_state": domain.ToolOutcomeUnknown},
 					CreatedAt:  current.Message.CreatedAt,
 				},
 			})

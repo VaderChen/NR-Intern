@@ -137,9 +137,9 @@ func (t *CreateTool) Definition() domain.ToolDefinition {
 		Label:              "建立本地文件（Word／Excel／PowerPoint／PDF／Markdown／CSV／HTML／純文字）",
 		Version:            "1.0.0",
 		Category:           "documents",
-		Description:        "在 Project／Session Sandbox 內以結構化內容建立本地文件：Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）、PDF、Markdown（MD）、純文字（TXT）、CSV 與 HTML。使用者說「做一份 Word」「轉成 Excel」「產生簡報」「寫成 Markdown」「輸出 CSV」時都用這個工具，不要改用 Shell 的 echo、cat 或 heredoc——那會在中文、引號與換行上出錯。內容結構：DOCX／PDF／MD／TXT／HTML 用 blocks（heading／paragraph／bullet／numbered／table／page_break）；XLSX 用 sheets（每張表給 name 與 rows），CSV 用同樣的 sheets 但只能一張表；只給 cell_updates（sheet／cell／value）時會自動組成工作表。template_path 可保留既有 Office／PDF 文件樣式，再以 replacements、cell_updates 或 annotations 填入內容。預設不覆寫既有檔案；Unicode PDF 會優先使用指定字型，否則自動探索完整覆蓋的系統字型。",
+		Description:        "在 Project／Session Sandbox 內以結構化內容建立本地文件：Word（DOCX）、Excel（XLSX）、PowerPoint（PPTX）、PDF、Markdown（MD）、純文字（TXT）、CSV 與 HTML 文字報告。HTML 模式會跳脫文字中的標籤，不支援以 blocks 注入可執行原始碼；製作網頁、互動遊戲或 HTML/CSS/JavaScript 請改用 file_write 的 content 原樣寫入。使用者說「做一份 Word」「轉成 Excel」「產生簡報」「寫成 Markdown 報告」「輸出 CSV」時使用本工具。內容結構：DOCX／PDF／MD／TXT／HTML 用 blocks（heading／paragraph／bullet／numbered／table／page_break）；XLSX 用 sheets（每張表給 name 與 rows），CSV 用同樣的 sheets 但只能一張表；只給 cell_updates（sheet／cell／value）時會自動組成工作表。template_path 可保留既有 Office／PDF 文件樣式，再以 replacements、cell_updates 或 annotations 填入內容。預設不覆寫既有檔案；Unicode PDF 會優先使用指定字型，否則自動探索完整覆蓋的系統字型。",
 		Platforms:          []string{"darwin", "linux", "windows"},
-		Capabilities:       []string{"document-create", "template-preservation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "markdown", "csv", "html", "plain-text", "workspace-sandbox", "atomic-write", "atomic-replace", "bounded-input"},
+		Capabilities:       []string{"document-create", "template-preservation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "markdown", "csv", "html", "plain-text", "workspace-sandbox", "workspace-contained", "atomic-write", "atomic-replace", "bounded-input"},
 		RequiresPermission: true,
 		InputSchema:        documentCreateSchema(),
 	}
@@ -153,7 +153,7 @@ func (t *EditTool) Definition() domain.ToolDefinition {
 		Category:           "documents",
 		Description:        "保留來源文件，將局部編輯結果另存到 output_path。Word（DOCX）與 PowerPoint（PPTX）使用 replacements 精確替換文字；Excel（XLSX）使用 cell_updates 更新儲存格，也可 replacements；PDF 使用 annotations 疊加文字、線段或方框，Unicode 標註可自動探索完整覆蓋的系統 TTF。",
 		Platforms:          []string{"darwin", "linux", "windows"},
-		Capabilities:       []string{"document-edit", "exact-replace", "spreadsheet-cell-update", "pdf-annotation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "workspace-sandbox", "atomic-write", "atomic-replace"},
+		Capabilities:       []string{"document-edit", "exact-replace", "spreadsheet-cell-update", "pdf-annotation", "automatic-font-discovery", "glyph-coverage", "docx", "xlsx", "pptx", "pdf", "workspace-sandbox", "workspace-contained", "atomic-write", "atomic-replace"},
 		RequiresPermission: true,
 		InputSchema:        documentEditSchema(),
 	}
@@ -490,7 +490,7 @@ func documentCreateSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"type":  map[string]any{"type": "string", "enum": []string{"heading", "paragraph", "bullet", "numbered", "table", "page_break"}},
-			"text":  map[string]any{"type": "string"},
+			"text":  map[string]any{"type": "string", "description": "文件顯示文字，不是原始碼插槽；HTML 模式會跳脫標籤，需要可執行網頁請使用 file_write"},
 			"level": map[string]any{"type": "integer", "minimum": 1, "maximum": 3},
 			"rows":  map[string]any{"type": "array", "items": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}},
 		},
@@ -500,7 +500,7 @@ func documentCreateSchema() map[string]any {
 		"type": "object",
 		"properties": map[string]any{
 			"path":          map[string]any{"type": "string", "description": "輸出檔路徑，副檔名須與 format 一致"},
-			"format":        map[string]any{"type": "string", "enum": []string{"docx", "xlsx", "pptx", "pdf", "md", "txt", "csv", "html"}, "description": "省略時由 path 副檔名判斷"},
+			"format":        map[string]any{"type": "string", "enum": []string{"docx", "xlsx", "pptx", "pdf", "md", "txt", "csv", "html"}, "description": "省略時由 path 副檔名判斷；html 是結構化文字報告，互動網頁使用 file_write"},
 			"template_path": map[string]any{"type": "string", "description": "可選的同格式來源範本；DOCX/PPTX 用 replacements、XLSX 用 cell_updates、PDF 用 annotations 填入，未提供操作時原樣複製"},
 			"title":         map[string]any{"type": "string"},
 			"subject":       map[string]any{"type": "string"},
@@ -508,7 +508,7 @@ func documentCreateSchema() map[string]any {
 			"overwrite":     map[string]any{"type": "boolean", "default": false},
 			"create_parent": map[string]any{"type": "boolean", "default": false},
 			"font_path":     map[string]any{"type": "string", "description": "PDF Unicode 文字使用的 Sandbox 內 TTF 字型"},
-			"blocks":        map[string]any{"type": "array", "items": block, "description": "DOCX/PDF/MD/TXT/HTML 內容區塊"},
+			"blocks":        map[string]any{"type": "array", "items": block, "description": "DOCX/PDF/MD/TXT/HTML 結構化文字區塊；HTML 會跳脫 text 與 rows，不會執行其中的標籤或程式碼"},
 			"sheets": map[string]any{"type": "array", "items": map[string]any{
 				"type": "object", "required": []string{"name", "rows"}, "properties": map[string]any{
 					"name":          map[string]any{"type": "string"},

@@ -4,9 +4,19 @@
   const bareResourcePattern = /https?:\/\/[^\s<>"'`]+|(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+[\\/]|\/)[^\s<>"'`]+/gi;
   const trailingPunctuation = /[.,;:!?\)\]\}，。；：！？）】》」』]+$/u;
 
-  function resourceDescriptor(value) {
-    const target = (value || "").trim();
+  function resourceDescriptor(value, encodedPath = false) {
+    let target = (value || "").trim();
+    // sandbox: 是模型使用的本機檔案連結前綴，不是瀏覽器可導覽的協定。
+    if (/^sandbox:/i.test(target)) {
+      target = target.slice("sandbox:".length);
+      if (!target.startsWith("/") || target.startsWith("//")) return null;
+      encodedPath = true;
+    }
     if (/^https?:\/\/[^\s]+$/i.test(target)) return { kind: "url", target };
+    if (encodedPath) {
+      try { target = decodeURIComponent(target); } catch (_) { return null; }
+    }
+    if (/[\u0000-\u001f\u007f]/.test(target)) return null;
     if (/^(?:\/|[A-Za-z]:[\\/]|\\\\)[^\r\n]*$/.test(target)) return { kind: "path", target };
     return null;
   }
@@ -27,7 +37,7 @@
     for (const link of element.querySelectorAll("a[href]")) {
       const href = link.getAttribute("href") || "";
       if (href.startsWith("#")) continue;
-      const descriptor = resourceDescriptor(href);
+      const descriptor = resourceDescriptor(href, true);
       if (!descriptor) {
         link.removeAttribute("href");
         continue;
@@ -111,6 +121,15 @@
         async: false,
         breaks: true,
         gfm: true,
+        walkTokens(token) {
+          // 在清理 HTML 前轉成標準路徑，避免清理器先移除未知協定的 href。
+          // 只處理 Markdown 連結，不變更程式碼區塊，也不放寬協定白名單。
+          if (token.type !== "link" || !/^sandbox:/i.test(token.href || "")) return;
+          const descriptor = resourceDescriptor(token.href);
+          if (descriptor?.kind === "path") {
+            token.href = encodeURI(descriptor.target).replaceAll("#", "%23").replaceAll("?", "%3F");
+          }
+        },
       });
       return window.DOMPurify.sanitize(unsafeHTML, {
         USE_PROFILES: { html: true },

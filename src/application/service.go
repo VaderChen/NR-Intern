@@ -144,6 +144,7 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		stop()
 		return nil, err
 	}
+	service.reconcilePlanLoops(context.Background())
 	service.startScheduleRunner()
 	return service, nil
 }
@@ -871,6 +872,13 @@ func (s *Service) ListRunEvents(ctx context.Context, runID string, afterSequence
 // StartRun 建立 durable Run 後立即返回。實際工作使用 service-owned context，
 // 不會因建立 Run 的 HTTP request 結束或 SSE client 斷線而取消。
 func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.Run, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	return s.startRunLocked(ctx, input, nil)
+}
+
+// 呼叫端持有 startMu；beforeSave 完成關聯資料持久化後，才允許啟動工作。
+func (s *Service) startRunLocked(ctx context.Context, input domain.RunInput, beforeSave func(domain.Run) error) (domain.Run, error) {
 	input.SessionID = strings.TrimSpace(input.SessionID)
 	input.UserInput = strings.TrimSpace(textutil.NormalizeFullwidthASCII(input.UserInput))
 	input.AttachmentIDs = normalizedAttachmentIDs(input.AttachmentIDs)
@@ -881,8 +889,6 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 	if len(input.AttachmentIDs) > 16 {
 		return domain.Run{}, fmt.Errorf("%w: no more than 16 attachments are allowed", domain.ErrInvalidInput)
 	}
-	s.startMu.Lock()
-	defer s.startMu.Unlock()
 	engine, session, err := s.resolveSession(ctx, input.SessionID)
 	if err != nil {
 		return domain.Run{}, err
@@ -1047,6 +1053,11 @@ func (s *Service) StartRun(ctx context.Context, input domain.RunInput) (domain.R
 		Metadata:               valueutil.CloneMap(input.Metadata),
 		CreatedAt:              now,
 	}
+	if beforeSave != nil {
+		if err := beforeSave(run); err != nil {
+			return domain.Run{}, err
+		}
+	}
 	if guard, ok := s.runs.(ports.RunRetentionGuard); ok {
 		guard.ProtectRun(run.ID)
 	}
@@ -1198,6 +1209,11 @@ func (s *Service) SubscribeRunEvents(ctx context.Context, runID string) (<-chan 
 func (s *Service) CancelRun(ctx context.Context, runID string) (domain.Run, error) {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
+	return s.cancelRunLocked(ctx, runID)
+}
+
+// 呼叫端持有 startMu，供 LOOP 在同一個啟停交易中取消 Run。
+func (s *Service) cancelRunLocked(ctx context.Context, runID string) (domain.Run, error) {
 	run, err := s.runs.Get(ctx, strings.TrimSpace(runID))
 	if err != nil {
 		return domain.Run{}, err
@@ -1276,6 +1292,9 @@ func (s *Service) DecideRun(ctx context.Context, runID string, input domain.Tool
 	}
 	if input.Permanent && input.Decision != domain.ToolApprovalApprove {
 		return run, fmt.Errorf("%w: permanent approval requires an approve decision", domain.ErrInvalidInput)
+	}
+	if input.Permanent && run.PendingApproval.OneTimeOnly {
+		return run, fmt.Errorf("%w: 結果未知的操作只允許逐次核准，不能設為永久授權", domain.ErrInvalidInput)
 	}
 	var permanentEngine ports.AgentEngine
 	permanentChanged := false
@@ -1830,7 +1849,8 @@ func (s *Service) reconcileTerminalEvents(ctx context.Context) error {
 		}
 		values, err := s.events.List(ctx, run.ID, 0)
 		if err != nil {
-			return err
+			s.logger.Error("run event log unavailable; isolating this run", "run_id", run.ID, "error", err)
+			continue
 		}
 		if len(values) > 0 && terminalEvent(values[len(values)-1].Type) {
 			continue
@@ -1851,7 +1871,8 @@ func (s *Service) reconcileTerminalEvents(ctx context.Context) error {
 		}
 		s.logger.Warn("reconciling missing terminal event after restart", "run_id", run.ID, "status", run.Status)
 		if err := s.appendEvent(run, &sequence, "run."+string(run.Status), payload); err != nil {
-			return fmt.Errorf("reconcile run %q terminal event: %w", run.ID, err)
+			s.logger.Error("could not reconcile terminal event; other runs remain available", "run_id", run.ID, "error", err)
+			continue
 		}
 		if run.Error != nil && run.Error.Code == "server_restarted" {
 			s.notifyRunFinished(run)

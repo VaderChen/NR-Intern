@@ -4,12 +4,14 @@ import (
 	"AgenticService/src/domain"
 	"AgenticService/src/ports"
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +80,15 @@ func (r *RunEventRepository) Append(ctx context.Context, event domain.Event) err
 	if event.Sequence != last+1 {
 		return fmt.Errorf("%w: run %q event sequence must be %d, got %d", domain.ErrConflict, event.RunID, last+1, event.Sequence)
 	}
+	// 任何寫入／Sync 失敗都可能留下未知尾筆；下次必須重新掃描，不能沿用快取。
+	written := false
+	defer func() {
+		if !written {
+			r.mu.Lock()
+			delete(r.sequences, event.RunID)
+			r.mu.Unlock()
+		}
+	}()
 	data, err := json.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("encode run event: %w", err)
@@ -104,6 +115,7 @@ func (r *RunEventRepository) Append(ctx context.Context, event domain.Event) err
 	r.mu.Lock()
 	r.sequences[event.RunID] = event.Sequence
 	r.mu.Unlock()
+	written = true
 	return nil
 }
 
@@ -116,34 +128,18 @@ func (r *RunEventRepository) List(ctx context.Context, runID string, afterSequen
 		return nil, err
 	}
 	lock := r.runLock(runID)
-	lock.RLock()
-	defer lock.RUnlock()
-	file, err := os.Open(path)
+	lock.Lock()
+	defer lock.Unlock()
+	values, last, err := r.readEventLogLocked(ctx, runID, path, afterSequence, true)
+	r.mu.Lock()
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []domain.Event{}, nil
-		}
-		return nil, fmt.Errorf("open run event log: %w", err)
+		// 發現中段損壞後不能讓 Append 以舊快取繼續寫入。
+		delete(r.sequences, runID)
+	} else {
+		r.sequences[runID] = last
 	}
-	defer file.Close()
-	decoder := json.NewDecoder(bufio.NewReader(file))
-	values := []domain.Event{}
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		var event domain.Event
-		if err := decoder.Decode(&event); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, fmt.Errorf("decode run event log: %w", err)
-		}
-		if event.Sequence > afterSequence {
-			values = append(values, event)
-		}
-	}
-	return values, nil
+	r.mu.Unlock()
+	return values, err
 }
 
 func (r *RunEventRepository) lastSequenceLocked(runID, path string) (int64, error) {
@@ -153,32 +149,114 @@ func (r *RunEventRepository) lastSequenceLocked(runID, path string) (int64, erro
 	if exists {
 		return sequence, nil
 	}
-	file, err := os.Open(path)
+	_, last, err := r.readEventLogLocked(context.Background(), runID, path, 0, false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("open run event log: %w", err)
-	}
-	defer file.Close()
-	decoder := json.NewDecoder(bufio.NewReader(file))
-	last := int64(0)
-	for {
-		var event domain.Event
-		if err := decoder.Decode(&event); err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return 0, fmt.Errorf("decode run event log: %w", err)
-		}
-		if event.Sequence > last {
-			last = event.Sequence
-		}
+		return 0, err
 	}
 	r.mu.Lock()
 	r.sequences[runID] = last
 	r.mu.Unlock()
 	return last, nil
+}
+
+// 逐行驗證，只修復缺少換行且 JSON 未完成的最後一筆。中段錯誤與序號異常不能跳過。
+func (r *RunEventRepository) readEventLogLocked(ctx context.Context, runID, path string, after int64, collect bool) ([]domain.Event, int64, error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return []domain.Event{}, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	values := []domain.Event{}
+	var offset, last int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, last, err
+		}
+		line, readErr := reader.ReadBytes('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, last, readErr
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			offset += int64(len(line))
+			continue
+		}
+		var event domain.Event
+		decodeErr := json.Unmarshal(line, &event)
+		if decodeErr != nil {
+			var probe domain.Event
+			tailErr := json.NewDecoder(bytes.NewReader(line)).Decode(&probe)
+			if errors.Is(readErr, io.EOF) && errors.Is(tailErr, io.ErrUnexpectedEOF) {
+				if err := repairEventTail(path, offset, false); err != nil {
+					return nil, last, err
+				}
+				break
+			}
+			return nil, last, fmt.Errorf("run %s 的事件紀錄在位移 %d 損壞，已隔離讀寫，原檔保持不變", runID, offset)
+		}
+		if event.RunID != runID || event.ID == "" || event.Type == "" || event.Sequence != last+1 {
+			return nil, last, fmt.Errorf("run %s 的事件身分或序號在位移 %d 不一致，原檔保持不變", runID, offset)
+		}
+		last = event.Sequence
+		if collect && event.Sequence > after {
+			values = append(values, event)
+		}
+		offset += int64(len(line))
+		if errors.Is(readErr, io.EOF) {
+			if err := repairEventTail(path, offset, true); err != nil {
+				return nil, last, err
+			}
+			break
+		}
+	}
+	r.mu.Lock()
+	r.sequences[runID] = last
+	r.mu.Unlock()
+	return values, last, nil
+}
+
+// 同目錄備份可隨 ProjectRoots 留在 RAM，不把隔離資料複製到持久儲存。
+func repairEventTail(path string, offset int64, appendNewline bool) error {
+	source, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	backupPath := path + ".recovery-" + domain.NewID("tail") + ".bak"
+	backup, err := os.OpenFile(backupPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(backup, source)
+	syncErr := backup.Sync()
+	closeErr := backup.Close()
+	if err := errors.Join(copyErr, syncErr, closeErr); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if appendNewline {
+		_, err = file.WriteAt([]byte{'\n'}, offset)
+	} else {
+		err = file.Truncate(offset)
+	}
+	if err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	slog.Warn("已備份並修復事件尾筆", "backup_path", backupPath, "valid_bytes", offset)
+	return nil
 }
 
 // ListRunIDs 回傳預設根的事件目錄裡目前有檔案的所有 run ID。

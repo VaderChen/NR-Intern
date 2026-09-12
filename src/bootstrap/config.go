@@ -552,8 +552,8 @@ func validateConfig(config *Config) error {
 	return nil
 }
 
-// LeanToolNames 是精簡工具集：一個通用主機工具、最基本的讀取能力、辦公文件
-// 產出與計畫控制。其餘工具（寫入、編輯、SSH、記憶、比較等）在管理介面打開
+// LeanToolNames 是精簡工具集：一個通用主機工具、最基本的讀取與原始碼寫入能力、辦公文件
+// 產出與計畫控制。其餘工具（局部編輯、SSH、記憶、比較等）在管理介面打開
 // 「擴充工具集」後才公開。MCP 工具由各自的 Server 設定控制，不受這個清單限制。
 //
 // 文件工具原本不在精簡集合裡，結果是使用者要一份 Excel，Agent 只剩 shell 可用，
@@ -566,6 +566,8 @@ var LeanToolNames = []string{
 	// 而且 schema 很小。放進擴充集合等於預設關掉它，功能就等於不存在。
 	"ask_user",
 	"file_read",
+	// 原始碼與互動網頁不能由 document_create 的跳脫文字區塊替代。
+	"file_write",
 	"directory_list",
 	"file_search",
 	"document_inspect",

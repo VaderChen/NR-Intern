@@ -22,6 +22,7 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 	dataLines := []string{}
 	sawChunk := false
 	sawTerminal := false
+	sawDone := false
 
 	consume := func(data string) error {
 		data = strings.TrimSpace(data)
@@ -30,11 +31,12 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 		}
 		if data == "[DONE]" {
 			sawTerminal = true
+			sawDone = true
 			return nil
 		}
 		var chunk streamChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			return fmt.Errorf("decode chat completion stream event: %w", err)
+			return providerStreamDecodeError("chat stream decode", err, requestID, clientRequestID)
 		}
 		sawChunk = true
 		if chunk.Error != nil {
@@ -119,6 +121,10 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 				return domain.ModelResponse{}, err
 			}
 			dataLines = dataLines[:0]
+			// finish_reason 後仍可能有 usage；只有 [DONE] 才停止讀取。
+			if sawDone {
+				break
+			}
 			continue
 		}
 		if strings.HasPrefix(line, ":") {

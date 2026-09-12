@@ -315,6 +315,7 @@ type ToolApprovalRequest struct {
 	ToolName    string         `json:"tool_name"`
 	Arguments   map[string]any `json:"arguments,omitempty"`
 	Reason      string         `json:"reason,omitempty"`
+	OneTimeOnly bool           `json:"one_time_only,omitempty"`
 	RequestedAt time.Time      `json:"requested_at"`
 }
 

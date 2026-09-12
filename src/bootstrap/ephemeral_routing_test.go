@@ -25,11 +25,11 @@ func TestEphemeralSessionDirectoryNeverTouchesDataDir(t *testing.T) {
 	// 不是磁碟掛載本身（那有 ramdisk_test.go 涵蓋）。
 	projectID := "project_abc123"
 	sessions.SetProjectRoots(fixedRoots{code: "abc123", root: volatileRoot})
-	sessions.SetSessionIDFactory(func(requested string) string {
+	sessions.SetSessionIDFactory(func(_ context.Context, requested string) (string, error) {
 		if requested != projectID {
-			return ""
+			return "", nil
 		}
-		return domain.NewEphemeralSessionID(projectID)
+		return domain.NewEphemeralSessionID(projectID), nil
 	})
 
 	ctx := context.Background()
@@ -93,7 +93,7 @@ func TestEphemeralSessionDisappearsWithoutItsDisk(t *testing.T) {
 	}
 	projectID := "project_abc123"
 	sessions.SetProjectRoots(fixedRoots{code: "abc123", root: volatileRoot})
-	sessions.SetSessionIDFactory(func(string) string { return domain.NewEphemeralSessionID(projectID) })
+	sessions.SetSessionIDFactory(func(context.Context, string) (string, error) { return domain.NewEphemeralSessionID(projectID), nil })
 	ctx := context.Background()
 	volatile, err := sessions.Create(ctx, "agent", domain.CreateSessionInput{ProjectID: projectID})
 	if err != nil {

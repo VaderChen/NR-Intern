@@ -31,15 +31,15 @@ func (t *WriteTool) Definition() domain.ToolDefinition {
 		Label:              "寫入檔案",
 		Version:            "1.0.0",
 		Category:           "files",
-		Description:        "在 Project／Session Sandbox 內建立或完整覆寫文字檔。使用同目錄暫存檔與原子替換；預設不覆寫既有檔案。",
+		Description:        "在 Project／Session Sandbox 內建立或完整覆寫 UTF-8 文字檔，content 原樣寫入，不加文件模板、不跳脫 HTML。網頁、互動遊戲、HTML/CSS/JavaScript 與其他程式原始碼應使用本工具；不要把原始碼放進 document_create 的文字區塊。預設不覆寫既有檔案，覆寫時使用同目錄暫存檔與原子替換。",
 		Platforms:          []string{"darwin", "linux", "windows"},
-		Capabilities:       []string{"write", "atomic-replace", "workspace-sandbox", "bounded-input"},
+		Capabilities:       []string{"write", "atomic-replace", "workspace-sandbox", "workspace-contained", "bounded-input"},
 		RequiresPermission: true,
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"path":          map[string]any{"type": "string"},
-				"content":       map[string]any{"type": "string", "description": "UTF-8 文字內容"},
+				"content":       map[string]any{"type": "string", "description": "完整 UTF-8 檔案內容；網頁請提供原始 HTML/CSS/JavaScript，不包 Markdown 程式碼圍欄，不預先轉成 HTML entities"},
 				"overwrite":     map[string]any{"type": "boolean", "default": false},
 				"create_parent": map[string]any{"type": "boolean", "default": false},
 			},

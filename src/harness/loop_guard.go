@@ -31,14 +31,15 @@ type toolLoopGuard struct {
 	mu                   sync.Mutex
 	definitions          map[string]domain.ToolDefinition
 	successfulSignatures map[string]bool
-	strategySuccesses    map[string]int
+	latestResourceCalls  map[string]string
 	mutationSummaries    map[string]string
 	failureCounts        map[string]int
 	blockedStrategies    map[string]*blockedMutationStrategy
 	// repeatedErrors 與 blockedErrors 不看內容，只看同一資源重複出現的相同錯誤。
-	repeatedErrors map[string]int
-	blockedErrors  map[string]string
-	forcedReason   string
+	repeatedErrors      map[string]int
+	blockedErrors       map[string]string
+	forcedReason        string
+	uncertainSignatures map[string]bool
 }
 
 func newToolLoopGuard(definitions []domain.ToolDefinition) *toolLoopGuard {
@@ -49,12 +50,13 @@ func newToolLoopGuard(definitions []domain.ToolDefinition) *toolLoopGuard {
 	return &toolLoopGuard{
 		definitions:          byName,
 		successfulSignatures: map[string]bool{},
-		strategySuccesses:    map[string]int{},
+		latestResourceCalls:  map[string]string{},
 		mutationSummaries:    map[string]string{},
 		failureCounts:        map[string]int{},
 		blockedStrategies:    map[string]*blockedMutationStrategy{},
 		repeatedErrors:       map[string]int{},
 		blockedErrors:        map[string]string{},
+		uncertainSignatures:  map[string]bool{},
 	}
 }
 
@@ -71,6 +73,11 @@ func (g *toolLoopGuard) before(call domain.ToolCall) (domain.ToolExecution, bool
 	attempt := mutationAttemptKey(definition, call)
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.uncertainSignatures[signature] {
+		result := guardedToolFailure(call, "先前相同操作的結果未知，不能自動重送；請先唯讀查證並由使用者逐次確認是否接受重複副作用風險。")
+		result.Details["outcome_unknown"] = true
+		return result, true
+	}
 	if g.forcedReason == "" && g.successfulSignatures[signature] {
 		g.forcedReason = fmt.Sprintf("模型重複要求已成功執行的副作用工具 %s，Harness 已略過重複操作。", call.Name)
 	}
@@ -108,6 +115,12 @@ func (g *toolLoopGuard) observe(call domain.ToolCall, result domain.ToolExecutio
 	}
 	resource := mutationResource(definition, call.Arguments)
 	strategy := mutationStrategyKey(definition, call)
+	if domain.ToolExecutionState(result.Details) == domain.ToolOutcomeUnknown {
+		g.mu.Lock()
+		g.uncertainSignatures[toolCallSignature(call)] = true
+		g.mu.Unlock()
+		return
+	}
 	if result.IsError {
 		// 失敗要擋在哪一把鑰匙上，取決於錯誤在指責什麼：
 		//   - 錯誤指名內容欄位（例如 cell_updates[0]: ...）→ 用含內容的 attempt key，
@@ -143,19 +156,27 @@ func (g *toolLoopGuard) observe(call domain.ToolCall, result domain.ToolExecutio
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.successfulSignatures[toolCallSignature(call)] = true
+	signature := toolCallSignature(call)
+	if previous := g.latestResourceCalls[resource]; resource != "" && previous != "" && previous != signature {
+		// 產物已變更，較早的內容不代表現在的狀態；允許後續有意義的修正或回復。
+		delete(g.successfulSignatures, previous)
+	}
+	g.successfulSignatures[signature] = true
 	if resource == "" {
 		return
 	}
+	g.latestResourceCalls[resource] = signature
 	g.mutationSummaries[resource] = fmt.Sprintf("%s → %s：%s",
 		strings.TrimSpace(call.Name), strings.TrimPrefix(resource, "atomic-resource:"), truncateLoopGuardText(result.Content, 400))
-	if strategy == "" {
-		return
+	// 成功不是空轉。內容不同的修改不累計停止門檻，且成功會清除該資源先前的錯誤封鎖。
+	for key := range g.blockedErrors {
+		if strings.HasPrefix(key, strings.TrimSpace(call.Name)+":"+resource+":") {
+			delete(g.blockedErrors, key)
+			delete(g.repeatedErrors, key)
+		}
 	}
-	g.strategySuccesses[strategy]++
-	if g.strategySuccesses[strategy] >= maxSuccessfulMutationsPerStrategy && g.forcedReason == "" {
-		g.forcedReason = fmt.Sprintf("同一資源已使用相同控制策略成功改寫 %d 次，Harness 判定操作開始重複並停止繼續改寫。", g.strategySuccesses[strategy])
-	}
+	delete(g.blockedStrategies, strategy)
+	delete(g.blockedStrategies, mutationAttemptKey(definition, call))
 }
 
 // successfulMutationSummary 回傳本次 Run 已確認成功的最新副作用結果。
@@ -238,8 +259,8 @@ func firstLine(value string) string {
 	return trimmed
 }
 
-// mutationStrategyKey 用於「成功但沒有進展」的判定：同一個資源、同一組控制參數，
-// 只是換一份近似內容反覆完整覆寫。內容刻意不進 key——那正是要偵測的行為。
+// mutationStrategyKey 識別同一資源與控制參數，用於失敗歸因及完成度追蹤，
+// 不用成功次數阻擋內容修正；成功重複判定改由完整呼叫指紋負責。
 func mutationStrategyKey(definition domain.ToolDefinition, call domain.ToolCall) string {
 	resource := mutationResource(definition, call.Arguments)
 	if resource == "" {
@@ -370,8 +391,9 @@ func guardedToolResult(call domain.ToolCall, reason string) domain.ToolExecution
 		ToolName:   call.Name,
 		Content:    "Harness 已略過這次工具呼叫：" + reason + " 請直接使用目前結果整理最終答案。",
 		Details: map[string]any{
-			"skipped":    true,
-			"loop_guard": true,
+			"skipped":         true,
+			"loop_guard":      true,
+			"execution_state": domain.ToolNotDispatched,
 		},
 	}
 }
@@ -386,6 +408,7 @@ func guardedToolFailure(call domain.ToolCall, reason string) domain.ToolExecutio
 			"skipped":          true,
 			"loop_guard":       true,
 			"repeated_failure": true,
+			"execution_state":  domain.ToolNotDispatched,
 		},
 	}
 }

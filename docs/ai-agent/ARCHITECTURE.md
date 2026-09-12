@@ -145,8 +145,12 @@ LOOP 要解決的是「Agent 跑一半就忘了」，不是自動化便利。反
   現在改為**避開撞字**：對外一律稱 LOOP，計數說「第 N 次／共 M 次」。
   `plan_create` 的說明改為交代兩段式分工——先照工作本身的結構規劃內容，
   次數是計畫建立之後由使用者設定的另一個階段，與步驟數無關。
-- **完成不能自我宣告。** 步驟要 `completed` 必須有證據（`TransitionPlanStep` 早有此限制），
-  全部結束才算完成。Agent 沒有任何工具可以宣告做完了。
+- **完成需引用實際證據。** 步驟要 `completed`，除文字 `evidence` 外必須提供
+  `evidence_tool_call_ids`。後端查閱目前 Session 的工具紀錄，確認結果成功、非計畫工具、
+  非略過／未知結果，且發生於該步驟進入 `verifying` 之後；保存結果 SHA-256 與時間。
+  證據集合中最新的結果不能早於之後可能改變狀態的工具操作。這保證證據來源與時序，
+  不代表能自動判定任意自然語言驗收條件；模型與使用者仍須確認結果是否符合要求。
+  全部步驟 `completed` 才算完成；結束時含有 `skipped` 則為 `partial`，不是完整完成。
 - **LOOP 期間禁止 `plan_create`。** 這是走鐘最直接的路徑：開一個新計畫，LOOP 會很開心地繼續
   跑，跑的卻是另一個任務、次數還在算。步驟仍可用 `plan_step_update` 調整。
 - **次數是預算。** `Round` 記的是「已開始」而非已完成——中斷的那一次照樣計入，
@@ -159,6 +163,15 @@ LOOP 要解決的是「Agent 跑一半就忘了」，不是自動化便利。反
 這不是要避免的問題，而是要正式記錄的東西，有了它中斷才等於「隨時可以再開始」。續跑從
 中斷的下一次接續，並把交接內容逐字帶回。
 
+LOOP 啟動、續跑、停止與 Run 啟動共用 `startMu`：輪數與 `RoundRunID` 在工作 goroutine
+啟動前完成持久化，不在 Run 啟動後回寫舊計畫快照。`PlanRepository.Mutate` 將最新計畫的
+讀取、步驟更新／LOOP 轉移與寫回放在同一把儲存鎖下。停止／中斷先保存狀態再取消 Run；
+送出失敗會保存暫停狀態，保存或取消失敗會回報／記錄錯誤，不宣稱續跑成功。
+
+啟動時先恢復 Run 終態，再檢查沒有 worker 的 active LOOP：保留已開始次數、步驟與交接內容，
+轉為可由使用者續跑的 `paused`；不自動重送中斷的工具。控制 API 也會重做這項檢查，避免
+一次啟動修復失敗後永遠無法操作。計畫暫存檔與目的檔位於同一目錄，RAM 計畫不經一般磁碟。
+
 啟動與續跑都只有使用者能發起；Agent 只能中斷。允許它自行啟動等於讓它決定開始無人看管地
 花錢，與 Approval 機制的整個前提衝突。輪次狀態存在 `Plan.Loop` 上而非 Run metadata：
 存在計畫上根本沒有偽造路徑，而且跟著 `PlanRepository` 的 `ProjectRoots` 路由，
@@ -166,7 +179,8 @@ LOOP 要解決的是「Agent 跑一半就忘了」，不是自動化便利。反
 
 每一步由 Domain 強制依序轉移：`pending → in_progress → verifying → completed`。只有目前
 步驟可開始；進入 `completed` 前必須已在 `verifying`，並提供實際工具檢查所得的
-`evidence`。受阻時可標記 `blocked` 並保留原因。只要計畫仍有未完成且未受阻的步驟，
+`evidence` 及可查證的 `evidence_tool_call_ids`。舊的 `verifying` 若缺少驗證起點，須先標記
+`blocked` 再重新開始查證；不回填或偽造歷史證據。受阻時可標記 `blocked` 並保留原因。只要計畫仍有未完成且未受阻的步驟，
 Harness 就會攔截模型過早產生的 final answer，要求繼續執行與驗證；攔截次數有上限，
 避免 Provider 不遵循工具協定時形成無限迴圈。
 
@@ -178,14 +192,21 @@ Session 有 `shell_exec` 時，每個 Run 從「系統工具優先階段」開�
   `memory_search` 與文件檢視等），仍受工具集設定與檢索結果限制。
 - `shell_exec`，以及 Harness 計畫控制工具與已連線的 MCP 工具。
 - `document_create`、`document_convert`；擴充工具集允許時也包含 `document_edit`。
+- `file_write`（原始碼原樣寫入）與已啟用的 `file_edit`；`file_write` 納入精簡工具集並列為檢索核心工具，避免網頁需求只取得文件產生器，仍與管理者 allowlist 取交集。
 - `wait_for`／`ssh_wait` 只有已啟用且由檢索帶入時才公開，不屬於固定核心工具。
 
-其他寫入型內建工具（建立目錄、寫檔、文字編輯）與 `ssh_exec` 仍維持 Shell 優先：需要這類
+其他寫入型內建工具（例如建立目錄）與 `ssh_exec` 仍維持 Shell 優先：需要這類
 副作用時先用 `shell_exec` 實際執行，Shell 真正執行失敗後才由備援階段公開完整目錄。人工拒絕、
 Approval 中斷或 loop guard 都不算 Shell 失敗，不能藉此解鎖。
 
 文件產出、轉換與編輯可直接使用專門工具，避免先尋找 Shell 套件或自行改用不符需求的格式。
 較大的文件 schema 由工具檢索控制；其他文件副作用工具仍依原有階段規則供應。
+
+產出流程依用途分流，不只依副檔名：HTML 文字報告可用 `document_create`，其文字與表格仍以
+`html.EscapeString` 跳脫；HTML 網頁、互動遊戲及其他原始碼使用 `file_write.content` 原樣寫入，
+不套文件模板、不預先轉成 HTML entities。公開工具不改變既有 Sandbox、allowlist 或 Approval
+檢查。Office／PDF 才使用 `document_validate`／`document_render`；HTML 等文字格式使用
+`file_read` 或對應格式檢查能力，寫檔成功不等同互動功能已驗證。
 
 唯讀工具提前公開是刻意的取捨：先前它們要等一次 Shell 失敗才解鎖，等於每個「讀檔案、盤點目錄」
 的需求都固定多花一輪跑一個註定失敗的命令卻沒有任何產出。唯讀工具沒有副作用，提前公開不會
@@ -197,9 +218,10 @@ Approval 中斷或 loop guard 都不算 Shell 失敗，不能藉此解鎖。
 外部狀態仍由當輪公開的工作工具處理。只有計畫工具的回合不消耗 autonomous work-tool
 turn 配額，但仍受整體 `max_turns` 與已啟用的 `max_tool_calls` 限制。
 
-Harness 另有結構化重複操作防護：已成功的相同副作用工具呼叫不會執行第二次；具
-`atomic-replace` 能力的工具對同一資源成功改寫三次後，下一輪會停用工具並強制整理
-目前結果。判定只使用工具定義、參數與執行結果，不分析模型自然語言。
+Harness 另有結構化重複操作防護：同一 Run 中，沒有後續資源變更的相同成功副作用不自動重做。
+`atomic-replace` 資源的內容變更不再累計「成功太多次」停止門檻；更新資源後會淘汰舊成功指紋，
+允許正常修正或回復。重複操作／失敗觸發收斂時停止新的副作用，仍保留唯讀工具供查證；
+整體回合預算耗盡才進入無工具收尾。判定使用契約、參數與執行結果，不分析自然語言。
 
 失敗防護區分操作策略與內容修正：一般錯誤以工具、目標與控制參數辨識；錯誤指向
 `cell_updates`、`blocks` 等內容欄位時，另把內容摘要加入 attempt key，避免把真正修正後的
@@ -212,7 +234,10 @@ Harness 另有結構化重複操作防護：已成功的相同副作用工具呼
 `max_tool_calls` 限制。`max_tokens` 與 `max_tool_calls` 設為 `0` 時不限制，預設採此模式，
 避免長任務因累計用量提前停止；兩者仍可從系統管理或設定檔重新啟用限制。
 `max_wall_clock_seconds` 保留正整數上限，並可在系統管理調整。wall-clock 使用可取消的
-context，會中止仍在等待的模型或工具；token 依 Provider 回傳的 usage 逐輪累計。
+context，會中止仍在等待的模型或工具。主模型、Context 摘要與摘要備援共用 token 帳本，
+包含僅在串流或失敗前回報的 usage；送出前檢查剩餘額度，串流期間以固定字元區塊估算輸出，
+避免網路分包造成逐片進位超計。usage 缺失時的估算只用於預算煞車，不冒充精確計費；
+串流取消也不能保證上游立刻停止計費。
 管理設定只套用到之後開始的 Run，執行中的 Run 保留啟動時快照。
 
 達到已啟用的上限不是系統錯誤：Run 以 `completed` 收尾，`result.budget_exceeded` 與
@@ -227,6 +252,8 @@ context，會中止仍在等待的模型或工具；token 依 Provider 回傳的
 Harness 會在每輪 Provider 回報 usage 時累加 input、output 與 total token；Run 收尾時由
 Application 保存一次 `Run.Usage` 快照，即使 Run 失敗或取消，也保留錯誤前已收到的用量。
 重試會建立新的 Run 並保留原 Run，因此每個 Run 的統計彼此獨立，不會因重試或重新讀取重複計算。
+`Run.Usage.by_model` 包含主模型與摘要模型的實際回報分項，成本逐模型計算，不把摘要套用主模型價格。
+彙總只累計分項一次；分項與總量不一致時不猜測成本，沒有價格的部分也不冒充零成本。
 
 Session 的 `Usage` 不寫入 `session.json`，而是每次由獨立的精簡用量快照即時彙總，並依
 Provider／Model 提供 `by_model` 明細。`model_prices` 設定以 Provider ID 與模型名稱索引，
@@ -254,6 +281,10 @@ Run、用量與淘汰清單以同一候選狀態提交，寫入失敗時全部�
 核准時可另外傳送 `permanent=true`。Application 會先把核准狀態持久化到目前 Session，
 再喚醒 Harness；同一 Run 的後續工具與日後該 Session 的 Run 都會略過逐次審核。這個
 狀態不放在一般 Session 更新輸入中，因此 Client 無法在沒有 pending approval 時自行提權。
+
+先前結果未知的相同副作用例外：必須逐次人工核准，`one_time_only=true`，前端禁用永久選項，
+後端也拒絕永久授權，既有 Session 授權不能略過。核准僅接受本次重試的重複副作用風險，
+不會抹除先前未知紀錄，也不代表系統能保證恰好執行一次。
 
 等待期間 Harness goroutine 只等待決策，不持有實體 session gate。Application 仍保留該
 Session 對原 Run 的邏輯預約，因此其他已排隊 Run 不會插入尚未完成的 assistant/tool
@@ -549,8 +580,9 @@ CJK 字元約 1 token、ASCII 約 0.25 token。以英文為前提的 characters/
 高估只會提早 compaction，因此預設權重刻意偏保守。
 
 大型 tool result 只會在送入模型的 context view 中保留頭尾並縮減；原始工具輸出不會被改寫。若
-固定提示本身已佔滿極小的 context window，ContextManager 會優先縮短摘要，再以頭尾保留策略
-產生單一預算版 prompt，避免把正常 compaction 誤報為安全中止。每次 Run、Turn 與 Tool execution
+固定提示與工具定義已佔滿 context window，ContextManager 會明確拒絕請求；固定指示不得頭尾裁切。
+一般壓縮後仍不足時只縮摘要，不裁當前訊息，也不把歷史／工具內容升格合併到 system prompt。
+仍超額則要求縮小工作範圍。每次 Run、Turn 與 Tool execution
 另有 operation records，供當機診斷與後續復原使用。
 
 ## 紀錄與可觀測性
@@ -661,7 +693,7 @@ output_schema、read_only、requires_permission）。`platforms` 與 `capabiliti
 問題也不是「哪些工具用不到」——使用者通常全部都要用——而是「這一輪用得到哪些」。
 因此 `harness.toolRetriever` 在每個 Run 開始時對工具目錄做一次檢索。內建工具同樣納入：
 擴充工具集打開後有近二十個內建工具，`document_*`、`ssh_*` 的 schema 都不小，而任何一次需求
-通常只會用到其中一兩個。核心工具（`coreToolNames`：Shell、讀檔、列目錄、搜尋與計畫控制）不參與檢索——
+通常只會用到其中一兩個。核心工具（`coreToolNames`：Shell、讀檔、原始碼寫入、列目錄、搜尋與計畫控制）不參與檢索——
 階段提示直接點名它們，少了任何一個模型會先卡一輪。
 
 `wait_for` 與 `ssh_wait` 刻意**不是**核心工具。它們一度被列入，理由只是「階段提示提到
@@ -805,13 +837,26 @@ completed，也不會在收尾尚需讀取它時遭淘汰。取消、暫停與�
 核准回呼重新檢查取消意圖與終態；終態競爭只有首次保存成功者發送終止事件，晚到的失敗不改寫
 已取消／完成狀態，僅補上不倒退的最後用量。找不到 Run 的事件寫入直接拒絕，避免重建孤兒事件。
 
+事件 JSONL 只自動修復「無換行且 JSON 未完成」的最後一筆；完整尾筆缺換行則補齊。
+修改前把完整原檔備份到同目錄 `.recovery-*.bak`，RAM 紀錄不搬到磁碟，備份保留供人工查證。
+中段毀損、身分或序號異常不跳過、不改原檔，並失效序號快取以阻止繼續寫入；
+啟動恢復按 Run 隔離錯誤，不因單一壞事件檔讓整個服務無法啟動。
+
+工具副作用前先持久化 `tool_dispatched` 派送意圖，結果再保存 `execution_state`：
+`not_dispatched`、`succeeded`、`failed`、`unknown` 或 MCP 的 `awaiting_input`。
+派送意圖不代表遠端已收到，工具失敗也不代表沒有副作用。結果遺失／取消時保守標為未知；
+新 Run 從原始分頁稽核紀錄恢復未知呼叫指紋，不依賴模型摘要。相同未知副作用不自動重送，
+先唯讀查證，再由使用者逐次決定是否接受重試風險。
+
 ## 完成度判定
 
 Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成宣告。模型可以在工具失敗之後
 直接產出一段聽起來已完成的文字，而後端沒有任何機制察覺宣稱與實際狀態不一致。
 
 `completionTracker` 追蹤本次 run 內尚未解決的工具失敗，判定完全來自執行記錄，不解讀模型文字：
-某個工具失敗後，同一個工具名稱只要在之後成功執行過一次，就視為已解決（那正是模型自我修正的正常樣態）。
+逐 call 保留失敗，只由同一工具契約、目標資源及操作策略的成功解決；沒有資源契約時使用完整參數指紋。
+寫入 B 成功不能清除寫入 A 失敗，略過不能當成功，未知結果不自動被成功覆蓋。
+MCP 追加輸入只透過 Runtime 驗證的續接關係替換前一個 `awaiting_input` 紀錄。
 
 模型給出不含 tool_calls 的最終回覆時，若仍有未解決的失敗，Harness 會：
 
@@ -882,8 +927,8 @@ scope 不受影響。
 - `file_compare`：純 Go unified diff 與 SHA-256，不依賴 `diff`。
 - `directory_list`：有深度與項目上限的目錄列舉，不追蹤目錄 symlink。
 - `directory_create`：在 workspace 內建立單層或多層目錄。
-- `file_write`：限制輸入大小，預設不覆寫；覆寫時使用同目錄暫存檔與原子替換。
-- `file_edit`：以 old/new text 與預期替換數作 optimistic precondition，保留 mode 後原子寫回。
+- `file_write`：限制輸入大小，預設不覆寫；先完成同目錄暫存檔與 sync，再原子發布或替換。不覆寫時 Unix 使用硬連結、Windows 使用不帶 replace 標誌的 MoveFileEx，既有目標不可被取代；不支援硬連結的 Unix 檔案系統明確失敗，不降級成會曝光半成品的直接寫入。
+- `file_edit`：讀取、前置條件、替換與寫回共用程序內路徑鎖，跨 Session 的內建原子寫入不交錯。`expected_replacements` 只檢查替換數；可用 `expected_sha256` 檢查完整檔案版本。讀取與產出大小皆有限制，保留 mode 後原子寫回。這不是跨程序鎖，不能阻止外部 Shell 或編輯器同時修改。
 - `document_inspect`：檢視 PDF、DOCX、XLSX、PPTX 的格式、中繼資料、頁數、區段、工作表或投影片；不將二進位內容直接送給模型。
 - `document_read`：PDF／PPTX 依頁、DOCX 依區段與段落、XLSX 依工作表與列分段抽取文字；保留 Excel 儲存格座標與公式。掃描型 PDF 不內建 OCR。
 - `document_compare`：以相同範圍抽取兩份支援文件的可見文字並產生 bounded unified diff，同時回傳原始檔 SHA-256；內容相同不等同版面相同。
@@ -900,7 +945,7 @@ scope 不受影響。
 - `document_convert`：elevated 工具；由固定探索的 LibreOffice 將 Office／OpenDocument 文件轉成 PDF，或將舊式 DOC／XLS／PPT 與 ODT／ODS／ODP／RTF 遷移到同家族 Open XML。來源與輸出不可為同一路徑。
 - `pdf_pages`：elevated 工具；以純 Go PDF 匯入器完成合併、擷取、重排與分批拆分，保留來源檔與各頁尺寸，單次最多 500 頁。
 - `document_render`：elevated 工具；PDF 由 Poppler 輸出逐頁 PNG，Office 文件先用獨立 LibreOffice profile 轉成 PDF。後端只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受模型指定任意 executable。
-- `shell_exec`：必要高權限工具；Unix 使用 process group，Windows 使用 Job Object，取消或逾時會終止子程序樹；子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
+- `shell_exec`：必要高權限工具；Unix 使用 process group，Windows 使用 Job Object，取消或逾時會嘗試終止所管理子程序樹。輸出管線使用 2 秒 WaitDelay，取消後清理最多等待 3 秒；尚未回收時回報 cleanup_pending，不等待脫離群組的子程序永久持有 stdout。這不保證能終止已脫離管理的程序。子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
 - `ssh_exec`：使用 Go SSH client；連線憑證只存在後端 profile，模型只取得 profile 名稱。初始連線預設最多三次並使用 keepalive；工作中斷線不自動重跑遠端命令，以免重複副作用。
 - `wait_for`：不執行命令的可取消等待，具有最大秒數與進度事件；適合讓非同步上傳或服務啟動完成後再進行下一次檢查。
 - `ssh_wait`：只輪詢唯讀、冪等的遠端檢查命令，每次檢查重新建立 SSH session，支援預期 exit code、stdout 包含／完全相等與連續穩定檢查；逾時不會被視為部署成功。
@@ -938,19 +983,29 @@ Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具�
 `domain.ToolDefinition`；Server 通知工具清單變動時會重新載入。公開工具名稱會加入 Server
 命名空間，過長時以穩定雜湊截短，避免不同 Server 的同名工具互相覆蓋。
 
-MCP 工具與原生工具進入同一個 `ports.ToolRuntime`，並先通過同一個 elevated permission profile。
+MCP 工具與原生工具進入同一個 `ports.ToolRuntime`。原生工具受 elevated permission profile 控制，
+MCP 工具依 Server 啟用狀態、契約與人工 Approval 控制，不將 RAM 儲存視為遠端沙箱。
 唯讀工具是否免逐次人工 Approval 取決於 Server 宣告的 `readOnlyHint` 與管理者設定的
 `trust_annotations`；這個選項**預設開啟**（設定檔未提供時採預設值，明確設為 false 則沿用）。
 未信任的 Server 或非唯讀工具仍須逐次核准。豁免會發出 `run.approval_skipped`
-（`reason=read_only_tool`）留下紀錄，`trust_annotations` 同時仍用於唯讀並行排程。
+（`reason=read_only_or_isolated_workspace`）留下紀錄，`trust_annotations` 同時仍用於唯讀並行排程。
 
-記憶體隔離專案是第二種豁免：這類 Session 的所有工具都免逐次核准，紀錄的
-`reason` 為 `ephemeral_project`。判斷依據是 Run metadata 的 `ephemeral_project`
-旗標——與 `sandbox_roots` 同屬後端保留欄位，Client 夾帶的同名值會先被清除，
-因此不存在「宣告自己是記憶體專案就免審核」的路徑。這個豁免不改變並行排程：
-`shell_exec` 不是唯讀工具，仍然序列執行。進度通知會轉成 `tool.execution.update`，結果文字受全域工具輸出上限約束；結構化
-結果會一併提供給模型。Server 要求額外互動輸入時，會把 `input_required`、輸入請求與
-`requestState` 回傳給模型，模型可補上控制欄位後重試，不會假裝完成。
+記憶體隔離專案僅在單一 `sandbox_roots` 且工具具後端 `workspace-contained` 能力時豁免，
+例如原生檔案寫入／編輯、建立目錄與文件建立／編輯；Shell、SSH、MCP、外部轉換與渲染不因此豁免。
+`ephemeral_project` 與 `sandbox_roots` 是後端保留欄位，Client 夾帶值先清除。額外掛入持久根目錄
+時也不適用此例外；豁免不把副作用工具改成可並行。
+
+進度通知轉成 `tool.execution.update`，一般結果文字受全域工具輸出上限約束。
+MCP 需要追加輸入時，模型取得輸入請求與 `_mcp_continuation_id`，保留原始業務參數並提供
+`_mcp_input_responses`。opaque `requestState` 只保存在 Runtime 記憶體，不送給模型或 transcript。
+續接綁定 Session、Server、工具、原參數指紋與契約版本，單次消耗、24 小時到期，最多保留 512 筆，
+單筆狀態上限 64 KiB。同操作仍待輸入時拒絕重開；重啟後舊 ID 失效，不自動重做原操作。
+
+Harness 每輪刷新工具目錄，將模型看到的契約指紋綁定該次呼叫；核准前與 Runtime 派送前再次比對。
+隱藏工具若在本 Run 尚未公開契約，先拒絕派送並於下一輪公開；不能直接把記憶中的舊名稱綁到新定義。
+指紋包含 schema、讀寫／授權屬性及來源版本；MCP 重新連線後也再次比對，變更時停止派送並要求
+重新確認，不能以舊唯讀快照執行新副作用。來源版本用不透明 ID，不將憑證內容放入指紋。
+這只能核對 Client 可取得的契約，不能保證遠端實作與其宣告一致。
 
 連線壽命由三層機制維持，長時間執行的 Session 不必靠使用者手動重新連線：
 
@@ -958,9 +1013,9 @@ MCP 工具與原生工具進入同一個 `ports.ToolRuntime`，並先通過同�
   默默回收；連線真的結束時，`session.Wait()` 的監看會立即清掉狀態與工具快取。
 - 每次使用前先確認連線可用：已結束的連線直接重建；閒置超過 20 秒的連線會先 ping 再使用。
   ping 沒有副作用，因此這個檢查對所有工具都安全。
-- 呼叫失敗時區分「伺服器沒有收下」與「可能已執行」。`session not found`、session 過期與
-  連線根本沒建立起來代表遠端不可能執行過工具，這種情況重新連線後重送一次，不受
-  idempotent 宣告限制；其餘連線層錯誤維持只有 Server 宣告 idempotent 的工具才重試，
+- 呼叫失敗時區分「未派送」與「可能已執行」。只有 SDK 的連線已關閉型別錯誤或本機 dial
+  失敗，才當作未派送而允許重連重試；不以 `session not found` 等一般錯誤文字判定安全重送。
+  其餘連線層錯誤維持只有 Server 宣告 idempotent 的工具才重試，
   避免同一個副作用執行兩次。
 
 `call_timeout_seconds` 是「沒有回應或進度更新」的容忍時間，不是總時長上限：MCP Server 只要
@@ -1003,9 +1058,10 @@ OpenAI-compatible adapter 行為如下：
 - tool result `tool_call_id`；空的工具結果代換成明確文字後才送出，見「Tool call 協定不變式」。
 - SSE 文字、refusal 與 tool call arguments 串流累積，支援多行 SSE 與常見 NDJSON 相容輸出。
 - `stream_options.include_usage` 可設定；不支援串流或 `tool_choice` 的相容服務可分別停用。
-- 初始連線（包含 connection refused）、408/409/429 與暫時性 5xx 依 `max_attempts` 最多嘗試三次；未提供有效 `Retry-After` 時，分別等待 10、20 秒再重連，讓上游有時間恢復。有效 `Retry-After` 優先使用，上限 30 秒；Chat 與 Codex Responses 共用退避規則。等待期間透過既有 `agent.progress` 顯示重試狀態，可由停止操作或 Run 時間預算中止，不重新建立 Run 或重跑先前工具。已送出**回答文字或工具呼叫 delta** 就不自動重送——那是這一輪真正的產出，重來一次會變成兩份；次數耗盡後回報失敗。
-
-  **思考 delta 不阻擋重試。** 它曾經也算在內，理由是 durable event log 會出現無法去重的重複片段；但代價是一次跑了一分多鐘的推理遇到上游暫時性錯誤就整個作廢、連重試都不會發生，使用者什麼都拿不到。重試前本來就會送出 `agent.progress`（「準備第 N/M 次嘗試」）並寫進 event log，兩段思考在紀錄上有明確分界。
+- 初始連線（包含 connection refused）、408/409/429 與暫時性 5xx 依 `max_attempts` 最多嘗試三次；未提供有效 `Retry-After` 時，分別等待 10、20 秒再重連。有效 `Retry-After` 優先使用，上限 30 秒；Chat 與 Codex Responses 共用退避規則。等待期間 Console 透過 `agent.progress` 顯示重試狀態；等待結束以空進度訊息清除提示。停止操作或 Run 時間預算可中止等待，不重新建立 Run 或重跑先前工具。已送出回答文字、思考或工具呼叫 delta 就不自動重送，避免事件紀錄出現重複片段；次數耗盡後回報失敗。
+- Chat 與 Codex 串流事件的截斷 JSON 轉為可重試 Provider 錯誤，仍受已送出內容與嘗試次數限制；完整但格式錯誤的 JSON 不自動重試。Console 在累積緩衝區辨識 SSE 換行，支援跨網路封包的 CRLF，並依 sequence 跳過重複事件。
+- 收到完整的 Chat `[DONE]` 或 Codex `response.completed` 後停止讀取，不再等待連線 EOF；Chat 的 `finish_reason` 之後仍讀取可能的 usage，直到 `[DONE]` 或 EOF。Codex completed 補齊工具呼叫時沿用輸出陣列的真實索引，不以工具數量推算位置，避免稀疏索引相撞。
+- Console 收到 Run 終態或查詢確認終態時，透過共用清理立即停止草稿處理狀態與等待提示；後續等待計時不會重新啟用，無須等待 SSE 關閉。
 - 串流中的錯誤封包若含上游自己的重試建議（`you can retry your request`）或通用暫時性錯誤措辭，視為可重試。上游對這次失敗性質的宣告比從訊息文字猜測可靠，而金鑰錯誤、額度用盡、權限不足這類永久性失敗不會這樣寫。
 - 每次請求送出 `X-Client-Request-Id`，並將 Provider 回傳的 `x-request-id` 保存於 assistant message 與 turn record；API key 不會出現在診斷資料。
 - Provider HTTP 錯誤解析為 status、code、request ID、可重試狀態與受限長度訊息。
@@ -1097,6 +1153,11 @@ Pool 依配置容量計算本程序所有 Project 的總額，上限為實體記
 歸屬編碼在 ID 裡：隔離對話的 Session ID 為 `session_v<projectHex>_<random>`，Run ID 沿用同一個
 代碼。因為對話建立後不能換 Project（`Service.validateEphemeralSessionMove`），這個代碼永遠成立，
 路徑解析只需要字串處理，不必查詢狀態，也沒有需要失效的快取。
+
+建立 Session 的 ID factory 使用呼叫端 context 查詢 Project；查詢失敗直接中止，不得以一般
+Session ID 降級寫入 `dataDir`。隔離 ID 找不到 RAM disk 時，即使尚未注入根目錄解析器，
+也必須拒絕存取。Sandbox 路徑大小寫對齊只接受檔案系統確認存在且指向同一項目的別名，
+不把不存在的拼法猜成另一個檔案。
 
 | 資料 | 作法 | 解析依據 |
 | --- | --- | --- |

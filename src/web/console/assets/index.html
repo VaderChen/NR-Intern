@@ -667,6 +667,7 @@
               <div class="provider-editor-action-group">
                 <span id="mcpTestState" class="hint"></span>
                 <button id="testMCPSetting" class="ghost" type="button">測試連線</button>
+                <button id="readMCPContract" class="ghost" type="button" title="重新讀取這台 Server 的工具契約，整理成使用導覽寫入共用記憶">詳讀契約</button>
                 <button id="saveMCPSetting" class="primary" type="submit">儲存 MCP Server</button>
               </div>
             </div>
@@ -766,7 +767,7 @@
             <label class="check-label"><input id="settingExtendedTools" type="checkbox">擴充工具集</label>
             <label class="check-label"><input id="settingInstructionToolCalls" type="checkbox">改用指令模式工具呼叫</label>
             <label class="check-label"><input id="settingToolRetrieval" type="checkbox" checked>工具目錄先經檢索再進入提示</label>
-            <p class="hint">工具目錄每一輪都會整份送進提示。預設只公開精簡工具集（Shell、讀檔、列目錄、搜尋、辦公文件產出與計畫控制）；需要寫入、編輯、SSH 或記憶工具時再開啟擴充工具集。檢索會再過濾一次：可選工具超過 12 個時，只有與這次需求相關的工具進入提示，內建工具與 MCP 工具都適用，其餘工具 Agent 仍可用 find_tools 找回來直接呼叫，沒有任何工具被停用；關閉檢索會讓整份目錄進入每一次請求，大型 MCP Server 可能讓單次請求膨脹到數萬 tokens。工具呼叫預設使用 Provider 的原生 tool_calls 欄位；Provider 不支援時才改用指令模式，由模型自行輸出 JSON 指令。</p>
+            <p class="hint">預設公開精簡工具集（Shell、讀檔、原始碼寫入、列目錄、搜尋、辦公文件產出與計畫控制）；需要局部編輯、SSH 或記憶工具時再開啟擴充工具集。互動 HTML 網頁使用 file_write 原樣寫入；document_create 的 HTML 用於文字報告。所有寫入仍受工具 allowlist 與權限審核限制。啟用檢索後，可選工具超過 12 個時，只有與這次需求相關的工具進入提示，內建工具與 MCP 工具都適用；已啟用但未命中檢索的工具仍可用 find_tools 找回，未啟用的工具不會因此解鎖。關閉檢索會讓整份已公開目錄進入每一次請求，大型 MCP Server 可能讓單次請求膨脹到數萬 tokens。工具呼叫預設使用 Provider 的原生 tool_calls 欄位；Provider 不支援時才改用指令模式，由模型自行輸出 JSON 指令。</p>
           </fieldset>
           <fieldset class="settings-fieldset">
             <legend>對外網路</legend>

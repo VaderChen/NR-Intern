@@ -85,6 +85,11 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 			return domain.ModelResponse{}, ctx.Err()
 		case <-timer.C:
 		}
+		if sink != nil {
+			if err := sink(domain.ModelEvent{Type: domain.ModelEventProgress}); err != nil {
+				return domain.ModelResponse{}, err
+			}
+		}
 	}
 	return domain.ModelResponse{}, lastErr
 }

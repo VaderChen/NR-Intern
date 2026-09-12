@@ -269,7 +269,9 @@ func TestEphemeralConversationLeavesDataDirUntouchedWhileRunning(t *testing.T) {
 	seedEveryStore(t, ctx, normal.ID, "一般", sessions, plans, attachments, runs, events, notifications, memories)
 	baseline := snapshotTree(t, dataDir)
 
-	sessions.SetSessionIDFactory(func(string) string { return domain.NewEphemeralSessionID(volatileProjectID) })
+	sessions.SetSessionIDFactory(func(context.Context, string) (string, error) {
+		return domain.NewEphemeralSessionID(volatileProjectID), nil
+	})
 	volatile, err := sessions.Create(ctx, "agent", domain.CreateSessionInput{ProjectID: volatileProjectID, Title: "隔離對話"})
 	if err != nil {
 		t.Fatalf("create volatile session: %v", err)

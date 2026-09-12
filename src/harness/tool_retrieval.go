@@ -45,6 +45,7 @@ const (
 var coreToolNames = map[string]bool{
 	systemShellToolName: true,
 	"file_read":         true,
+	"file_write":        true,
 	"directory_list":    true,
 	"file_search":       true,
 	"plan_get":          true,

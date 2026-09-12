@@ -102,6 +102,11 @@ func alignPathCase(path string) string {
 // matchDirEntryCase 在 parent 底下找出與 name 大小寫無關相符的真實名稱。
 // 找不到（例如尚未建立的檔案）就原樣回傳，讓後續步驟自行處理。
 func matchDirEntryCase(parent, name string) string {
+	// 只有檔案系統本身接受此拼法時才能對齊，不能猜測不存在的別名。
+	requestedInfo, err := os.Lstat(filepath.Join(parent, name))
+	if err != nil {
+		return name
+	}
 	entries, err := os.ReadDir(parent)
 	if err != nil {
 		return name
@@ -113,7 +118,9 @@ func matchDirEntryCase(parent, name string) string {
 	}
 	for _, entry := range entries {
 		if strings.EqualFold(entry.Name(), name) {
-			return entry.Name()
+			if info, err := entry.Info(); err == nil && os.SameFile(requestedInfo, info) {
+				return entry.Name()
+			}
 		}
 	}
 	return name

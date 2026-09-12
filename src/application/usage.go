@@ -42,6 +42,34 @@ func pricedRunUsage(raw *domain.RunUsage, providerID, model string, prices map[s
 	}
 	usage.EstimatedCostUSD = nil
 	usage.Currency = ""
+	if len(raw.ByModel) > 0 {
+		usage.ByModel = nil
+		var input, output, total int
+		cost := 0.0
+		known := true
+		for _, part := range raw.ByModel {
+			part.ByModel = nil
+			priced := pricedRunUsage(&part, part.ProviderID, part.Model, prices)
+			usage.ByModel = append(usage.ByModel, *priced)
+			input += priced.InputTokens
+			output += priced.OutputTokens
+			total += priced.TotalTokens
+			if priced.EstimatedCostUSD == nil {
+				known = false
+			} else {
+				cost += *priced.EstimatedCostUSD
+			}
+		}
+		if input != usage.InputTokens || output != usage.OutputTokens || total != usage.TotalTokens {
+			usage.ByModel = nil
+			return &usage
+		}
+		if known {
+			usage.EstimatedCostUSD = &cost
+			usage.Currency = "USD"
+		}
+		return &usage
+	}
 	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
 		return &usage
 	}
@@ -83,6 +111,16 @@ func summarizeSessionUsage(runs []domain.Run) *domain.SessionUsage {
 }
 
 func summarizeUsageSnapshots(values []domain.RunUsage) *domain.SessionUsage {
+	// 明細已包含於 Run 總數，只攤平一次，避免重複累計。
+	flattened := make([]domain.RunUsage, 0, len(values))
+	for _, value := range values {
+		if len(value.ByModel) > 0 {
+			flattened = append(flattened, value.ByModel...)
+		} else {
+			flattened = append(flattened, value)
+		}
+	}
+	values = flattened
 	result := &domain.SessionUsage{}
 	groups := map[string]*sessionUsageGroup{}
 	allCostKnown := true

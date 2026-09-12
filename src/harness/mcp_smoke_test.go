@@ -492,7 +492,7 @@ func TestSmokeReadOnlyToolsAreAvailableOnTheFirstTurn(t *testing.T) {
 	// 唯讀工具與辦公文件產出都在第一階段就公開：使用者說「轉成 Excel」時，
 	// 沒有 document_create 就只能用 shell 去找 python，失敗後才退成 CSV。
 	// 目錄大小改由工具檢索控制，不再靠延後整個文件家族來省提示。
-	want := "directory_list,document_create,document_read,file_read,mcp__mars-mes__query_work_orders,memory_search,plan_get,shell_exec,wait_for"
+	want := "directory_list,document_create,document_read,file_read,file_write,mcp__mars-mes__query_work_orders,memory_search,plan_get,shell_exec,wait_for"
 	if got != want {
 		t.Fatalf("system-first stage exposes %s, want %s", got, want)
 	}

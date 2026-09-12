@@ -113,14 +113,32 @@ func ephemeralProjectSession(session domain.Session) bool {
 	return value
 }
 
-func approvalExemptToolNames(definitions []domain.ToolDefinition) map[string]bool {
+func approvalExemptToolNames(definitions []domain.ToolDefinition, sessions ...domain.Session) map[string]bool {
 	result := make(map[string]bool, len(definitions))
+	isolatedWorkspace := false
+	if len(sessions) > 0 && ephemeralProjectSession(sessions[0]) {
+		// 額外掛入排程等持久目錄時，不能再以 RAM 工作區為由免審核。
+		switch roots := sessions[0].Metadata["sandbox_roots"].(type) {
+		case []string:
+			isolatedWorkspace = len(roots) == 1 && strings.TrimSpace(roots[0]) != ""
+		case []any:
+			root, _ := firstRoot(roots).(string)
+			isolatedWorkspace = len(roots) == 1 && strings.TrimSpace(root) != ""
+		}
+	}
 	for _, definition := range definitions {
-		if definition.ReadOnly {
+		if definition.ReadOnly || (isolatedWorkspace && hasCapability(definition.Capabilities, "workspace-contained")) {
 			result[strings.TrimSpace(definition.Name)] = true
 		}
 	}
 	return result
+}
+
+func firstRoot(roots []any) any {
+	if len(roots) == 0 {
+		return nil
+	}
+	return roots[0]
 }
 
 func availableToolNames(definitions []domain.ToolDefinition) map[string]bool {
@@ -129,6 +147,16 @@ func availableToolNames(definitions []domain.ToolDefinition) map[string]bool {
 		result[definition.Name] = true
 	}
 	return result
+}
+
+func readOnlyToolDefinitions(definitions []domain.ToolDefinition) []domain.ToolDefinition {
+	values := make([]domain.ToolDefinition, 0, len(definitions))
+	for _, definition := range definitions {
+		if definition.ReadOnly && definition.Name != askUserToolName {
+			values = append(values, definition)
+		}
+	}
+	return values
 }
 
 func availableToolNamesSorted(definitions []domain.ToolDefinition) []string {
@@ -151,7 +179,8 @@ func availableToolNamesSorted(definitions []domain.ToolDefinition) []string {
 // 唯讀工具一律直接公開：先前它們要等 shell_exec 實際失敗過一次才解鎖，等於每個
 // 「讀檔案／盤點目錄」的需求都固定多花一輪跑一個註定失敗的命令，卻沒有任何產出。
 // 唯讀工具沒有副作用，提前公開不會放寬任何權限邊界（elevated 與 Approval 仍照舊）。
-// 寫入型內建工具維持原本的 Shell 優先策略，失敗後才由備援階段公開。
+// 原始碼寫入／編輯與文件產出直接公開，但不改變原有權限閘門。
+// 其餘寫入型內建工具維持 Shell 優先策略，失敗後才由備援階段公開。
 func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback bool) []domain.ToolDefinition {
 	if builtinFallback || !definitionNamed(definitions, systemShellToolName) {
 		return definitions
@@ -161,6 +190,7 @@ func stagedToolDefinitions(definitions []domain.ToolDefinition, builtinFallback 
 		name := strings.ToLower(strings.TrimSpace(definition.Name))
 		staged := definition.ReadOnly ||
 			name == systemShellToolName || name == waitToolName || name == sshWaitToolName ||
+			name == "file_write" || name == "file_edit" ||
 			strings.HasPrefix(name, "plan_") || strings.HasPrefix(name, "mcp__") ||
 			documentAuthoringTool(name)
 		if staged {
@@ -284,6 +314,7 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 				Details: map[string]any{
 					"refused":              true,
 					"unavailable_in_stage": true,
+					"execution_state":      domain.ToolNotDispatched,
 				},
 			},
 			startedAt: startedAt,
@@ -295,9 +326,26 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	if retriever.enabled() && !retrievalExempt(call.Name) {
 		retriever.reveal(call.Name)
 	}
-	if guarded, skip := loopGuard.before(call); skip {
-		return toolOutcome{call: call, result: guarded, startedAt: startedAt, duration: time.Since(startedAt)}
+	if resolver, ok := r.Tools.(ports.ToolContractResolver); ok {
+		definition, err := resolver.ResolveDefinition(ctx, session, call.Name)
+		if err != nil || call.ExpectedContractID == "" || call.ExpectedContractID != domain.ToolContractID(definition) {
+			return toolOutcome{call: call, startedAt: startedAt, result: domain.ToolExecution{
+				ToolCallID: call.ID, ToolName: call.Name, IsError: true,
+				Content: "工具契約已變更或不可用，本次未派送。下一輪將更新目錄；請重新確認工具參數與授權範圍。",
+				Details: map[string]any{"execution_state": domain.ToolNotDispatched, "contract_changed": true},
+			}}
+		}
+		approvalExempt = approvalExemptToolNames([]domain.ToolDefinition{definition}, session)[call.Name]
 	}
+	uncertainRetry := false
+	if guarded, skip := loopGuard.before(call); skip {
+		unknown, _ := guarded.Details["outcome_unknown"].(bool)
+		if !unknown || r.Approvals == nil {
+			return toolOutcome{call: call, result: guarded, startedAt: startedAt, duration: time.Since(startedAt)}
+		}
+		uncertainRetry = true
+	}
+	unknownRetryApproved := false
 	result := domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name}
 	refused := false
 	if r.BeforeTool != nil {
@@ -308,14 +356,9 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			refused = true
 		}
 	}
-	// 記憶體隔離專案的工作區是揮發性 RAM Disk，關閉程式即消失，因此不再逐次詢問。
-	// 這裡放在 read-only 判斷之後，讓兩種豁免各自留下可辨識的原因。
-	exemptReason := "read_only_tool"
-	if !approvalExempt && ephemeralProjectSession(session) {
-		approvalExempt = true
-		exemptReason = "ephemeral_project"
-	}
-	if !refused && approvalExempt && r.Approvals != nil && r.Approvals.Required(call.Name) {
+	// 豁免只來自本輪工具契約：RAM 儲存不能豁免 Shell、SSH 或遠端副作用。
+	exemptReason := "read_only_or_isolated_workspace"
+	if !refused && !uncertainRetry && approvalExempt && r.Approvals != nil && r.Approvals.Required(call.Name) {
 		// 留下紀錄：使用者要能看出這次呼叫為什麼沒有跳核准。
 		_ = sink.emitEvent("run.approval_skipped", map[string]any{
 			"tool_call_id": call.ID,
@@ -323,7 +366,7 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			"reason":       exemptReason,
 		})
 	}
-	if !refused && !approvalExempt && r.Approvals != nil && !approvals.approved() && r.Approvals.Required(call.Name) {
+	if !refused && r.Approvals != nil && (uncertainRetry || (!approvalExempt && !approvals.approved() && r.Approvals.Required(call.Name))) {
 		request := domain.ToolApprovalRequest{
 			ID:          domain.NewID("approval"),
 			RunID:       strings.TrimSpace(runID),
@@ -333,6 +376,10 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			Arguments:   visibleApprovalArguments(call.Arguments),
 			Reason:      "此工具可能產生外部副作用，需要人工核准。",
 			RequestedAt: time.Now().UTC(),
+		}
+		if uncertainRetry {
+			request.OneTimeOnly = true
+			request.Reason = "先前相同操作的執行結果未知，可能已產生副作用。請先查證外部狀態；核准僅代表接受本次重新執行可能造成重複副作用的風險，不代表先前未執行。"
 		}
 		if err := r.Approvals.Begin(request); err != nil {
 			return toolOutcome{call: call, startedAt: startedAt, duration: time.Since(startedAt), err: err}
@@ -350,7 +397,8 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			result.Details = map[string]any{"approval_interrupted": true, "approval_id": request.ID}
 			refused = true
 		} else {
-			if decision.Decision == domain.ToolApprovalApprove && decision.Permanent {
+			unknownRetryApproved = uncertainRetry && decision.Decision == domain.ToolApprovalApprove
+			if decision.Decision == domain.ToolApprovalApprove && decision.Permanent && !request.OneTimeOnly {
 				approvals.approvePermanently()
 			}
 			if err := sink.emitEvent("run.approval_resolved", map[string]any{"approval": request, "decision": decision}); err != nil {
@@ -371,6 +419,18 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 		}
 	}
 	if !refused {
+		// 派送意圖必須先持久化；此紀錄不聲稱遠端已收到。結果遺失時一律保守為未知。
+		if err := ctx.Err(); err != nil {
+			return toolOutcome{call: call, startedAt: startedAt, err: err}
+		}
+		if r.Sessions != nil {
+			if _, err := appendRecord(ctx, r.Sessions, session.ID, domain.SessionEntryToolDispatched, map[string]any{
+				"operation_id": runID, "tool_call_id": call.ID, "tool_name": call.Name,
+				"call_signature": toolCallSignature(call),
+			}); err != nil {
+				return toolOutcome{call: call, startedAt: startedAt, err: err}
+			}
+		}
 		executed, err := r.Tools.Execute(ctx, session, call, func(update domain.ToolExecution) error {
 			return sink.emitEvent("tool.execution.update", map[string]any{
 				"tool_call_id": call.ID,
@@ -379,7 +439,14 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			})
 		})
 		if err != nil {
-			executed = domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: err.Error(), IsError: true}
+			executed.IsError = true
+			executed.Content = strings.TrimSpace(executed.Content + "\n" + err.Error())
+			if executed.Details == nil {
+				executed.Details = map[string]any{}
+			}
+			if domain.ToolExecutionState(executed.Details) == "" {
+				executed.Details["execution_state"] = domain.ToolOutcomeUnknown
+			}
 		}
 		result = executed
 	}
@@ -388,6 +455,29 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	}
 	result.ToolCallID = call.ID
 	result.ToolName = call.Name
+	if result.Details == nil {
+		result.Details = map[string]any{}
+	}
+	if unknownRetryApproved {
+		// 新呼叫成功也不抹除舊呼叫的未知紀錄，無法據此宣稱恰好執行一次。
+		result.Details["unknown_retry_approved"] = true
+	}
+	if domain.ToolExecutionState(result.Details) == "" {
+		switch {
+		case refused:
+			result.Details["execution_state"] = domain.ToolNotDispatched
+		case ctx.Err() != nil:
+			result.Details["execution_state"] = domain.ToolOutcomeUnknown
+		case result.IsError:
+			result.Details["execution_state"] = domain.ToolFailed
+		default:
+			result.Details["execution_state"] = domain.ToolSucceeded
+		}
+	}
+	if domain.ToolExecutionState(result.Details) == domain.ToolOutcomeUnknown {
+		result.IsError = true
+		result.Content += "\n[執行結果未知：可能已產生副作用，請先唯讀查證，不得直接重送。]"
+	}
 	loopGuard.observe(call, result)
 	return toolOutcome{call: call, result: result, startedAt: startedAt, duration: time.Since(startedAt)}
 }

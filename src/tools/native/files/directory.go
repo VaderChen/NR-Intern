@@ -155,7 +155,7 @@ func (t *DirectoryCreateTool) Definition() domain.ToolDefinition {
 		Category:           "files",
 		Description:        "在 Project／Session Sandbox 內建立目錄，可一併建立缺少的父目錄。",
 		Platforms:          []string{"darwin", "linux", "windows"},
-		Capabilities:       []string{"directory", "create", "workspace-sandbox"},
+		Capabilities:       []string{"directory", "create", "workspace-sandbox", "workspace-contained"},
 		RequiresPermission: true,
 		InputSchema: map[string]any{
 			"type": "object",

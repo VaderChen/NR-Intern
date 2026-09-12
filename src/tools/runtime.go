@@ -5,6 +5,7 @@ import (
 	"AgenticService/src/mcpclient"
 	"AgenticService/src/ports"
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -14,6 +15,16 @@ import (
 type Runtime struct {
 	Native *Registry
 	MCP    *mcpclient.Manager
+}
+
+func (r *Runtime) ResolveDefinition(ctx context.Context, session domain.Session, name string) (domain.ToolDefinition, error) {
+	if strings.HasPrefix(strings.ToLower(name), "mcp__") && r != nil && r.MCP != nil {
+		return r.MCP.ResolveDefinition(ctx, session, name)
+	}
+	if r != nil && r.Native != nil {
+		return r.Native.ResolveDefinition(ctx, session, name)
+	}
+	return domain.ToolDefinition{}, fmt.Errorf("%w: 工具不可用", domain.ErrNotFound)
 }
 
 func (r *Runtime) Definitions(ctx context.Context, session domain.Session) ([]domain.ToolDefinition, error) {

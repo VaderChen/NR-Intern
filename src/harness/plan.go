@@ -28,7 +28,7 @@ func planningPhasePrompt(locked, hasPlans bool) string {
 1. 先讀取 ContextPrompt 的「計畫佇列」；需要重新確認時可用 plan_get。沒有適用計畫時，用 plan_create 把一個獨立任務拆成少量、可驗證的步驟；不可為同一任務重複建立計畫。
 2. ` + planPolicy + ` 實際工作前先把目標步驟標為 in_progress。
 3. 工作完成後先標為 verifying，再呼叫適合的系統或內建工具執行客觀檢查。
-4. 只有驗證結果符合該步驟的 verification 條件，才能標為 completed，並在 evidence 填入實際結果；不得用預期結果或自行宣稱代替工具證據。
+4. 只有驗證結果符合該步驟的 verification 條件，才能標為 completed；evidence 填實際結果，evidence_tool_call_ids 引用進入 verifying 後的成功工具 call ID。後端會核對 ID、結果與時間，不接受預期結果或自行宣稱。
 5. 無法繼續時標為 blocked 並記錄原因；不得略過失敗步驟後宣稱整份計畫完成。
 
 plan_get、plan_create 與 plan_step_update 是 Harness 控制工具，無論目前是 Shell 優先或內建備援階段都可以呼叫。計畫只負責控制生命週期；檔案、主機與外部狀態仍必須用本輪公開的工作工具實際處理。`

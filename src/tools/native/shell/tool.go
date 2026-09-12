@@ -94,6 +94,8 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, sink po
 		return shellFailure(invocation.Call, err.Error(), nil), nil
 	}
 	command.Dir = workingDirectory
+	// 子程序可能脫離 process group 卻仍持有輸出管線；不能無限等 EOF。
+	command.WaitDelay = 2 * time.Second
 	command.Env = mergeEnvironment(safeEnvironment(os.Environ()), arguments["env"])
 	adapter.Prepare(command)
 	stdout := toolutil.NewLimitedBuffer(t.MaxOutputBytes)
@@ -101,6 +103,9 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, sink po
 	command.Stdout = stdout
 	command.Stderr = stderr
 	startedAt := time.Now().UTC()
+	if err := runCtx.Err(); err != nil {
+		return domain.ToolExecution{}, err
+	}
 	if err := command.Start(); err != nil {
 		return shellFailure(invocation.Call, err.Error(), nil), nil
 	}
@@ -113,28 +118,41 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, sink po
 	go func() { done <- command.Wait() }()
 	var runErr error
 	var terminationErr error
+	waitCompleted := true
 	select {
 	case runErr = <-done:
 	case <-runCtx.Done():
 		terminationErr = group.Terminate()
-		runErr = <-done
+		// 群組終止失敗時仍嘗試終止直接子程序，並限制清理等待時間。
+		if terminationErr != nil {
+			_ = command.Process.Kill()
+		}
+		timer := time.NewTimer(3 * time.Second)
+		select {
+		case runErr = <-done:
+		case <-timer.C:
+			waitCompleted = false
+		}
+		timer.Stop()
+		runErr = runCtx.Err()
 	}
 	duration := time.Since(startedAt)
 	exitCode := -1
-	if command.ProcessState != nil {
+	if waitCompleted && command.ProcessState != nil {
 		exitCode = command.ProcessState.ExitCode()
 	}
 	details := map[string]any{
-		"mode":          mode,
-		"working_dir":   toolutil.DisplayPathInRoots(sandboxRoots, workingDirectory),
-		"exit_code":     exitCode,
-		"duration_ms":   duration.Milliseconds(),
-		"stdout":        stdout.String(),
-		"stderr":        stderr.String(),
-		"stdout_cut":    stdout.Truncated(),
-		"stderr_cut":    stderr.Truncated(),
-		"timed_out":     errors.Is(runCtx.Err(), context.DeadlineExceeded),
-		"process_group": group.Name(),
+		"mode":            mode,
+		"working_dir":     toolutil.DisplayPathInRoots(sandboxRoots, workingDirectory),
+		"exit_code":       exitCode,
+		"duration_ms":     duration.Milliseconds(),
+		"stdout":          stdout.String(),
+		"stderr":          stderr.String(),
+		"stdout_cut":      stdout.Truncated(),
+		"stderr_cut":      stderr.Truncated(),
+		"timed_out":       errors.Is(runCtx.Err(), context.DeadlineExceeded),
+		"process_group":   group.Name(),
+		"cleanup_pending": !waitCompleted,
 	}
 	if terminationErr != nil && !errors.Is(terminationErr, os.ErrProcessDone) {
 		details["termination_error"] = terminationErr.Error()

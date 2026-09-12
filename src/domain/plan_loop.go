@@ -33,6 +33,7 @@ const (
 	PlanLoopStopNoProgress PlanLoopStopReason = "no_progress"
 	PlanLoopStopRunFailed  PlanLoopStopReason = "run_failed"
 	PlanLoopStopCompleted  PlanLoopStopReason = "completed"
+	PlanLoopStopIncomplete PlanLoopStopReason = "incomplete"
 )
 
 const (
@@ -280,7 +281,11 @@ func EvaluatePlanLoopAfterRound(plan Plan, progressed bool, now time.Time) (Plan
 	// 完成優先於一切：做完了就是做完了，不必再提上限或空轉。
 	// 這裡看的是計畫狀態，不是 Agent 說了什麼——Agent 的最後一句話不是驗收標準。
 	if PlanIsTerminal(plan) {
-		stopped, _ := StopPlanLoop(plan, PlanLoopStopCompleted, "計畫的所有步驟都已完成或略過", now)
+		if plan.Status != PlanStatusCompleted {
+			stopped, _ := StopPlanLoop(plan, PlanLoopStopIncomplete, "計畫已結束，但仍有略過或未交付部分", now)
+			return stopped, PlanLoopDecision{StopBy: PlanLoopStopIncomplete, Reason: "計畫未全部完成"}
+		}
+		stopped, _ := StopPlanLoop(plan, PlanLoopStopCompleted, "計畫的所有步驟都已完成", now)
 		return stopped, PlanLoopDecision{StopBy: PlanLoopStopCompleted, Reason: "計畫已完成"}
 	}
 	if loop.IdleRounds >= PlanLoopIdleLimit {

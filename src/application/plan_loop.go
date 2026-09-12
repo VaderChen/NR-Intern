@@ -3,6 +3,7 @@ package application
 import (
 	"AgenticService/src/domain"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -16,6 +17,8 @@ import (
 
 // StartPlanLoop 由使用者啟動多輪，並立刻送出第一輪。
 func (s *Service) StartPlanLoop(ctx context.Context, sessionID, planID string, maxRounds int) (domain.Plan, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	plan, session, err := s.prepareLoopMutation(ctx, sessionID, planID)
 	if err != nil {
 		return domain.Plan{}, err
@@ -24,11 +27,10 @@ func (s *Service) StartPlanLoop(ctx context.Context, sessionID, planID string, m
 	if session.LockPlans {
 		return domain.Plan{}, fmt.Errorf("%w: 這個對話鎖定了計畫，無法啟動 LOOP", domain.ErrConflict)
 	}
-	started, err := domain.StartPlanLoop(plan, maxRounds, s.now())
+	started, err := s.plans.Mutate(ctx, plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+		return domain.StartPlanLoop(current, maxRounds, s.now())
+	})
 	if err != nil {
-		return domain.Plan{}, err
-	}
-	if started, err = s.plans.Update(ctx, started); err != nil {
 		return domain.Plan{}, err
 	}
 	return s.startPlanLoopRound(ctx, started)
@@ -36,15 +38,19 @@ func (s *Service) StartPlanLoop(ctx context.Context, sessionID, planID string, m
 
 // ResumePlanLoop 從檢查點的下一輪接續。由使用者發起，與「只有使用者能啟動」一致。
 func (s *Service) ResumePlanLoop(ctx context.Context, sessionID, planID string) (domain.Plan, error) {
-	plan, _, err := s.prepareLoopMutation(ctx, sessionID, planID)
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	plan, session, err := s.prepareLoopMutation(ctx, sessionID, planID)
 	if err != nil {
 		return domain.Plan{}, err
 	}
-	resumed, err := domain.ResumePlanLoop(plan, s.now())
-	if err != nil {
-		return domain.Plan{}, err
+	if session.LockPlans {
+		return domain.Plan{}, fmt.Errorf("%w: 這個對話鎖定了計畫，無法續跑 LOOP", domain.ErrConflict)
 	}
-	if resumed, err = s.plans.Update(ctx, resumed); err != nil {
+	resumed, err := s.plans.Mutate(ctx, plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+		return domain.ResumePlanLoop(current, s.now())
+	})
+	if err != nil {
 		return domain.Plan{}, err
 	}
 	return s.startPlanLoopRound(ctx, resumed)
@@ -52,6 +58,8 @@ func (s *Service) ResumePlanLoop(ctx context.Context, sessionID, planID string) 
 
 // StopPlanLoop 由使用者終結多輪，不留續跑餘地。
 func (s *Service) StopPlanLoop(ctx context.Context, sessionID, planID, reason string) (domain.Plan, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	plan, err := s.loopPlan(ctx, sessionID, planID)
 	if err != nil {
 		return domain.Plan{}, err
@@ -59,12 +67,13 @@ func (s *Service) StopPlanLoop(ctx context.Context, sessionID, planID, reason st
 	if strings.TrimSpace(reason) == "" {
 		reason = "使用者停止"
 	}
-	stopped, err := domain.StopPlanLoop(plan, domain.PlanLoopStopUser, reason, s.now())
+	stopped, err := s.plans.Mutate(ctx, plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+		return domain.StopPlanLoop(current, domain.PlanLoopStopUser, reason, s.now())
+	})
 	if err != nil {
 		return domain.Plan{}, err
 	}
-	s.cancelSessionRuns(ctx, sessionID)
-	return s.plans.Update(ctx, stopped)
+	return stopped, s.cancelSessionRuns(context.WithoutCancel(ctx), sessionID)
 }
 
 // InterruptPlanLoop 立刻中止當前這一輪並留下檢查點。
@@ -72,22 +81,20 @@ func (s *Service) StopPlanLoop(ctx context.Context, sessionID, planID, reason st
 // Agent 透過 plan_loop_interrupt 走這條路；使用者的「暫停」也是同一條。
 // 語意是「現在就停」，所以要真的把正在跑的 Run 取消掉。
 func (s *Service) InterruptPlanLoop(ctx context.Context, sessionID, planID string, by domain.PlanLoopStopReason, reason, note string) (domain.Plan, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	plan, err := s.loopPlan(ctx, sessionID, planID)
 	if err != nil {
 		return domain.Plan{}, err
 	}
-	interrupted, err := domain.InterruptPlanLoop(plan, by, reason, note, s.now())
+	// 原子讀取最新步驟並保存檢查點，再取消 Run；不得覆寫同期工具更新。
+	saved, err := s.plans.Mutate(ctx, plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+		return domain.InterruptPlanLoop(current, by, reason, note, s.now())
+	})
 	if err != nil {
 		return domain.Plan{}, err
 	}
-	// 先寫入檢查點再取消 Run：反過來的話，取消觸發的收尾會看到還在 running
-	// 的多輪，而去開下一輪。
-	saved, err := s.plans.Update(ctx, interrupted)
-	if err != nil {
-		return domain.Plan{}, err
-	}
-	s.cancelSessionRuns(ctx, sessionID)
-	return saved, nil
+	return saved, s.cancelSessionRuns(context.WithoutCancel(ctx), sessionID)
 }
 
 // ActivePlanLoop 回傳這個 Session 目前正在多輪執行的計畫。
@@ -110,41 +117,41 @@ func (s *Service) ActivePlanLoop(ctx context.Context, sessionID string) (domain.
 
 // startPlanLoopRound 把輪數加一並送出這一輪的 Run。
 func (s *Service) startPlanLoopRound(ctx context.Context, plan domain.Plan) (domain.Plan, error) {
-	begun, err := domain.BeginPlanLoopRound(plan, s.now())
+	// 呼叫端持有 startMu：計畫啟停、一般 Run 啟動與自動續跑不會交錯。
+	briefPlan, err := domain.BeginPlanLoopRound(plan, s.now())
 	if err != nil {
-		return domain.Plan{}, err
+		return plan, err
 	}
-	// 先把輪數寫進儲存再送 Run：Run 送出後才寫的話，程序在中間死掉就會少算一輪，
-	// 而少算的那一輪確實已經花掉了成本。
-	saved, err := s.plans.Update(ctx, begun)
-	if err != nil {
-		return domain.Plan{}, err
-	}
-	// 輸入完全由後端從儲存組裝，不含模型上一輪的任何複述——那正是走鐘的傳染途徑。
-	run, err := s.StartRun(ctx, domain.RunInput{
-		SessionID: saved.SessionID,
-		UserInput: domain.PlanRoundBrief(saved),
-	})
-	if err != nil {
-		// 送不出去就把這一輪標記為暫停，讓使用者看得到原因並自行續跑，
-		// 而不是留下一個看起來在跑、其實不會前進的多輪。
-		failed, interruptErr := domain.InterruptPlanLoop(saved, domain.PlanLoopStopRunFailed,
-			"無法送出這一次："+err.Error(), "", s.now())
-		if interruptErr == nil {
-			if updated, updateErr := s.plans.Update(ctx, failed); updateErr == nil {
-				return updated, err
+	saved := plan
+	_, err = s.startRunLocked(ctx, domain.RunInput{
+		SessionID: plan.SessionID,
+		UserInput: domain.PlanRoundBrief(briefPlan),
+	}, func(run domain.Run) error {
+		var updateErr error
+		saved, updateErr = s.plans.Mutate(ctx, plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+			if s.hasActiveSession(current.SessionID) {
+				return domain.Plan{}, fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
 			}
-		}
-		return saved, err
+			begun, err := domain.BeginPlanLoopRound(current, s.now())
+			if err != nil {
+				return domain.Plan{}, err
+			}
+			begun.Loop.RoundRunID = run.ID
+			return begun, nil
+		})
+		return updateErr
+	})
+	if err == nil {
+		return saved, nil
 	}
-	// 記下這一輪對應的 Run，收尾時才認得出「這是多輪的一輪」。
-	loop := *saved.Loop
-	loop.RoundRunID = run.ID
-	saved.Loop = &loop
-	if updated, updateErr := s.plans.Update(ctx, saved); updateErr == nil {
-		saved = updated
+	// HTTP context 取消也要收尾；儲存失敗則明確回報，不吞掉第二個錯誤。
+	paused, pauseErr := s.plans.Mutate(context.WithoutCancel(ctx), plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+		return domain.InterruptPlanLoop(current, domain.PlanLoopStopRunFailed, "無法送出這一次："+err.Error(), "", s.now())
+	})
+	if pauseErr != nil {
+		return saved, errors.Join(err, fmt.Errorf("保存 LOOP 暫停狀態失敗: %w", pauseErr))
 	}
-	return saved, nil
+	return paused, err
 }
 
 // advancePlanLoop 在一輪的 Run 結束後決定要不要開下一輪。
@@ -152,35 +159,38 @@ func (s *Service) startPlanLoopRound(ctx context.Context, plan domain.Plan) (dom
 // 掛在 executeRun 的 defer 上，且排在 clearActive 之後執行——下一輪要通過
 // hasActiveSession 的檢查，前一輪必須已經從 active 移除。
 func (s *Service) advancePlanLoop(runID string) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	ctx := context.Background()
 	run, err := s.runs.Get(ctx, runID)
 	if err != nil {
+		s.logger.Warn("could not read finished run for plan loop", "run_id", runID, "error", err)
 		return
 	}
 	plan, found := s.planForLoopRun(ctx, run.SessionID, runID)
 	if !found {
 		return
 	}
-	if run.Status != domain.RunStatusCompleted {
-		reason := "這一次的 Run 未正常結束（" + string(run.Status) + "）"
-		paused, interruptErr := domain.InterruptPlanLoop(plan, domain.PlanLoopStopRunFailed, reason, "", s.now())
-		if interruptErr == nil {
-			_, _ = s.plans.Update(ctx, paused)
+	continueLoop := false
+	updated, err := s.plans.Mutate(ctx, plan.SessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+		if !current.Loop.Active() || current.Loop.RoundRunID != runID {
+			return domain.Plan{}, fmt.Errorf("%w: plan loop round changed", domain.ErrConflict)
 		}
-		return
-	}
-
-	// 推進與否用「步驟狀態或證據有沒有變」判定，不看輸出長度——
-	// 「我來確認一下」寫得再長也不是推進。
-	progressed := domain.PlanStepFingerprint(plan) != plan.Loop.RoundFingerprint
-	evaluated, decision := domain.EvaluatePlanLoopAfterRound(plan, progressed, s.now())
-	updated, err := s.plans.Update(ctx, evaluated)
+		if run.Status != domain.RunStatusCompleted {
+			reason := "這一次的 Run 未正常結束（" + string(run.Status) + "）"
+			return domain.InterruptPlanLoop(current, domain.PlanLoopStopRunFailed, reason, "", s.now())
+		}
+		progressed := domain.PlanStepFingerprint(current) != current.Loop.RoundFingerprint
+		evaluated, decision := domain.EvaluatePlanLoopAfterRound(current, progressed, s.now())
+		continueLoop = decision.Continue
+		return evaluated, nil
+	})
 	if err != nil {
+		s.logger.Error("could not persist plan loop completion", "plan_id", plan.ID, "run_id", runID, "error", err)
 		return
 	}
-	if !decision.Continue {
-		s.logger.Info("plan loop finished",
-			"plan_id", updated.ID, "session_id", updated.SessionID,
+	if !continueLoop {
+		s.logger.Info("plan loop finished", "plan_id", updated.ID, "session_id", updated.SessionID,
 			"round", updated.Loop.Round, "stopped_by", updated.Loop.StoppedBy, "reason", updated.Loop.StoppedReason)
 		return
 	}
@@ -190,8 +200,8 @@ func (s *Service) advancePlanLoop(runID string) {
 	}
 }
 
-// cancelSessionRuns 取消該 Session 目前還在跑的 Run。
-func (s *Service) cancelSessionRuns(ctx context.Context, sessionID string) {
+// cancelSessionRuns 取消該 Session 目前還在跑的 Run；呼叫端持有 startMu。
+func (s *Service) cancelSessionRuns(ctx context.Context, sessionID string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.active))
@@ -201,11 +211,14 @@ func (s *Service) cancelSessionRuns(ctx context.Context, sessionID string) {
 		}
 	}
 	s.mu.Unlock()
+	var cancelErr error
 	for _, runID := range ids {
-		if _, err := s.CancelRun(ctx, runID); err != nil {
+		if _, err := s.cancelRunLocked(ctx, runID); err != nil {
 			s.logger.Warn("could not cancel run for plan loop", "run_id", runID, "error", err)
+			cancelErr = errors.Join(cancelErr, err)
 		}
 	}
+	return cancelErr
 }
 
 // planForLoopRun 找出這個 Run 屬於哪一輪的哪個計畫。
@@ -215,6 +228,7 @@ func (s *Service) cancelSessionRuns(ctx context.Context, sessionID string) {
 func (s *Service) planForLoopRun(ctx context.Context, sessionID, runID string) (domain.Plan, bool) {
 	values, err := s.plans.List(ctx, strings.TrimSpace(sessionID))
 	if err != nil {
+		s.logger.Error("could not find plan loop for finished run", "run_id", runID, "error", err)
 		return domain.Plan{}, false
 	}
 	for _, value := range values {
@@ -245,9 +259,69 @@ func (s *Service) prepareLoopMutation(ctx context.Context, sessionID, planID str
 	if s.hasActiveSession(session.ID) {
 		return domain.Plan{}, domain.Session{}, fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
 	}
+	if err := s.reconcileSessionPlanLoops(ctx, session.ID); err != nil {
+		return domain.Plan{}, domain.Session{}, err
+	}
 	plan, err := s.plans.Get(ctx, session.ID, strings.TrimSpace(planID))
 	if err != nil {
 		return domain.Plan{}, domain.Session{}, err
 	}
 	return plan, session, nil
+}
+
+// 啟動只修復狀態，不自動重送前一輪，也不重設已消耗的輪數。
+func (s *Service) reconcilePlanLoops(ctx context.Context) {
+	for _, engine := range s.registry.Engines() {
+		sessions, err := engine.ListSessions(ctx)
+		if err != nil {
+			s.logger.Error("could not inspect plan loops after restart", "error", err)
+			continue
+		}
+		for _, session := range sessions {
+			if err := s.reconcileSessionPlanLoops(ctx, session.ID); err != nil {
+				s.logger.Error("could not recover plan loop", "session_id", session.ID, "error", err)
+			}
+		}
+	}
+}
+
+func (s *Service) reconcileSessionPlanLoops(ctx context.Context, sessionID string) error {
+	if s.hasActiveSession(sessionID) {
+		return nil
+	}
+	plans, err := s.plans.List(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	for _, plan := range plans {
+		if !plan.Loop.Active() {
+			continue
+		}
+		run, runErr := s.runs.Get(ctx, plan.Loop.RoundRunID)
+		if runErr != nil && !errors.Is(runErr, domain.ErrNotFound) && plan.Loop.RoundRunID != "" {
+			return runErr
+		}
+		_, err := s.plans.Mutate(ctx, sessionID, plan.ID, func(current domain.Plan) (domain.Plan, error) {
+			if !current.Loop.Active() || current.Loop.RoundRunID != plan.Loop.RoundRunID {
+				return current, nil
+			}
+			if runErr == nil && run.Status == domain.RunStatusCompleted && domain.PlanIsTerminal(current) {
+				reason := domain.PlanLoopStopCompleted
+				if current.Status != domain.PlanStatusCompleted {
+					reason = domain.PlanLoopStopIncomplete
+				}
+				return domain.StopPlanLoop(current, reason, "恢復時確認計畫已結束", s.now())
+			}
+			reason := "上一輪已無執行者；可能因程式重啟或收尾中斷。請確認已產生的結果後續跑。"
+			note := "保留既有步驟、證據與輪數；未知工具結果不得直接重送。"
+			if current.Loop.Checkpoint != nil && current.Loop.Checkpoint.Note != "" {
+				note += "\n" + current.Loop.Checkpoint.Note
+			}
+			return domain.InterruptPlanLoop(current, domain.PlanLoopStopRunFailed, reason, note, s.now())
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

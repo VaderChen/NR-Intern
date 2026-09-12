@@ -2876,6 +2876,7 @@ const planStatusLabels = {
   queued: "排隊中",
   active: "進行中",
   completed: "已完成",
+  partial: "部分完成（含略過）",
   canceled: "已取消",
   pending: "待處理",
   in_progress: "執行中",
@@ -2884,7 +2885,7 @@ const planStatusLabels = {
   skipped: "已略過",
 };
 
-const terminalPlanStatuses = new Set(["completed", "canceled"]);
+const terminalPlanStatuses = new Set(["completed", "partial", "canceled"]);
 
 function sessionRunIsActive(sessionID = state.session?.id) {
   return Boolean(sessionID && state.activeRuns.has(sessionID));
@@ -2982,7 +2983,7 @@ function syncPlanButton() {
   button.classList.toggle("hidden", !state.session);
   button.parentElement.classList.toggle("hidden", !state.session);
   const active = plans.find((plan) => plan.status === "active");
-  const completed = plans.filter((plan) => ["completed", "canceled"].includes(plan.status)).length;
+  const completed = plans.filter((plan) => terminalPlanStatuses.has(plan.status)).length;
   button.dataset.status = active ? "active" : plans.length ? "completed" : "empty";
   button.classList.toggle("is-processing", Boolean(active && sessionRunIsActive()));
   button.setAttribute("aria-busy", String(Boolean(active && sessionRunIsActive())));
@@ -3066,7 +3067,7 @@ function renderPlanCard(plan, index, visiblePlanCount) {
   const sortable = !terminal && state.planTab === "active";
   const expanded = state.expandedPlanIDs.has(plan.id);
   const steps = Array.isArray(plan.steps) ? plan.steps : [];
-  const executedStepCount = steps.filter((step) => ["completed", "skipped"].includes(step.status)).length;
+  const executedStepCount = steps.filter((step) => step.status === "completed").length;
   const card = document.createElement("article");
   card.className = "plan-card";
   card.dataset.planId = plan.id;
@@ -3179,6 +3180,7 @@ const planLoopStopLabels = {
   no_progress: "連續空轉",
   run_failed: "這一次未正常結束",
   completed: "計畫完成",
+  incomplete: "計畫未全部完成",
 };
 
 function planLoopStatusText(loop) {
@@ -4345,7 +4347,7 @@ function restoreStalledRunIndicator() {
 function updateWaitingForModelActivity() {
   const sessionID = state.session?.id;
   const runState = activeRunFor(sessionID);
-  if (!runState) return;
+  if (!runState || runState.terminalHandled) return;
   const draft = runState.runDraft;
   const started = state.runStartedAt.get(draft?.operationId || runState.runId || "");
   const current = runState.activityText || "";
@@ -5259,19 +5261,21 @@ async function consumeEvents(stream, progress, sessionID) {
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    buffer += decoder.decode(value, { stream: true }).replaceAll("\r\n", "\n");
+    buffer += decoder.decode(value, { stream: true });
     let boundary;
-    while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = block.split("\n")
+    // 在累積緩衝區辨識換行，CR 與 LF 分屬不同網路封包時仍可完整解析。
+    while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
+      const block = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary[0].length);
+      const data = block.split(/\r?\n/)
         .filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).trimStart())
         .join("\n");
       if (!data) continue;
       const event = JSON.parse(data);
-      if (Number.isInteger(event.sequence) && event.sequence > progress.lastSequence) progress.lastSequence = event.sequence;
+      if (Number.isInteger(event.sequence) && event.sequence <= progress.lastSequence) continue;
       handleEvent(event, sessionID);
+      if (Number.isInteger(event.sequence)) progress.lastSequence = event.sequence;
       if (["run.completed", "run.failed", "run.canceled"].includes(event.type)) {
         progress.terminal = true;
         // 終止事件已經是完整結果，不應繼續等待 SSE 自己斷線；部分後端／
@@ -5283,15 +5287,22 @@ async function consumeEvents(stream, progress, sessionID) {
   }
 }
 
+// SSE 終態與狀態查詢共用清理，立即移除等待文字與動畫，不依賴連線關閉。
+function markRunTerminal(runState, status) {
+  runState.status = status || runState.status;
+  runState.terminal = true;
+  runState.terminalHandled = true;
+  runState.canceling = false;
+  if (runState.runDraft) runState.runDraft.processing = false;
+  setRunActivity("", runState.sessionId);
+}
+
 function handleTerminalRun(run, sessionID) {
   const runState = activeRunFor(sessionID);
   if (runState?.terminalHandled) return;
   if (runState) {
     runState.runId = run.id || runState.runId;
-    runState.status = run.status || runState.status;
-    runState.terminal = true;
-    runState.terminalHandled = true;
-    runState.canceling = false;
+    markRunTerminal(runState, run.status);
   }
   const visible = state.session?.id === sessionID;
   const startedAt = Date.parse(run.started_at);
@@ -5323,7 +5334,9 @@ function handleEvent(event, sessionID) {
   // 停止已被本地確認後，串流中尚未送達的 late event 不得重新點亮處理動畫。
   if (!runState || runState.terminalHandled) return;
   if (event.run_id) runState.runId = String(event.run_id);
-	if (event.type === "context.compaction.started") {
+	if (event.type === "agent.progress") {
+    setRunActivity(String(payload.message || ""), sessionID);
+  } else if (event.type === "context.compaction.started") {
 	  setContextCompactionReason(event.payload);
 	  setContextCompactionState(sessionID, true);
 	} else if (["context.compacted", "context.compaction.failed"].includes(event.type)) {
@@ -5535,10 +5548,7 @@ function handleEvent(event, sessionID) {
 		continueRunProcessing(sessionID, operationID);
 		} else if (event.type === "run.completed") {
     if (runState.terminalHandled) return;
-    runState.terminal = true;
-    runState.terminalHandled = true;
-    runState.canceling = false;
-    runState.status = "completed";
+    markRunTerminal(runState, "completed");
     setContextCompactionState(sessionID, false);
     finalizeLiveReasoningDuration(event, operationID, visible, sessionID);
     if (visible) setAgentProcessing(runState.liveMessage, false);
@@ -5547,10 +5557,7 @@ function handleEvent(event, sessionID) {
     if (visible) loadPlans(sessionID).catch(() => {});
 		} else if (event.type === "run.failed" || event.type === "run.canceled") {
     if (runState.terminalHandled) return;
-    runState.terminal = true;
-    runState.terminalHandled = true;
-    runState.canceling = false;
-    runState.status = event.type === "run.canceled" ? "canceled" : "failed";
+    markRunTerminal(runState, event.type === "run.canceled" ? "canceled" : "failed");
     setContextCompactionState(sessionID, false);
     finalizeLiveReasoningDuration(event, operationID, visible, sessionID);
     if (visible) setAgentProcessing(runState.liveMessage, false);
@@ -5644,7 +5651,7 @@ function showApproval(approval, sessionID = state.runningSessionId) {
   $("approvalArgumentsField").classList.toggle("hidden", Object.keys(argumentsValue).length === 0);
   $("approvalDecisionReason").value = "";
   $("permanentApproval").checked = false;
-  $("permanentApproval").disabled = false;
+  $("permanentApproval").disabled = !!approval.one_time_only;
   $("approveTool").disabled = false;
   $("denyTool").disabled = false;
 	if (state.session?.id === sessionID && !$("approvalDialog").open) $("approvalDialog").show();
@@ -5658,7 +5665,7 @@ async function decideApproval(decision) {
   $("approveTool").disabled = true;
   $("denyTool").disabled = true;
   $("permanentApproval").disabled = true;
-  const permanent = decision === "approve" && $("permanentApproval").checked;
+  const permanent = decision === "approve" && !approval.one_time_only && $("permanentApproval").checked;
   try {
     await request(`/api/v1/runs/${encodeURIComponent(runState.runId)}/decision`, {
       method: "POST",
@@ -5674,7 +5681,7 @@ async function decideApproval(decision) {
     toast(error.message);
     $("approveTool").disabled = false;
     $("denyTool").disabled = false;
-    $("permanentApproval").disabled = false;
+    $("permanentApproval").disabled = !!approval.one_time_only;
   }
 }
 
@@ -5694,10 +5701,7 @@ async function cancelCurrentRun() {
     } else {
       // 舊版或反向代理可能只回覆「已接受」而沒有帶回完整 Run；取消要求
       // 已送達時仍須停止本地串流，避免 UI 一直顯示執行中。
-      runState.status = "canceled";
-      runState.terminal = true;
-      runState.terminalHandled = true;
-      runState.canceling = false;
+      markRunTerminal(runState, "canceled");
       setContextCompactionState(sessionID, false);
       if (state.session?.id === sessionID) {
         setAgentProcessing(runState.liveMessage, false);
@@ -8558,6 +8562,12 @@ async function installMCPImport(event) {
     await loadMCPSettings(selectedID);
     await loadTools();
     toast(`已安裝 ${imported.length} 個 MCP Server`);
+    // 安裝當下就把契約讀過一遍：這是模型第一次遇到這台 Server 之前唯一的
+    // 準備機會，等它在對話中摸索等於把成本轉嫁到每一次使用。
+    // 靜默進行，失敗不影響安裝結果本身。
+    for (const server of imported) {
+      await readMCPContractNow(server.id, { quiet: true });
+    }
   } catch (error) {
     toast(`MCP 安裝失敗：${error.message}`);
   } finally {
@@ -9015,6 +9025,7 @@ function renderMCPSettings() {
   $("mcpTestState").textContent = "";
   $("deleteMCPSetting").classList.toggle("hidden", isNew);
   $("exportMCPSetting").classList.toggle("hidden", isNew);
+  $("readMCPContract").classList.toggle("hidden", isNew);
   const toolList = $("mcpToolList");
   const exposed = Array.isArray(selected.tools) ? selected.tools : [];
   const available = Array.isArray(selected.available_tools) && selected.available_tools.length
@@ -9957,6 +9968,41 @@ $("mcpSettingTransport").addEventListener("change", (event) => renderMCPTranspor
 $("mcpSettingAPIKey").addEventListener("input", (event) => {
   if (event.target.value) setClearSecretPressed($("mcpSettingClearKey"), false);
 });
+// readMCPContractNow 重讀契約並寫入共用記憶。
+//
+// 工具目錄每一輪都整份進入提示，但幾百條扁平清單很難讓模型判斷「這件事該用
+// 哪一組」——實測看過它挑錯工具、反覆呼叫不適合的那個，每次燒掉一整輪。
+// 這裡把契約讀過一遍整理成導覽，之後每次對話都帶得到。
+//
+// 會分批送進模型，工具多時要好幾分鐘，因此按鈕全程停用並顯示進行中。
+async function readMCPContractNow(id, { quiet = false } = {}) {
+  if (!id) return null;
+  const button = $("readMCPContract");
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = translate("解讀中…");
+  $("mcpSettingsState").textContent = translate("正在讀取並整理 MCP 契約，工具多時需要數分鐘…");
+  try {
+    const digest = await request(`/api/v1/admin/mcp-settings/${encodeURIComponent(id)}/contract`, { method: "POST" });
+    $("mcpSettingsState").textContent = `${translate("契約已寫入共用記憶")}（${digest.tool_count} ${translate("個工具")}）`;
+    toast(`${translate("契約已寫入共用記憶")}：${digest.display_name || id}`);
+    return digest;
+  } catch (error) {
+    $("mcpSettingsState").textContent = translate("契約解讀失敗");
+    // 安裝後自動觸發時保持安靜：沒有 Provider 或模型不可用是常見狀態，
+    // 不該讓它看起來像安裝失敗——MCP Server 本身已經存好了。
+    if (!quiet) toast(`${translate("契約解讀失敗")}：${error.message}`);
+    return null;
+  } finally {
+    button.disabled = false;
+    button.textContent = original;
+  }
+}
+
+$("readMCPContract").addEventListener("click", () => {
+  void readMCPContractNow(state.selectedMCPSettingsID);
+});
+
 $("mcpSettingClearKey").addEventListener("click", (event) => {
   toggleClearSecret(event.currentTarget, ["mcpSettingAPIKey"]);
 });

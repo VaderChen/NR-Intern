@@ -78,6 +78,8 @@ type RunUsage struct {
 	TotalTokens      int      `json:"total_tokens,omitempty"`
 	EstimatedCostUSD *float64 `json:"estimated_cost_usd,omitempty"`
 	Currency         string   `json:"currency,omitempty"`
+	// ByModel 將背景摘要與主模型分開，避免套錯價格。只使用一層明細。
+	ByModel []RunUsage `json:"by_model,omitempty"`
 }
 
 // SessionUsage 是依 Session 所有 Run 即時彙總的統計，不作為 Session metadata
@@ -95,6 +97,8 @@ type ToolCall struct {
 	ID        string         `json:"id"`
 	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments,omitempty"`
+	// 只由 Harness 綁定，不接受模型或 HTTP 呼叫端設定。
+	ExpectedContractID string `json:"-"`
 }
 
 type ToolDefinition struct {
@@ -113,6 +117,7 @@ type ToolDefinition struct {
 	Capabilities       []string       `json:"capabilities,omitempty"`
 	ReadOnly           bool           `json:"read_only,omitempty"`
 	RequiresPermission bool           `json:"requires_permission,omitempty"`
+	ContractID         string         `json:"contract_id,omitempty"`
 }
 
 type ToolCatalogEntry struct {
@@ -208,7 +213,7 @@ type ModelCapabilities struct {
 	MaxHistoryCharacters int `json:"max_history_characters,omitempty"`
 }
 
-// UnresolvedToolFailure 是一次工具失敗，且同名工具在之後沒有成功執行過。
+// UnresolvedToolFailure 是尚無相同操作／資源成功證據的工具失敗或未知結果。
 type UnresolvedToolFailure struct {
 	ToolCallID string `json:"tool_call_id"`
 	ToolName   string `json:"tool_name"`

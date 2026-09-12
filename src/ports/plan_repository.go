@@ -13,6 +13,8 @@ type PlanRepository interface {
 	Get(context.Context, string, string) (domain.Plan, error)
 	Create(context.Context, domain.Plan) (domain.Plan, error)
 	Update(context.Context, domain.Plan) (domain.Plan, error)
+	// Mutate 在同一把儲存鎖下讀取最新計畫、套用變更並寫回；callback 不可重入儲存。
+	Mutate(context.Context, string, string, func(domain.Plan) (domain.Plan, error)) (domain.Plan, error)
 	Delete(context.Context, string, string) error
 	DeleteSession(context.Context, string) error
 	Reorder(context.Context, string, []string) ([]domain.Plan, error)

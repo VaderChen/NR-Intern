@@ -4,10 +4,14 @@ import (
 	"AgenticService/src/domain"
 	"context"
 	"errors"
+	"sort"
 	"time"
 )
 
 var errRunBudgetWallClock = errors.New("run wall-clock budget exhausted")
+var errRunBudgetTokens = errors.New("Run Token 預算不足或已耗盡")
+
+type runBudgetContextKey struct{}
 
 type runBudgetTracker struct {
 	budget    domain.RunBudget
@@ -16,13 +20,15 @@ type runBudgetTracker struct {
 	tokens    int
 	toolCalls int
 	reported  domain.Usage
+	byModel   map[string]domain.RunUsage
+	tokenStop *domain.RunBudgetExceeded
 }
 
 func newRunBudgetTracker(budget domain.RunBudget, startedAt time.Time) *runBudgetTracker {
 	if budget.MaxTurns <= 0 {
 		budget.MaxTurns = DefaultMaxTurns
 	}
-	return &runBudgetTracker{budget: budget, startedAt: startedAt}
+	return &runBudgetTracker{budget: budget, startedAt: startedAt, byModel: map[string]domain.RunUsage{}}
 }
 
 // context 讓 wall-clock 成為真正的執行上限；只在回合邊界檢查會讓長時間 shell/SSH
@@ -67,6 +73,31 @@ func (t *runBudgetTracker) addReportedUsage(usage domain.Usage) {
 
 func (t *runBudgetTracker) usageSnapshot() domain.Usage {
 	return t.reported
+}
+
+func (t *runBudgetTracker) tokensExceeded() *domain.RunBudgetExceeded {
+	if t.tokenStop != nil {
+		value := *t.tokenStop
+		value.Usage = t.usage()
+		return &value
+	}
+	if t.budget.MaxTokens > 0 && t.tokens >= t.budget.MaxTokens {
+		return t.exceeded(domain.RunBudgetResourceTokens, int64(t.budget.MaxTokens), int64(t.tokens))
+	}
+	return nil
+}
+
+func (t *runBudgetTracker) modelUsage() []domain.RunUsage {
+	keys := make([]string, 0, len(t.byModel))
+	for key := range t.byModel {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	values := make([]domain.RunUsage, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, t.byModel[key])
+	}
+	return values
 }
 
 // planToolCalls 只允許在剩餘額度內的前綴。模型同一輪要求的其餘呼叫會得到合成的

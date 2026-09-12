@@ -14,10 +14,13 @@ const DefaultMaxCompletionChecks = 1
 const maxFailureSummaryRunes = 400
 
 type failureRecord struct {
-	order      int
-	toolCallID string
-	toolName   string
-	summary    string
+	order         int
+	toolCallID    string
+	toolName      string
+	summary       string
+	operationKey  string
+	unknown       bool
+	awaitingInput bool
 }
 
 // completionTracker 追蹤本次 run 內尚未解決的工具失敗。
@@ -27,38 +30,71 @@ type failureRecord struct {
 // 不一致時，至少要讓模型面對一次事實，而不是靜默地把失敗當成完成。
 //
 // 判定完全來自本次 run 自己的執行記錄，不解讀模型文字：
-// 某個工具失敗後，同一個工具名稱只要在之後成功執行過一次，就視為已解決。
+// 只允許同一操作／資源的成功解決先前失敗；無資源契約時採完整參數指紋。
 type completionTracker struct {
-	failures map[string]*failureRecord
-	sequence int
-	checks   int
+	failures    map[string]*failureRecord
+	sequence    int
+	checks      int
+	definitions map[string]domain.ToolDefinition
 	// executions 是本次 run 實際執行過的工具次數（成功或失敗都算）。
 	// 用來辨識「模型只描述了打算怎麼做，但一個工具都沒呼叫」的情況。
 	executions int
 }
 
-func newCompletionTracker() *completionTracker {
-	return &completionTracker{failures: map[string]*failureRecord{}}
+func newCompletionTracker(catalogs ...[]domain.ToolDefinition) *completionTracker {
+	tracker := &completionTracker{failures: map[string]*failureRecord{}, definitions: map[string]domain.ToolDefinition{}}
+	if len(catalogs) > 0 {
+		for _, definition := range catalogs[0] {
+			tracker.definitions[definition.Name] = definition
+		}
+	}
+	return tracker
 }
 
-// observe 記錄一次工具執行結果。同名工具的後續成功會清掉先前的失敗，
-// 因為那正是「模型發現錯誤並修正」的正常樣態。
+// observe 逐筆保留失敗，不能以另一個目標成功掩蓋先前的失敗。
 func (t *completionTracker) observe(call domain.ToolCall, result domain.ToolExecution) {
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return
 	}
-	t.executions++
+	if skipped, _ := result.Details["skipped"].(bool); skipped && !result.IsError {
+		return
+	}
+	if parent, _ := result.Details["mcp_resumed_tool_call_id"].(string); parent != "" {
+		// 續接關係由 Runtime 驗證，不能以同名工具或模型自行填寫的文字取代。
+		if previous := t.failures[parent]; previous != nil && previous.awaitingInput && previous.toolName == name {
+			delete(t.failures, parent)
+		}
+	}
+	if domain.ToolExecutionState(result.Details) != domain.ToolNotDispatched {
+		t.executions++
+	}
+	operationKey := mutationStrategyKey(t.definitions[name], call)
+	if operationKey == "" {
+		operationKey = toolCallSignature(call)
+	}
+	operationKey = domain.ToolContractID(t.definitions[name]) + ":" + operationKey
 	if !result.IsError {
-		delete(t.failures, name)
+		for id, failure := range t.failures {
+			if !failure.unknown && failure.operationKey == operationKey {
+				delete(t.failures, id)
+			}
+		}
 		return
 	}
 	t.sequence++
-	t.failures[name] = &failureRecord{
-		order:      t.sequence,
-		toolCallID: call.ID,
-		toolName:   name,
-		summary:    truncateMiddle(strings.TrimSpace(result.Content), maxFailureSummaryRunes),
+	id := call.ID
+	if id == "" {
+		id = toolCallSignature(call)
+	}
+	t.failures[id] = &failureRecord{
+		order:         t.sequence,
+		toolCallID:    call.ID,
+		toolName:      name,
+		summary:       truncateMiddle(strings.TrimSpace(result.Content), maxFailureSummaryRunes),
+		operationKey:  operationKey,
+		unknown:       domain.ToolExecutionState(result.Details) == domain.ToolOutcomeUnknown,
+		awaitingInput: domain.ToolExecutionState(result.Details) == "awaiting_input",
 	}
 }
 
@@ -123,7 +159,7 @@ func (t *completionTracker) challenge(maxChecks int) string {
 	t.checks++
 	var builder strings.Builder
 	builder.WriteString("\n\n<completion_check>\n")
-	builder.WriteString("你剛才給出了最終回覆，但這次工作中有工具失敗且沒有後續成功的同名呼叫：\n")
+	builder.WriteString("你剛才給出了最終回覆，但這次工作中仍有未確認解決的工具操作：\n")
 	for _, failure := range unresolved {
 		builder.WriteString(fmt.Sprintf("- %s（tool_call_id=%s）：%s\n", failure.ToolName, failure.ToolCallID, failure.Summary))
 	}

@@ -69,7 +69,7 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		}
 		var event map[string]any
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
-			return fmt.Errorf("decode Codex Responses stream event: %w", err)
+			return providerStreamDecodeError("Codex stream decode", err, requestID, clientRequestID)
 		}
 		sawEvent = true
 		eventType := firstText(stringValue(event["type"]), name)
@@ -150,6 +150,9 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 			if err := flush(); err != nil {
 				return domain.ModelResponse{}, err
 			}
+			if sawTerminal {
+				break
+			}
 			continue
 		}
 		if strings.HasPrefix(line, ":") {
@@ -166,6 +169,9 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		if strings.HasPrefix(strings.TrimSpace(line), "{") {
 			if err := consume(eventName, strings.TrimSpace(line)); err != nil {
 				return domain.ModelResponse{}, err
+			}
+			if sawTerminal {
+				break
 			}
 		}
 	}
@@ -264,7 +270,7 @@ func appendCodexArguments(index int, key, complete string, state *codexStreamSta
 
 func consumeCodexCompleted(completed codexCompletedResponse, content *strings.Builder, state *codexStreamState, sink ports.ModelEventSink) error {
 	var completedText strings.Builder
-	for _, output := range completed.Output {
+	for index, output := range completed.Output {
 		switch strings.ToLower(strings.TrimSpace(output.Type)) {
 		case "message":
 			for _, part := range output.Content {
@@ -273,7 +279,7 @@ func consumeCodexCompleted(completed codexCompletedResponse, content *strings.Bu
 				}
 			}
 		case "function_call":
-			event := map[string]any{"item_id": output.ID, "call_id": output.CallID, "output_index": len(state.partials)}
+			event := map[string]any{"item_id": output.ID, "call_id": output.CallID, "output_index": index}
 			item := map[string]any{"id": output.ID, "call_id": output.CallID, "name": output.Name, "type": output.Type, "arguments": output.Arguments}
 			if err := consumeCodexFunctionItem(event, item, state, sink); err != nil {
 				return err
@@ -362,6 +368,8 @@ func stringValue(value any) string {
 
 func intValue(value any) int {
 	switch typed := value.(type) {
+	case int:
+		return typed
 	case float64:
 		return int(typed)
 	case json.Number:

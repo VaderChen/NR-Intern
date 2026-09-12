@@ -2,6 +2,7 @@ package openaicompat
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -61,6 +62,15 @@ type apiErrorEnvelope struct {
 		Code    json.RawMessage `json:"code"`
 		Param   string          `json:"param"`
 	} `json:"error"`
+}
+
+// JSON 在事件中途截斷可以重試；完整但格式錯誤的事件不因重送而恢復。
+func providerStreamDecodeError(operation string, cause error, requestID, clientRequestID string) error {
+	var syntaxError *json.SyntaxError
+	truncated := errors.Is(cause, io.ErrUnexpectedEOF) ||
+		(errors.As(cause, &syntaxError) && syntaxError.Error() == "unexpected end of JSON input")
+	return &ProviderError{Operation: operation, Message: cause.Error(), RequestID: requestID,
+		ClientRequestID: clientRequestID, Retryable: truncated, Cause: cause}
 }
 
 func providerHTTPError(response *http.Response, clientRequestID string) (*ProviderError, time.Duration) {

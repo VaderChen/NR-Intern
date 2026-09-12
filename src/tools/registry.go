@@ -112,6 +112,7 @@ func (r *Registry) Definitions(_ context.Context, session domain.Session) ([]dom
 		if definition.RequiresPermission && !r.elevatedAllowed(session.PermissionProfile) {
 			continue
 		}
+		definition.ContractID = domain.ToolContractFingerprint(definition, "native")
 		definitions = append(definitions, cloneDefinition(definition))
 	}
 	sort.Slice(definitions, func(i, j int) bool { return definitions[i].Name < definitions[j].Name })
@@ -136,6 +137,11 @@ func (r *Registry) Execute(ctx context.Context, session domain.Session, call dom
 		return failedExecution(call, reason), nil
 	}
 	definition := value.Definition()
+	if call.ExpectedContractID != "" && call.ExpectedContractID != domain.ToolContractFingerprint(definition, "native") {
+		result := failedExecution(call, "工具契約已變更，未派送；請重新讀取目錄並取得核准。")
+		result.Details = map[string]any{"execution_state": domain.ToolNotDispatched, "contract_changed": true}
+		return result, nil
+	}
 	if definition.RequiresPermission && !r.elevatedAllowed(session.PermissionProfile) {
 		// 提權被擋下屬於安全事件，必須留下紀錄。
 		r.logger.Warn("elevated tool refused",
@@ -159,6 +165,19 @@ func (r *Registry) Execute(ctx context.Context, session domain.Session, call dom
 	result.ToolCallID = call.ID
 	result.ToolName = name
 	return result, err
+}
+
+func (r *Registry) ResolveDefinition(ctx context.Context, session domain.Session, name string) (domain.ToolDefinition, error) {
+	definitions, err := r.Definitions(ctx, session)
+	if err != nil {
+		return domain.ToolDefinition{}, err
+	}
+	for _, definition := range definitions {
+		if definition.Name == name {
+			return definition, nil
+		}
+	}
+	return domain.ToolDefinition{}, fmt.Errorf("%w: 工具已停用或權限不足", domain.ErrNotFound)
 }
 
 func (r *Registry) ListToolNames() []string {

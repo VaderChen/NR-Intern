@@ -38,6 +38,7 @@ Authorization: Bearer <token>
 | GET／PUT | `/api/v1/admin/mcp-settings` | 讀取或完整取代 MCP Server 設定 |
 | POST | `/api/v1/admin/mcp-settings/{mcp_id}/test` | 重新連線 MCP Server 並刷新工具清單 |
 | GET | `/api/v1/admin/mcp-settings/{mcp_id}/export` | 匯出單一 MCP Server；使用 `mcpServers` 鍵，預設遮蔽憑證 |
+| POST | `/api/v1/admin/mcp-settings/{mcp_id}/contract` | 解讀契約並寫入共用記憶；工具多時需數分鐘 |
 | GET／PUT | `/api/v1/admin/reverse-proxy` | 讀取或更新 NetPass 反向代理設定 |
 | POST | `/api/v1/admin/reverse-proxy/start` | 接受使用政策後啟動 NetPassClient |
 | POST | `/api/v1/admin/reverse-proxy/stop` | 停止 NetPassClient |
@@ -115,6 +116,9 @@ Run 達到後端設定的回合、wall-clock、token 或工具呼叫上限時仍
 
 ### 用量與成本
 
+Run 的 `usage.by_model` 包含主模型、Context 摘要與備援的實際回報用量，已計入上層總數，
+不可重複相加；成本按各模型單價估算。未回報的串流估算只用於預算煞車，不作為精確計費。
+
 `GET /api/v1/runs`、`GET /api/v1/runs/{run_id}`、Session 相關端點與 JSON 匯出會帶出用量：
 
 - Run 的 `usage` 保存該次實際收到的 input／output／total token，以及收尾時依
@@ -152,6 +156,10 @@ curl -X POST http://127.0.0.1:8787/api/v1/runs/RUN_ID/decision \
 `permanent: true` 只能和 `decision: "approve"` 一起送出。後端會把永久核准持久化到
 目前 Session，這次之後該對話的高風險工具不再逐次詢問；其他 Session 不受影響。
 一般 Session PATCH 不能直接開啟此欄位，必須經過一次有效的 pending approval。
+
+`pending_approval.one_time_only=true` 時不能帶 `permanent=true`，後端會拒絕。
+先前結果未知的相同副作用，即使 Session 已有永久授權，也必須逐次確認；核准重試不代表
+先前沒有執行，原有未知紀錄不會被清除。
 
 `deny` 不會讓 Run 失敗；拒絕理由會寫成 tool observation，讓模型改走其他路徑。
 
@@ -349,6 +357,15 @@ Session 有 queued 或 running Run 時，更新與刪除都回傳 `409 Conflict`
 
 ## Session 計畫
 
+步驟轉為 `completed` 時，`plan_step_update` 必須帶 `evidence` 與 `evidence_tool_call_ids`。
+後端核對目前 Session 中、進入 `verifying` 後實際成功的工具結果，保存
+`verification_started_at` 及 `verified_evidence`（call ID、工具名稱、結果 SHA-256、時間）。
+模型與 HTTP 呼叫端不能自行指定已查證證據；來源與時序檢查不等於語意或功能實測。
+全部步驟完成才是 `completed`；已結束但含略過步驟的計畫為 `partial`。
+
+重啟後沒有執行者的 active LOOP 轉為 `paused`，保留輪數與檢查點；使用者明確續跑後才開新 Run。
+事件 JSONL 的未完成尾筆先備份再修復；中段損毀按 Run 隔離，不阻擋其他 Run 的服務啟動。
+
 使用者可新增多份包含客觀驗證條件的計畫；新計畫會排在列表尾端：
 
 ```bash
@@ -367,7 +384,7 @@ curl -X POST http://127.0.0.1:8787/api/v1/sessions/SESSION_ID/plans \
 `lock_plans=true` 時，列表中第一份未完成計畫為 `active`，後續計畫為 `queued`；active 完成後
 會自動啟用下一份。`lock_plans=false`（預設）時，未完成計畫可同時為 `active`，不同計畫可由
 不同 Run 平行執行。Console 可收合各計畫，並以拖曳後送出完整 `plan_ids` 調整順序；「清除已完成」
-只會刪除 `completed` 與 `canceled`，不影響未完成計畫。已經開始執行的 active 計畫不能移到其他
+只會刪除已終結的 `completed`、`partial` 與 `canceled`，不影響仍在進行的計畫。已經開始執行的 active 計畫不能移到其他
 未完成計畫之後。Run 執行期間不能由 HTTP 新增、重建、刪除或排序計畫，
 以免 UI 與 Agent 同時改寫。Agent 使用 `plan_get`、`plan_create`、`plan_step_update`、
 `plan_loop_interrupt` 控制

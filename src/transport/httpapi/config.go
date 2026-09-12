@@ -20,6 +20,7 @@ type Config struct {
 	ConfigBundle            func(context.Context, bool) ([]byte, error)
 	ExportProviderSetting   func(context.Context, string, bool) ([]byte, error)
 	ExportMCPSetting        func(context.Context, string, bool) ([]byte, error)
+	ReadMCPContract         func(context.Context, string) (any, error)
 	Restore                 func(context.Context, []byte) (domain.RestoreResult, error)
 	Permissions             func(context.Context) (domain.PermissionCenter, error)
 	UpdateStatus            func(context.Context) (domain.UpdateStatus, error)

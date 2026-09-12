@@ -22,9 +22,9 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - You can keep typing while a conversation is running; later messages are stored in the browser's IndexedDB Durable Outbox and submitted in order after the active run ends. Network retries reuse the same Idempotency-Key.
 - Automatic context compaction with a history character limit, persistent memory, and configurable memory scopes.
 - Optional experimental Memory Space reuses preferences, decisions, and procedures with near-duplicate handling, project-first scopes, compact recall, and failure-triggered memory lookup.
-- Per-run input, output, and total token usage, with session totals across retained runs and estimated cost from configurable model prices. No price means tokens only.
+- Per-run input, output, and total token usage, with session totals stored independently of run-history retention. Main, summary, and fallback model usage is recorded separately for cost estimates; unpriced models show tokens only.
 - Native file, document, shell, SSH, and planning tools protected by sandboxes and execution approval.
-- Memory-isolated projects keep conversations, plans, attachments, and work files **on the RAM disk as they are written** — never on the drive — so they are gone when the app closes or restarts, leaving only the project settings; each project gets a dedicated, size-configurable RAM disk sandbox. Tool calls in these projects skip per-call approval, and creating new ones can be turned off under Experimental features (on by default) without affecting existing projects.
+- Memory-isolated projects keep conversations, plans, attachments, and work files on a dedicated RAM disk. Only backend-confined tools in a single isolated workspace may skip per-call approval; shell, SSH, MCP, external conversion, and rendering are not exempt. Creating new projects can be disabled under Experimental features without changing existing projects.
 - The compact tool set includes document reading, creation, and conversion; extended tools, tool retrieval, and native or instruction tool-call modes are also available.
 - Indexed paging for long conversations, question previews, and section navigation. Cumulative usage uses K/M notation with exact values on hover.
 - Bounded, cancellable waiting with `wait_for`, plus `ssh_wait` polling for read-only remote checks so deployments are confirmed by bytes, SHA-256, or service readiness instead of an early upload return.
@@ -73,9 +73,7 @@ Back up before upgrading. Older runs, event files, and inactive memories beyond 
 
 ## Licensing
 
-This project is dual-licensed:
-
-- Open-source use is available under the [GNU General Public License v3.0 only](LICENSE).
-- Commercial licensing is available when GPLv3 obligations are unsuitable; see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+This project is provided under the [NR-Intern License v1.1](LICENSE.en.md).
+The license text and [commercial licensing notes](COMMERCIAL-LICENSE.md) govern use and separate licensing.
 
 Third-party components remain subject to their respective bundled licenses.

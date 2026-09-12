@@ -98,11 +98,12 @@ type serverState struct {
 	lastUsedAt  time.Time
 	tools       map[string]resolvedTool
 	// available 是 Server 回報的完整工具清單（含未公開的），供管理介面挑選。
-	available  []ToolInfo
-	toolsDirty bool
-	status     string
-	lastError  string
-	updatedAt  time.Time
+	available     []ToolInfo
+	toolsDirty    bool
+	status        string
+	lastError     string
+	updatedAt     time.Time
+	contractScope string
 }
 
 type Manager struct {
@@ -114,6 +115,8 @@ type Manager struct {
 	maxOutputBytes int
 	progressMu     sync.RWMutex
 	progress       map[string]progressListener
+	continuationMu sync.Mutex
+	continuations  map[string]*toolContinuation
 }
 
 // progressListener 把工具的進度事件同時交給 UI 與呼叫的閒置計時器：
@@ -176,10 +179,11 @@ func (m *Manager) Replace(configs []ServerConfig) error {
 			}
 		}
 		updated[id] = &serverState{
-			config:     config,
-			tools:      map[string]resolvedTool{},
-			toolsDirty: config.Enabled,
-			status:     map[bool]string{true: "disconnected", false: "disabled"}[config.Enabled],
+			config:        config,
+			contractScope: domain.NewID("mcp_contract"),
+			tools:         map[string]resolvedTool{},
+			toolsDirty:    config.Enabled,
+			status:        map[bool]string{true: "disconnected", false: "disabled"}[config.Enabled],
 		}
 	}
 	m.servers = updated
@@ -277,7 +281,50 @@ func (m *Manager) Definitions(ctx context.Context, _ domain.Session) ([]domain.T
 	return definitions, nil
 }
 
-func (m *Manager) Execute(ctx context.Context, _ domain.Session, call domain.ToolCall, sink ports.ToolUpdateSink) (domain.ToolExecution, error) {
+// ServerDefinitions 回傳單一 Server 的完整工具定義，含描述與輸入 schema。
+//
+// Definitions 給模型用，會把所有 Server 的工具混在一起，而且只含本次公開的那些。
+// 解讀契約要的是「這一台提供什麼」，包含被工具白名單擋掉的：那些工具仍然是這台
+// Server 的能力，只是這次沒公開，寫進記憶時應該讓人知道它們存在。
+func (m *Manager) ServerDefinitions(ctx context.Context, id string) ([]domain.ToolDefinition, error) {
+	id = strings.TrimSpace(id)
+	for _, state := range m.states() {
+		if stateID(state) != id {
+			continue
+		}
+		if err := m.ensureConnected(ctx, state, true); err != nil {
+			return nil, err
+		}
+		state.mu.RLock()
+		defer state.mu.RUnlock()
+		definitions := make([]domain.ToolDefinition, 0, len(state.tools))
+		for _, tool := range state.tools {
+			definitions = append(definitions, cloneDefinition(tool.definition))
+		}
+		sort.Slice(definitions, func(i, j int) bool { return definitions[i].Name < definitions[j].Name })
+		return definitions, nil
+	}
+	return nil, fmt.Errorf("%w: MCP %q", domain.ErrNotFound, id)
+}
+
+func (m *Manager) Execute(ctx context.Context, owner domain.Session, call domain.ToolCall, sink ports.ToolUpdateSink) (execution domain.ToolExecution, executeErr error) {
+	dispatched := false
+	resumedFrom := ""
+	defer func() {
+		if execution.Details == nil {
+			execution.Details = map[string]any{}
+		}
+		if resumedFrom != "" {
+			execution.Details["mcp_resumed_tool_call_id"] = resumedFrom
+		}
+		if domain.ToolExecutionState(execution.Details) == "" && execution.IsError {
+			if dispatched {
+				execution.Details["execution_state"] = domain.ToolOutcomeUnknown
+			} else {
+				execution.Details["execution_state"] = domain.ToolNotDispatched
+			}
+		}
+	}()
 	state, tool := m.route(call.Name)
 	if state == nil {
 		return failed(call, "MCP 工具不存在或尚未連線"), nil
@@ -293,6 +340,18 @@ func (m *Manager) Execute(ctx context.Context, _ domain.Session, call domain.Too
 	if session == nil || tool.remoteName == "" {
 		return failed(call, "MCP 工具已不可用，請重新整理 MCP 連線"), nil
 	}
+	if call.ExpectedContractID != "" && call.ExpectedContractID != domain.ToolContractID(tool.definition) {
+		return failed(call, "MCP 工具契約已變更，未派送；請重新取得工具定義與核准。"), nil
+	}
+	if _, supplied := call.Arguments[mcpRequestStateArgument]; supplied {
+		return failed(call, "MCP request_state 由 Runtime 管理，請使用 _mcp_continuation_id 續接。"), nil
+	}
+	resumed, parentCallID, resumeErr := m.resumeToolCall(owner.ID, config.ID, call, tool)
+	if resumeErr != nil {
+		return failed(call, resumeErr.Error()), nil
+	}
+	call = resumed
+	resumedFrom = parentCallID
 
 	// CallTimeoutSeconds 是「沒有任何回應或進度更新」的容忍時間，不是硬性的
 	// 總時長上限：長時間執行的 MCP 工作只要持續回報進度就能繼續，整體時間仍由
@@ -324,10 +383,14 @@ func (m *Manager) Execute(ctx context.Context, _ domain.Session, call domain.Too
 	stopHeartbeat := m.startWaitHeartbeat(ctx, call, config, sink, startedAt, progressCount)
 	defer stopHeartbeat()
 	for attempt := 1; attempt <= MCPCallRetryAttempts; attempt++ {
+		if m.state(config.ID) != state {
+			return failed(call, "MCP 設定來源已替換，已停止派送；請重新取得工具目錄。"), nil
+		}
 		params, paramsErr := m.callToolParams(call, tool)
 		if paramsErr != nil {
 			return failed(call, fmt.Sprintf("MCP %s 輸入無效：%v", config.DisplayName, paramsErr)), nil
 		}
+		dispatched = true
 		result, err, outcome := callToolWithTimeout(ctx, inactivity, ceiling, progressResets, func(callCtx context.Context) (*mcp.CallToolResult, error) {
 			return session.CallTool(callCtx, params)
 		})
@@ -335,10 +398,10 @@ func (m *Manager) Execute(ctx context.Context, _ domain.Session, call domain.Too
 			state.mu.Lock()
 			state.lastUsedAt = time.Now()
 			state.mu.Unlock()
-			return m.executionFromResult(call, config, result), nil
+			return m.executionFromResult(call, config, result, owner.ID), nil
 		}
-		// 伺服器明確拒收（session 已失效、連線根本沒建立）代表工具沒有被執行過，
-		// 重連後重送不會產生第二次副作用；這種情況對所有工具都重試一次。
+		// SDK 明確指出派送前已關閉，或本機 dial 失敗，才視為未派送。
+		// 不以一般錯誤文字中的 session 失效推定遠端沒有執行。
 		// 其他錯誤有可能是「已執行、但回應遺失」，維持只有 idempotent 工具才重試。
 		if outcome == mcpCallStalled {
 			message := fmt.Sprintf("MCP %s 呼叫已中止：%d 秒內沒有回應或進度更新（已等待 %s）",
@@ -383,6 +446,9 @@ func (m *Manager) Execute(ctx context.Context, _ domain.Session, call domain.Too
 		if session == nil || tool.remoteName == "" {
 			return failed(call, "MCP 工具在重新連線後已不存在，請重新整理工具清單"), nil
 		}
+		if call.ExpectedContractID != "" && call.ExpectedContractID != domain.ToolContractID(tool.definition) {
+			return failed(call, "MCP 重連後契約已變更，已停止自動重送；請確認先前結果並重新核准。"), nil
+		}
 	}
 	return failed(call, fmt.Sprintf("MCP %s 呼叫失敗", config.DisplayName)), nil
 }
@@ -390,6 +456,7 @@ func (m *Manager) Execute(ctx context.Context, _ domain.Session, call domain.Too
 const (
 	mcpInputResponsesArgument = "_mcp_input_responses"
 	mcpRequestStateArgument   = "_mcp_request_state"
+	mcpContinuationArgument   = "_mcp_continuation_id"
 )
 
 // callToolParams 將 MCP 多輪輸入的控制欄位與實際工具參數分開。一般工具
@@ -442,7 +509,7 @@ func (m *Manager) startWaitHeartbeat(
 func (m *Manager) callToolParams(call domain.ToolCall, tool resolvedTool) (*mcp.CallToolParams, error) {
 	arguments := make(map[string]any, len(call.Arguments))
 	for key, value := range call.Arguments {
-		if key == mcpInputResponsesArgument || key == mcpRequestStateArgument {
+		if key == mcpInputResponsesArgument || key == mcpRequestStateArgument || key == mcpContinuationArgument {
 			continue
 		}
 		arguments[key] = value
@@ -549,16 +616,10 @@ func deliveryRejectedMCPError(err error) bool {
 	if errors.Is(err, mcp.ErrConnectionClosed) {
 		return true
 	}
-	message := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"session not found", "session expired", "unknown session", "invalid session",
-		"missing session", "connection refused", "no such session",
-	} {
-		if strings.Contains(message, marker) {
-			return true
-		}
-	}
-	return false
+	// 遠端內部錯誤也可能含 connection refused／session expired 等字樣，
+	// 不能據此推定這次工具尚未執行。只接受 SDK 的未派送錯誤或本機 dial 失敗。
+	var operation *net.OpError
+	return errors.As(err, &operation) && operation.Op == "dial"
 }
 
 func isUnsupportedMCPMethod(err error) bool {
@@ -600,6 +661,9 @@ func (m *Manager) Catalog(_ *domain.Session) []domain.ToolCatalogEntry {
 }
 
 func (m *Manager) Close() error {
+	m.continuationMu.Lock()
+	m.continuations = nil
+	m.continuationMu.Unlock()
 	var first error
 	for _, state := range m.states() {
 		if err := m.closeState(state); err != nil && first == nil {
@@ -617,6 +681,9 @@ func (m *Manager) ensureConnected(parent context.Context, state *serverState, fo
 	session := state.session
 	toolsDirty := state.toolsDirty
 	state.mu.RUnlock()
+	if m.state(config.ID) != state {
+		return fmt.Errorf("%w: MCP 設定來源已替換，不能重新啟用舊連線", domain.ErrConflict)
+	}
 	if !config.Enabled {
 		return nil
 	}
@@ -624,7 +691,7 @@ func (m *Manager) ensureConnected(parent context.Context, state *serverState, fo
 	// 在使用前就確認，讓呼叫端拿到的一定是活的 session，而不是等工具呼叫失敗
 	// 才發現——後者對沒有宣告 idempotent 的工具等於直接失敗。
 	if session != nil && !m.sessionUsable(parent, state, session) {
-		m.closeState(state)
+		m.closeStateLocked(state)
 		session = nil
 		toolsDirty = true
 	}
@@ -890,10 +957,13 @@ func (m *Manager) refreshTools(ctx context.Context, state *serverState) error {
 		readOnly := trusted && tool.Annotations != nil && tool.Annotations.ReadOnlyHint
 		idempotent := trusted && tool.Annotations != nil && tool.Annotations.IdempotentHint
 		resolved[name] = resolvedTool{remoteName: tool.Name, definition: domain.ToolDefinition{
-			Name: name, Label: label, Category: "mcp", Description: strings.TrimSpace(tool.Description), InputSchema: schemaMap(tool.InputSchema),
+			Name: name, Label: label, Category: "mcp", Description: strings.TrimSpace(tool.Description), InputSchema: continuationSchema(schemaMap(tool.InputSchema)),
 			OutputSchema: optionalSchemaMap(tool.OutputSchema), ServerInstructions: serverInstructions,
 			Capabilities: []string{"mcp", "mcp:" + config.ID}, ReadOnly: readOnly, RequiresPermission: true,
 		}, idempotent: idempotent}
+		value := resolved[name]
+		value.definition.ContractID = domain.ToolContractFingerprint(value.definition, fmt.Sprintf("%s:%s:%t", state.contractScope, tool.Name, idempotent))
+		resolved[name] = value
 	}
 	state.mu.Lock()
 	state.tools = resolved
@@ -1020,7 +1090,7 @@ func stopTimer(timer *time.Timer) {
 	}
 }
 
-func (m *Manager) executionFromResult(call domain.ToolCall, config ServerConfig, result *mcp.CallToolResult) domain.ToolExecution {
+func (m *Manager) executionFromResult(call domain.ToolCall, config ServerConfig, result *mcp.CallToolResult, owners ...string) domain.ToolExecution {
 	execution := domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Details: map[string]any{
 		"mcp_server_id": config.ID, "mcp_transport": config.Transport,
 	}}
@@ -1030,6 +1100,9 @@ func (m *Manager) executionFromResult(call domain.ToolCall, config ServerConfig,
 		return execution
 	}
 	execution.IsError = result.IsError
+	if result.IsError {
+		execution.Details["execution_state"] = domain.ToolFailed
+	}
 	if result.StructuredContent != nil {
 		execution.Details["structured_content"] = result.StructuredContent
 	}
@@ -1038,10 +1111,20 @@ func (m *Manager) executionFromResult(call domain.ToolCall, config ServerConfig,
 		if marshalErr == nil {
 			execution.Details["mcp_input_requests"] = result.InputRequests
 		}
-		if strings.TrimSpace(result.RequestState) != "" {
-			execution.Details["mcp_request_state"] = result.RequestState
+		ownerID := ""
+		if len(owners) > 0 {
+			ownerID = owners[0]
 		}
-		execution.Content = "MCP 工具需要額外輸入。請依下列請求補齊資料，並以同一工具重試；回傳參數請放入 " + mcpInputResponsesArgument + "，並原樣帶回 " + mcpRequestStateArgument + "。"
+		continuationID, err := m.saveContinuation(ownerID, config.ID, call, result.RequestState)
+		if err != nil {
+			execution.IsError = true
+			execution.Content = err.Error()
+			execution.Details["execution_state"] = domain.ToolOutcomeUnknown
+			return execution
+		}
+		execution.Details["mcp_continuation_id"] = continuationID
+		execution.Details["execution_state"] = "awaiting_input"
+		execution.Content = "MCP 工具需要額外輸入。沿用相同工具及原始業務參數，將回覆放入 " + mcpInputResponsesArgument + "，並帶上 " + mcpContinuationArgument + "=" + continuationID + "。續接狀態由 Runtime 自動帶回；不可重開原始操作。"
 		if len(requests) > 0 {
 			execution.Content += "\nMCP 輸入請求：" + string(requests)
 		}
@@ -1152,6 +1235,11 @@ func (m *Manager) statusOf(state *serverState) ServerStatus {
 func (m *Manager) closeState(state *serverState) error {
 	state.connectMu.Lock()
 	defer state.connectMu.Unlock()
+	return m.closeStateLocked(state)
+}
+
+// 呼叫端已持有 connectMu，避免重連檢查再次鎖住同一把非重入鎖。
+func (m *Manager) closeStateLocked(state *serverState) error {
 	state.mu.Lock()
 	session := state.session
 	state.session = nil

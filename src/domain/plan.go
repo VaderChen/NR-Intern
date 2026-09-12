@@ -12,6 +12,7 @@ const (
 	PlanStatusQueued    PlanStatus = "queued"
 	PlanStatusActive    PlanStatus = "active"
 	PlanStatusCompleted PlanStatus = "completed"
+	PlanStatusPartial   PlanStatus = "partial"
 	PlanStatusCanceled  PlanStatus = "canceled"
 )
 
@@ -53,14 +54,24 @@ type Plan struct {
 }
 
 type PlanStep struct {
-	ID           string         `json:"id"`
-	Title        string         `json:"title"`
-	Description  string         `json:"description,omitempty"`
-	Verification string         `json:"verification"`
-	Status       PlanStepStatus `json:"status"`
-	Evidence     string         `json:"evidence,omitempty"`
-	StartedAt    *time.Time     `json:"started_at,omitempty"`
-	CompletedAt  *time.Time     `json:"completed_at,omitempty"`
+	ID                    string         `json:"id"`
+	Title                 string         `json:"title"`
+	Description           string         `json:"description,omitempty"`
+	Verification          string         `json:"verification"`
+	Status                PlanStepStatus `json:"status"`
+	Evidence              string         `json:"evidence,omitempty"`
+	StartedAt             *time.Time     `json:"started_at,omitempty"`
+	CompletedAt           *time.Time     `json:"completed_at,omitempty"`
+	VerificationStartedAt *time.Time     `json:"verification_started_at,omitempty"`
+	VerifiedEvidence      []PlanEvidence `json:"verified_evidence,omitempty"`
+}
+
+// PlanEvidence 由後端查閱實際工具結果建立，不接受模型直接宣告。
+type PlanEvidence struct {
+	ToolCallID   string    `json:"tool_call_id"`
+	ToolName     string    `json:"tool_name"`
+	ResultSHA256 string    `json:"result_sha256"`
+	ObservedAt   time.Time `json:"observed_at"`
 }
 
 type CreatePlanInput struct {
@@ -77,8 +88,9 @@ type CreatePlanStepInput struct {
 }
 
 type UpdatePlanStepInput struct {
-	Status   PlanStepStatus `json:"status"`
-	Evidence string         `json:"evidence,omitempty"`
+	Status           PlanStepStatus `json:"status"`
+	Evidence         string         `json:"evidence,omitempty"`
+	VerifiedEvidence []PlanEvidence `json:"-"`
 }
 
 type ReorderPlansInput struct {
@@ -170,11 +182,14 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 			step.StartedAt = timePointer(now)
 		}
 		step.Evidence = ""
+		step.VerifiedEvidence = nil
+		step.VerificationStartedAt = nil
 		step.CompletedAt = nil
 	case PlanStepStatusVerifying:
 		if step.Status != PlanStepStatusInProgress {
 			return Plan{}, invalidPlanTransition(step.Status, input.Status)
 		}
+		step.VerificationStartedAt = timePointer(now)
 	case PlanStepStatusCompleted:
 		if step.Status != PlanStepStatusVerifying {
 			return Plan{}, invalidPlanTransition(step.Status, input.Status)
@@ -182,6 +197,15 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 		if input.Evidence == "" {
 			return Plan{}, fmt.Errorf("%w: completing a plan step requires verification evidence", ErrInvalidInput)
 		}
+		if step.VerificationStartedAt == nil || len(input.VerifiedEvidence) == 0 {
+			return Plan{}, fmt.Errorf("%w: 完成步驟必須引用驗證階段之後的成功工具結果", ErrInvalidInput)
+		}
+		for _, proof := range input.VerifiedEvidence {
+			if proof.ToolCallID == "" || proof.ToolName == "" || len(proof.ResultSHA256) != 64 || proof.ObservedAt.Before(*step.VerificationStartedAt) {
+				return Plan{}, fmt.Errorf("%w: 工具驗證證據無效或已過期", ErrInvalidInput)
+			}
+		}
+		step.VerifiedEvidence = append([]PlanEvidence(nil), input.VerifiedEvidence...)
 		step.Evidence = input.Evidence
 		step.CompletedAt = timePointer(now)
 	case PlanStepStatusBlocked:
@@ -209,7 +233,11 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 	plan.UpdatedAt = now
 	plan.CurrentStepID = ""
 	allFinished := true
+	allCompleted := true
 	for _, candidate := range plan.Steps {
+		if candidate.Status != PlanStepStatusCompleted {
+			allCompleted = false
+		}
 		if candidate.Status != PlanStepStatusCompleted && candidate.Status != PlanStepStatusSkipped {
 			allFinished = false
 			if plan.CurrentStepID == "" {
@@ -218,7 +246,10 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 		}
 	}
 	if allFinished {
-		plan.Status = PlanStatusCompleted
+		plan.Status = PlanStatusPartial
+		if allCompleted {
+			plan.Status = PlanStatusCompleted
+		}
 	}
 	return plan, nil
 }
@@ -231,7 +262,7 @@ func ValidatePlan(plan Plan) error {
 		return fmt.Errorf("%w: plan must contain between 1 and %d steps", ErrInvalidInput, MaxPlanSteps)
 	}
 	switch plan.Status {
-	case PlanStatusQueued, PlanStatusActive, PlanStatusCompleted, PlanStatusCanceled:
+	case PlanStatusQueued, PlanStatusActive, PlanStatusCompleted, PlanStatusPartial, PlanStatusCanceled:
 	default:
 		return fmt.Errorf("%w: unsupported plan status %q", ErrInvalidInput, plan.Status)
 	}
@@ -268,7 +299,7 @@ func PlanHasProgress(plan Plan) bool {
 }
 
 func PlanIsTerminal(plan Plan) bool {
-	return plan.Status == PlanStatusCompleted || plan.Status == PlanStatusCanceled
+	return plan.Status == PlanStatusCompleted || plan.Status == PlanStatusPartial || plan.Status == PlanStatusCanceled
 }
 
 // invalidPlanTransition 要把「現在在哪、下一步能往哪走」一次講完。
@@ -289,9 +320,9 @@ func planStepNextMove(from PlanStepStatus) string {
 	case PlanStepStatusPending:
 		return lifecycle + "：請先送 in_progress 開始執行；確定不做這一步則送 skipped"
 	case PlanStepStatusInProgress:
-		return lifecycle + "：請先送 verifying 表示開始查證，查證通過後再送一次 completed 並附上 evidence；卡住則送 blocked 並把阻礙寫進 evidence"
+		return lifecycle + "：請先送 verifying 表示開始查證，查證通過後再送一次 completed，附上 evidence 與實際成功結果的 evidence_tool_call_ids；卡住則送 blocked 並把阻礙寫進 evidence"
 	case PlanStepStatusVerifying:
-		return "下一步只有 completed（附上查證得到的 evidence）或 blocked（把阻礙寫進 evidence）；重送 verifying 不會有任何變化"
+		return "下一步只有 completed（附上查證得到的 evidence 與 evidence_tool_call_ids）或 blocked（把阻礙寫進 evidence）；重送 verifying 不會有任何變化"
 	case PlanStepStatusBlocked:
 		return lifecycle + "：阻礙排除後請先送 in_progress 重新開始"
 	case PlanStepStatusCompleted, PlanStepStatusSkipped:

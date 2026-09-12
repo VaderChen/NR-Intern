@@ -164,41 +164,60 @@ func (r *PlanRepository) Create(ctx context.Context, value domain.Plan) (domain.
 }
 
 func (r *PlanRepository) Update(ctx context.Context, value domain.Plan) (domain.Plan, error) {
+	return r.Mutate(ctx, value.SessionID, value.ID, func(domain.Plan) (domain.Plan, error) {
+		return value, nil
+	})
+}
+
+func (r *PlanRepository) Mutate(ctx context.Context, sessionID, planID string, mutate func(domain.Plan) (domain.Plan, error)) (domain.Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Plan{}, err
 	}
-	if err := domain.ValidatePlan(value); err != nil {
-		return domain.Plan{}, err
-	}
-	path, err := r.path(value.SessionID)
+	path, err := r.path(sessionID)
 	if err != nil {
 		return domain.Plan{}, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	values, err := r.read(path, value.SessionID)
+	if err := ctx.Err(); err != nil {
+		return domain.Plan{}, err
+	}
+	values, err := r.read(path, sessionID)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return domain.Plan{}, fmt.Errorf("%w: plan %q", domain.ErrNotFound, value.ID)
+			return domain.Plan{}, fmt.Errorf("%w: plan %q", domain.ErrNotFound, planID)
 		}
 		return domain.Plan{}, err
 	}
 	updated := false
 	for index := range values {
-		if values[index].ID == value.ID {
+		if values[index].ID == planID {
+			value, err := mutate(values[index])
+			if err != nil {
+				return domain.Plan{}, err
+			}
+			if value.ID != planID || value.SessionID != sessionID {
+				return domain.Plan{}, fmt.Errorf("%w: plan identity cannot change", domain.ErrInvalidInput)
+			}
+			if err := domain.ValidatePlan(value); err != nil {
+				return domain.Plan{}, err
+			}
 			values[index] = value
 			updated = true
 			break
 		}
 	}
 	if !updated {
-		return domain.Plan{}, fmt.Errorf("%w: plan %q", domain.ErrNotFound, value.ID)
+		return domain.Plan{}, fmt.Errorf("%w: plan %q", domain.ErrNotFound, planID)
 	}
-	values = normalizePlanQueue(values)
-	if err := r.write(path, value.SessionID, values); err != nil {
+	if err := ctx.Err(); err != nil {
 		return domain.Plan{}, err
 	}
-	return planByID(values, value.ID)
+	values = normalizePlanQueue(values)
+	if err := r.write(path, sessionID, values); err != nil {
+		return domain.Plan{}, err
+	}
+	return planByID(values, planID)
 }
 
 func (r *PlanRepository) Delete(ctx context.Context, sessionID, planID string) error {
@@ -369,7 +388,8 @@ func (r *PlanRepository) write(path, sessionID string, values []domain.Plan) err
 	if err != nil {
 		return fmt.Errorf("encode plans: %w", err)
 	}
-	temporary, err := os.CreateTemp(r.root, ".plans-*.tmp")
+	// 與目的檔位於同一根目錄，避免 RAM 計畫外洩到磁碟及跨磁碟 rename 失敗。
+	temporary, err := os.CreateTemp(filepath.Dir(path), ".plans-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create plans temporary file: %w", err)
 	}

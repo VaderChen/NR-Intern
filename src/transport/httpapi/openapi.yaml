@@ -126,6 +126,31 @@ paths:
                 type: object
         "404":
           description: 沒有這個 MCP Server。
+  /api/v1/admin/mcp-settings/{mcp_id}/contract:
+    post:
+      summary: 解讀 MCP 契約並寫入共用記憶
+      description: >-
+        重新連線取得該 Server 的完整工具定義（含描述、必填參數與唯讀屬性），
+        分批交給摘要 Provider 整理成使用導覽，寫入跨專案共用的記憶 scope。
+        工具數量多時需要數分鐘。Server 自述的 instructions 以外部資料邊界標示後送入，
+        不視為指令。沒有可用 Provider 或回憶空間停用時回傳 409。
+      parameters:
+        - name: mcp_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 契約摘要與寫入結果。
+          content:
+            application/json:
+              schema:
+                type: object
+        "404":
+          description: 沒有這個 MCP Server。
+        "409":
+          description: 缺少可用的 Provider 或回憶空間。
   /api/v1/admin/config-bundle:
     get:
       summary: 下載設定包（Provider、MCP、反向代理與服務設定）
@@ -1501,7 +1526,7 @@ components:
         session_id: { type: string }
         title: { type: string }
         objective: { type: string }
-        status: { type: string, enum: [queued, active, completed, canceled] }
+        status: { type: string, enum: [queued, active, completed, partial, canceled], description: 含略過步驟的已結束計畫為 partial，不代表全部完成。 }
         position: { type: integer, minimum: 0 }
         current_step_id: { type: string }
         created_by: { type: string, enum: [user, agent] }
@@ -1524,6 +1549,20 @@ components:
         evidence: { type: string }
         started_at: { type: string, format: date-time }
         completed_at: { type: string, format: date-time }
+        verification_started_at: { type: string, format: date-time }
+        verified_evidence:
+          type: array
+          readOnly: true
+          items: { $ref: "#/components/schemas/PlanEvidence" }
+    PlanEvidence:
+      type: object
+      description: 後端核對實際工具結果的來源與時序，不等於自動驗證任意自然語言驗收條件。
+      required: [tool_call_id, tool_name, result_sha256, observed_at]
+      properties:
+        tool_call_id: { type: string }
+        tool_name: { type: string }
+        result_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+        observed_at: { type: string, format: date-time }
     CreatePlanInput:
       type: object
       required: [title, steps]
@@ -1947,6 +1986,10 @@ components:
         total_tokens: { type: integer, minimum: 0 }
         estimated_cost_usd: { type: number, minimum: 0, description: 未設定價格時省略。 }
         currency: { type: string, enum: [USD] }
+        by_model:
+          type: array
+          description: 主模型、摘要與備援的實際用量分項；只使用一層，已包含於上層總數，不重複加總。
+          items: { $ref: "#/components/schemas/RunUsage" }
     SessionUsage:
       type: object
       description: >-
@@ -2266,6 +2309,7 @@ components:
         tool_name: { type: string }
         arguments: { type: object, additionalProperties: true }
         reason: { type: string }
+        one_time_only: { type: boolean, description: true 時不能要求永久核准；先前結果未知的重試必須逐次確認。 }
         requested_at: { type: string, format: date-time }
     ToolApprovalDecisionInput:
       type: object
@@ -2274,7 +2318,7 @@ components:
         approval_id: { type: string, minLength: 1 }
         decision: { type: string, enum: [approve, deny] }
         reason: { type: string }
-        permanent: { type: boolean, description: 僅能搭配 approve；持久化核准到目前 Session，後續不再逐次詢問。 }
+        permanent: { type: boolean, description: 僅能搭配 approve 且 pending approval 非 one_time_only；持久化至目前 Session，但不豁免結果未知的重試。 }
     ToolDefinition:
       type: object
       required: [name, description]
@@ -2282,6 +2326,7 @@ components:
         name: { type: string }
         label: { type: string }
         version: { type: string }
+        contract_id: { type: string, description: 後端產生的工具契約指紋；模型與 HTTP 呼叫端不可指定執行時預期契約。 }
         category: { type: string }
         description: { type: string }
         input_schema: { type: object, additionalProperties: true }

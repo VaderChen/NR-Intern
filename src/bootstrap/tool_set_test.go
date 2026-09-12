@@ -24,7 +24,7 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 		t.Fatalf("lean set = %v, want %v", lean, LeanToolNames)
 	}
 	// 文件產出留在精簡集合裡：使用者說「給我 Excel」時，沒有這些工具就只能用
-	// shell 寫一個沒有 BOM 的 CSV 交差。寫入、編輯、SSH 與記憶仍然要擴充工具集。
+	// shell 寫一個沒有 BOM 的 CSV 交差。局部編輯、SSH 與記憶仍然要擴充工具集。
 	if !strings.Contains(strings.Join(lean, ","), "document_create") {
 		t.Fatalf("document_create must stay in the lean set: %v", lean)
 	}
@@ -38,7 +38,10 @@ func TestEffectiveAllowedToolsUsesLeanSetByDefault(t *testing.T) {
 	if !strings.Contains(strings.Join(lean, ","), "plan_loop_interrupt") {
 		t.Fatalf("plan_loop_interrupt must stay in the lean set: %v", lean)
 	}
-	for _, name := range []string{"file_write", "file_edit", "ssh_exec", "document_edit", "memory_remember", "http_fetch"} {
+	if !strings.Contains(strings.Join(lean, ","), "file_write") {
+		t.Fatal("lean tools must include raw source writing")
+	}
+	for _, name := range []string{"file_edit", "ssh_exec", "document_edit", "memory_remember", "http_fetch"} {
 		if strings.Contains(strings.Join(lean, ","), name) {
 			t.Fatalf("%q must not be in the lean set: %v", name, lean)
 		}

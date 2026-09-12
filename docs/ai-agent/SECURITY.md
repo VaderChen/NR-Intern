@@ -22,7 +22,7 @@
 
 `http_fetch` 的限制如下：
 
-- 工具必須同時通過 allowlist、elevated permission profile、單次人工 Approval，以及 `ServiceSettings.http_fetch.enabled` 開關；管理介面關閉後工具立即從模型的工具清單消失，不需重啟後端。
+- 工具必須同時通過 allowlist、elevated permission profile、適用的 Approval 政策，以及 `ServiceSettings.http_fetch.enabled` 開關；管理介面關閉後工具立即從模型的工具清單消失，不需重啟後端。
 - 私有網段預設允許：`allow_private_networks` 預設為 `true`，因此 localhost、loopback、RFC1918、link-local（含 `169.254.169.254` 這類雲端 metadata 位址）、CGNAT 與 multicast 都可連線；設為 `false` 時全部拒絕。判斷在 Dial 階段執行，因此 DNS 重新綁定與轉址無法繞過。若不需要存取私有服務，建議由管理介面關閉此開關。
 - 不使用系統 Proxy 設定，避免實際連線目標與網址主機不一致而讓上述檢查失效。可另外以 `http_fetch.allowed_hosts` 限制成白名單，`blocked_hosts` 一律優先拒絕。
 - 只允許 http／https 與 GET、HEAD、POST；`Host`、`Content-Length`、`Connection` 等由 Transport 管理的 header 不可覆寫，帶換行的 header 值直接丟棄。回應大小、逾時與轉址次數都有上限，非文字內容不會送進上下文。
@@ -189,23 +189,23 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 
 ## 內建與 MCP 工具
 
-- 工具必須同時通過後端 allowlist 與 Session permission profile；profile 本身由上述後端策略指派。
+- 原生工具必須同時通過後端 allowlist 與 Session permission profile；profile 本身由上述後端策略指派。MCP 則使用下述獨立的 Server、契約與 Approval 邊界。
 - 精簡工具集已包含文件建立與轉換；進入目錄或被 `find_tools` 找到不代表核准，仍須通過原有
   Sandbox、elevated policy、輸入大小與 Approval 檢查。Schema 導向參數正規化只處理型別／格式，
   不授予額外工具或路徑權限；MCP 參數與結果仍視為外部不受信任資料。
 - 寫檔、Shell 與 SSH 是 elevated tools；還需要 `allow_elevated_tools=true`。
-- elevated tool 在實際執行前還要經過單次人工 Approval；permission profile 是資格邊界，Approval 是本次具體參數的副作用確認，兩者不能互相取代。
+- elevated tool 在實際執行前還要經過 Approval 判斷；除下述唯讀、受限隔離工作區或有效 Session 永久核准外，須逐次人工確認。permission profile 是資格邊界，不等於已核准具體參數的副作用。
 - Approval decision 必須攜帶目前 `approval_id`；後端拒絕過期或不相符的決策，避免舊 UI 操作誤套到下一個工具呼叫。
 - Session 永久核准只能在有效 pending approval 上以 `approve + permanent` 開啟，不能透過一般 Session PATCH 提權；拒絕、過期 approval 或其他 Session 都不會繼承。
 - Approval 對外參數會移除 `content`、`old_text`、`new_text`、`patch` 等本文欄位，只顯示路徑、操作模式與前置條件等判斷副作用所需資料。
 - 檔案工具會解析最深既有父路徑與 symlink，限制在目前 Session 的沙箱根目錄集合內（見上節「工具沙箱範圍」）。
 - 文件工具同樣受 Sandbox 限制，並限制來源檔案、範本、結構化輸入、輸出文件、PDF 操作頁數／總量、渲染頁數／大小與 Open XML 解壓項目大小；不執行 PDF、DOCX、XLSX、PPTX 中的巨集、外部關聯或嵌入物件。`document_create`、`document_edit`、`document_convert`、`pdf_pages`、`document_render` 屬於 elevated tools；編輯與轉換必須另存新檔。模型指定的 TTF 必須位於 Sandbox；自動字型探索只讀固定的應用程式與作業系統字型目錄，回傳結果不揭露絕對路徑。LibreOffice／Poppler 只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受工具參數指定任意 executable，且子程序只繼承 PATH、HOME、暫存目錄、語系與必要的作業系統環境，不繼承 Provider API key 或後端 token。Approval 對外參數會隱藏 blocks、sheets、slides、replacements、cell_updates、annotations、sources 與 pages 的實際本文。
 - `http_fetch` 是唯一可由模型自行指定任意 URL 的內建工具，邊界見上節「網路邊界」；關閉後不會出現在模型的工具清單。
-- MCP 工具一律標記 `RequiresPermission=true`，必須通過 elevated profile；權限邊界不因唯讀而放寬。
-- **唯讀工具可免逐次 Approval，但不是無條件豁免。** MCP 工具的唯讀屬性來自 Server 自己宣告的 `readOnlyHint`，屬於外部不受信任資料，只有管理者對該 Server 開啟 `trust_annotations` 後才會被採信；未開啟時 MCP 工具不算唯讀，仍然逐次核准。跳過核准會發出 `run.approval_skipped`（`reason=read_only_tool`）留下紀錄。
+- 原生工具受 elevated profile 控制；MCP 工具依 Server 啟用狀態、契約與人工 Approval 控制，不宣稱受同一個本機檔案沙箱保護。
+- **唯讀工具可免逐次 Approval，但不是無條件豁免。** MCP 工具只有在管理者信任 `readOnlyHint` 時才算唯讀。豁免紀錄為 `run.approval_skipped`，`reason=read_only_or_isolated_workspace`。
 - **記憶體隔離專案的對話在執行期間就不落地。** transcript、計畫、附件與 Run 事件在寫入當下即
   指向該 Project 的 RAM disk；`runs.json` 與 `notifications.json` 是單一檔案無法分流，改為只留在
-  記憶體、不寫入。歸屬編碼在 Session／Run ID 裡，磁碟未掛載時解析回到預設根，該對話即視為不存在。
+  記憶體、不寫入。歸屬編碼在 Session／Run ID 裡，磁碟未掛載時該對話即視為不存在。
   磁碟不在時解析回傳 `ErrNotFound`、讀寫一律失敗，不會退回 `dataDir`。
   模型主動寫入回憶空間（`memory_remember`）的內容同樣不落地，且隔離對話一律使用專案專屬
   記憶 scope、不接受 `memory_scope` 覆寫——共用 scope 會讓一筆隨程序結束消失的記憶就地改寫或
@@ -217,18 +217,17 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
   前端二次確認、後端不掛任何排程或預先擷取。重送沿用同一個 `Idempotency-Key`，因為連線中斷時
   無法分辨「沒送出」與「送出了但沒收到回應」，換鑰匙會扣掉第二次。額度不足與先前已兌換都以
   正常結果回覆，不當成錯誤重試。
-- **記憶體隔離專案免逐次 Approval。** 這類專案的 sandbox 是揮發性 RAM Disk，關閉程式即消失，
-  逐次詢問只會把使用者訓練成無條件按下核准，反而讓真正有副作用的操作更容易被順手放行。
-  豁免會發出 `run.approval_skipped`（`reason=ephemeral_project`）留下紀錄。
-  依據是後端在組裝 Run metadata 時寫入的 `ephemeral_project` 旗標，與 `sandbox_roots`
-  一樣會先清除 Client 夾帶的同名值，且讀取端只接受布林 `true`。
-  **這個豁免的邊界必須講清楚**：`shell_exec` 啟動的是真實子行程，sandbox 對它沒有強制力——
-  working directory 在 RAM Disk 上，不代表命令不能寫到其他路徑。因此這裡豁免的語意是
-  「信任這個專案裡執行的命令」，不是「保證只會寫入 RAM Disk」。需要嚴格邊界時，
-  應改用一般專案並保留逐次核准。
+- **RAM 儲存不代表外部副作用已隔離。** 只有單一隔離根目錄且具後端 `workspace-contained`
+  能力的工具可免逐次 Approval；Shell、SSH、MCP、外部轉換／渲染與額外持久根目錄不適用。
+  `ephemeral_project` 與 `sandbox_roots` 仍是後端保留欄位，不採信 Client 自行宣告。
+- **結果未知必須與未派送區分。** 副作用前先保存派送意圖，取消或結果未保存時標為未知；
+  相同未知操作不自動重送，只允許逐次人工核准。`one_time_only=true` 時前後端皆禁止永久授權，
+  既有永久授權也不能略過。核准代表接受重複副作用風險，不保證恰好執行一次。
+- Context 不裁掉固定約束，也不將歷史／工具資料合併提升為系統指令；超出可容納範圍即明確停止。
 - `trust_annotations` **預設開啟**：MCP Server 由管理者自己加入，唯讀查詢逐次核准只會增加不必要的操作負擔。設定檔沒有這個欄位時採預設值；明確設為 `false` 時保存並沿用該決定，不會被預設值蓋掉。對不完全信任的 Server 應主動關閉——關閉後該 Server 的所有工具都逐次核准。
 - MCP stdio 子程序只繼承必要 OS 環境以及管理者明確設定的變數；SSE 與 Streamable HTTP 的 Bearer Token、Basic Auth 與 headers 不會顯示於工具定義、Prompt 或管理 API 回應。管理 API 只回傳 `auth_mode`（實際送出的驗證方式），讓使用者能確認憑證有被採用而不必顯示明文。
-- MCP 連線在伺服器 session 失效或重啟後會自動重連。只有「伺服器明確拒收」的錯誤（session not found／session 過期／連線未建立）才會自動重送工具呼叫，因為這種情況遠端不可能執行過；其餘連線錯誤仍只對宣告 idempotent 的工具重試，避免重複副作用。
+- MCP 允許重連，但只有 SDK 明確指出派送前已關閉或本機 dial 失敗，才視為未派送；一般錯誤文字不構成安全重送證據。其餘連線錯誤只對宣告 idempotent 的工具重試。
+- MCP 追加輸入的 opaque state 只保存在 Runtime 記憶體；模型使用綁定 Session、Server、工具、原參數及契約的單次續接 ID。目錄、核准及派送時再次核對契約，變更後不得沿用舊唯讀或授權快照。
 - MCP Server 回傳的工具描述、schema 與內容屬於外部不受信任資料。Harness 可用它來定義及執行工具，但不應把描述文字視為高於使用者要求、權限政策或 Host 指示的系統命令。
 - Shell 子程序只繼承必要 OS 環境，避免無條件洩漏 Provider API key 或後端 token；timeout/cancel 會終止程序樹。
 - SSH 憑證只存在後端 profile。正式環境應設定 known_hosts 或 SHA-256 host key；`insecure_ignore_host_key` 只供明確接受風險的隔離環境。

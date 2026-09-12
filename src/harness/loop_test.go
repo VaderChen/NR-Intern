@@ -304,8 +304,8 @@ func TestRunStartsWithReadOnlyToolsAndSystemShell(t *testing.T) {
 			t.Errorf("read-only tool %q must be available in the system-first stage: %s", exposed, exposedNames)
 		}
 	}
-	if strings.Contains(exposedNames, "file_write") {
-		t.Errorf("write tool was exposed before Shell failure: %s", exposedNames)
+	if !strings.Contains(exposedNames, "file_write") {
+		t.Errorf("source writing must be available before Shell failure: %s", exposedNames)
 	}
 	for _, expected := range []string{"Host 執行環境", "GOOS=" + runtime.GOOS, runtime.GOARCH, "shell_exec 本輪可呼叫：true", "必須透過 shell_exec 實際執行", "direct mode", "shell mode"} {
 		if !strings.Contains(request.HostPrompt, expected) {
@@ -395,10 +395,10 @@ func TestRunUnlocksBuiltinToolsAfterShellExecutionFailure(t *testing.T) {
 	if len(model.requests) != 3 {
 		t.Fatalf("requests = %d, want 3", len(model.requests))
 	}
-	// 第一輪已包含唯讀工具，但寫入型工具仍要等 Shell 實際失敗才解鎖。
+	// 第一輪已包含唯讀與原始碼寫入工具，不需要先讓 Shell 失敗。
 	firstNames := strings.Join(availableToolNamesSorted(model.requests[0].Tools), ",")
-	if firstNames != "directory_list,file_read,shell_exec" {
-		t.Fatalf("first request tools = %s, want read-only tools plus shell_exec", firstNames)
+	if firstNames != "directory_list,file_read,file_write,shell_exec" {
+		t.Fatalf("first request tools = %s, want read/write tools plus shell_exec", firstNames)
 	}
 	secondNames := strings.Join(availableToolNamesSorted(model.requests[1].Tools), ",")
 	if secondNames != "directory_list,file_read,file_write,shell_exec" {

@@ -13,9 +13,21 @@ NR-Intern 以十個原生工具處理 PDF、DOCX、XLSX 與 PPTX。讀取、建�
 - `pdf_pages`：合併、擷取、重排或拆分 PDF 頁面。
 - `document_render`：將文件渲染成逐頁 PNG，供交付前視覺檢查。
 
-所有模型提供的來源、範本、字型與輸出路徑都必須位於目前 Project／Session Sandbox。建立、編輯、轉換、PDF 頁面整理與渲染是 elevated 操作，須通過工具 allowlist、permission profile 與單次 Approval。輸出預設不可覆寫；需要覆寫時明確設定 `overwrite=true`。
+所有模型提供的來源、範本、字型與輸出路徑都必須位於目前 Project／Session Sandbox。建立、編輯、轉換、PDF 頁面整理與渲染是 elevated 操作，須通過工具 allowlist、permission profile 與適用的 Approval 政策；受限隔離工作區等例外見 [SECURITY.md](SECURITY.md)。輸出預設不可覆寫；需要覆寫時明確設定 `overwrite=true`。
 
 ## 建立文件
+
+### HTML 網頁與文字報告分流
+
+互動網頁、遊戲及 HTML/CSS/JavaScript 原始碼使用 `file_write.content` 原樣寫入；不要放進
+`document_create.blocks`，也不要預先轉成 HTML entities 或包上 Markdown 程式碼圍欄。
+`document_create` 的 HTML 輸出是文字報告，區塊文字會跳脫，不能當成網頁執行器。
+
+回答中的檔案連結使用標準 Markdown，例如 `[開啟網頁](sandbox:/workspace/index.html)`，
+其中路徑須採實際工具回傳值，不自行猜測。HTML 用 `file_read` 或對應格式能力檢查；
+Office／PDF 才使用文件驗證與渲染。檔案寫入成功、連結可開啟都不等於互動功能已驗證。
+
+### 辦公文件
 
 精簡工具集已提供 `document_inspect`、`document_read`、`document_create`、`document_convert`；
 其餘工具需啟用擴充集合並列於 allowlist。文件建立與轉換可在第一階段直接呼叫，不需先嘗試
