@@ -1,7 +1,7 @@
 // Package providerauth implements the ChatGPT/Codex OAuth authorization-code
 // flow used by PI Agent. It owns a short-lived loopback callback server and a
-// permission-restricted token store; it never reads another application's login
-// files or returns bearer credentials to the management UI.
+// permission-restricted token store. Account files are read only through explicit
+// account selection; bearer credentials are never returned to the management UI.
 package providerauth
 
 import (

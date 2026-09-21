@@ -461,7 +461,14 @@
                 <option value="openai-codex-responses">OpenAI Codex Responses</option>
               </select></label>
               <label class="provider-field-full">顯示名稱<input id="providerSettingDisplayName" maxlength="80" autocomplete="off"></label>
-              <label id="providerSettingBaseURLField" class="provider-field-full">Base URL<input id="providerSettingBaseURL" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" required></label>
+              <div id="providerSettingBaseURLField" class="provider-field-full">
+                <label for="providerSettingBaseURL">Base URL</label>
+                <div class="provider-endpoint-control">
+                  <input id="providerSettingBaseURL" type="url" placeholder="https://api.openai.com/v1" autocomplete="off" required>
+                  <label class="switch-label"><input id="providerSettingUseResponses" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span>使用 Response</span></label>
+                </div>
+                <small id="providerSettingResponsesHint" class="hidden">請填完整 Responses URL，不會附加路徑；模型列表使用同站台 /v1/models。此模式使用串流。</small>
+              </div>
               <div id="providerAPIKeyFields" class="provider-field-full provider-auth-fields">
                 <label>API Key
                   <input id="providerSettingAPIKey" type="password" autocomplete="new-password">
@@ -475,6 +482,8 @@
                 <small>驗證期間才會啟動本機 HTTP Server；Token 僅儲存在本機權限限制檔案中。</small>
                 <div class="provider-oauth-actions">
                   <span id="providerOAuthState" class="hint">尚未連線</span>
+                  <input id="providerAccountFile" type="file" accept=".json,application/json" hidden>
+                  <button id="selectProviderAccountFile" class="ghost" type="button">從檔案選擇帳號</button>
                   <button id="connectProviderOAuth" class="ghost" type="button">使用 ChatGPT 帳號登入</button>
                   <button id="disconnectProviderOAuth" class="danger ghost hidden" type="button">中斷 OAuth</button>
                 </div>
@@ -1178,6 +1187,20 @@
     </form>
   </dialog>
 
+  <dialog id="providerAccountDialog" class="confirmation-dialog" aria-labelledby="providerAccountDialogTitle">
+    <form method="dialog">
+      <h2 id="providerAccountDialogTitle">選擇要匯入的帳號</h2>
+      <p id="providerAccountFileName" class="hint"></p>
+      <p class="hint">確認後將取代目前 Provider 的登入帳號；不會修改來源檔案。</p>
+      <label>帳號列表<select id="providerAccountList" size="7" required aria-label="帳號列表"></select></label>
+      <p id="providerAccountListState" class="hint" role="status"></p>
+      <div class="dialog-actions">
+        <button class="ghost" type="submit" value="cancel" formnovalidate>取消</button>
+        <button id="confirmProviderAccount" class="primary" type="submit" value="import">匯入選取帳號</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="confirmationDialog" class="confirmation-dialog">
     <form method="dialog">
       <h2>確認操作</h2>
@@ -1297,8 +1320,8 @@
     </div>
     <textarea id="memoText" class="memo-editor" placeholder="開始輸入記事…" aria-label="記事本"></textarea>
     <div class="memo-footer">
-      <span id="memoSaveState" class="save-state" role="status">自動儲存在本機</span>
       <button id="clearMemo" class="danger ghost" type="button">清除記事</button>
+      <span id="memoSaveState" class="save-state" role="status">自動儲存在本機</span>
     </div>
   </dialog>
 

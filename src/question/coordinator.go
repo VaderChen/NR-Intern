@@ -19,6 +19,9 @@ const maxPendingQuestions = 16
 type pendingQuestion struct {
 	question domain.UserQuestion
 	answer   chan domain.UserQuestionAnswer
+	done     chan struct{}
+	waiting  bool
+	answered bool
 }
 
 // Coordinator 是 process 內的等待協調器。
@@ -50,7 +53,7 @@ func (c *Coordinator) Begin(question domain.UserQuestion) error {
 	if len(c.pending) >= maxPendingQuestions {
 		return fmt.Errorf("%w: too many questions are already waiting for an answer", domain.ErrConflict)
 	}
-	c.pending[question.ID] = &pendingQuestion{question: question, answer: make(chan domain.UserQuestionAnswer, 1)}
+	c.pending[question.ID] = &pendingQuestion{question: question, answer: make(chan domain.UserQuestionAnswer, 1), done: make(chan struct{})}
 	return nil
 }
 
@@ -58,16 +61,31 @@ func (c *Coordinator) Wait(ctx context.Context, questionID string) (domain.UserQ
 	questionID = strings.TrimSpace(questionID)
 	c.mu.Lock()
 	pending := c.pending[questionID]
-	c.mu.Unlock()
 	if pending == nil {
+		c.mu.Unlock()
 		return domain.UserQuestionAnswer{}, fmt.Errorf("%w: question %q", domain.ErrNotFound, questionID)
 	}
+	if pending.waiting {
+		c.mu.Unlock()
+		return domain.UserQuestionAnswer{}, fmt.Errorf("%w: question already has a waiter", domain.ErrConflict)
+	}
+	pending.waiting = true
+	c.mu.Unlock()
+	defer c.cancelPending(questionID, pending)
 	select {
 	case <-ctx.Done():
-		c.Cancel(questionID)
 		return domain.UserQuestionAnswer{}, ctx.Err()
+	case <-pending.done:
+		return domain.UserQuestionAnswer{}, context.Canceled
 	case answer := <-pending.answer:
-		c.Cancel(questionID)
+		if err := ctx.Err(); err != nil {
+			return domain.UserQuestionAnswer{}, err
+		}
+		select {
+		case <-pending.done:
+			return domain.UserQuestionAnswer{}, context.Canceled
+		default:
+		}
 		return answer, nil
 	}
 }
@@ -89,6 +107,10 @@ func (c *Coordinator) Answer(answer domain.UserQuestionAnswer) error {
 		c.mu.Unlock()
 		return fmt.Errorf("%w: pending question %q", domain.ErrNotFound, answer.QuestionID)
 	}
+	if pending.answered {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: question %q already has an answer", domain.ErrConflict, answer.QuestionID)
+	}
 	if !answer.Canceled {
 		if answer.Selected == "" && answer.Custom == "" {
 			c.mu.Unlock()
@@ -106,6 +128,7 @@ func (c *Coordinator) Answer(answer domain.UserQuestionAnswer) error {
 	}
 	select {
 	case pending.answer <- answer:
+		pending.answered = true
 	default:
 		c.mu.Unlock()
 		return fmt.Errorf("%w: question %q already has an answer", domain.ErrConflict, answer.QuestionID)
@@ -115,11 +138,18 @@ func (c *Coordinator) Answer(answer domain.UserQuestionAnswer) error {
 }
 
 func (c *Coordinator) Cancel(questionID string) {
+	c.cancelPending(strings.TrimSpace(questionID), nil)
+}
+
+func (c *Coordinator) cancelPending(questionID string, expected *pendingQuestion) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	delete(c.pending, strings.TrimSpace(questionID))
+	if pending := c.pending[questionID]; pending != nil && (expected == nil || expected == pending) {
+		delete(c.pending, questionID)
+		close(pending.done)
+	}
 	c.mu.Unlock()
 }
 

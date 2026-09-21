@@ -155,8 +155,8 @@ func (t *UpdateStepTool) Definition() domain.ToolDefinition {
 				"plan_id":                map[string]any{"type": "string", "description": "目標計畫 ID；省略時使用 current_plan"},
 				"step_id":                map[string]any{"type": "string"},
 				"status":                 map[string]any{"type": "string", "enum": []string{"in_progress", "verifying", "completed", "blocked", "skipped"}},
-				"evidence":               map[string]any{"type": "string", "description": "completed 時填入工具驗證結果；blocked/skipped 時填入原因"},
-				"evidence_tool_call_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 32, "description": "completed 必填：進入 verifying 後實際成功的驗證工具 call ID；不能引用計畫工具或未知結果"},
+				"evidence":               map[string]any{"type": "string", "description": "completed 時填實際驗證結果；未引用工具證據時記為 Agent 自行確認，不代表人工驗收；blocked/skipped 時填原因"},
+				"evidence_tool_call_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": 32, "description": "工具驗收時引用成功呼叫 ID，由後端核對；省略時只能記為 Agent 自行確認"},
 			},
 			"required": []string{"step_id", "status"},
 		},
@@ -166,6 +166,9 @@ func (t *UpdateStepTool) Definition() domain.ToolDefinition {
 func (t *UpdateStepTool) Execute(ctx context.Context, invocation tools.Invocation, _ ports.ToolUpdateSink) (domain.ToolExecution, error) {
 	if t == nil || t.Repository == nil {
 		return failure(invocation.Call, "plan repository is unavailable"), nil
+	}
+	if stringArgument(invocation.Call.Arguments, "user_confirmation") != "" {
+		return failure(invocation.Call, "工具不能代替使用者提供人工驗收。請引用工具證據，或明確記為 Agent 自行確認。"), nil
 	}
 	planID := stringArgument(invocation.Call.Arguments, "plan_id")
 	if planID == "" {
@@ -181,7 +184,8 @@ func (t *UpdateStepTool) Execute(ctx context.Context, invocation tools.Invocatio
 	}
 	value, err := t.Repository.Mutate(ctx, invocation.Session.ID, planID, func(value domain.Plan) (domain.Plan, error) {
 		var proofs []domain.PlanEvidence
-		if stringArgument(invocation.Call.Arguments, "status") == string(domain.PlanStepStatusCompleted) {
+		if stringArgument(invocation.Call.Arguments, "status") == string(domain.PlanStepStatusCompleted) &&
+			hasEvidenceToolCallIDs(invocation.Call.Arguments) {
 			var err error
 			proofs, err = t.verifyEvidence(ctx, invocation, value)
 			if err != nil {
@@ -205,6 +209,21 @@ func (t *UpdateStepTool) Execute(ctx context.Context, invocation tools.Invocatio
 		return failure(invocation.Call, err.Error()), nil
 	}
 	return jsonExecution(invocation.Call, map[string]any{"plan": value})
+}
+
+func hasEvidenceToolCallIDs(arguments map[string]any) bool {
+	value, ok := arguments["evidence_tool_call_ids"]
+	if !ok || value == nil {
+		return false
+	}
+	switch ids := value.(type) {
+	case []any:
+		return len(ids) > 0
+	case []string:
+		return len(ids) > 0
+	default:
+		return true
+	}
 }
 
 func stringArgument(arguments map[string]any, key string) string {

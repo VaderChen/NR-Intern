@@ -1,5 +1,14 @@
 # 執行與開發
 
+## macOS 原生選檔
+
+桌面容器為 WKWebView 安裝並持有 `WKUIDelegate`，共用於所有 HTML `input[type=file]`。
+WebKit 的 `UIDelegate` 是弱參照；只建立 autoreleased delegate 會使代理提前釋放，造成按鈕
+觸發後沒有選檔視窗。代理以 WebView associated object 持有，視窗銷毀時釋放；其他 UI 回呼保留轉送。
+選檔使用非同步 NSOpenPanel sheet，不指定預設路徑；保留單選／多選與目錄參數，取消回傳 nil。
+Smoke 檢查需涵蓋原生代理生命週期、實際開啟選檔 sheet 及取消回呼，不能只以 JS `.click()` mock 代替。
+可執行 `sh scripts/smoke-macos-file-picker.sh`：建立獨立測試視窗，自動開啟並取消選檔，不讀取使用者檔案。
+
 ## 設定
 
 複製 `configs/ai-agent/config.example.json`，或使用環境變數：

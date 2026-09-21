@@ -69,7 +69,42 @@ func usageAtLeast(candidate, previous *domain.RunUsage) bool {
 			candidate.TotalTokens >= previous.TotalTokens))
 }
 
+// commitCompletedRun 的 bool 表示仍暫停，呼叫端應在鎖外等待。
+// 兩層鎖分別以 defer 釋放，事件儲存異常也不能永久鎖住同分片的其他 Run。
+func (s *Service) commitCompletedRun(run domain.Run, sequence *int64) (paused bool, err error) {
+	lock := s.eventLock(run.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	err = func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if current, ok := s.active[run.ID]; ok && current.cancelRequested {
+			return context.Canceled
+		}
+		if s.pausedRuns[run.ID] {
+			paused = true
+			return nil
+		}
+		return s.runs.Save(context.Background(), run)
+	}()
+	if err != nil || paused {
+		return paused, err
+	}
+	defer s.notifyRun(run.ID)
+	payload := map[string]any{"status": run.Status, "result": run.Result}
+	if err := s.appendEventLocked(run, sequence, "run.completed", payload); err != nil {
+		// 工作已完成，事件通道故障不改寫成 failed；重連時只補事件。
+		s.logger.Error("terminal event write failed", "run_id", run.ID, "error", err)
+	}
+	return false, nil
+}
+
 func (s *Service) finishTerminalRun(run domain.Run, sequence *int64) {
+	lock := s.eventLock(run.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	// 即使事件寫入失敗，等待者仍須醒來讀取終態並嘗試補齊事件。
+	defer s.notifyRun(run.ID)
 	current, changed, err := s.saveTerminalRun(run)
 	if err != nil {
 		s.logger.Error("terminal run write failed", "run_id", run.ID, "error", err)
@@ -82,7 +117,7 @@ func (s *Service) finishTerminalRun(run domain.Run, sequence *int64) {
 	if current.Usage != nil {
 		payload["usage"] = *current.Usage
 	}
-	if err := s.appendEvent(current, sequence, "run."+string(current.Status), payload); err != nil {
+	if err := s.appendEventLocked(current, sequence, "run."+string(current.Status), payload); err != nil {
 		s.logger.Error("terminal event write failed", "run_id", run.ID, "error", err)
 	}
 	s.notifyRunFinished(current)

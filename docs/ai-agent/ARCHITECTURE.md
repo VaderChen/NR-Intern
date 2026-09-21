@@ -145,11 +145,13 @@ LOOP 要解決的是「Agent 跑一半就忘了」，不是自動化便利。反
   現在改為**避開撞字**：對外一律稱 LOOP，計數說「第 N 次／共 M 次」。
   `plan_create` 的說明改為交代兩段式分工——先照工作本身的結構規劃內容，
   次數是計畫建立之後由使用者設定的另一個階段，與步驟數無關。
-- **完成需引用實際證據。** 步驟要 `completed`，除文字 `evidence` 外必須提供
-  `evidence_tool_call_ids`。後端查閱目前 Session 的工具紀錄，確認結果成功、非計畫工具、
+- **完成需區分驗收來源。** 步驟要 `completed` 必須提供文字 `evidence`；有提供
+  `evidence_tool_call_ids` 時，後端查閱目前 Session 的工具紀錄，確認結果成功、非計畫工具、
   非略過／未知結果，且發生於該步驟進入 `verifying` 之後；保存結果 SHA-256 與時間。
   證據集合中最新的結果不能早於之後可能改變狀態的工具操作。這保證證據來源與時序，
-  不代表能自動判定任意自然語言驗收條件；模型與使用者仍須確認結果是否符合要求。
+  不代表能自動判定任意自然語言驗收條件。未提供工具證據時沿用 `agent_confirmation`，
+  明確表示 Agent 自行判斷，不是工具驗證或人工驗收。模型工具不提供、也拒絕
+  `user_confirmation`；人工驗收只能來自受信任的管理 API。模型與使用者仍須確認成果。
   全部步驟 `completed` 才算完成；結束時含有 `skipped` 則為 `partial`，不是完整完成。
 - **LOOP 期間禁止 `plan_create`。** 這是走鐘最直接的路徑：開一個新計畫，LOOP 會很開心地繼續
   跑，跑的卻是另一個任務、次數還在算。步驟仍可用 `plan_step_update` 調整。
@@ -167,6 +169,7 @@ LOOP 啟動、續跑、停止與 Run 啟動共用 `startMu`：輪數與 `RoundRu
 啟動前完成持久化，不在 Run 啟動後回寫舊計畫快照。`PlanRepository.Mutate` 將最新計畫的
 讀取、步驟更新／LOOP 轉移與寫回放在同一把儲存鎖下。停止／中斷先保存狀態再取消 Run；
 送出失敗會保存暫停狀態，保存或取消失敗會回報／記錄錯誤，不宣稱續跑成功。
+上游模型明確拒答時保留待完成步驟並暫停 LOOP，不以完成度追問或新一輪自動重送。
 
 啟動時先恢復 Run 終態，再檢查沒有 worker 的 active LOOP：保留已開始次數、步驟與交接內容，
 轉為可由使用者續跑的 `paused`；不自動重送中斷的工具。控制 API 也會重做這項檢查，避免
@@ -289,6 +292,9 @@ Run、用量與淘汰清單以同一候選狀態提交，寫入失敗時全部�
 等待期間 Harness goroutine 只等待決策，不持有實體 session gate。Application 仍保留該
 Session 對原 Run 的邏輯預約，因此其他已排隊 Run 不會插入尚未完成的 assistant/tool
 協定區段。決策完成後原 Run 先重新取得 gate，才寫入 resolved 事件與工具結果。
+核准與問答協調器的取消會主動喚醒等待者；同一請求僅允許一名等待者與一次決策。
+決策在等待者取走前仍保留佔用，舊等待者收尾只移除原請求實例，不影響重建的請求。
+若 context 已取消，不採用已排入佇列但尚未消費的核准或答案。
 
 ### 工具分組執行
 
@@ -303,14 +309,37 @@ Session 對原 Run 的邏輯預約，因此其他已排隊 Run 不會插入尚�
 開始事件與結果寫入都依原本的 tool_calls 順序進行，因此 transcript 與事件流的順序不受併發影響。
 `tool.execution.update` 經過序列化後才送出，因為下游的 durable event log 以遞增 sequence 寫入，
 不可併發呼叫。**`BeforeTool` 與 `AfterTool` hook 因此必須是併發安全的。**
+每個工具呼叫在自身 goroutine 設置 panic 邊界，避免並行工具異常越過 Run 外層攔截。
+派送前異常記為 `not_dispatched`，派送後（包含結果 hook）異常記為 `outcome_unknown`，
+仍循正常工具結果路徑保存；日誌只記 panic 型別，不輸出 panic 值。此邊界不攔截工具自行
+建立之其他 goroutine 的 panic，也無法處理程序遭強制終止或記憶體耗盡。
+Shell 未派送或結果未知不啟用備援工具階段；只有確認失敗才可作為備援解鎖依據。
 
 工具執行完成後的結果寫入使用不受取消影響的 context：工具可能已經產生副作用，結果不能因為
 `CancelRun` 而消失；Run 狀態則會先立即標記為 `canceled`，讓 UI 不必等待底層工具收尾。未
-執行的 tool call 不會留下假結果。
+執行的 tool call 不會留下假成功。整批工具返回後，先依序保存所有已知結果與 `tool_finished`，
+再發送結果事件；某筆寫入失敗仍嘗試保存同批其餘結果，最後回報彙總錯誤。整批共用 10 秒
+收尾 context，不因逐筆失敗重設期限。派送前失敗明確保存 `not_dispatched`；展示 hook
+不得抹除既有的 `not_dispatched`／`unknown` 狀態或把它改成成功。這是有界的盡力保存，
+不是整批磁碟交易；永久 I/O 故障、儲存實作不配合 context 或程序中止仍可能留下未知結果。
 
 Run 建立與 HTTP request 生命週期分離：`POST` 先回傳 durable queued Run，背景 worker 使用後端持有的 context 繼續執行。所有 event 先 append 到 `runs/events/<run-id>.jsonl`，再通知目前的 SSE 訂閱者；訂閱通知只負責喚醒，Client 一律依最後 sequence 從 durable log 取資料，因此通知合併或短暫離線不會形成事件缺口。
 
-SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後最多重連三次，每次從最後完整事件補流；三次仍失敗才結束前端連線，後端 Run 本身不受影響。後端重啟時，原本 queued/running/paused/waiting_approval Run 會標記為可重試的 `server_restarted` failure，啟動期也會補齊缺少的 terminal event。
+SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後持續以最高 30 秒退避重連，
+每次從最後完整事件補流並查詢 Run 狀態；斷線不是 Run 終態，不會因嘗試次數耗盡清除 active Run
+或提早派送 outbox。只有 terminal event 或查詢確認終態才收尾，取消退避等待可即時中止。
+後端重啟時，原本 queued/running/paused/waiting_approval Run 會標記為可重試的
+`server_restarted` failure，啟動期也會補齊缺少的 terminal event。
+
+事件儲存首次掃描後建立 sequence → 位移索引，只保留每筆 8 bytes 的位置，不快取事件本文。
+增量重播直接 seek；檔案身分、大小或修改時間改變會重新驗證，讀取異常回到完整掃描與損壞隔離。
+application 與儲存層均依 Run 分條帶鎖定，避免所有 Run 共用一把磁碟寫入鎖。
+終態保存與終止事件追加共用事件鎖；SSE 與 `WaitRun` 在同一同步邊界讀取狀態和事件，
+不會因先讀到舊事件、後看到新終態而提前關閉。終止事件追加失敗仍喚醒等待者；重連時
+依 durable Run 補齊缺少的終止事件，僅補事件、不重做任務。補寫前核對磁碟末筆，避免
+Sync 回報錯誤但資料實際已寫入時產生重複終態。正常重播不取得全域准入鎖，只有修復
+才依准入鎖 → 事件鎖重新讀取，避免與 Session 刪除交錯。矛盾或損壞紀錄不猜測覆寫。
+完成工作的事件通道故障不改寫 Run 為失敗；磁碟持續故障仍可能無法補流，不保證 I/O 可用性。
 
 Browser Console 允許使用者在目前 Run 尚未結束時繼續輸入。一般專案訊息會先寫入該 Browser profile
 的 IndexedDB Durable Outbox，內容包含 Session、輸入、附件 File、固定 Idempotency-Key 與目前
@@ -368,9 +397,25 @@ WARN，不讓事件寫入失敗**。理由是優先序：去重是盡量不要�
 `DiagnosticsExport` 只輸出脫敏的管理摘要，移除 API token、DataDir 絕對路徑與憑證欄位；
 不把對話全文放入診斷包。安全備份則保存 sessions、projects、workspaces、runs、events、
 plans、attachments、memories、schedules、notifications 與非秘密的 service settings，明確
-排除 Provider、OAuth、MCP 與 NetPass 憑證檔。還原前先保存 `backups/pre-restore-*.zip`，
-只接受白名單資料目錄、拒絕絕對路徑、`..`、符號連結及超過 512 MiB 的解壓內容，完成後回傳
-`restart_required=true`。
+排除 Provider、OAuth、MCP 與 NetPass 憑證檔。還原先完整解壓至專屬 staging，拒絕非法路徑、
+符號連結、重複項目、錯誤根目錄型別、超過 100,000 項或 512 MiB 的解壓內容，並驗證非秘密
+服務設定。上傳成功只回傳 `pending=true`、`restart_required=true`，不改動運行中的資料。
+下次啟動在任何 repository 或背景 worker 建立前，先保存 `backups/pre-restore-*.zip`，
+再以交易日誌逐一替換備份內的資料根目錄（不是與舊目錄合併）。偵測到中斷時回滾並停止開機，
+避免載入混合快照；下次啟動才重試。未列入備份的根目錄保持原狀。舊根目錄保留在
+`.restore-stage-*/rollback` 供人工救援；此目錄與 pre-restore ZIP 都含使用者資料，需妥善保管。
+目前保護的是程序中斷復原，不宣稱多檔案替換具有跨平台斷電原子性。
+交易必須有合法階段；套用中與已提交階段須完整記錄每個根項目的原始存在狀態。
+回滾先驗證所有根項目的 live／incoming／rollback 組合，僅接受正常交換或回滾中斷可達的
+狀態；矛盾或缺件時保留資料與交易紀錄並停止啟動，不猜測或覆蓋現行檔案。
+交易日誌與服務設定必須為普通檔案，資料根與救援備份目錄不得為符號連結。
+
+備份掃描與檔案複製會檢查 context 取消，總資料量依實際複製 bytes 限制為 512 MiB，
+ZIP 項目總數（含 manifest）不超過 100,000，避免產生自身無法還原的備份。來源持續增長
+也不能超出限制。資料根目錄必須是真實目錄，`service-settings.json` 必須是普通檔案；
+拒絕 FIFO、裝置等特殊檔案，目錄內既有 symlink 沿用略過政策。開檔後再次比對檔案身分，
+錯誤或取消不回傳部分 ZIP。運行中備份仍非跨儲存庫的一致快照，亦不保證對抗本機程序的
+惡意並行檔案替換。還原前的自動備份也套用相同限制；無法保留原資料時停止還原。
 
 設定包是獨立的管理匯出，不是安全備份。`Runtime.ConfigBundle` 只讀取 `data_dir` 中已存在的
 `providers.json`、`mcp-servers.json`、`netpass.json`、`service-settings.json`，依欄位名稱
@@ -452,9 +497,11 @@ Project 可保存多個 `sandbox_roots`。建立與更新時由後端解析實�
 使用日期加法而非固定加 24 小時，夏令時間切換時仍停在使用者設定的時刻。
 
 `application.Service` 內只有一個排程迴圈，隨 Service 的 root context 一起結束，每 20 秒檢查
-一次到期排程。到點後的處理順序固定：先算出下一次時間，再建立 Session 與 Run；即使這次啟動
-失敗，時間軸仍會往前走，不會每 20 秒重試同一個到期時間點。失敗原因寫回排程的
-`last_status` 與 `last_error`，Console 會顯示在該列。
+一次到期排程。到點後先透過儲存層 CAS 比對原到期時間，持久化推進 `next_run_at` 與
+`dispatching` 狀態，成功認領後才建立 Session 與 Run。認領失敗不派送；派送結果寫入失敗
+也不倒退時間軸或重送。同一到期點採 at-most-once 自動派送，並非 exactly-once：認領後崩潰
+可能漏掉該次，保留 `dispatching` 與結果未知說明供人工確認。不同到期點仍可能重疊執行，
+目前沒有跨次互斥政策。手動立即執行不改變下一次時間。失敗原因寫回 `last_status`／`last_error`。
 
 錯過的時間點不補跑。後端重新啟動時，`next_run_at` 落後超過 15 分鐘寬限的排程會直接對齊到
 下一次；關機一週再開機時，使用者要的是下一次執行，不是一次湧出的補償 Run。落在寬限內的
@@ -816,9 +863,14 @@ Runtime 以原子開關即時套用至 `memory.Manager`。Agent 的記憶工具�
 ## 長對話索引與儲存保留
 
 `SessionRepository` 的記憶體索引只存每筆 entry 的 sequence、type 與 byte offset，首次掃描
-header，後續以二分搜尋及 seek 讀取指定頁。append 同步更新索引；大小不符可重建，無法建立
-索引時退回掃描，不掩蓋真正的 JSON 損毀。`ListEntriesPage` 從 HTTP 經 application、agent
+header，後續以二分搜尋及 seek 讀取指定頁。append 同步更新索引；檔案身分、大小或修改時間
+不同即重建，不以「較大的舊索引」覆蓋截短後的新狀態。取號與查詢使用同一份已驗證索引，
+沒有獨立且可能過期的序號快取。讀取／追加／刪除共用固定 64 個 Session 鎖分片，不在
+全域索引 map 鎖內做磁碟 I/O；索引記錄的身分來自實際掃描的檔案，掃描前後必須一致。
+合法尾筆缺換行時先補分隔；不完整尾筆拒絕追加並保留原檔，不靜默略過。讀取索引不可用時
+仍可退回掃描，不掩蓋真正的 JSON 損毀。`ListEntriesPage` 從 HTTP 經 application、agent
 一路傳到 Repository，避免每翻一頁都完整解碼 transcript；既有游標契約不變。
+上述同步限同一 Repository 實例；不支援多程序共同寫入或惡意保留相同身分／時間戳的外部改寫。
 
 前端訊息查找直接使用 ID 屬性選擇器，處理計時只查當前 operation 的節點；段落刻度保存目標
 節點參照，減少長對話捲動時的重複查找。
@@ -945,10 +997,16 @@ scope 不受影響。
 - `document_convert`：elevated 工具；由固定探索的 LibreOffice 將 Office／OpenDocument 文件轉成 PDF，或將舊式 DOC／XLS／PPT 與 ODT／ODS／ODP／RTF 遷移到同家族 Open XML。來源與輸出不可為同一路徑。
 - `pdf_pages`：elevated 工具；以純 Go PDF 匯入器完成合併、擷取、重排與分批拆分，保留來源檔與各頁尺寸，單次最多 500 頁。
 - `document_render`：elevated 工具；PDF 由 Poppler 輸出逐頁 PNG，Office 文件先用獨立 LibreOffice profile 轉成 PDF。後端只從固定環境變數、PATH、封裝資源與標準安裝位置探索，不接受模型指定任意 executable。
-- `shell_exec`：必要高權限工具；Unix 使用 process group，Windows 使用 Job Object，取消或逾時會嘗試終止所管理子程序樹。輸出管線使用 2 秒 WaitDelay，取消後清理最多等待 3 秒；尚未回收時回報 cleanup_pending，不等待脫離群組的子程序永久持有 stdout。這不保證能終止已脫離管理的程序。子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
+- `shell_exec`：必要高權限工具；Unix 使用 process group；Windows 先以 suspended 建立程序，成功加入 Job Object 才恢復執行，建立管理失敗即要求中止，不退回無管理執行。取消或逾時會嘗試終止所管理子程序樹。輸出管線使用 2 秒 WaitDelay，取消或管理失敗後清理最多等待 3 秒；尚未回收時回報 cleanup_pending。這不保證能終止已脫離管理的程序。子程序只繼承必要 OS 環境，另有不經 shell 的 direct 模式。
 - `ssh_exec`：使用 Go SSH client；連線憑證只存在後端 profile，模型只取得 profile 名稱。初始連線預設最多三次並使用 keepalive；工作中斷線不自動重跑遠端命令，以免重複副作用。
 - `wait_for`：不執行命令的可取消等待，具有最大秒數與進度事件；適合讓非同步上傳或服務啟動完成後再進行下一次檢查。
-- `ssh_wait`：只輪詢唯讀、冪等的遠端檢查命令，每次檢查重新建立 SSH session，支援預期 exit code、stdout 包含／完全相等與連續穩定檢查；逾時不會被視為部署成功。
+- `ssh_wait`：預期只用於唯讀、冪等檢查，但任意 command 無法由系統證明唯讀，因此 `ReadOnly=false`，套用寫入型 Approval 與重複操作防護，不參與唯讀並行批次。核准範圍包含有界輪詢；任何一次派送後結果未知立即停止，不再輪詢。支援預期 exit code、stdout 比對與連續穩定檢查；逾時不代表部署成功。
+
+  SSH 的 context 取消涵蓋連線後建立 Session、執行命令與 keepalive，不讓遠端不回應
+  channel-open 的等待繞過執行預算。輪詢取消與逾時分開記錄，保留最後一次檢查資料；
+  尚未派送、已確認失敗及結果未知分別保存。`ssh_wait` 成功以符合指定的退出碼／輸出為準，
+  預期非零退出碼亦可成功；原命令狀態另存 `command_execution_state`，避免驗收狀態互相矛盾。
+
 - `http_fetch`：唯一由 Agent 直接指定任意網址的內建工具。以 Go `net/http` 讀取 http／https 資源，回傳文字內容；HTML 會先轉成純文字再送進上下文。回應大小、逾時與轉址次數都有上限，localhost 與私有網段預設允許，並且可由管理介面即時關閉。
 - `memory_search`：查詢目前 scope 的有效長期記憶。
 - `memory_remember`：保存耐久資訊並支援去重與取代舊記憶。
@@ -959,6 +1017,12 @@ scope 不受影響。
 即時套用，不需要改設定檔或重啟後端——工具留在清單上但保證失敗，只會讓模型反覆重試。
 私有網段的判斷放在 Dial 階段而不是網址解析階段，因此 DNS 重新綁定與轉址都由同一條規則攔下；
 Client 也刻意不使用系統 Proxy 設定，避免實際連線目標與網址主機不一致而讓檢查失效。
+即時設定異動會原子替換政策與整個 HTTP Client／Transport，關閉舊閒置連線，避免撤銷私網存取
+後新請求沿用 keep-alive 舊連線。已派送請求仍依原 context／deadline 收尾，不宣稱回溯撤銷。
+
+Shell、SSH、HTTP 工具共用執行狀態語意：未派送為 `not_dispatched`；已派送但因逾時、取消、
+斷線或讀取失敗而無法確認結果為 `unknown`。收到明確退出狀態／完整回應才可標示成功或失敗；
+`unknown` 不能被當成安全重跑依據，也不能充作計畫驗收證據。
 
 Shell 與 SSH 必須同時符合：後端 `allow_elevated_tools=true`、工具在 allowlist、session permission profile 屬於
 `permissions.elevated_profiles`。profile 由後端 `permissions` 策略指派，預設不接受 API request 指定；
@@ -1060,15 +1124,23 @@ OpenAI-compatible adapter 行為如下：
 - `stream_options.include_usage` 可設定；不支援串流或 `tool_choice` 的相容服務可分別停用。
 - 初始連線（包含 connection refused）、408/409/429 與暫時性 5xx 依 `max_attempts` 最多嘗試三次；未提供有效 `Retry-After` 時，分別等待 10、20 秒再重連。有效 `Retry-After` 優先使用，上限 30 秒；Chat 與 Codex Responses 共用退避規則。等待期間 Console 透過 `agent.progress` 顯示重試狀態；等待結束以空進度訊息清除提示。停止操作或 Run 時間預算可中止等待，不重新建立 Run 或重跑先前工具。已送出回答文字、思考或工具呼叫 delta 就不自動重送，避免事件紀錄出現重複片段；次數耗盡後回報失敗。
 - Chat 與 Codex 串流事件的截斷 JSON 轉為可重試 Provider 錯誤，仍受已送出內容與嘗試次數限制；完整但格式錯誤的 JSON 不自動重試。Console 在累積緩衝區辨識 SSE 換行，支援跨網路封包的 CRLF，並依 sequence 跳過重複事件。
-- 收到完整的 Chat `[DONE]` 或 Codex `response.completed` 後停止讀取，不再等待連線 EOF；Chat 的 `finish_reason` 之後仍讀取可能的 usage，直到 `[DONE]` 或 EOF。Codex completed 補齊工具呼叫時沿用輸出陣列的真實索引，不以工具數量推算位置，避免稀疏索引相撞。
+- 收到完整的 Chat `[DONE]` 或 Codex `response.completed` 後停止讀取，不再等待連線 EOF；Chat 的 `finish_reason` 之後仍讀取可能的 usage，直到 `[DONE]` 或 EOF。Responses 單獨的 `[DONE]`、或缺少 response 物件的 completed 不代表完成，不將尚未確認完成的工具呼叫交給 Harness 執行。Codex completed 補齊工具呼叫時沿用輸出陣列的真實索引，不以工具數量推算位置，避免稀疏索引相撞。
 - Console 收到 Run 終態或查詢確認終態時，透過共用清理立即停止草稿處理狀態與等待提示；後續等待計時不會重新啟用，無須等待 SSE 關閉。
 - 串流中的錯誤封包若含上游自己的重試建議（`you can retry your request`）或通用暫時性錯誤措辭，視為可重試。上游對這次失敗性質的宣告比從訊息文字猜測可靠，而金鑰錯誤、額度用盡、權限不足這類永久性失敗不會這樣寫。
 - 每次請求送出 `X-Client-Request-Id`，並將 Provider 回傳的 `x-request-id` 保存於 assistant message 與 turn record；API key 不會出現在診斷資料。
 - Provider HTTP 錯誤解析為 status、code、request ID、可重試狀態與受限長度訊息。
-- 串流錯誤同樣辨識暫時過載與服務不可用；Responses 失敗會讀取 `response.error`，而非將整個事件當成錯誤文字。相容舊代理時，以代理模型與保留的 refusal response ID 識別「成功封包內的上游失敗」，在送出回答 delta 前轉為 Provider 錯誤；不以一般回答中的文字判定失敗。可重試錯誤沿用次數上限與退避，其他拒絕直接結束 Run，不進入空回答補問流程。
+- 串流錯誤同樣辨識暫時過載與服務不可用；Responses 失敗會讀取 `response.error`，而非將整個事件當成錯誤文字。相容舊代理時，以代理模型與保留的 refusal response ID 識別「成功封包內的上游失敗」，保留跨封包身分，收集最多 16 KiB 的分段原因，到終態或 EOF 才分類；不送出這些回答 delta，也不以一般回答中的文字判定失敗。可重試錯誤沿用次數上限與退避，其他拒絕直接結束 Run，不進入空回答補問流程。
 
 Codex Responses adapter 將 Responses 的 message、reasoning 與 function call item 轉成相同的
-Harness 事件與 transcript 結構，工具結果也會在下一輪完整回送。它不依賴 `/models` 目錄；管理
+Harness 事件與 transcript 結構，工具結果也會在下一輪完整回送。`store=false` 時保存上游的
+`reasoning.encrypted_content` item，與 assistant 訊息一起複製、計入上下文預算並回送後續工具輪。
+不透明狀態只限同一 Provider 設定實例與模型；設定重建、切換實例或服務重啟後不再回送，
+因此不宣稱加密推理狀態跨重啟連續，普通文字／工具歷史仍保留。`response.refusal.delta/done`
+與 completed-only refusal 都會產生可見拒答並標記 `stop_reason=refusal`，不執行伴隨工具、
+不解析文字內指令、不觸發完成度追問，計畫 LOOP 暫停。
+此處依據官方 [Reasoning](https://developers.openai.com/api/docs/guides/reasoning) 與
+[Streaming Responses](https://developers.openai.com/api/docs/guides/streaming-responses) 協定。
+它不依賴 `/models` 目錄；管理
 介面無法取得清單時顯示 `-`，仍允許使用者指定模型名稱。Codex 額度只讀取帳號 API
 `GET https://chatgpt.com/backend-api/wham/usage`，沿用 OAuth Bearer Token 與 ChatGPT-Account-Id；
 不發送模型探測請求，也不再從推論回應的 Header 更新帳號配額。解析方式參考 LoadBalanceProvider

@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"sort"
 	"strings"
@@ -40,8 +41,12 @@ type Options struct {
 // 其他原生工具都在本機沙箱內；這個工具會把資料送出去，因此除了 elevated 權限與
 // 人工 Approval 之外，還可以在管理介面直接關閉，不必改設定檔或重啟後端。
 type Tool struct {
-	options  Options
-	settings atomic.Pointer[domain.HTTPFetchSettings]
+	options Options
+	policy  atomic.Pointer[fetchPolicy]
+}
+
+type fetchPolicy struct {
+	settings domain.HTTPFetchSettings
 	client   *http.Client
 }
 
@@ -59,33 +64,35 @@ func New(options Options, settings domain.HTTPFetchSettings) *Tool {
 	}
 	tool := &Tool{options: options}
 	tool.ApplySettings(settings)
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: tool.controlDial}
-	tool.client = &http.Client{
+	return tool
+}
+
+// 政策與連線池一起原子替換；新呼叫不會沿用撤權前的 keep-alive／HTTP/2 連線。
+// 已開始的呼叫仍受原本的 request context 與逾時限制。
+func (t *Tool) ApplySettings(settings domain.HTTPFetchSettings) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: t.controlDial}
+	client := &http.Client{
 		// 刻意不使用系統 Proxy 設定：經過 Proxy 後實際連線目標不再是網址的主機，
 		// 私有網段檢查就會失去意義。
 		Transport: &http.Transport{
 			Proxy:                 nil,
 			DialContext:           dialer.DialContext,
 			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: time.Duration(options.TimeoutSeconds) * time.Second,
+			ResponseHeaderTimeout: time.Duration(t.options.TimeoutSeconds) * time.Second,
 			MaxIdleConns:          8,
 			IdleConnTimeout:       60 * time.Second,
 			ForceAttemptHTTP2:     true,
 		},
-		CheckRedirect: tool.checkRedirect,
+		CheckRedirect: t.checkRedirect,
 	}
-	return tool
-}
-
-// ApplySettings 讓管理介面的變更立即生效，不需要重新啟動後端。
-func (t *Tool) ApplySettings(settings domain.HTTPFetchSettings) {
-	value := settings
-	t.settings.Store(&value)
+	if previous := t.policy.Swap(&fetchPolicy{settings: settings, client: client}); previous != nil {
+		previous.client.CloseIdleConnections()
+	}
 }
 
 func (t *Tool) Settings() domain.HTTPFetchSettings {
-	if value := t.settings.Load(); value != nil {
-		return *value
+	if value := t.policy.Load(); value != nil {
+		return value.settings
 	}
 	return domain.HTTPFetchSettings{}
 }
@@ -124,7 +131,8 @@ func (t *Tool) Definition() domain.ToolDefinition {
 
 func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, _ ports.ToolUpdateSink) (domain.ToolExecution, error) {
 	call := invocation.Call
-	if !t.Enabled() {
+	policy := t.policy.Load()
+	if policy == nil || !policy.settings.Enabled {
 		return failure(call, t.DisabledReason(), nil), nil
 	}
 	arguments := call.Arguments
@@ -178,19 +186,21 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, _ ports
 	}
 
 	startedAt := time.Now()
-	response, err := t.client.Do(request)
+	// 取得連線後已進入派送邊界；即使無法得知寫入多少 bytes，也不能宣稱未執行。
+	var dispatched atomic.Bool
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { dispatched.Store(true) },
+	}))
+	response, err := policy.client.Do(request)
 	if err != nil {
-		if requestCtx.Err() != nil && ctx.Err() != nil {
-			return domain.ToolExecution{}, ctx.Err()
-		}
-		return failure(call, requestFailureMessage(err, timeoutSeconds, requestCtx.Err()), map[string]any{"url": target.String(), "method": method}), nil
+		result := failure(call, requestFailureMessage(err, timeoutSeconds, requestCtx.Err()), map[string]any{
+			"url": target.String(), "method": method, "execution_state": domain.ToolOperationState(dispatched.Load(), false, true),
+		})
+		return result, ctx.Err()
 	}
 	defer response.Body.Close()
 
 	data, err := io.ReadAll(io.LimitReader(response.Body, int64(maxBytes)+1))
-	if err != nil && ctx.Err() != nil {
-		return domain.ToolExecution{}, ctx.Err()
-	}
 	truncated := len(data) > maxBytes
 	if truncated {
 		data = data[:maxBytes]
@@ -213,6 +223,8 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, _ ports
 	header := fmt.Sprintf("%s %s → %d %s", method, response.Request.URL.String(), response.StatusCode, http.StatusText(response.StatusCode))
 	if err != nil {
 		details["read_error"] = err.Error()
+		details["execution_state"] = domain.ToolOutcomeUnknown
+		return failure(call, header+"\n回應未完整讀取，執行結果未知："+err.Error()+"\n"+string(data), details), ctx.Err()
 	}
 
 	if method == http.MethodHead {
@@ -360,5 +372,8 @@ func requestFailureMessage(err error, timeoutSeconds int, ctxErr error) string {
 }
 
 func failure(call domain.ToolCall, message string, details map[string]any) domain.ToolExecution {
+	if details == nil {
+		details = map[string]any{"execution_state": domain.ToolNotDispatched}
+	}
 	return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: strings.TrimSpace(message), Details: details, IsError: true}
 }

@@ -34,8 +34,8 @@ func (unixAdapter) Prepare(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func (unixAdapter) Attach(command *exec.Cmd) processGroup {
-	return &unixProcessGroup{processID: command.Process.Pid}
+func (unixAdapter) Attach(command *exec.Cmd) (processGroup, error) {
+	return &unixProcessGroup{processID: command.Process.Pid}, nil
 }
 
 func (g *unixProcessGroup) Terminate() error {

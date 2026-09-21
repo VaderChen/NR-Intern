@@ -271,9 +271,8 @@ func TestSmokeUnretrievedToolIsReachableThroughFindTools(t *testing.T) {
 	}
 }
 
-// 檢索失準時，模型如果已經知道工具名稱（來自 history 或使用者指名），
-// 應該直接呼叫得到，而不是被目錄擋下來多花一輪。
-func TestSmokeUnlistedMCPToolStaysCallable(t *testing.T) {
+// 已知名稱但尚未公開契約的工具先拒絕派送；下一輪取得新契約後才能執行。
+func TestSmokeUnlistedMCPToolRequiresContractRefreshBeforeDispatch(t *testing.T) {
 	server := newLargeMCPServer(t, 60)
 	runtime := newLargeToolRuntime(t, server)
 	session := smokeSession(t)
@@ -282,8 +281,14 @@ func TestSmokeUnlistedMCPToolStaysCallable(t *testing.T) {
 	sessions := newMemorySessions(session)
 	model := &scriptedModel{responses: []domain.ModelResponse{
 		{Content: instruction(target, map[string]any{"keyword": "A100"})},
+		{Content: instruction(target, map[string]any{"keyword": "A100"})},
 		{Content: "庫存共 42 筆。"},
 	}}
+	model.onStream = func(turn int) {
+		if turn == 1 && server.calls.Load() != 0 {
+			t.Error("unlisted tool was dispatched before contract refresh")
+		}
+	}
 	runner := smokeRunner(sessions, model, runtime)
 
 	result, err := runner.Run(context.Background(), Input{RunID: "run_direct", Session: session, UserInput: "幫我看一下產線的情況"}, func(domain.EngineEvent) error { return nil })
@@ -295,6 +300,9 @@ func TestSmokeUnlistedMCPToolStaysCallable(t *testing.T) {
 	}
 	if server.calls.Load() != 1 {
 		t.Fatalf("unlisted MCP tool was not executed: %d calls", server.calls.Load())
+	}
+	if len(model.requests) != 3 || !offersTool(model.requests[1], target) {
+		t.Fatal("next turn did not reveal the requested contract")
 	}
 	if result.Message.Content != "庫存共 42 筆。" {
 		t.Fatalf("final answer = %q", result.Message.Content)

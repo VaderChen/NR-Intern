@@ -30,6 +30,7 @@ type ProviderSetting struct {
 // OpenAICompatibleProviderSetting 同時作為管理 API 的讀取模型與寫入模型。
 // APIKey=nil 代表保留現有值，指向空字串則代表明確清除金鑰。
 type OpenAICompatibleProviderSetting struct {
+	UseResponses                 bool    `json:"use_responses"`
 	BaseURL                      string  `json:"base_url"`
 	APIKey                       *string `json:"api_key,omitempty"`
 	HasAPIKey                    bool    `json:"has_api_key"`
@@ -80,6 +81,15 @@ type ProviderOAuthStatus struct {
 	AccountEmail string `json:"account_email,omitempty"`
 	AccountName  string `json:"account_name,omitempty"`
 	ExpiresAt    string `json:"expires_at,omitempty"`
+}
+
+// ProviderOAuthFileAccount 是帳號檔的安全選擇項目，ID 綁定上傳檔案快照。
+type ProviderOAuthFileAccount struct {
+	ID        string `json:"id"`
+	Email     string `json:"email"`
+	Name      string `json:"name,omitempty"`
+	ExpiresAt string `json:"expires_at,omitempty"`
+	Problem   string `json:"problem,omitempty"`
 }
 
 // ProviderModels 是 Provider 可使用的模型目錄。

@@ -33,11 +33,12 @@ func (s *Service) PruneRunEvents(ctx context.Context, runID string) (bool, error
 	if !ok {
 		return false, nil
 	}
-	s.eventMu.Lock()
-	defer s.eventMu.Unlock()
+	lock := s.eventLock(runID)
+	lock.Lock()
+	defer lock.Unlock()
 	if err := store.Delete(runID); err != nil {
 		return false, err
 	}
-	delete(s.eventSequences, runID)
+	s.eventSequences.Delete(runID)
 	return true, nil
 }

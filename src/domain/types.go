@@ -42,6 +42,7 @@ type Session struct {
 }
 
 type Message struct {
+	Continuation      *ModelContinuation `json:"continuation,omitempty"`
 	ID                string         `json:"id"`
 	SessionID         string         `json:"session_id"`
 	Role              string         `json:"role"`
@@ -270,6 +271,7 @@ type ToolPermissionInfo struct {
 }
 
 type RestoreResult struct {
+	Pending         bool     `json:"pending"`
 	RestartRequired bool     `json:"restart_required"`
 	Restored        []string `json:"restored"`
 	Excluded        []string `json:"excluded"`

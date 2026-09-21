@@ -109,7 +109,27 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, sink po
 	if err := command.Start(); err != nil {
 		return shellFailure(invocation.Call, err.Error(), nil), nil
 	}
-	group := adapter.Attach(command)
+	group, attachErr := adapter.Attach(command)
+	if attachErr != nil {
+		cleanupErr := command.Process.Kill()
+		if group != nil {
+			cleanupErr = errors.Join(cleanupErr, group.Close())
+		}
+		done := make(chan error, 1)
+		go func() { done <- command.Wait() }()
+		timer := time.NewTimer(3 * time.Second)
+		defer timer.Stop()
+		details := map[string]any{"execution_state": domain.ToolOutcomeUnknown, "cleanup_pending": false}
+		select {
+		case <-done:
+		case <-timer.C:
+			details["cleanup_pending"] = true
+		}
+		if cleanupErr != nil {
+			details["termination_error"] = cleanupErr.Error()
+		}
+		return shellFailure(invocation.Call, "無法建立程序樹管理，已要求中止命令；請確認清理狀態："+attachErr.Error(), details), nil
+	}
 	defer group.Close()
 	if sink != nil {
 		_ = sink(domain.ToolExecution{ToolCallID: invocation.Call.ID, ToolName: invocation.Call.Name, Details: map[string]any{"phase": "process_started", "mode": mode, "process_group": group.Name()}})
@@ -158,11 +178,14 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, sink po
 		details["termination_error"] = terminationErr.Error()
 	}
 	content := formatProcessOutput(stdout.String(), stderr.String(), exitCode)
+	var exitErr *exec.ExitError
+	confirmed := waitCompleted && runCtx.Err() == nil && terminationErr == nil && (runErr == nil || errors.As(runErr, &exitErr))
+	details["execution_state"] = domain.ToolOperationState(true, confirmed, runErr != nil)
 	if runErr != nil {
 		if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 			content = fmt.Sprintf("command timed out after %d seconds\n%s", timeoutSeconds, content)
 		} else if errors.Is(runCtx.Err(), context.Canceled) {
-			return domain.ToolExecution{}, runCtx.Err()
+			return shellFailure(invocation.Call, content, details), runCtx.Err()
 		} else {
 			content = strings.TrimSpace(runErr.Error() + "\n" + content)
 		}
@@ -232,5 +255,8 @@ func formatProcessOutput(stdout, stderr string, exitCode int) string {
 }
 
 func shellFailure(call domain.ToolCall, message string, details map[string]any) domain.ToolExecution {
+	if details == nil {
+		details = map[string]any{"execution_state": domain.ToolNotDispatched}
+	}
 	return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: strings.TrimSpace(message), Details: details, IsError: true}
 }

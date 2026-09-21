@@ -8,6 +8,8 @@ Authorization: Bearer <token>
 
 ## Endpoints
 
+OpenAI Compatible Provider 可設定 `openai_compatible.use_responses: true`（預設 `false`）。開啟後，`base_url` 為完整 Responses 推論端點，例如 `https://example.com/backend-api/codex/responses`，不附加或替換路徑，保留查詢參數；模型列表另外使用同一 origin（含連接埠）的 `/v1/models`，不帶推論查詢參數。此選項不切換 OAuth，仍使用 API Key。Responses 使用串流及既有取消、重試／工具事件處理，忽略 Chat 專用的 `instruction_role`、`disable_streaming`、`stream_include_usage`、`omit_tool_choice`；關閉後恢復 Chat Completions。切換不會自動修改 URL，請填入對應端點並儲存，再更新模型列表。
+
 | Method | Path | 用途 |
 |---|---|---|
 | GET | `/healthz` | Process health |
@@ -33,6 +35,8 @@ Authorization: Bearer <token>
 | POST | `/api/v1/admin/provider-settings/{provider_id}/test` | 送出最小模型請求並測試工具呼叫 |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/export` | 匯出單一 Provider；格式與拖放匯入相同，預設遮蔽憑證 |
 | POST | `/api/v1/admin/provider-settings/{provider_id}/oauth/start` | 啟動 ChatGPT／Codex OAuth PKCE 驗證 |
+| POST | `/api/v1/admin/provider-settings/{provider_id}/oauth/accounts` | 解析使用者選取的 JSON 多帳號檔，只回傳可選帳號摘要 |
+| POST | `/api/v1/admin/provider-settings/{provider_id}/oauth/accounts/{selection_id}` | 重新提交同一檔案，匯入明確選取的帳號 |
 | GET | `/api/v1/admin/provider-settings/{provider_id}/oauth/status` | 讀取脫敏 OAuth 狀態 |
 | DELETE | `/api/v1/admin/provider-settings/{provider_id}/oauth` | 中斷 OAuth 並刪除該 Provider Token |
 | GET／PUT | `/api/v1/admin/mcp-settings` | 讀取或完整取代 MCP Server 設定 |
@@ -196,6 +200,16 @@ OAuth 流程如下：
 3. `GET .../{provider_id}/oauth/status` 輪詢 `pending`、`connected` 或 `failed`；狀態不含 access
    token 或 refresh token。
 4. `DELETE .../{provider_id}/oauth` 中斷連線並刪除該 Provider 的本機 Token。
+
+也可在已儲存的 Codex Provider 按「從檔案選擇帳號」：先由原生檔案選擇器選取 JSON，
+再由 DLG 帳號列表選取並確認；沒有預設路徑，也不自動選第一筆。取消不變更登入。
+兩個帳號檔端點都以 `application/json` 直接上傳原始陣列，上限 8 MiB／1000 筆；支援
+`codex_auth.tokens` 及頂層 Token 欄位，同一筆不混用不同來源的 Token。
+列表只含 `id`、`email`、`name`、`expires_at`、`problem`，`id` 綁定完整檔案快照及位置。
+確認時須重新提交同一檔案與選取 ID，檔案變更或項目不可用時拒絕匯入；互動 OAuth 尚在等待時也拒絕。
+切換後重建該 Provider 的 adapter，不沿用前一個帳號的用量與模型快取；其他 Provider 不受影響。
+只有確認後才寫入該 Provider 的受限 Token 儲存，不修改來源檔、其他 Provider 或回傳 Token。
+匯入成功表示本機格式檢查與儲存成功；實際連線與更新仍由原有 OAuth 狀態及模型流程確認。
 
 OpenAI Codex Responses 不提供模型目錄時，models endpoint 回傳空陣列，Console 顯示 `-`，仍可
 `POST /api/v1/providers/{provider_id}/usage/reset` 兌換一次「用量上限重置」，只適用於以

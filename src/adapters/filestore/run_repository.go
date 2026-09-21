@@ -132,15 +132,25 @@ func (r *RunRepository) pruneGroupLocked(volatile bool) {
 	if len(ordered) <= r.retention {
 		return
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].CreatedAt.Before(ordered[j].CreatedAt) })
-	for index := 0; index < len(ordered)-r.retention; index++ {
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].CreatedAt.Equal(ordered[j].CreatedAt) {
+			return ordered[i].ID < ordered[j].ID
+		}
+		return ordered[i].CreatedAt.Before(ordered[j].CreatedAt)
+	})
+	excess := len(ordered) - r.retention
+	for _, run := range ordered {
+		if excess <= 0 {
+			break
+		}
 		// 只淘汰已經結束的 run。paused 與 waiting_approval 看起來像停住了，
 		// 其實都還會寫回狀態——用「是否為終態」判斷才不會漏掉。
-		if !terminalRunStatus(ordered[index].Status) || r.protected[ordered[index].ID] {
+		if !terminalRunStatus(run.Status) || r.protected[run.ID] {
 			continue
 		}
-		delete(r.runs, ordered[index].ID)
-		r.pruned = append(r.pruned, ordered[index].ID)
+		delete(r.runs, run.ID)
+		r.pruned = append(r.pruned, run.ID)
+		excess--
 	}
 }
 

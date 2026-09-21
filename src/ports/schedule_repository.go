@@ -21,3 +21,9 @@ type ScheduleRepository interface {
 	// 不會動到最近一次執行結果。
 	Reschedule(context.Context, string, *time.Time) (domain.Schedule, error)
 }
+
+// ScheduleOccurrenceClaimer 在派送前持久化認領到期時間；不可認領就不可啟動 Run。
+// 採 at-most-once：認領後崩潰可能漏跑，但不會盲目重做外部副作用。
+type ScheduleOccurrenceClaimer interface {
+	ClaimOccurrence(context.Context, string, time.Time, time.Time) (domain.Schedule, bool, error)
+}

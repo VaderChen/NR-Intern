@@ -19,6 +19,9 @@ func run(ctx context.Context, options Options) error {
 		return fmt.Errorf("%w: cannot create macOS WebKit window", ErrUnavailable)
 	}
 	defer view.Destroy()
+	if !installFilePicker(view.Window()) {
+		return fmt.Errorf("%w: cannot install macOS file picker delegate", ErrUnavailable)
+	}
 	installWindowLifecycle(view.Window())
 	defer uninstallWindowLifecycle()
 

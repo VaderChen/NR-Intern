@@ -49,6 +49,7 @@ type remoteCommandResult struct {
 	connectionAttempts int
 	duration           time.Duration
 	timedOut           bool
+	dispatched         bool
 }
 
 func New(profiles map[string]Profile, maxOutputBytes int, maxTimeout time.Duration) *Tool {
@@ -110,7 +111,7 @@ func (t *Tool) Execute(ctx context.Context, invocation tools.Invocation, sink po
 	content := formatSSHOutput(result.stdout, result.stderr, result.exitCode)
 	if result.runErr != nil {
 		if errors.Is(result.runErr, context.Canceled) && !result.timedOut {
-			return domain.ToolExecution{}, result.runErr
+			return sshFailure(invocation.Call, content, details), result.runErr
 		}
 		content = strings.TrimSpace(result.runErr.Error() + "\n" + content)
 		return sshFailure(invocation.Call, content, details), nil
@@ -126,8 +127,8 @@ func (t *Tool) executeRemoteCommand(ctx context.Context, invocation tools.Invoca
 		}
 	})
 	if err != nil {
-		if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return remoteCommandResult{}, ctx.Err()
+		if ctx.Err() != nil {
+			err = ctx.Err()
 		}
 		return remoteCommandResult{
 			exitCode:           -1,
@@ -138,13 +139,20 @@ func (t *Tool) executeRemoteCommand(ctx context.Context, invocation tools.Invoca
 		}, nil
 	}
 	defer client.Close()
+	// NewSession 與 keepalive 的等待也必須能被取消，不只包住 session.Run。
+	stopCancellation := context.AfterFunc(ctx, func() { _ = client.Close() })
+	defer stopCancellation()
 	session, err := client.NewSession()
 	if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
 		return remoteCommandResult{
 			exitCode:           -1,
 			runErr:             fmt.Errorf("create SSH session: %w", err),
 			connectionAttempts: attempts,
 			duration:           time.Since(startedAt),
+			timedOut:           errors.Is(ctx.Err(), context.DeadlineExceeded),
 		}, nil
 	}
 	defer session.Close()
@@ -170,7 +178,6 @@ func (t *Tool) executeRemoteCommand(ctx context.Context, invocation tools.Invoca
 	case keepAliveErr := <-keepAliveErrors:
 		_ = session.Close()
 		_ = client.Close()
-		<-done
 		runErr = fmt.Errorf("SSH connection lost during command; command was not retried to avoid duplicate side effects: %w", keepAliveErr)
 	}
 	exitCode := 0
@@ -193,11 +200,13 @@ func (t *Tool) executeRemoteCommand(ctx context.Context, invocation tools.Invoca
 		connectionAttempts: attempts,
 		duration:           time.Since(startedAt),
 		timedOut:           errors.Is(ctx.Err(), context.DeadlineExceeded),
+		dispatched:         true,
 	}, nil
 }
 
 func remoteCommandDetails(profileName string, result remoteCommandResult) map[string]any {
 	return map[string]any{
+		"execution_state":     domain.ToolOperationState(result.dispatched, result.runErr == nil || result.exitError, result.runErr != nil),
 		"profile":             profileName,
 		"exit_code":           result.exitCode,
 		"duration_ms":         result.duration.Milliseconds(),
@@ -238,10 +247,10 @@ func (t *WaitTool) Definition() domain.ToolDefinition {
 		Label:              "等待 SSH 狀態",
 		Version:            "1.0.0",
 		Category:           "remote",
-		Description:        "以後端預先設定的 SSH profile 輪詢唯讀狀態命令，直到遠端檢查成功、輸出符合條件或逾時。適合確認非同步上傳、檔案大小／雜湊或服務就緒；command 必須是冪等且唯讀的檢查命令，不可放入部署、上傳、刪除或其他副作用。每次輪詢都重新建立 SSH session。",
+		Description:        "以後端預先設定的 SSH profile 重複執行狀態命令，直到條件符合或逾時。任意命令無法由後端保證唯讀，因此需要與 ssh_exec 相同的人工核准；核准範圍包含本次有時限的輪詢。只應提供冪等檢查，不可放部署、上傳或刪除；執行結果未知時立即停止，不自動重送。",
 		Platforms:          []string{"darwin", "linux", "windows"},
 		Capabilities:       []string{"ssh", "polling", "remote-readiness-check", "host-key-verification", "profile-credentials", "connect-retry", "keepalive", "timeout", "bounded-output"},
-		ReadOnly:           true,
+		ReadOnly:           false,
 		RequiresPermission: true,
 		InputSchema: map[string]any{
 			"type": "object",
@@ -303,9 +312,10 @@ func (t *WaitTool) Execute(ctx context.Context, invocation tools.Invocation, sin
 	matchingChecks := 0
 	var last remoteCommandResult
 	haveLast := false
+	anyDispatched := false
 	for {
 		if waitCtx.Err() != nil {
-			return sshWaitTimeout(invocation.Call, profileName, timeoutSeconds, checkAttempts, totalConnectionAttempts, last, haveLast), nil
+			return sshWaitInterrupted(invocation.Call, profileName, timeoutSeconds, checkAttempts, totalConnectionAttempts, last, haveLast, anyDispatched, waitCtx.Err()), ctx.Err()
 		}
 		checkCtx, stopCheck := context.WithTimeout(waitCtx, time.Duration(checkTimeoutSeconds)*time.Second)
 		result, err := t.executeRemoteCommand(checkCtx, invocation, profileName, profile, commandText, sink)
@@ -320,6 +330,10 @@ func (t *WaitTool) Execute(ctx context.Context, invocation tools.Invocation, sin
 		totalConnectionAttempts += result.connectionAttempts
 		last = result
 		haveLast = true
+		anyDispatched = anyDispatched || result.dispatched
+		if domain.ToolExecutionState(remoteCommandDetails(profileName, result)) == domain.ToolOutcomeUnknown {
+			return sshFailure(invocation.Call, "SSH 檢查結果未知，已停止輪詢；請先確認遠端狀態。\n"+formatRemoteCommandResult(result), remoteCommandDetails(profileName, result)), ctx.Err()
+		}
 		matched := remoteCheckMatches(result, expectedExitCode, outputContains, outputEquals)
 		if matched {
 			matchingChecks++
@@ -342,7 +356,7 @@ func (t *WaitTool) Execute(ctx context.Context, invocation tools.Invocation, sin
 			})
 		}
 		if matchingChecks >= stableChecks {
-			details := remoteCommandDetails(profileName, result)
+			details := successfulSSHCheckDetails(profileName, result)
 			details["check_attempts"] = checkAttempts
 			details["total_connection_attempts"] = totalConnectionAttempts
 			details["expected_exit_code"] = expectedExitCode
@@ -362,7 +376,7 @@ func (t *WaitTool) Execute(ctx context.Context, invocation tools.Invocation, sin
 		case <-timer.C:
 		case <-waitCtx.Done():
 			timer.Stop()
-			return sshWaitTimeout(invocation.Call, profileName, timeoutSeconds, checkAttempts, totalConnectionAttempts, last, haveLast), nil
+			return sshWaitInterrupted(invocation.Call, profileName, timeoutSeconds, checkAttempts, totalConnectionAttempts, last, haveLast, anyDispatched, waitCtx.Err()), ctx.Err()
 		}
 	}
 }
@@ -389,17 +403,33 @@ func formatRemoteCommandResult(result remoteCommandResult) string {
 	return content
 }
 
-func sshWaitTimeout(call domain.ToolCall, profileName string, timeoutSeconds, checkAttempts, totalConnectionAttempts int, last remoteCommandResult, haveLast bool) domain.ToolExecution {
+func successfulSSHCheckDetails(profileName string, result remoteCommandResult) map[string]any {
+	details := remoteCommandDetails(profileName, result)
+	details["command_execution_state"] = details["execution_state"]
+	// 輪詢契約是符合預期退出碼與輸出；預期非零碼也可驗證成功。
+	details["execution_state"] = domain.ToolSucceeded
+	return details
+}
+
+func sshWaitInterrupted(call domain.ToolCall, profileName string, timeoutSeconds, checkAttempts, totalConnectionAttempts int, last remoteCommandResult, haveLast, dispatched bool, cause error) domain.ToolExecution {
 	details := map[string]any{
 		"profile":                   profileName,
-		"timed_out":                 true,
+		"timed_out":                 errors.Is(cause, context.DeadlineExceeded),
+		"canceled":                  errors.Is(cause, context.Canceled),
+		"execution_state":           domain.ToolOperationState(dispatched, true, true),
 		"check_attempts":            checkAttempts,
 		"total_connection_attempts": totalConnectionAttempts,
 		"timeout_seconds":           timeoutSeconds,
 		"last_check":                haveLast,
 	}
 	content := fmt.Sprintf("SSH check timed out after %d second(s) and %d check(s)", timeoutSeconds, checkAttempts)
+	if !errors.Is(cause, context.DeadlineExceeded) {
+		content = fmt.Sprintf("SSH check interrupted after %d check(s): %v", checkAttempts, cause)
+	}
 	if haveLast {
+		if domain.ToolExecutionState(remoteCommandDetails(profileName, last)) == domain.ToolOutcomeUnknown {
+			details["execution_state"] = domain.ToolOutcomeUnknown
+		}
 		details["last_exit_code"] = last.exitCode
 		details["last_stdout"] = last.stdout
 		details["last_stderr"] = last.stderr
@@ -583,5 +613,8 @@ func formatSSHOutput(stdout, stderr string, exitCode int) string {
 }
 
 func sshFailure(call domain.ToolCall, message string, details map[string]any) domain.ToolExecution {
+	if details == nil {
+		details = map[string]any{"execution_state": domain.ToolNotDispatched}
+	}
 	return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: strings.TrimSpace(message), Details: details, IsError: true}
 }

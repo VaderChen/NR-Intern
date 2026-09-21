@@ -72,6 +72,7 @@ type Runtime struct {
 	cleanupEphemeralSessions func(context.Context) error
 
 	configMu               sync.RWMutex
+	restoreMu              sync.Mutex
 	providerUsageContext   context.Context
 	providerUsageCancel    context.CancelFunc
 	providerUsageRefreshMu sync.Mutex
@@ -156,6 +157,16 @@ type ManagementDiagnostics struct {
 }
 
 func Build(config Config) (*Runtime, error) {
+	// 必須在任何 repository、排程與背景執行緒啟動前套用，不能混用舊快取。
+	if applied, err := applyPendingRestore(config.DataDir); err != nil {
+		return nil, err
+	} else if applied {
+		var err error
+		config, err = reloadRestoredSettings(config)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err := validateConfig(&config); err != nil {
 		return nil, err
 	}
@@ -494,28 +505,30 @@ func Build(config Config) (*Runtime, error) {
 		ReadMCPContract: func(ctx context.Context, id string) (any, error) {
 			return runtime.ReadMCPContract(ctx, id)
 		},
-		Restore:                 runtime.Restore,
-		Permissions:             runtime.Permissions,
-		UpdateStatus:            runtime.UpdateStatus,
-		CheckForUpdates:         runtime.CheckForUpdates,
-		ServiceSettings:         runtime.ServiceSettings,
-		UpdateServiceSettings:   runtime.UpdateServiceSettings,
-		ProviderSettings:        runtime.ProviderSettings,
-		UpdateProviderSettings:  runtime.UpdateProviderSettings,
-		MCPSettings:             runtime.MCPSettings,
-		UpdateMCPSettings:       runtime.UpdateMCPSettings,
-		TestMCP:                 runtime.TestMCP,
-		ReverseProxyStatus:      runtime.ReverseProxyStatus,
-		UpdateReverseProxy:      runtime.UpdateReverseProxy,
-		StartReverseProxy:       runtime.StartReverseProxy,
-		StopReverseProxy:        runtime.StopReverseProxy,
-		ProviderModels:          runtime.ProviderModels,
-		ProviderUsage:           runtime.ProviderUsage,
-		ProviderRateLimitReset:  runtime.ConsumeProviderRateLimitReset,
-		TestProvider:            runtime.TestProvider,
-		StartProviderOAuth:      runtime.StartProviderOAuth,
-		ProviderOAuthStatus:     runtime.ProviderOAuthStatus,
-		DisconnectProviderOAuth: runtime.DisconnectProviderOAuth,
+		Restore:                        runtime.Restore,
+		Permissions:                    runtime.Permissions,
+		UpdateStatus:                   runtime.UpdateStatus,
+		CheckForUpdates:                runtime.CheckForUpdates,
+		ServiceSettings:                runtime.ServiceSettings,
+		UpdateServiceSettings:          runtime.UpdateServiceSettings,
+		ProviderSettings:               runtime.ProviderSettings,
+		UpdateProviderSettings:         runtime.UpdateProviderSettings,
+		MCPSettings:                    runtime.MCPSettings,
+		UpdateMCPSettings:              runtime.UpdateMCPSettings,
+		TestMCP:                        runtime.TestMCP,
+		ReverseProxyStatus:             runtime.ReverseProxyStatus,
+		UpdateReverseProxy:             runtime.UpdateReverseProxy,
+		StartReverseProxy:              runtime.StartReverseProxy,
+		StopReverseProxy:               runtime.StopReverseProxy,
+		ProviderModels:                 runtime.ProviderModels,
+		ProviderUsage:                  runtime.ProviderUsage,
+		ProviderRateLimitReset:         runtime.ConsumeProviderRateLimitReset,
+		TestProvider:                   runtime.TestProvider,
+		StartProviderOAuth:             runtime.StartProviderOAuth,
+		ProviderOAuthFileAccounts:      runtime.ProviderOAuthFileAccounts,
+		ImportProviderOAuthFileAccount: runtime.ImportProviderOAuthFileAccount,
+		ProviderOAuthStatus:            runtime.ProviderOAuthStatus,
+		DisconnectProviderOAuth:        runtime.DisconnectProviderOAuth,
 	})
 	if err != nil {
 		return nil, err
@@ -1181,6 +1194,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			}
 			provided := value.OpenAICompatible
 			settings.BaseURL = strings.TrimSpace(provided.BaseURL)
+			settings.UseResponses = provided.UseResponses
 			settings.Model = strings.TrimSpace(provided.Model)
 			settings.InstructionRole = strings.ToLower(strings.TrimSpace(provided.InstructionRole))
 			settings.DisableStreaming = provided.DisableStreaming
@@ -1303,6 +1317,7 @@ func providerSettingsView(config Config, providerAuth *providerauth.Manager) dom
 			settings := provider.OpenAICompatible
 			value.OpenAICompatible = &domain.OpenAICompatibleProviderSetting{
 				BaseURL:                      settings.BaseURL,
+				UseResponses:                 settings.UseResponses,
 				HasAPIKey:                    strings.TrimSpace(settings.APIKey) != "",
 				Model:                        settings.Model,
 				InstructionRole:              settings.InstructionRole,

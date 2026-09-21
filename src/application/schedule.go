@@ -2,6 +2,7 @@ package application
 
 import (
 	"AgenticService/src/domain"
+	"AgenticService/src/ports"
 	"context"
 	"errors"
 	"fmt"
@@ -115,17 +116,27 @@ func (s *Service) RunSchedule(ctx context.Context, scheduleID string) (domain.Ru
 // 排程刻意不綁定既有 Session：定期任務不應該繼承上一次的對話與上下文，也不該讓
 // 使用者為了排程去維護一個長對話。nextRunAt 為 nil 代表手動執行，不改寫時間軸。
 func (s *Service) triggerSchedule(ctx context.Context, schedule domain.Schedule, nextRunAt *time.Time) (domain.Run, error) {
+	if nextRunAt != nil {
+		claimer, ok := s.schedules.(ports.ScheduleOccurrenceClaimer)
+		if !ok || schedule.NextRunAt == nil {
+			return domain.Run{}, fmt.Errorf("%w: schedule store does not support durable occurrence claims", domain.ErrConflict)
+		}
+		claimed, acquired, err := claimer.ClaimOccurrence(ctx, schedule.ID, *schedule.NextRunAt, *nextRunAt)
+		if err != nil {
+			return domain.Run{}, err
+		}
+		if !acquired {
+			return domain.Run{}, fmt.Errorf("%w: schedule occurrence already claimed or changed", domain.ErrConflict)
+		}
+		schedule = claimed
+	}
 	startedAt := s.now().UTC()
 	run, err := s.startScheduleRun(ctx, schedule)
 	state := domain.ScheduleRunState{
 		LastRunAt:  startedAt,
-		NextRunAt:  nextRunAt,
 		LastStatus: domain.ScheduleStatusTriggered,
 	}
-	if nextRunAt == nil {
-		// 手動執行不移動時間軸；沿用排程目前的下一次時間。
-		state.NextRunAt = schedule.NextRunAt
-	}
+	// 時間軸已由認領交易更新；記錄結果不得蓋掉稍後的排程編輯或下一次認領。
 	if err != nil {
 		state.LastStatus = domain.ScheduleStatusFailed
 		state.LastError = err.Error()
@@ -135,6 +146,7 @@ func (s *Service) triggerSchedule(ctx context.Context, schedule domain.Schedule,
 	}
 	if _, markErr := s.schedules.MarkTriggered(ctx, schedule.ID, state); markErr != nil {
 		s.logger.Error("record schedule trigger failed", "schedule_id", schedule.ID, "error", markErr)
+		return run, errors.Join(err, fmt.Errorf("schedule run may have started; do not resend: %w", markErr))
 	}
 	return run, err
 }

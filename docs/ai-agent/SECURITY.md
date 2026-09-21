@@ -7,6 +7,11 @@
 - 未設定 `allowed_origins` 時只允許 loopback Browser origin；跨來源白名單不等同認證。若使用萬用 Origin，必須同時設定 API token。
 - HTTP request body 有大小上限、JSON 拒絕未知欄位與多個根值；request ID 只接受長度不超過 128 的安全字元。
 - 回應加入 `nosniff`、`no-referrer` 與禁止 frame 的安全標頭。
+- 桌面 listener 的 `/backend/` 代理與 `/desktop/api/` 共用控制 cookie 驗證，不能因代理持有
+  後端 Bearer 而匿名代送。所有桌面請求先驗證 loopback Host、同源 Origin 與 Fetch Metadata；
+  只有主頁導航可取得控制 cookie，其他 API 不會核發。`/desktop/identity` 與原生喚回入口
+  保留免 cookie 相容行為，但仍受來源檢查。此邊界防範瀏覽器跨站／DNS rebinding，不隔離
+  同一使用者權限下的惡意本機程序。
 - 伺服器內部錯誤只對 Client 回傳通用訊息與 request ID；詳細原因寫入後端紀錄，避免暴露檔案路徑或內部狀態。
 
 後端有四類對外連線，信任來源不同，不能共用同一套假設：
@@ -24,6 +29,8 @@
 
 - 工具必須同時通過 allowlist、elevated permission profile、適用的 Approval 政策，以及 `ServiceSettings.http_fetch.enabled` 開關；管理介面關閉後工具立即從模型的工具清單消失，不需重啟後端。
 - 私有網段預設允許：`allow_private_networks` 預設為 `true`，因此 localhost、loopback、RFC1918、link-local（含 `169.254.169.254` 這類雲端 metadata 位址）、CGNAT 與 multicast 都可連線；設為 `false` 時全部拒絕。判斷在 Dial 階段執行，因此 DNS 重新綁定與轉址無法繞過。若不需要存取私有服務，建議由管理介面關閉此開關。
+- 設定更新會一起替換 HTTP 政策與 Transport，並關閉舊閒置連線；新請求不能透過既有
+  keep-alive 連線繞過撤銷。更新前已派送的請求不回溯取消，仍受原逾時與 context 約束。
 - 不使用系統 Proxy 設定，避免實際連線目標與網址主機不一致而讓上述檢查失效。可另外以 `http_fetch.allowed_hosts` 限制成白名單，`blocked_hosts` 一律優先拒絕。
 - 只允許 http／https 與 GET、HEAD、POST；`Host`、`Content-Length`、`Connection` 等由 Transport 管理的 header 不可覆寫，帶換行的 header 值直接丟棄。回應大小、逾時與轉址次數都有上限，非文字內容不會送進上下文。
 - Approval 對話框會顯示 `url`、`method`、`headers` 與 `body`，讓使用者在送出前確認實際會離開本機的內容。
@@ -31,6 +38,13 @@
 ChatGPT／Codex OAuth 使用 authorization-code + PKCE，callback server 只監聽 loopback 且只在驗證期間
 存在。access token、refresh token 與 verifier 不透過管理 API 回傳；狀態 API 只提供連線狀態與可顯示
 的帳號資訊。
+
+帳號檔匯入必須由使用者先選檔，再於 DLG 明確選擇帳號；沒有預設路徑或自動掃描。
+瀏覽器只將選取的 File 傳送至既有管理 API，後端解析後只回傳帳號摘要，不回傳憑證。
+列表解析不寫入磁碟；取消後 UI 釋放檔案參照與列表。確認匯入才將選取項目寫入權限為 `0600`
+的 Token 儲存，不修改來源檔案。上傳限制為 8 MiB／1000 筆，錯誤訊息不引用檔案原文。
+上傳檔案含敏感憑證；若 Console 連接遠端後端，憑證會傳到該後端，須使用受信任的安全連線。
+Token 的本機結構與到期時間檢查不等於上游驗證；來源帳號的 refresh token 可能輪替，來源檔不會同步更新。
 
 NetPass 連線前必須保存自己的 API Key 並明確接受使用政策；這只保護 NetPass 通道的建立，不保護
 通道後方的 HTTP API。啟動前必須另外設定後端 `api_token`，並將公開網址與該 Token 視為同等敏感。
@@ -116,9 +130,19 @@ Session 不屬於任何 Project，沙箱只來自該排程；路徑經 `RunInput
   `netpass.json`，但不是匿名資料包：sessions、transcript、附件、記憶與排程可能含使用者
   個資，Session metadata 也可能包含本機工作目錄資訊。備份檔應存放在受限位置，不應直接上傳
   公開服務或版本庫。
-- 還原只允許固定資料目錄白名單，拒絕絕對路徑、`..` segment、符號連結、資料目錄符號連結及
-  超過 512 MiB 的解壓內容；寫入前會檢查目標與暫存檔，還原前另存 pre-restore backup。還原
-  完成後必須重啟後端，讓 filestore 與既有記憶體狀態重新載入。
+- 備份拒絕根目錄與 `service-settings.json` 的符號連結，以及 FIFO、裝置等特殊檔案；
+  目錄內 symlink 不跟隨。掃描／複製可取消，實際資料總量不得超過 512 MiB，項目總數
+  含 manifest 不超過 100,000；錯誤不回傳部分備份。這些限制也適用還原前的救援備份。
+  備份仍需在受信任的本機檔案環境執行；開檔身分檢查不是惡意並行替換的完整隔離措施。
+- 還原只允許固定資料目錄白名單，拒絕不安全路徑、符號連結、重複項目、錯誤根型別、超過
+  100,000 項或 512 MiB 的解壓內容。先完整驗證並存入 staging，運行中的資料不變；下次啟動
+  在 repository／背景工作建立前保存 pre-restore backup 並套用交易，中斷時回滾並停止啟動。
+  備份內的根目錄整體替換，不與舊檔混合；缺少的根目錄不動。pre-restore ZIP 與
+  `.restore-stage-*/rollback` 保留舊資料供救援，不自動刪除。這是程序中斷復原，不是跨平台
+  斷電原子性保證；還原來源仍須可信，合法格式不代表內容或計畫指令值得信任。
+  交易紀錄缺少原始狀態、未知階段或檔案存在狀態矛盾時停止啟動並保留資料，避免回滾
+  誤覆蓋。日誌、待還原設定與根節點、救援備份目錄另作型別與符號連結檢查；此檢查
+  不保證抵抗本機程序在檢查後惡意替換路徑。
 - Permission center 是唯讀資訊頁；它不接受修改 profile、elevated allowlist 或 Approval
   狀態的請求。任何高權限操作仍須同時符合後端 policy 與本次人工核准。
 
@@ -221,8 +245,15 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
   能力的工具可免逐次 Approval；Shell、SSH、MCP、外部轉換／渲染與額外持久根目錄不適用。
   `ephemeral_project` 與 `sandbox_roots` 仍是後端保留欄位，不採信 Client 自行宣告。
 - **結果未知必須與未派送區分。** 副作用前先保存派送意圖，取消或結果未保存時標為未知；
+  同批工具已返回的結果先盡力保存，再發送展示事件；單筆事件或儲存失敗不直接丟棄後續觀察。
+  派送前故障保存 `not_dispatched`，結果 hook 不得抹除未派送／未知標記並改報成功。
   相同未知操作不自動重送，只允許逐次人工核准。`one_time_only=true` 時前後端皆禁止永久授權，
   既有永久授權也不能略過。核准代表接受重複副作用風險，不保證恰好執行一次。
+  工具呼叫的 panic 同樣依派送邊界分類，派送後不冒充確定失敗，也不自動解鎖 Shell
+  備援階段。異常訊息與日誌不包含原始 panic 值，以免帶出工具參數、結果或憑證。
+  核准／問答取消會喚醒等待者；舊等待者不得刪除新請求，已取消 context 不消費排隊決策。
+  內建工具在 Runtime 派送前的取消、停用、契約或權限拒絕標記為 `not_dispatched`，不冒充
+  工具已執行失敗。既有工具目錄、沙箱、核准與認證規則不變。
 - Context 不裁掉固定約束，也不將歷史／工具資料合併提升為系統指令；超出可容納範圍即明確停止。
 - `trust_annotations` **預設開啟**：MCP Server 由管理者自己加入，唯讀查詢逐次核准只會增加不必要的操作負擔。設定檔沒有這個欄位時採預設值；明確設為 `false` 時保存並沿用該決定，不會被預設值蓋掉。對不完全信任的 Server 應主動關閉——關閉後該 Server 的所有工具都逐次核准。
 - MCP stdio 子程序只繼承必要 OS 環境以及管理者明確設定的變數；SSE 與 Streamable HTTP 的 Bearer Token、Basic Auth 與 headers 不會顯示於工具定義、Prompt 或管理 API 回應。管理 API 只回傳 `auth_mode`（實際送出的驗證方式），讓使用者能確認憑證有被採用而不必顯示明文。
@@ -232,8 +263,23 @@ Session 的 permission profile 不能被當成對抗 API 呼叫端的防線，�
 - Shell 子程序只繼承必要 OS 環境，避免無條件洩漏 Provider API key 或後端 token；timeout/cancel 會終止程序樹。
 - SSH 憑證只存在後端 profile。正式環境應設定 known_hosts 或 SHA-256 host key；`insecure_ignore_host_key` 只供明確接受風險的隔離環境。
 - SSH 初始連線最多三次；遠端命令執行中斷線不自動重跑，避免重複副作用。
-- `ssh_wait` 只能用於 Agent 指定的唯讀、冪等檢查命令；它會重新建立 session 進行輪詢，且仍需要 elevated profile 與人工 Approval。上傳／部署命令不得放入輪詢 command，避免因重試造成重複副作用。
+- `ssh_wait` 預期用於唯讀、冪等命令，但系統無法保證任意 command 唯讀，故標為 `ReadOnly=false`，
+  走寫入型授權與重複操作防護；人工核准包含有界輪詢。任何派送後結果未知立即停止輪詢。
+  上傳／部署命令不得放入輪詢 command，避免因重試造成重複副作用。
+- SSH 取消會關閉該次專屬連線，涵蓋尚在等待 channel-open 的 Session 建立；不只取消命令
+  執行。輪詢的取消與逾時分開保存，取消不丟棄最後檢查紀錄；本機取消仍不能證明遠端命令
+  沒有執行，已派送卻未確認者維持 `unknown`。
+- Shell／SSH／HTTP 在派送後逾時、取消、斷線或無法完整讀取結果時，保存 `execution_state=unknown`，
+  不把可能已完成的副作用宣稱為單純失敗。Windows shell 必須先加入 Job 才恢復 suspended 程序；
+  管理失敗會要求終止並回報清理狀態，不退回無程序樹管理執行。Windows 行為仍需實機 Smoke 驗證。
+- 模型可提供工具驗收證據，或沿用明確標示的 `agent_confirmation`；不得自行填寫
+  `user_confirmation` 冒充人工驗收。後者只接受受信任管理 API，並非多使用者身分驗證機制。
 - `wait_for` 不執行 Shell 命令，只在 Run context 與最大等待時間內暫停並發出進度；等待完成本身不構成遠端部署成功證據。
+
+Provider 串流的傳輸結束不等於任務完成：Responses 必須有完整的 `response.completed`
+事件與 response 物件，單獨 `[DONE]` 不會交付工具呼叫。已送出文字、思考或工具 delta
+後不自動重送。舊代理拒絕只依代理模型加保留 ID 識別，先組合分段錯誤再分類；正常回答
+引用「過載」不會被當成 Provider 失敗。這不改變登入、Token、核准或工具權限規則。
 
 ## 用量與成本資料
 
@@ -272,7 +318,8 @@ outbox 項目且不恢復它們。邏輯刪除不保證清除檔案系統或瀏�
 Project 強制刪除仍須先通過所有 Session 無 active 工作的檢查；不在 Run 收尾時卸載磁碟。
 刪除 Session 時一併移除通知及已淘汰 Run 留下的可辨識事件；未知或損壞的事件歸屬不猜測。
 執行中的 Run 持有明細保留保護到收尾完成；取消意圖與終態在控制鎖內判斷，晚到的核准／失敗
-不能復活 Run。事件寫入也必須找到所屬 Run，避免刪除後又由舊回呼建立資料。
+不能復活 Run。一般事件追加在 Run 暫時讀取失敗時仍沿用既有的診斷容錯並記警告，不宣稱
+這是跨程序的資料隔離；終止事件修復則必須重新取得 durable Run，並與 Session 刪除序列化。
 
 `ephemeral=true` 時，Run 的 Project Sandbox 會導向 RAM disk，且 API 不接受同時指定主機
 `sandbox_roots`。執行期間 transcript、附件、計畫與 Run 資料仍由既有 Repository 管理；正常關閉
@@ -290,9 +337,12 @@ Project 強制刪除仍須先通過所有 Session 無 active 工作的檢查；�
 ### 儲存保留與永久移除
 
 目前保留值固定在程式內，沒有設定開關。RunRepository 啟動與 Save 時以 500 筆為整理基準，
-只淘汰最舊範圍中的已結束 Run，未終態保留。Runtime 啟動後及每 30 分鐘只保留最新 50 筆 Run
+從最舊項目起淘汰已結束且未受執行緒保護的 Run；跳過受保護項目後繼續掃描，直到達標或
+只剩不可淘汰項目。未終態與正在收尾的 Run 保留，必要時可超過上限；用量快照不隨明細淘汰。
+Runtime 啟動後及每 30 分鐘只保留最新 50 筆 Run
 與所有未終態 Run 的事件檔；孤兒與較舊事件檔永久刪除。非 active 且 UpdatedAt 早於 30 天前
 的記憶也會永久清理，不受回憶空間開關影響。
+若仍有 Run 明細但事件已清理，後續 SSE 查詢最多依明細重建終止事件，不恢復已刪除的過程本文。
 
 Session transcript 與精簡用量快照不因上述維護而刪除，但不能從對話文字完整還原 Run metadata
 或 SSE 事件序列。升級前應備份，長期稽核需另存匯出；沒有備份的清理資料無法恢復。

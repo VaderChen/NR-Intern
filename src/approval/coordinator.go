@@ -12,6 +12,9 @@ import (
 type pendingApproval struct {
 	request  domain.ToolApprovalRequest
 	decision chan domain.ToolApprovalDecision
+	done     chan struct{}
+	waiting  bool
+	decided  bool
 }
 
 // Coordinator 是 process 內的等待協調器；Run 本身與 pending approval 另由
@@ -72,7 +75,7 @@ func (c *Coordinator) Begin(request domain.ToolApprovalRequest) error {
 	if _, exists := c.byRun[request.RunID]; exists {
 		return fmt.Errorf("%w: run %q already has a pending approval", domain.ErrConflict, request.RunID)
 	}
-	c.pending[request.ID] = &pendingApproval{request: request, decision: make(chan domain.ToolApprovalDecision, 1)}
+	c.pending[request.ID] = &pendingApproval{request: request, decision: make(chan domain.ToolApprovalDecision, 1), done: make(chan struct{})}
 	c.byRun[request.RunID] = request.ID
 	return nil
 }
@@ -81,16 +84,31 @@ func (c *Coordinator) Wait(ctx context.Context, approvalID string) (domain.ToolA
 	approvalID = strings.TrimSpace(approvalID)
 	c.mu.Lock()
 	pending := c.pending[approvalID]
-	c.mu.Unlock()
 	if pending == nil {
+		c.mu.Unlock()
 		return domain.ToolApprovalDecision{}, fmt.Errorf("%w: approval %q", domain.ErrNotFound, approvalID)
 	}
+	if pending.waiting {
+		c.mu.Unlock()
+		return domain.ToolApprovalDecision{}, fmt.Errorf("%w: approval already has a waiter", domain.ErrConflict)
+	}
+	pending.waiting = true
+	c.mu.Unlock()
+	defer c.cancelPending(approvalID, pending)
 	select {
 	case <-ctx.Done():
-		c.Cancel(approvalID)
 		return domain.ToolApprovalDecision{}, ctx.Err()
+	case <-pending.done:
+		return domain.ToolApprovalDecision{}, context.Canceled
 	case decision := <-pending.decision:
-		c.Cancel(approvalID)
+		if err := ctx.Err(); err != nil {
+			return domain.ToolApprovalDecision{}, err
+		}
+		select {
+		case <-pending.done:
+			return domain.ToolApprovalDecision{}, context.Canceled
+		default:
+		}
 		return decision, nil
 	}
 }
@@ -115,6 +133,10 @@ func (c *Coordinator) Decide(runID string, input domain.ToolApprovalDecisionInpu
 		c.mu.Unlock()
 		return fmt.Errorf("%w: pending approval for run %q", domain.ErrNotFound, runID)
 	}
+	if pending.decided {
+		c.mu.Unlock()
+		return fmt.Errorf("%w: approval %q already has a decision", domain.ErrConflict, approvalID)
+	}
 	decision := domain.ToolApprovalDecision{
 		ApprovalID: approvalID,
 		RunID:      runID,
@@ -125,7 +147,7 @@ func (c *Coordinator) Decide(runID string, input domain.ToolApprovalDecisionInpu
 	}
 	select {
 	case pending.decision <- decision:
-		delete(c.byRun, runID)
+		pending.decided = true
 	default:
 		c.mu.Unlock()
 		return fmt.Errorf("%w: approval %q already has a decision", domain.ErrConflict, approvalID)
@@ -135,14 +157,22 @@ func (c *Coordinator) Decide(runID string, input domain.ToolApprovalDecisionInpu
 }
 
 func (c *Coordinator) Cancel(approvalID string) {
+	c.cancelPending(strings.TrimSpace(approvalID), nil)
+}
+
+// 等待者只清理自己取得的實例，避免取消後重用 ID 時刪掉新請求。
+func (c *Coordinator) cancelPending(approvalID string, expected *pendingApproval) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	pending := c.pending[strings.TrimSpace(approvalID)]
-	if pending != nil {
-		delete(c.byRun, pending.request.RunID)
+	pending := c.pending[approvalID]
+	if pending != nil && (expected == nil || expected == pending) {
+		if c.byRun[pending.request.RunID] == pending.request.ID {
+			delete(c.byRun, pending.request.RunID)
+		}
 		delete(c.pending, pending.request.ID)
+		close(pending.done)
 	}
 	c.mu.Unlock()
 }

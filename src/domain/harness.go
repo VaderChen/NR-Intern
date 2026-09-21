@@ -157,14 +157,15 @@ type ModelRequest struct {
 }
 
 type ModelResponse struct {
-	ProviderID        string     `json:"provider_id,omitempty"`
-	ProviderRequestID string     `json:"provider_request_id,omitempty"`
-	Model             string     `json:"model,omitempty"`
-	Content           string     `json:"content,omitempty"`
-	Reasoning         string     `json:"reasoning,omitempty"`
-	ToolCalls         []ToolCall `json:"tool_calls,omitempty"`
-	StopReason        string     `json:"stop_reason,omitempty"`
-	Usage             Usage      `json:"usage,omitempty"`
+	Continuation      *ModelContinuation `json:"continuation,omitempty"`
+	ProviderID        string             `json:"provider_id,omitempty"`
+	ProviderRequestID string             `json:"provider_request_id,omitempty"`
+	Model             string             `json:"model,omitempty"`
+	Content           string             `json:"content,omitempty"`
+	Reasoning         string             `json:"reasoning,omitempty"`
+	ToolCalls         []ToolCall         `json:"tool_calls,omitempty"`
+	StopReason        string             `json:"stop_reason,omitempty"`
+	Usage             Usage              `json:"usage,omitempty"`
 }
 
 const (

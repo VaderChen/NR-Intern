@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -58,9 +59,8 @@ type SessionRepository struct {
 	roots     atomic.Pointer[ProjectRoots]
 	idFactory atomic.Pointer[SessionIDFactory]
 
-	mu        sync.Mutex
-	locks     map[string]*sync.Mutex
-	sequences map[string]int64
+	mu    sync.Mutex
+	locks [64]sync.Mutex
 	// indexes 是各 session transcript 的位置索引，見 session_index.go。
 	indexes map[string]*entryIndex
 }
@@ -151,10 +151,8 @@ func NewSessionRepository(dataDir string) (*SessionRepository, error) {
 		return nil, fmt.Errorf("create session store: %w", err)
 	}
 	return &SessionRepository{
-		root:      root,
-		locks:     map[string]*sync.Mutex{},
-		sequences: map[string]int64{},
-		indexes:   map[string]*entryIndex{},
+		root:    root,
+		indexes: map[string]*entryIndex{},
 	}, nil
 }
 
@@ -242,9 +240,6 @@ func (r *SessionRepository) Create(ctx context.Context, agentID string, input do
 	if err := file.Close(); err != nil {
 		return domain.Session{}, fmt.Errorf("close session transcript: %w", err)
 	}
-	r.mu.Lock()
-	r.sequences[sessionID] = 0
-	r.mu.Unlock()
 	return session, nil
 }
 
@@ -349,8 +344,6 @@ func (r *SessionRepository) Delete(ctx context.Context, sessionID string) error 
 		return fmt.Errorf("delete session: %w", err)
 	}
 	r.mu.Lock()
-	delete(r.sequences, sessionID)
-	delete(r.locks, sessionID)
 	delete(r.indexes, sessionID)
 	r.mu.Unlock()
 	return nil
@@ -371,7 +364,7 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 	if err != nil {
 		return domain.SessionEntry{}, err
 	}
-	sequence, err := r.nextSequenceLocked(sessionID, filepath.Join(directory, sessionEntriesFile))
+	sequence, err := r.nextSequenceLocked(ctx, sessionID, filepath.Join(directory, sessionEntriesFile))
 	if err != nil {
 		return domain.SessionEntry{}, err
 	}
@@ -395,16 +388,41 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 		return domain.SessionEntry{}, fmt.Errorf("encode session entry: %w", err)
 	}
 	entriesPath := filepath.Join(directory, sessionEntriesFile)
-	// 先取寫入前的檔案大小：那就是這一筆在索引裡的位移。
-	offset, err := transcriptSize(entriesPath)
-	if err != nil {
-		return domain.SessionEntry{}, err
-	}
-	file, err := os.OpenFile(entriesPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o640)
+	file, err := os.OpenFile(entriesPath, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0o640)
 	if err != nil {
 		return domain.SessionEntry{}, fmt.Errorf("open session transcript: %w", err)
 	}
-	if _, err := file.Write(append(data, '\n')); err != nil {
+	defer file.Close()
+	before, err := file.Stat()
+	if err != nil {
+		return domain.SessionEntry{}, fmt.Errorf("stat opened session transcript: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return domain.SessionEntry{}, err
+	}
+	payload := append(data, '\n')
+	separator := 0
+	if before.Size() > 0 {
+		var tail [1]byte
+		if _, err := file.ReadAt(tail[:], before.Size()-1); err != nil {
+			return domain.SessionEntry{}, fmt.Errorf("read session transcript boundary: %w", err)
+		}
+		if tail[0] != '\n' {
+			// 合法 JSON 尾筆可以沒有換行，但新 entry 仍必須從下一行開始。
+			payload = append([]byte{'\n'}, payload...)
+			separator = 1
+		}
+	}
+	// 任何寫入／Sync 失敗都可能留下尾筆；後續取號必須重掃，不能重用舊序號。
+	indexed := false
+	defer func() {
+		if !indexed {
+			r.mu.Lock()
+			delete(r.indexes, sessionID)
+			r.mu.Unlock()
+		}
+	}()
+	if _, err := file.Write(payload); err != nil {
 		_ = file.Close()
 		return domain.SessionEntry{}, fmt.Errorf("append session transcript: %w", err)
 	}
@@ -412,14 +430,16 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 		_ = file.Close()
 		return domain.SessionEntry{}, fmt.Errorf("sync session transcript: %w", err)
 	}
+	after, err := file.Stat()
+	if err != nil {
+		return domain.SessionEntry{}, fmt.Errorf("stat appended session transcript: %w", err)
+	}
 	if err := file.Close(); err != nil {
 		return domain.SessionEntry{}, fmt.Errorf("close session transcript: %w", err)
 	}
-	r.mu.Lock()
-	r.sequences[sessionID] = sequence
-	r.mu.Unlock()
 	// 索引就地延長，不必為了下一次讀取重掃整個檔案。
-	r.noteAppendedEntry(sessionID, sequence, entry.Type, offset, len(data)+1)
+	r.noteAppendedEntry(sessionID, sequence, entry.Type, before, after, len(data)+1, separator)
+	indexed = true
 	// 這裡刻意不重寫 session.json。一次 run 會 append 十幾筆 entry，
 	// 每筆都做一次完整 marshal + 暫存檔 + rename 只為了更新 UpdatedAt，
 	// 是長 session 變慢的主因之一。UpdatedAt 改由讀取時併入 transcript 的 mtime。
@@ -545,6 +565,9 @@ func (r *SessionRepository) entriesPage(ctx context.Context, sessionID string, a
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
+	lock := r.sessionLock(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
 	directory, err := r.sessionDir(sessionID)
 	if err != nil {
 		return nil, false, err
@@ -634,6 +657,9 @@ func (r *SessionRepository) LatestEntryOfType(ctx context.Context, sessionID, en
 	if err := ctx.Err(); err != nil {
 		return domain.SessionEntry{}, err
 	}
+	lock := r.sessionLock(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
 	entryType = strings.TrimSpace(entryType)
 	directory, dirErr := r.sessionDir(sessionID)
 	if dirErr != nil {
@@ -684,6 +710,13 @@ func (r *SessionRepository) LatestEntryOfType(ctx context.Context, sessionID, en
 }
 
 func (r *SessionRepository) ListEntries(ctx context.Context, sessionID string) ([]domain.SessionEntry, error) {
+	lock := r.sessionLock(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
+	return r.listEntriesLocked(ctx, sessionID)
+}
+
+func (r *SessionRepository) listEntriesLocked(ctx context.Context, sessionID string) ([]domain.SessionEntry, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -743,8 +776,11 @@ func withoutPersistedReasoning(entry domain.SessionEntry) domain.SessionEntry {
 // 截斷結果會與完整掃描不同。遇到這種情況就退回 ListMessages，
 // 寧可慢一次也不要回傳與稽核紀錄不一致的內容。
 func (r *SessionRepository) ListRecentMessages(ctx context.Context, sessionID string, limit int) ([]domain.Message, error) {
+	lock := r.sessionLock(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
 	if limit <= 0 {
-		return r.ListMessages(ctx, sessionID)
+		return r.listMessagesLocked(ctx, sessionID)
 	}
 	directory, err := r.sessionDir(sessionID)
 	if err != nil {
@@ -756,13 +792,13 @@ func (r *SessionRepository) ListRecentMessages(ctx context.Context, sessionID st
 	path := filepath.Join(directory, sessionEntriesFile)
 	index, indexErr := r.entryIndexFor(ctx, sessionID, path)
 	if indexErr != nil {
-		return r.ListMessages(ctx, sessionID)
+		return r.listMessagesLocked(ctx, sessionID)
 	}
 	r.mu.Lock()
 	offset, complete := index.offsetOfRecentType(domain.SessionEntryMessage, limit)
 	r.mu.Unlock()
 	if complete {
-		return r.ListMessages(ctx, sessionID)
+		return r.listMessagesLocked(ctx, sessionID)
 	}
 	messages := []domain.Message{}
 	truncated := false
@@ -785,7 +821,7 @@ func (r *SessionRepository) ListRecentMessages(ctx context.Context, sessionID st
 		return nil, err
 	}
 	if truncated {
-		return r.ListMessages(ctx, sessionID)
+		return r.listMessagesLocked(ctx, sessionID)
 	}
 	return messages, nil
 }
@@ -814,7 +850,14 @@ func (r *SessionRepository) readEntriesFrom(ctx context.Context, path string, of
 }
 
 func (r *SessionRepository) ListMessages(ctx context.Context, sessionID string) ([]domain.Message, error) {
-	entries, err := r.ListEntries(ctx, sessionID)
+	lock := r.sessionLock(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
+	return r.listMessagesLocked(ctx, sessionID)
+}
+
+func (r *SessionRepository) listMessagesLocked(ctx context.Context, sessionID string) ([]domain.Message, error) {
+	entries, err := r.listEntriesLocked(ctx, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -880,7 +923,6 @@ func (r *SessionRepository) PurgeVolatileResidue() (int, error) {
 		}
 		r.mu.Lock()
 		delete(r.indexes, entry.Name())
-		delete(r.sequences, entry.Name())
 		r.mu.Unlock()
 		removed++
 	}
@@ -888,32 +930,24 @@ func (r *SessionRepository) PurgeVolatileResidue() (int, error) {
 }
 
 func (r *SessionRepository) sessionLock(sessionID string) *sync.Mutex {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	lock := r.locks[sessionID]
-	if lock == nil {
-		lock = &sync.Mutex{}
-		r.locks[sessionID] = lock
-	}
-	return lock
+	// 固定分片不因歷史對話累積而增加；刪除對話也不會讓既有等待者使用另一把鎖。
+	hash := fnv.New32a()
+	_, _ = hash.Write([]byte(strings.TrimSpace(sessionID)))
+	return &r.locks[hash.Sum32()%uint32(len(r.locks))]
 }
 
-func (r *SessionRepository) nextSequenceLocked(sessionID string, entriesPath string) (int64, error) {
-	r.mu.Lock()
-	sequence, exists := r.sequences[sessionID]
-	r.mu.Unlock()
-	if exists {
-		return sequence + 1, nil
-	}
-	// 快取沒命中（程序剛啟動後第一次 append）時用索引取號。
+func (r *SessionRepository) nextSequenceLocked(ctx context.Context, sessionID string, entriesPath string) (int64, error) {
+	// 每次取號先驗證索引的檔案身分，避免還原／替換後沿用獨立的舊序號快取。
 	//
 	// 原本是把每一行完整 unmarshal 一次來找最大序號：那是整份 transcript 最貴的
 	// 一種讀法（21 MB 約 74 ms），而需要的只是最後一筆的序號。
-	if index, indexErr := r.entryIndexFor(context.Background(), sessionID, entriesPath); indexErr == nil {
+	if index, indexErr := r.entryIndexFor(ctx, sessionID, entriesPath); indexErr == nil {
 		r.mu.Lock()
 		last := index.lastSequence()
 		r.mu.Unlock()
 		return last + 1, nil
+	} else if !errors.Is(indexErr, errUnsortedTranscript) {
+		return 0, indexErr
 	}
 	file, err := os.Open(entriesPath)
 	if err != nil {
@@ -924,9 +958,15 @@ func (r *SessionRepository) nextSequenceLocked(sessionID string, entriesPath str
 	}
 	defer file.Close()
 	last := int64(0)
-	if err := readJSONLines(context.Background(), file, func(line []byte) error {
+	if err := readJSONLines(ctx, file, func(line []byte) error {
+		if len(bytes.TrimSpace(line)) == 0 {
+			return nil
+		}
 		var entry domain.SessionEntry
-		if json.Unmarshal(line, &entry) == nil && entry.Sequence > last {
+		if err := json.Unmarshal(line, &entry); err != nil {
+			return fmt.Errorf("decode session entry: %w", err)
+		}
+		if entry.Sequence > last {
 			last = entry.Sequence
 		}
 		return nil

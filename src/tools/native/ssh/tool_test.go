@@ -18,9 +18,9 @@ func TestRemoteCheckMatchesExpectedOutputAndExitCode(t *testing.T) {
 	}
 }
 
-func TestSSHWaitDefinitionRequiresReadOnlyCheck(t *testing.T) {
+func TestSSHWaitDefinitionRequiresMutationApproval(t *testing.T) {
 	definition := NewWaitTool(nil, 64*1024, time.Minute).Definition()
-	if definition.Name != "ssh_wait" || !definition.ReadOnly || !definition.RequiresPermission {
+	if definition.Name != "ssh_wait" || definition.ReadOnly || !definition.RequiresPermission {
 		t.Fatalf("definition = %+v", definition)
 	}
 	if definition.InputSchema["required"].([]string)[1] != "command" {

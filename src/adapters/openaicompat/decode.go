@@ -16,6 +16,7 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 	var content strings.Builder
 	var reasoning strings.Builder
 	var taggedStream taggedThinkingStream
+	var proxy proxyTerminalState
 	partials := map[int]*partialCall{}
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
@@ -53,15 +54,20 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 			result.Model = chunk.Model
 		}
 		result.Usage = chunk.Usage.domainUsage(result.Usage)
+		proxy.observe(chunk.Model, chunk.ID)
 		for _, choice := range chunk.Choices {
 			delta := contentText(choice.Delta.Content)
 			if delta == "" {
 				delta = choice.Delta.Refusal
 			}
-			if delta != "" {
-				if err := proxyTerminalError(chunk.Model, chunk.ID, delta, requestID, clientRequestID); err != nil {
-					return err
+			if proxy.active {
+				proxy.add(delta)
+				if choice.FinishReason != nil {
+					return proxy.failure(requestID, clientRequestID)
 				}
+				continue
+			}
+			if delta != "" {
 				content.WriteString(delta)
 				if sink != nil {
 					for _, fragment := range taggedStream.Push(delta, false) {
@@ -148,6 +154,9 @@ func decodeStream(reader io.Reader, fallbackModel, requestID, clientRequestID st
 		if err := consume(strings.Join(dataLines, "\n")); err != nil {
 			return domain.ModelResponse{}, err
 		}
+	}
+	if err := proxy.failure(requestID, clientRequestID); err != nil {
+		return domain.ModelResponse{}, err
 	}
 	if !sawChunk {
 		return domain.ModelResponse{}, &ProviderError{Operation: "stream read", Message: "stream ended without a completion chunk", RequestID: requestID, ClientRequestID: clientRequestID, Retryable: true}

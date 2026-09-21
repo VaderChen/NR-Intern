@@ -260,6 +260,36 @@ func (r *ScheduleRepository) Delete(ctx context.Context, scheduleID string) erro
 	return nil
 }
 
+func (r *ScheduleRepository) ClaimOccurrence(ctx context.Context, scheduleID string, due, next time.Time) (domain.Schedule, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.Schedule{}, false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	value, ok := r.items[scheduleID]
+	if !ok {
+		return domain.Schedule{}, false, domain.ErrNotFound
+	}
+	if !value.Enabled || value.NextRunAt == nil || !value.NextRunAt.Equal(due) {
+		return cloneSchedule(value), false, nil
+	}
+	if !next.After(due) {
+		return domain.Schedule{}, false, domain.ErrInvalidInput
+	}
+	previous := cloneSchedules(r.items)
+	next = next.UTC()
+	value.NextRunAt = &next
+	value.LastStatus = "dispatching"
+	value.LastError = "到期任務已認領；若服務在結果落盤前中斷，不會自動重送，請先查證執行狀態。"
+	value.UpdatedAt = time.Now().UTC()
+	r.items[scheduleID] = value
+	if err := r.persistLocked(); err != nil {
+		r.items = previous
+		return domain.Schedule{}, false, err
+	}
+	return cloneSchedule(value), true, nil
+}
+
 func (r *ScheduleRepository) MarkTriggered(ctx context.Context, scheduleID string, state domain.ScheduleRunState) (domain.Schedule, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Schedule{}, err
@@ -280,8 +310,6 @@ func (r *ScheduleRepository) MarkTriggered(ctx context.Context, scheduleID strin
 	if state.NextRunAt != nil {
 		next := state.NextRunAt.UTC()
 		value.NextRunAt = &next
-	} else {
-		value.NextRunAt = nil
 	}
 	value.UpdatedAt = time.Now().UTC()
 	previous := cloneSchedules(r.items)

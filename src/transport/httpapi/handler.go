@@ -21,45 +21,47 @@ var (
 )
 
 type Handler struct {
-	service                 *application.Service
-	apiToken                string
-	allowedOrigins          []string
-	maxBodyBytes            int64
-	maxAttachmentBytes      int64
-	maxRestoreBytes         int64
-	attachments             ports.AttachmentRepository
-	status                  func() domain.ServiceStatus
-	toolCatalog             func(context.Context, string) ([]domain.ToolCatalogEntry, error)
-	diagnostics             func(context.Context) (any, error)
-	diagnosticsExport       func(context.Context) ([]byte, error)
-	backup                  func(context.Context) ([]byte, error)
-	configBundle            func(context.Context, bool) ([]byte, error)
-	exportProviderSetting   func(context.Context, string, bool) ([]byte, error)
-	exportMCPSetting        func(context.Context, string, bool) ([]byte, error)
-	readMCPContract         func(context.Context, string) (any, error)
-	restore                 func(context.Context, []byte) (domain.RestoreResult, error)
-	permissions             func(context.Context) (domain.PermissionCenter, error)
-	updateStatus            func(context.Context) (domain.UpdateStatus, error)
-	checkForUpdates         func(context.Context) (domain.UpdateStatus, error)
-	serviceSettings         func(context.Context) (domain.ServiceSettings, error)
-	updateServiceSettings   func(context.Context, domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error)
-	providerSettings        func(context.Context) (domain.ProviderSettings, error)
-	updateProviderSettings  func(context.Context, domain.UpdateProviderSettingsInput) (domain.ProviderSettings, error)
-	mcpSettings             func(context.Context) (domain.MCPSettings, error)
-	updateMCPSettings       func(context.Context, domain.UpdateMCPSettingsInput) (domain.MCPSettings, error)
-	testMCP                 func(context.Context, string) (domain.MCPTestResult, error)
-	reverseProxyStatus      func(context.Context) (domain.ReverseProxyStatus, error)
-	updateReverseProxy      func(context.Context, domain.UpdateReverseProxyInput) (domain.ReverseProxyStatus, error)
-	startReverseProxy       func(context.Context, domain.StartReverseProxyInput) (domain.ReverseProxyStatus, error)
-	stopReverseProxy        func(context.Context) (domain.ReverseProxyStatus, error)
-	providerModels          func(context.Context, string) (domain.ProviderModels, error)
-	providerUsage           func(context.Context, string) (domain.ProviderUsage, error)
-	providerRateLimitReset  func(context.Context, string, string, string) (domain.ProviderResetResult, error)
-	testProvider            func(context.Context, string) (domain.ProviderTestResult, error)
-	startProviderOAuth      func(context.Context, string) (domain.ProviderOAuthStartResult, error)
-	providerOAuthStatus     func(context.Context, string) (domain.ProviderOAuthStatus, error)
-	disconnectProviderOAuth func(context.Context, string) error
-	mux                     *http.ServeMux
+	service                        *application.Service
+	apiToken                       string
+	allowedOrigins                 []string
+	maxBodyBytes                   int64
+	maxAttachmentBytes             int64
+	maxRestoreBytes                int64
+	attachments                    ports.AttachmentRepository
+	status                         func() domain.ServiceStatus
+	toolCatalog                    func(context.Context, string) ([]domain.ToolCatalogEntry, error)
+	diagnostics                    func(context.Context) (any, error)
+	diagnosticsExport              func(context.Context) ([]byte, error)
+	backup                         func(context.Context) ([]byte, error)
+	configBundle                   func(context.Context, bool) ([]byte, error)
+	exportProviderSetting          func(context.Context, string, bool) ([]byte, error)
+	exportMCPSetting               func(context.Context, string, bool) ([]byte, error)
+	readMCPContract                func(context.Context, string) (any, error)
+	restore                        func(context.Context, []byte) (domain.RestoreResult, error)
+	permissions                    func(context.Context) (domain.PermissionCenter, error)
+	updateStatus                   func(context.Context) (domain.UpdateStatus, error)
+	checkForUpdates                func(context.Context) (domain.UpdateStatus, error)
+	serviceSettings                func(context.Context) (domain.ServiceSettings, error)
+	updateServiceSettings          func(context.Context, domain.UpdateServiceSettingsInput) (domain.ServiceSettings, error)
+	providerSettings               func(context.Context) (domain.ProviderSettings, error)
+	updateProviderSettings         func(context.Context, domain.UpdateProviderSettingsInput) (domain.ProviderSettings, error)
+	mcpSettings                    func(context.Context) (domain.MCPSettings, error)
+	updateMCPSettings              func(context.Context, domain.UpdateMCPSettingsInput) (domain.MCPSettings, error)
+	testMCP                        func(context.Context, string) (domain.MCPTestResult, error)
+	reverseProxyStatus             func(context.Context) (domain.ReverseProxyStatus, error)
+	updateReverseProxy             func(context.Context, domain.UpdateReverseProxyInput) (domain.ReverseProxyStatus, error)
+	startReverseProxy              func(context.Context, domain.StartReverseProxyInput) (domain.ReverseProxyStatus, error)
+	stopReverseProxy               func(context.Context) (domain.ReverseProxyStatus, error)
+	providerModels                 func(context.Context, string) (domain.ProviderModels, error)
+	providerUsage                  func(context.Context, string) (domain.ProviderUsage, error)
+	providerRateLimitReset         func(context.Context, string, string, string) (domain.ProviderResetResult, error)
+	testProvider                   func(context.Context, string) (domain.ProviderTestResult, error)
+	startProviderOAuth             func(context.Context, string) (domain.ProviderOAuthStartResult, error)
+	providerOAuthFileAccounts      func(context.Context, string, []byte) ([]domain.ProviderOAuthFileAccount, error)
+	importProviderOAuthFileAccount func(context.Context, string, []byte, string) (domain.ProviderOAuthStatus, error)
+	providerOAuthStatus            func(context.Context, string) (domain.ProviderOAuthStatus, error)
+	disconnectProviderOAuth        func(context.Context, string) error
+	mux                            *http.ServeMux
 }
 
 func New(service *application.Service, config Config) (*Handler, error) {
@@ -76,45 +78,47 @@ func New(service *application.Service, config Config) (*Handler, error) {
 	}
 	maxRestoreBytes := int64(256 * 1024 * 1024)
 	handler := &Handler{
-		service:                 service,
-		apiToken:                strings.TrimSpace(config.APIToken),
-		allowedOrigins:          append([]string(nil), config.AllowedOrigins...),
-		maxBodyBytes:            maxBodyBytes,
-		maxAttachmentBytes:      maxAttachmentBytes,
-		maxRestoreBytes:         maxRestoreBytes,
-		attachments:             config.Attachments,
-		status:                  config.Status,
-		toolCatalog:             config.ToolCatalog,
-		diagnostics:             config.Diagnostics,
-		diagnosticsExport:       config.DiagnosticsExport,
-		backup:                  config.Backup,
-		configBundle:            config.ConfigBundle,
-		exportProviderSetting:   config.ExportProviderSetting,
-		exportMCPSetting:        config.ExportMCPSetting,
-		readMCPContract:         config.ReadMCPContract,
-		restore:                 config.Restore,
-		permissions:             config.Permissions,
-		updateStatus:            config.UpdateStatus,
-		checkForUpdates:         config.CheckForUpdates,
-		serviceSettings:         config.ServiceSettings,
-		updateServiceSettings:   config.UpdateServiceSettings,
-		providerSettings:        config.ProviderSettings,
-		updateProviderSettings:  config.UpdateProviderSettings,
-		mcpSettings:             config.MCPSettings,
-		updateMCPSettings:       config.UpdateMCPSettings,
-		testMCP:                 config.TestMCP,
-		reverseProxyStatus:      config.ReverseProxyStatus,
-		updateReverseProxy:      config.UpdateReverseProxy,
-		startReverseProxy:       config.StartReverseProxy,
-		stopReverseProxy:        config.StopReverseProxy,
-		providerModels:          config.ProviderModels,
-		providerUsage:           config.ProviderUsage,
-		providerRateLimitReset:  config.ProviderRateLimitReset,
-		testProvider:            config.TestProvider,
-		startProviderOAuth:      config.StartProviderOAuth,
-		providerOAuthStatus:     config.ProviderOAuthStatus,
-		disconnectProviderOAuth: config.DisconnectProviderOAuth,
-		mux:                     http.NewServeMux(),
+		service:                        service,
+		apiToken:                       strings.TrimSpace(config.APIToken),
+		allowedOrigins:                 append([]string(nil), config.AllowedOrigins...),
+		maxBodyBytes:                   maxBodyBytes,
+		maxAttachmentBytes:             maxAttachmentBytes,
+		maxRestoreBytes:                maxRestoreBytes,
+		attachments:                    config.Attachments,
+		status:                         config.Status,
+		toolCatalog:                    config.ToolCatalog,
+		diagnostics:                    config.Diagnostics,
+		diagnosticsExport:              config.DiagnosticsExport,
+		backup:                         config.Backup,
+		configBundle:                   config.ConfigBundle,
+		exportProviderSetting:          config.ExportProviderSetting,
+		exportMCPSetting:               config.ExportMCPSetting,
+		readMCPContract:                config.ReadMCPContract,
+		restore:                        config.Restore,
+		permissions:                    config.Permissions,
+		updateStatus:                   config.UpdateStatus,
+		checkForUpdates:                config.CheckForUpdates,
+		serviceSettings:                config.ServiceSettings,
+		updateServiceSettings:          config.UpdateServiceSettings,
+		providerSettings:               config.ProviderSettings,
+		updateProviderSettings:         config.UpdateProviderSettings,
+		mcpSettings:                    config.MCPSettings,
+		updateMCPSettings:              config.UpdateMCPSettings,
+		testMCP:                        config.TestMCP,
+		reverseProxyStatus:             config.ReverseProxyStatus,
+		updateReverseProxy:             config.UpdateReverseProxy,
+		startReverseProxy:              config.StartReverseProxy,
+		stopReverseProxy:               config.StopReverseProxy,
+		providerModels:                 config.ProviderModels,
+		providerUsage:                  config.ProviderUsage,
+		providerRateLimitReset:         config.ProviderRateLimitReset,
+		testProvider:                   config.TestProvider,
+		startProviderOAuth:             config.StartProviderOAuth,
+		providerOAuthFileAccounts:      config.ProviderOAuthFileAccounts,
+		importProviderOAuthFileAccount: config.ImportProviderOAuthFileAccount,
+		providerOAuthStatus:            config.ProviderOAuthStatus,
+		disconnectProviderOAuth:        config.DisconnectProviderOAuth,
+		mux:                            http.NewServeMux(),
 	}
 	handler.routes()
 	return handler, nil
@@ -150,6 +154,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("GET /api/v1/admin/provider-settings/{provider_id}/models", h.getProviderModels)
 	h.mux.HandleFunc("POST /api/v1/admin/provider-settings/{provider_id}/test", h.postProviderTest)
 	h.mux.HandleFunc("POST /api/v1/admin/provider-settings/{provider_id}/oauth/start", h.postProviderOAuthStart)
+	h.mux.HandleFunc("POST /api/v1/admin/provider-settings/{provider_id}/oauth/accounts", h.postProviderOAuthFileAccounts)
+	h.mux.HandleFunc("POST /api/v1/admin/provider-settings/{provider_id}/oauth/accounts/{selection_id}", h.postImportProviderOAuthFileAccount)
 	h.mux.HandleFunc("GET /api/v1/admin/provider-settings/{provider_id}/oauth/status", h.getProviderOAuthStatus)
 	h.mux.HandleFunc("DELETE /api/v1/admin/provider-settings/{provider_id}/oauth", h.deleteProviderOAuth)
 	h.mux.HandleFunc("GET /api/v1/admin/mcp-settings", h.getMCPSettings)
@@ -1421,7 +1427,7 @@ func (h *Handler) writeRunEventStream(writer http.ResponseWriter, request *http.
 		if err != nil {
 			return
 		}
-		events, err := h.service.ListRunEvents(request.Context(), runID, afterSequence)
+		run, events, err := h.service.ReadRunEventBatch(request.Context(), runID, afterSequence)
 		if err != nil {
 			unsubscribe()
 			return
@@ -1433,11 +1439,6 @@ func (h *Handler) writeRunEventStream(writer http.ResponseWriter, request *http.
 			}
 			afterSequence = event.Sequence
 			flusher.Flush()
-		}
-		run, err := h.service.GetRun(request.Context(), runID)
-		if err != nil {
-			unsubscribe()
-			return
 		}
 		if isTerminalRun(run.Status) {
 			unsubscribe()

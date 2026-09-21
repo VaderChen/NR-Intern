@@ -77,11 +77,21 @@ func New(config Config) (*Server, error) {
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if strings.HasPrefix(request.URL.Path, "/desktop/api/") && !s.authorized(request) {
+	if !localUIRequest(request) {
+		writeJSON(writer, http.StatusForbidden, map[string]any{"error": "desktop request origin is not allowed"})
+		return
+	}
+	writer.Header().Set("X-Frame-Options", "DENY")
+	writer.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+	writer.Header().Set("X-Content-Type-Options", "nosniff")
+	protected := strings.HasPrefix(request.URL.Path, "/desktop/api/") || strings.HasPrefix(request.URL.Path, "/backend/")
+	if protected && !s.authorized(request) {
 		writeJSON(writer, http.StatusForbidden, map[string]any{"error": "desktop control token is invalid"})
 		return
 	}
-	if !strings.HasPrefix(request.URL.Path, "/backend/") {
+	// 僅由同源的 Console 文件導覽建立 Cookie；API 與辨識探測不能換取授權。
+	if request.Method == http.MethodGet && (request.URL.Path == "/" || request.URL.Path == "/index.html") &&
+		(request.Header.Get("Sec-Fetch-Dest") == "" || request.Header.Get("Sec-Fetch-Dest") == "document") {
 		http.SetCookie(writer, &http.Cookie{
 			Name:     controlCookie,
 			Value:    s.controlToken,

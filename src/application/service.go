@@ -65,8 +65,8 @@ type Service struct {
 	runSignals     map[string]chan struct{}
 	watchers       map[string]map[uint64]chan struct{}
 	nextWatcher    uint64
-	eventMu        sync.Mutex
-	eventSequences map[string]int64
+	eventMu        [64]sync.Mutex
+	eventSequences sync.Map // Run ID -> int64；檔案 I/O 只持有對應 Run 的分片鎖。
 	closed         bool
 	wg             sync.WaitGroup
 }
@@ -136,7 +136,6 @@ func NewService(dependencies Dependencies) (*Service, error) {
 		pausedRuns:        map[string]bool{},
 		runSignals:        map[string]chan struct{}{},
 		watchers:          map[string]map[uint64]chan struct{}{},
-		eventSequences:    map[string]int64{},
 	}
 	service.notificationsEnabled.Store(dependencies.NotificationsEnabled)
 	service.memoryIsolatedProjects.Store(dependencies.MemoryIsolatedProjects)
@@ -1142,7 +1141,7 @@ func (s *Service) WaitRun(ctx context.Context, runID string, afterSequence int64
 		if err != nil {
 			return domain.Run{}, err
 		}
-		events, err := s.ListRunEvents(ctx, runID, afterSequence)
+		run, events, err := s.ReadRunEventBatch(ctx, runID, afterSequence)
 		if err != nil {
 			unsubscribe()
 			return domain.Run{}, err
@@ -1156,11 +1155,6 @@ func (s *Service) WaitRun(ctx context.Context, runID string, afterSequence int64
 				}
 			}
 			afterSequence = event.Sequence
-		}
-		run, err := s.GetRun(ctx, runID)
-		if err != nil {
-			unsubscribe()
-			return domain.Run{}, err
 		}
 		if terminalRun(run.Status) {
 			unsubscribe()
@@ -1242,6 +1236,10 @@ func (s *Service) cancelRunLocked(ctx context.Context, runID string) (domain.Run
 // persistImmediateCancellation 讓控制 API 立即反映使用者的停止意圖，
 // 不把完成時間綁在第三方 Provider 是否正確遵守 context 取消上。
 func (s *Service) persistImmediateCancellation(run domain.Run) (domain.Run, error) {
+	lock := s.eventLock(run.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	defer s.notifyRun(run.ID)
 	completedAt := s.now().UTC()
 	run.Status = domain.RunStatusCanceled
 	run.PendingApproval = nil
@@ -1255,7 +1253,12 @@ func (s *Service) persistImmediateCancellation(run domain.Run) (domain.Run, erro
 	if current.Usage != nil {
 		payload["usage"] = *current.Usage
 	}
-	if err := s.appendControlEvent(current, "run."+string(current.Status), payload); err != nil {
+	value, _ := s.eventSequences.Load(run.ID)
+	sequence, _ := value.(int64)
+	if sequence == 0 {
+		sequence = s.latestRunSequence(context.Background(), run.ID)
+	}
+	if err := s.appendEventLocked(current, &sequence, "run."+string(current.Status), payload); err != nil {
 		// 狀態已落盤，事件失敗仍保留可診斷資訊，不讓重送取消產生第二個終止事件。
 		s.logger.Error("run cancellation event write failed", "run_id", current.ID, "error", err)
 		s.notifyRun(current.ID)
@@ -1431,10 +1434,10 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			// 這裡過去完全沒有紀錄：panic 被吞掉，只留下一筆沒有原因的 failed run。
-			s.logger.Error("run panicked", "run_id", run.ID, "session_id", run.SessionID, "panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+			s.logger.Error("run panicked", "run_id", run.ID, "session_id", run.SessionID, "panic_type", fmt.Sprintf("%T", recovered), "stack", string(debug.Stack()))
 			latest, err := s.runs.Get(context.Background(), run.ID)
 			if err == nil && !terminalRun(latest.Status) {
-				s.finishFailed(latest, "agent_panic", fmt.Errorf("unexpected panic: %v", recovered), false, &sequence)
+				s.finishFailed(latest, "agent_panic", fmt.Errorf("代理執行發生內部異常；請以 Run 識別碼查閱日誌"), false, &sequence)
 			}
 		}
 	}()
@@ -1561,34 +1564,25 @@ func (s *Service) executeRun(ctx context.Context, engine ports.AgentEngine, sess
 	run.CompletedAt = &completedAt
 	// PauseRun 與 terminal transition 共用這把鎖，避免完成寫入後又被舊的
 	// running 快照覆蓋成 paused。若 pause 先取得鎖，則在安全邊界等待恢復。
-	var saveErr error
 	for {
-		s.mu.Lock()
-		if current, canceled := s.active[run.ID]; canceled && current.cancelRequested {
-			s.mu.Unlock()
-			s.finishCanceled(run, context.Canceled, &sequence)
+		paused, err := s.commitCompletedRun(run, &sequence)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				s.finishCanceled(run, err, &sequence)
+			} else {
+				s.finishFailed(run, "run_state_write_failed", err, true, &sequence)
+			}
 			return
 		}
-		if !s.pausedRuns[run.ID] {
-			s.logger.Info("run completed", "run_id", run.ID, "session_id", run.SessionID, "duration_ms", completedAt.Sub(startedAt).Milliseconds(), "event_count", sequence)
-			saveErr = s.runs.Save(context.Background(), run)
-			s.mu.Unlock()
+		if !paused {
 			break
 		}
-		s.mu.Unlock()
 		if err := s.waitIfRunPaused(ctx, run.ID); err != nil {
 			s.finishCanceled(run, err, &sequence)
 			return
 		}
 	}
-	if saveErr != nil {
-		s.finishFailed(run, "run_state_write_failed", saveErr, true, &sequence)
-		return
-	}
-	if err := s.appendEvent(run, &sequence, "run.completed", map[string]any{"status": run.Status, "result": result}); err != nil {
-		s.finishFailed(run, "event_write_failed", err, true, &sequence)
-		return
-	}
+	s.logger.Info("run completed", "run_id", run.ID, "session_id", run.SessionID, "duration_ms", completedAt.Sub(startedAt).Milliseconds(), "event_count", sequence)
 	s.notifyRunFinished(run)
 }
 
@@ -1604,17 +1598,20 @@ func classifyRunFailure(cause error) (code string, retryable bool) {
 }
 
 func (s *Service) appendEvent(run domain.Run, sequence *int64, eventType string, payload map[string]any) error {
-	s.eventMu.Lock()
-	defer s.eventMu.Unlock()
+	lock := s.eventLock(run.ID)
+	lock.Lock()
+	defer lock.Unlock()
 	return s.appendEventLocked(run, sequence, eventType, payload)
 }
 
 // appendControlEvent 供 HTTP 控制操作使用；它會和 Harness 的事件寫入共用同一把鎖，
 // 避免 pause/resume 與模型事件同時寫入時產生重複 sequence。
 func (s *Service) appendControlEvent(run domain.Run, eventType string, payload map[string]any) error {
-	s.eventMu.Lock()
-	defer s.eventMu.Unlock()
-	sequence := s.eventSequences[run.ID]
+	lock := s.eventLock(run.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	value, _ := s.eventSequences.Load(run.ID)
+	sequence, _ := value.(int64)
 	if sequence == 0 {
 		sequence = s.latestRunSequence(context.Background(), run.ID)
 	}
@@ -1635,7 +1632,8 @@ func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType s
 	} else if terminalRun(latest.Status) && eventType != "run."+string(latest.Status) {
 		return fmt.Errorf("%w: cannot append %s after run.%s", domain.ErrConflict, eventType, latest.Status)
 	}
-	if latest := s.eventSequences[run.ID]; latest > *sequence {
+	value, _ := s.eventSequences.Load(run.ID)
+	if latest, _ := value.(int64); latest > *sequence {
 		*sequence = latest
 	}
 	next := *sequence + 1
@@ -1654,7 +1652,7 @@ func (s *Service) appendEventLocked(run domain.Run, sequence *int64, eventType s
 		return err
 	}
 	*sequence = next
-	s.eventSequences[run.ID] = next
+	s.eventSequences.Store(run.ID, next)
 	s.notifyRun(run.ID)
 	return nil
 }
@@ -1663,6 +1661,7 @@ func (s *Service) finishCanceled(run domain.Run, cause error, sequence *int64) {
 	s.logger.Info("run canceled", "run_id", run.ID, "session_id", run.SessionID, "cause", cause)
 	completedAt := s.now().UTC()
 	run.Status = domain.RunStatusCanceled
+	run.Result = nil
 	run.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
 	if cause != nil {
 		run.Error.Message = cause.Error()
@@ -1675,6 +1674,7 @@ func (s *Service) finishFailed(run domain.Run, code string, cause error, retryab
 	s.logger.Error("run failed", "run_id", run.ID, "session_id", run.SessionID, "code", code, "retryable", retryable, "error", cause)
 	completedAt := s.now().UTC()
 	run.Status = domain.RunStatusFailed
+	run.Result = nil
 	run.Error = &domain.RunError{Code: code, Message: cause.Error(), Retryable: retryable}
 	run.CompletedAt = &completedAt
 	s.finishTerminalRun(run, sequence)
@@ -1853,6 +1853,7 @@ func (s *Service) reconcileTerminalEvents(ctx context.Context) error {
 			continue
 		}
 		if len(values) > 0 && terminalEvent(values[len(values)-1].Type) {
+			s.eventSequences.Store(run.ID, values[len(values)-1].Sequence)
 			continue
 		}
 		sequence := int64(0)

@@ -136,6 +136,40 @@ func proxyTerminalError(model, id, message, requestID, clientRequestID string) e
 	return &ProviderError{Operation: "upstream rejection", Message: message, RequestID: requestID, ClientRequestID: clientRequestID, Retryable: retryableStreamError("", message)}
 }
 
+// 代理識別欄位可以只出現在首個封包；錯誤原因也可能分成多個 delta。
+// 確認保留身分後先收集錯誤，不輸出為模型文字；一般回答不使用內容比對。
+type proxyTerminalState struct {
+	model, id string
+	active    bool
+	message   strings.Builder
+}
+
+func (s *proxyTerminalState) observe(model, id string) {
+	if s.active {
+		return
+	}
+	s.model = firstText(model, s.model)
+	s.id = firstText(id, s.id)
+	s.active = proxyTerminalError(s.model, s.id, "", "", "") != nil
+}
+
+func (s *proxyTerminalState) add(message string) {
+	// 錯誤本文有界；不因異常代理持續串流而無限保留。
+	const maximum = 16 * 1024
+	remaining := maximum - s.message.Len()
+	if remaining > 0 {
+		s.message.WriteString(message[:min(len(message), remaining)])
+	}
+}
+
+func (s *proxyTerminalState) failure(requestID, clientRequestID string) error {
+	if !s.active {
+		return nil
+	}
+	message := firstText(s.message.String(), "上游代理回報請求失敗，但沒有提供原因。")
+	return proxyTerminalError(s.model, s.id, message, requestID, clientRequestID)
+}
+
 func retryableStatus(status int) bool {
 	switch status {
 	case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooManyRequests,

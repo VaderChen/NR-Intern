@@ -38,6 +38,14 @@ func (m *Model) ListModels(ctx context.Context) ([]string, error) {
 		return m.listCodexModels(ctx)
 	}
 	endpoint, err := modelCatalogEndpoint(m.endpoint)
+	if m.useResponses {
+		var parsed *url.URL
+		parsed, err = url.Parse(m.endpoint)
+		if err == nil {
+			// 推論路徑與查詢參數不屬於模型目錄；保留同一 origin（含 port）。
+			endpoint = (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: "/v1/models"}).String()
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

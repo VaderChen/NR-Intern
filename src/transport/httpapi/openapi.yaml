@@ -371,6 +371,48 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ProviderOAuthStartEnvelope" }
         default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/oauth/accounts:
+    post:
+      summary: 解析使用者選取的多帳號檔案
+      description: 無預設路徑。直接上傳 JSON 陣列，最多 8 MiB／1000 筆；不寫入 Token 儲存、不回傳 Token，回應禁止快取。
+      parameters:
+        - { name: provider_id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, maxItems: 1000, items: { type: object } }
+      responses:
+        "200":
+          description: 帳號摘要；problem 非空的項目不可匯入
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/ProviderOAuthFileAccount" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/admin/provider-settings/{provider_id}/oauth/accounts/{selection_id}:
+    post:
+      summary: 匯入 DLG 明確選取的帳號
+      description: 重新提交列表使用的完整 JSON 檔案；選取 ID 綁定檔案內容與位置。資料變更、無效或互動 OAuth 尚在等待時拒絕。只寫入指定 Provider，成功不等於上游已驗證。
+      parameters:
+        - { name: provider_id, in: path, required: true, schema: { type: string } }
+        - { name: selection_id, in: path, required: true, schema: { type: string, pattern: "^[a-f0-9]{64}$" } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: array, maxItems: 1000, items: { type: object } }
+      responses:
+        "200":
+          description: 所選帳號已保存，不包含 Token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderOAuthStatusEnvelope" }
+        default: { $ref: "#/components/responses/Problem" }
   /api/v1/admin/provider-settings/{provider_id}/oauth/status:
     get:
       summary: 取得脫敏的 ChatGPT/Codex OAuth 狀態
@@ -1936,6 +1978,7 @@ components:
       required: [base_url, model, instruction_role, max_attempts]
       properties:
         base_url: { type: string, format: uri }
+        use_responses: { type: boolean, default: false, description: "開啟後以 Responses 串流協定直接呼叫完整 base_url，不附加路徑；模型列表使用同一 origin 的 /v1/models。API Key 驗證不變，此模式忽略 Chat 專用的 instruction_role、disable_streaming、stream_include_usage 與 omit_tool_choice。" }
         api_key: { type: string, writeOnly: true, description: 省略時保留，空字串清除。 }
         has_api_key: { type: boolean, readOnly: true }
         model: { type: string, minLength: 1 }
@@ -2092,6 +2135,15 @@ components:
         callback_uri: { type: string, format: uri }
         browser_opened: { type: boolean }
         expires_at: { type: string, format: date-time }
+    ProviderOAuthFileAccount:
+      type: object
+      required: [id, email]
+      properties:
+        id: { type: string, description: 綁定檔案快照與項目位置的選取 ID }
+        email: { type: string }
+        name: { type: string }
+        expires_at: { type: string, format: date-time }
+        problem: { type: string, description: 不可匯入的原因；不引用原始憑證 }
     ProviderOAuthStatus:
       type: object
       required: [provider_id, status]

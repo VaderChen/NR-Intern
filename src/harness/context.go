@@ -811,6 +811,7 @@ func truncateMiddle(value string, maxRunes int) string {
 
 func cloneMessage(message domain.Message) domain.Message {
 	result := message
+	result.Continuation = message.Continuation.Clone()
 	result.Metadata = valueutil.CloneMap(message.Metadata)
 	result.ToolCalls = cloneToolCalls(message.ToolCalls)
 	if message.Usage != nil {
@@ -871,7 +872,7 @@ func shapedCharacters(messages []sequencedMessage, maxToolResultCharacters int) 
 		if strings.EqualFold(message.Message.Role, "tool") && length > maxToolResultCharacters {
 			length = maxToolResultCharacters
 		}
-		total += length + toolCallCharacters(message.Message.ToolCalls)
+		total += length + toolCallCharacters(message.Message.ToolCalls) + message.Message.Continuation.Bytes()
 	}
 	return total
 }

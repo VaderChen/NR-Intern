@@ -3,6 +3,7 @@
 package shell
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -41,15 +42,15 @@ func (windowsAdapter) Prepare(command *exec.Cmd) {
 	// 管道收的，不靠 console 顯示。
 	command.SysProcAttr = &windows.SysProcAttr{
 		HideWindow:    true,
-		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW,
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP | windows.CREATE_NO_WINDOW | windows.CREATE_SUSPENDED,
 	}
 }
 
-func (windowsAdapter) Attach(command *exec.Cmd) processGroup {
+func (windowsAdapter) Attach(command *exec.Cmd) (processGroup, error) {
 	group := &windowsProcessGroup{process: command}
 	job, err := windows.CreateJobObject(nil, nil)
 	if err != nil {
-		return group
+		return group, err
 	}
 	information := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
 	information.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
@@ -60,21 +61,63 @@ func (windowsAdapter) Attach(command *exec.Cmd) processGroup {
 		uint32(unsafe.Sizeof(information)),
 	); err != nil {
 		_ = windows.CloseHandle(job)
-		return group
+		return group, err
 	}
 	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(command.Process.Pid))
 	if err != nil {
 		_ = windows.CloseHandle(job)
-		return group
+		return group, err
 	}
 	err = windows.AssignProcessToJobObject(job, process)
 	_ = windows.CloseHandle(process)
 	if err != nil {
 		_ = windows.CloseHandle(job)
-		return group
+		return group, err
 	}
 	group.job = job
-	return group
+	// 子程序仍是 suspended，先納入 Job 才允許它執行與建立後代。
+	if err := resumeSuspendedProcess(uint32(command.Process.Pid)); err != nil {
+		return group, err
+	}
+	return group, nil
+}
+
+func resumeSuspendedProcess(processID uint32) error {
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPTHREAD, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(snapshot)
+	entry := windows.ThreadEntry32{Size: uint32(unsafe.Sizeof(windows.ThreadEntry32{}))}
+	var threadID uint32
+	for err = windows.Thread32First(snapshot, &entry); err == nil; err = windows.Thread32Next(snapshot, &entry) {
+		if entry.OwnerProcessID == processID {
+			if threadID != 0 {
+				return fmt.Errorf("suspended process unexpectedly has multiple threads")
+			}
+			threadID = entry.ThreadID
+		}
+		entry.Size = uint32(unsafe.Sizeof(entry))
+	}
+	if !errors.Is(err, windows.ERROR_NO_MORE_FILES) {
+		return err
+	}
+	if threadID == 0 {
+		return fmt.Errorf("suspended process thread not found")
+	}
+	thread, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME, false, threadID)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(thread)
+	previous, err := windows.ResumeThread(thread)
+	if err != nil {
+		return err
+	}
+	if previous != 1 {
+		return fmt.Errorf("unexpected initial suspend count: %d", previous)
+	}
+	return nil
 }
 
 func (g *windowsProcessGroup) Terminate() error {

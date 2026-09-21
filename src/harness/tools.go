@@ -234,6 +234,9 @@ func shouldEnableBuiltinFallback(call domain.ToolCall, result domain.ToolExecuti
 	if !strings.EqualFold(strings.TrimSpace(call.Name), systemShellToolName) || !result.IsError || result.Terminate {
 		return false
 	}
+	if state := domain.ToolExecutionState(result.Details); state == domain.ToolNotDispatched || state == domain.ToolOutcomeUnknown {
+		return false
+	}
 	for _, key := range []string{"approval_decision", "approval_interrupted", "refused", "loop_guard", "skipped"} {
 		if _, exists := result.Details[key]; exists {
 			return false
@@ -295,8 +298,41 @@ func (r *Runner) runToolGroup(ctx context.Context, session domain.Session, group
 // 工具失敗是要交回模型的觀察，不是 run 的失敗。
 //
 // 並行群組會同時呼叫這個方法，因此 BeforeTool 與 AfterTool hook 必須是併發安全的。
-func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, call domain.ToolCall, sink *serializedSink, runID string, available, approvalExempt bool, approvals *runApprovalState, loopGuard *toolLoopGuard, retriever *toolRetriever) toolOutcome {
+func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, call domain.ToolCall, sink *serializedSink, runID string, available, approvalExempt bool, approvals *runApprovalState, loopGuard *toolLoopGuard, retriever *toolRetriever) (outcome toolOutcome) {
 	startedAt := time.Now().UTC()
+	dispatched := false
+	// recover 必須位於執行工具的 goroutine；Run 外層無法攔截並行工具的 panic。
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			state := domain.ToolNotDispatched
+			content := "工具發生內部異常，本次未派送。"
+			if dispatched {
+				state = domain.ToolOutcomeUnknown
+				content = "工具派送後發生內部異常，執行結果未知；可能已產生副作用，請先唯讀查證，不得直接重送。"
+			}
+			result := domain.ToolExecution{
+				ToolCallID: call.ID, ToolName: call.Name, IsError: true, Content: content,
+				Details: map[string]any{"execution_state": state, "internal_error": true},
+			}
+			loopGuard.observe(call, result)
+			outcome = toolOutcome{call: call, result: result, startedAt: startedAt, duration: time.Since(startedAt)}
+			if r.Logger != nil {
+				// panic 的值可能含工具參數、輸出或憑證；僅記錄型別與操作識別。
+				r.Logger.Error("tool call panicked", "tool_name", call.Name, "tool_call_id", call.ID, "execution_state", state, "panic_type", fmt.Sprintf("%T", recovered))
+			}
+		}
+		if outcome.err != nil {
+			state := domain.ToolNotDispatched
+			if dispatched {
+				state = domain.ToolOutcomeUnknown
+			}
+			outcome.result = domain.ToolExecution{
+				ToolCallID: call.ID, ToolName: call.Name, IsError: true,
+				Content: outcome.err.Error(), Details: map[string]any{"execution_state": state},
+			}
+			outcome.duration = time.Since(startedAt)
+		}
+	}()
 	// find_tools 是 Harness 自己的工具目錄檢索，不下放到任何 Runtime，
 	// 也不需要核准：它只讀取本 run 已經取得的工具定義。
 	if retriever.enabled() && strings.EqualFold(strings.TrimSpace(call.Name), findToolsToolName) {
@@ -384,11 +420,13 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 		if err := r.Approvals.Begin(request); err != nil {
 			return toolOutcome{call: call, startedAt: startedAt, duration: time.Since(startedAt), err: err}
 		}
+		defer r.Approvals.Cancel(request.ID)
 		if err := sink.emitEvent("run.approval_required", map[string]any{"approval": request}); err != nil {
 			r.Approvals.Cancel(request.ID)
 			return toolOutcome{call: call, startedAt: startedAt, duration: time.Since(startedAt), err: err}
 		}
 		stopApprovalHeartbeat := startApprovalHeartbeat(ctx, sink, call, request)
+		defer stopApprovalHeartbeat()
 		decision, err := r.Approvals.Wait(ctx, request.ID)
 		stopApprovalHeartbeat()
 		if err != nil {
@@ -431,6 +469,7 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 				return toolOutcome{call: call, startedAt: startedAt, err: err}
 			}
 		}
+		dispatched = true
 		executed, err := r.Tools.Execute(ctx, session, call, func(update domain.ToolExecution) error {
 			return sink.emitEvent("tool.execution.update", map[string]any{
 				"tool_call_id": call.ID,
@@ -450,6 +489,10 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 		}
 		result = executed
 	}
+	executionState := domain.ToolExecutionState(result.Details)
+	if refused {
+		executionState = domain.ToolNotDispatched
+	}
 	if r.AfterTool != nil {
 		result = r.AfterTool(ctx, session, call, result)
 	}
@@ -457,6 +500,11 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	result.ToolName = call.Name
 	if result.Details == nil {
 		result.Details = map[string]any{}
+	}
+	// 展示／內容 hook 不得抹除未派送或未知的執行事實，造成授權繞過或自動重送。
+	if executionState == domain.ToolNotDispatched || executionState == domain.ToolOutcomeUnknown {
+		result.Details["execution_state"] = executionState
+		result.IsError = true
 	}
 	if unknownRetryApproved {
 		// 新呼叫成功也不抹除舊呼叫的未知紀錄，無法據此宣稱恰好執行一次。
@@ -517,7 +565,8 @@ func startApprovalHeartbeat(ctx context.Context, sink *serializedSink, call doma
 			}
 		}
 	}()
-	return func() { close(done) }
+	var stopOnce sync.Once
+	return func() { stopOnce.Do(func() { close(done) }) }
 }
 
 var hiddenApprovalArgumentNames = map[string]bool{

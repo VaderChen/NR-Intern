@@ -20,9 +20,21 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 	if modelName == "" {
 		modelName = m.defaultModel
 	}
+	// 設定重建／切換帳號或服務重啟後，不能把舊憑證範圍的加密狀態送給新實例。
+	request.History = append([]domain.Message(nil), request.History...)
+	for i := range request.History {
+		state := request.History[i].Continuation
+		if state != nil && (m.continuationScope == "" || state.Scope != m.continuationScope || state.Model != modelName || state.Protocol != "responses") {
+			request.History[i].Continuation = nil
+		}
+	}
 	payload, err := buildCodexRequest(request, modelName)
 	if err != nil {
 		return domain.ModelResponse{}, err
+	}
+	if m.authMode != "oauth" {
+		// 自訂端點的模型 ID 區分大小寫，不套用 Codex 帳號的正規化。
+		payload.Model = modelName
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -54,6 +66,10 @@ func (m *Model) streamCodex(ctx context.Context, request domain.ModelRequest, si
 		}
 		result, retryAfter, attemptErr := m.executeCodexAttempt(ctx, body, modelName, request.SessionID, inputShape, attemptSink)
 		if attemptErr == nil {
+			if result.Continuation != nil {
+				result.Continuation.Scope = m.continuationScope
+				result.Continuation.Model = modelName
+			}
 			return result, nil
 		}
 		lastErr = attemptErr
@@ -110,10 +126,12 @@ func (m *Model) executeCodexAttempt(ctx context.Context, body []byte, modelName,
 	httpRequest.Header.Set("Accept", "text/event-stream")
 	httpRequest.Header.Set("User-Agent", "NR-Intern/codex")
 	httpRequest.Header.Set("X-Client-Request-Id", clientRequestID)
-	httpRequest.Header.Set("OpenAI-Beta", "responses=experimental")
-	httpRequest.Header.Set("Originator", providerauth.DefaultOriginator)
-	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
-		httpRequest.Header.Set("session_id", sessionID)
+	if m.authMode == "oauth" {
+		httpRequest.Header.Set("OpenAI-Beta", "responses=experimental")
+		httpRequest.Header.Set("Originator", providerauth.DefaultOriginator)
+		if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
+			httpRequest.Header.Set("session_id", sessionID)
+		}
 	}
 	if err := m.applyAuthorization(ctx, httpRequest); err != nil {
 		return domain.ModelResponse{}, 0, &ProviderError{

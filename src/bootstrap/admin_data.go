@@ -24,6 +24,7 @@ var backupExcludedFiles = []string{
 }
 
 const maxRestoreExpandedBytes uint64 = 512 * 1024 * 1024
+const maxRestoreEntries = 100_000
 
 type backupManifest struct {
 	Version       int      `json:"version"`
@@ -61,24 +62,37 @@ func (r *Runtime) DiagnosticsExport(ctx context.Context) ([]byte, error) {
 }
 
 func (r *Runtime) Backup(ctx context.Context) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	r.configMu.RLock()
 	dataDir := r.Config.DataDir
 	r.configMu.RUnlock()
 	if strings.TrimSpace(dataDir) == "" {
 		return nil, fmt.Errorf("%w: data directory is unavailable", domain.ErrConflict)
 	}
+	if err := ensureSafeParents(dataDir, "entry"); err != nil {
+		return nil, err
+	}
 	var buffer bytes.Buffer
 	archive := zip.NewWriter(&buffer)
+	defer archive.Close()
+	budget := backupCopyBudget{ctx: ctx, remaining: int64(maxRestoreExpandedBytes)}
 	manifest := backupManifest{Version: 1, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Excluded: append([]string(nil), backupExcludedFiles...), RestartNeeded: true}
 	for _, name := range backupDirectories {
 		root := filepath.Join(dataDir, name)
-		if _, err := os.Stat(root); err != nil {
+		if info, err := os.Lstat(root); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
 			return nil, fmt.Errorf("inspect backup directory %q: %w", name, err)
+		} else if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("backup root %q must be a real directory", name)
 		}
 		if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if walkErr != nil {
 				return walkErr
 			}
@@ -93,11 +107,20 @@ func (r *Runtime) Backup(ctx context.Context) ([]byte, error) {
 				return err
 			}
 			nameInArchive := filepath.ToSlash(rel)
-			manifest.Included = append(manifest.Included, nameInArchive)
 			info, err := entry.Info()
 			if err != nil {
 				return err
 			}
+			if !info.IsDir() && !info.Mode().IsRegular() {
+				return fmt.Errorf("backup entry %q is not a regular file", nameInArchive)
+			}
+			if len(manifest.Included) >= maxRestoreEntries-1 {
+				return fmt.Errorf("%w: 備份項目總數超過還原上限（%d 項），已停止備份", domain.ErrConflict, maxRestoreEntries)
+			}
+			if !info.IsDir() && info.Size() > budget.remaining {
+				return backupSizeLimitError()
+			}
+			manifest.Included = append(manifest.Included, nameInArchive)
 			header, err := zip.FileInfoHeader(info)
 			if err != nil {
 				return err
@@ -115,13 +138,7 @@ func (r *Runtime) Backup(ctx context.Context) ([]byte, error) {
 			if entry.IsDir() {
 				return nil
 			}
-			file, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer file.Close()
-			_, err = io.Copy(writer, file)
-			return err
+			return budget.copyFile(writer, path, info)
 		}); err != nil {
 			_ = archive.Close()
 			return nil, fmt.Errorf("create backup: %w", err)
@@ -129,9 +146,15 @@ func (r *Runtime) Backup(ctx context.Context) ([]byte, error) {
 	}
 	// service-settings.json 不含密鑰，但仍列入 manifest，方便還原時知道設定來源。
 	settingsPath := filepath.Join(dataDir, "service-settings.json")
-	if info, err := os.Stat(settingsPath); err == nil && !info.Mode().IsRegular() {
+	if info, err := os.Lstat(settingsPath); err == nil && !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("service settings is not a regular file")
 	} else if err == nil {
+		if len(manifest.Included) >= maxRestoreEntries-1 {
+			return nil, fmt.Errorf("%w: 備份項目總數超過還原上限（%d 項），已停止備份", domain.ErrConflict, maxRestoreEntries)
+		}
+		if info.Size() > budget.remaining {
+			return nil, backupSizeLimitError()
+		}
 		manifest.Included = append(manifest.Included, "service-settings.json")
 		header := &zip.FileHeader{Name: "service-settings.json", Method: zip.Deflate}
 		header.SetMode(0o600)
@@ -140,17 +163,14 @@ func (r *Runtime) Backup(ctx context.Context) ([]byte, error) {
 			_ = archive.Close()
 			return nil, err
 		}
-		file, err := os.Open(settingsPath)
-		if err != nil {
-			_ = archive.Close()
+		if err := budget.copyFile(writer, settingsPath, info); err != nil {
 			return nil, err
 		}
-		_, copyErr := io.Copy(writer, file)
-		_ = file.Close()
-		if copyErr != nil {
-			_ = archive.Close()
-			return nil, copyErr
-		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	manifestData, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -171,31 +191,19 @@ func (r *Runtime) Backup(ctx context.Context) ([]byte, error) {
 	if err := archive.Close(); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return buffer.Bytes(), nil
 }
 
-func (r *Runtime) Restore(ctx context.Context, data []byte) (domain.RestoreResult, error) {
+// extractRestoreArchive 僅能寫入新建的 staging 目錄，不能直接覆寫運行中的資料。
+func extractRestoreArchive(ctx context.Context, data []byte, dataDir string) (domain.RestoreResult, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.RestoreResult{}, err
 	}
 	if len(data) == 0 {
 		return domain.RestoreResult{}, fmt.Errorf("%w: backup is empty", domain.ErrInvalidInput)
-	}
-	// 保留目前資料的可復原快照；Backup 本身不會包含 credentials。
-	backup, err := r.Backup(ctx)
-	if err != nil {
-		return domain.RestoreResult{}, err
-	}
-	r.configMu.RLock()
-	dataDir := r.Config.DataDir
-	r.configMu.RUnlock()
-	backupDir := filepath.Join(dataDir, "backups")
-	if err := os.MkdirAll(backupDir, 0o700); err != nil {
-		return domain.RestoreResult{}, err
-	}
-	backupPath := filepath.Join(backupDir, "pre-restore-"+time.Now().UTC().Format("20060102-150405")+".zip")
-	if err := os.WriteFile(backupPath, backup, 0o600); err != nil {
-		return domain.RestoreResult{}, fmt.Errorf("save pre-restore backup: %w", err)
 	}
 	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
@@ -207,7 +215,14 @@ func (r *Runtime) Restore(ctx context.Context, data []byte) (domain.RestoreResul
 	}
 	result := domain.RestoreResult{RestartRequired: true, Excluded: append([]string(nil), backupExcludedFiles...)}
 	var expandedBytes uint64
+	seen := map[string]bool{}
+	if len(reader.File) > maxRestoreEntries {
+		return domain.RestoreResult{}, fmt.Errorf("%w: too many archive entries", domain.ErrInvalidInput)
+	}
 	for _, file := range reader.File {
+		if err := ctx.Err(); err != nil {
+			return domain.RestoreResult{}, err
+		}
 		name, err := safeArchiveName(file.Name)
 		if err != nil {
 			return domain.RestoreResult{}, err
@@ -215,9 +230,17 @@ func (r *Runtime) Restore(ctx context.Context, data []byte) (domain.RestoreResul
 		if name == "manifest.json" {
 			continue
 		}
+		if seen[name] {
+			return domain.RestoreResult{}, fmt.Errorf("%w: duplicate archive entry %q", domain.ErrInvalidInput, name)
+		}
+		seen[name] = true
 		top := strings.SplitN(name, "/", 2)[0]
 		if !allowed[top] {
 			return domain.RestoreResult{}, fmt.Errorf("%w: archive entry %q is not restorable", domain.ErrInvalidInput, name)
+		}
+		if (top == serviceSettingsFilename && (name != top || file.FileInfo().IsDir())) ||
+			(top != serviceSettingsFilename && name == top && !file.FileInfo().IsDir()) {
+			return domain.RestoreResult{}, fmt.Errorf("%w: invalid archive root type %q", domain.ErrInvalidInput, name)
 		}
 		if file.Mode()&os.ModeSymlink != 0 {
 			return domain.RestoreResult{}, fmt.Errorf("%w: symlink entry %q is not allowed", domain.ErrInvalidInput, name)
@@ -240,6 +263,7 @@ func (r *Runtime) Restore(ctx context.Context, data []byte) (domain.RestoreResul
 			if err := os.MkdirAll(target, 0o700); err != nil {
 				return domain.RestoreResult{}, err
 			}
+			result.Restored = append(result.Restored, name)
 			continue
 		}
 		if err := ensureSafeParents(dataDir, name); err != nil {
@@ -255,14 +279,21 @@ func (r *Runtime) Restore(ctx context.Context, data []byte) (domain.RestoreResul
 		if err != nil {
 			return domain.RestoreResult{}, err
 		}
-		tmp := target + ".restore-tmp"
-		if err := ensureSafeTarget(tmp, false); err != nil {
+		destination, err := os.CreateTemp(filepath.Dir(target), ".restore-file-")
+		if err != nil {
 			_ = source.Close()
 			return domain.RestoreResult{}, err
 		}
-		destination, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		tmp := destination.Name()
 		if err == nil {
-			_, err = io.Copy(destination, source)
+			var copied int64
+			copied, err = io.Copy(destination, io.LimitReader(source, int64(file.UncompressedSize64)+1))
+			if err == nil && uint64(copied) != file.UncompressedSize64 {
+				err = fmt.Errorf("archive entry size mismatch")
+			}
+			if err == nil {
+				err = destination.Sync()
+			}
 			closeErr := destination.Close()
 			if err == nil {
 				err = closeErr

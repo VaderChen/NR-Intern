@@ -180,6 +180,9 @@ func (s *Service) advancePlanLoop(runID string) {
 			reason := "這一次的 Run 未正常結束（" + string(run.Status) + "）"
 			return domain.InterruptPlanLoop(current, domain.PlanLoopStopRunFailed, reason, "", s.now())
 		}
+		if run.Result != nil && run.Result.Message.StopReason == "refusal" {
+			return domain.InterruptPlanLoop(current, domain.PlanLoopStopRunFailed, "上游模型拒絕此要求；保留未完成步驟，等待使用者調整。", "", s.now())
+		}
 		progressed := domain.PlanStepFingerprint(current) != current.Loop.RoundFingerprint
 		evaluated, decision := domain.EvaluatePlanLoopAfterRound(current, progressed, s.now())
 		continueLoop = decision.Continue

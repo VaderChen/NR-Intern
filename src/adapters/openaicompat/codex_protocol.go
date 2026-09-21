@@ -26,6 +26,7 @@ type codexRequest struct {
 }
 
 type codexInputItem struct {
+	Raw       json.RawMessage    `json:"-"`
 	Type      string             `json:"type"`
 	Role      string             `json:"role,omitempty"`
 	Content   []codexContentPart `json:"content,omitempty"`
@@ -44,8 +45,17 @@ type codexInputItem struct {
 }
 
 type codexContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	Refusal string `json:"refusal,omitempty"`
+}
+
+func (item codexInputItem) MarshalJSON() ([]byte, error) {
+	if len(item.Raw) > 0 {
+		return item.Raw, nil
+	}
+	type plain codexInputItem
+	return json.Marshal(plain(item))
 }
 
 type codexTool struct {
@@ -169,6 +179,13 @@ func codexInput(request domain.ModelRequest) []codexInputItem {
 		case "user":
 			appendMessage("user", message.Content)
 		case "assistant":
+			if state := message.Continuation; state != nil && state.Protocol == "responses" {
+				for _, raw := range state.Items {
+					if validCodexReasoning(raw) {
+						items = append(items, codexInputItem{Type: "reasoning", Raw: append(json.RawMessage(nil), raw...)})
+					}
+				}
+			}
 			appendMessage("assistant", message.Content)
 			for index, call := range message.ToolCalls {
 				name := strings.TrimSpace(call.Name)

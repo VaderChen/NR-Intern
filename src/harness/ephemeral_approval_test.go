@@ -40,6 +40,8 @@ func runShellOnce(t *testing.T, session domain.Session) (asked bool, skipReason 
 		switch event.Type {
 		case "run.approval_required":
 			asked = true
+			request := event.Payload["approval"].(domain.ToolApprovalRequest)
+			return runner.Approvals.Decide(request.RunID, domain.ToolApprovalDecisionInput{ApprovalID: request.ID, Decision: domain.ToolApprovalApprove})
 		case "run.approval_skipped":
 			skipReason, _ = event.Payload["reason"].(string)
 		}
@@ -48,18 +50,51 @@ func runShellOnce(t *testing.T, session domain.Session) (asked bool, skipReason 
 	return asked, skipReason, err
 }
 
-// 記憶體隔離專案的工作區是揮發性 RAM Disk，關閉程式即消失。逐次詢問只會把使用者
-// 訓練成無條件按下核准，反而讓真正有副作用的操作更容易被順手放行。
-func TestEphemeralProjectSkipsToolApproval(t *testing.T) {
-	asked, reason, err := runShellOnce(t, ephemeralSession())
+// Shell 能操作工作區外的系統或網路，RAM 儲存不構成免核准的安全邊界。
+func TestEphemeralProjectShellStillRequiresApproval(t *testing.T) {
+	session := ephemeralSession()
+	session.Metadata["sandbox_roots"] = []string{t.TempDir()}
+	asked, reason, err := runShellOnce(t, session)
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	if asked {
-		t.Fatal("記憶體隔離專案不應跳出人工核准")
+	if !asked {
+		t.Fatal("記憶體隔離專案的 Shell 仍須人工核准")
 	}
-	if reason != "ephemeral_project" {
-		t.Fatalf("skip reason = %q, want ephemeral_project；沒有原因就看不出這次為什麼沒問", reason)
+	if reason != "" {
+		t.Fatalf("Shell 不應記錄核准豁免：%q", reason)
+	}
+}
+
+func TestEphemeralApprovalRequiresContainedToolAndSingleRootSmoke(t *testing.T) {
+	definitions := []domain.ToolDefinition{
+		{Name: "file_write", Capabilities: []string{"workspace-contained"}},
+		{Name: "shell_exec"}, {Name: "ssh_exec"}, {Name: "mcp__remote"},
+		{Name: "file_read", ReadOnly: true},
+	}
+	for _, tc := range []struct {
+		name   string
+		roots  any
+		exempt bool
+	}{
+		{"single", []string{"synthetic-workspace"}, true},
+		{"decoded-single", []any{"synthetic-workspace"}, true},
+		{"additional-persistent", []string{"synthetic-workspace", "synthetic-persistent"}, false},
+		{"missing", nil, false}, {"empty", []string{""}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := ephemeralSession()
+			session.Metadata["sandbox_roots"] = tc.roots
+			exempt := approvalExemptToolNames(definitions, session)
+			if exempt["file_write"] != tc.exempt || !exempt["file_read"] {
+				t.Fatalf("豁免範圍不符：%v", exempt)
+			}
+			for _, name := range []string{"shell_exec", "ssh_exec", "mcp__remote"} {
+				if exempt[name] {
+					t.Fatalf("外部副作用被豁免：%s", name)
+				}
+			}
+		})
 	}
 }
 

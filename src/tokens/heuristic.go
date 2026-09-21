@@ -82,6 +82,8 @@ func (c *HeuristicCounter) EstimateMessages(messages []domain.Message) int {
 	for _, message := range messages {
 		total += float64(config.MessageOverhead)
 		total += config.weight(message.Content)
+		// 不透明加密狀態仍有傳輸／上下文成本，不能繞過長任務壓縮預算。
+		total += float64(message.Continuation.Bytes()) / 4
 		total += config.weight(message.Role)
 		total += config.weight(message.ToolName)
 		for _, call := range message.ToolCalls {

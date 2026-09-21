@@ -659,6 +659,9 @@ summary { cursor: pointer; color: var(--muted); }
 .switch-label input:focus-visible + .switch-track { box-shadow: 0 0 0 3px var(--focus-ring); }
 .switch-label input:disabled + .switch-track { opacity: .5; }
 .switch-label.switch-disabled { cursor: not-allowed; }
+.provider-endpoint-control { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.provider-endpoint-control > input { flex: 1 1 240px; min-width: 0; }
+.provider-endpoint-control > .switch-label { display: inline-flex; flex: 0 0 auto; white-space: nowrap; margin: 0; }
 /* 開關一律是那一列最右邊的元素。這兩個標題列的 DOM 是「軌道在前、文字在後」，
    用 order 調整視覺順序即可，不必改標記，點擊與朗讀順序都不變。 */
 .switch-label.switch-trailing .switch-track { order: 2; }
@@ -992,6 +995,9 @@ button.ghost.folder-picker:hover:not(:disabled) { border-color: var(--line-stron
 .plan-step-edit-fields input:last-child { color: var(--muted); }
 .plan-step-remove { width: 32px; height: 32px; padding: 0; border-color: transparent; background: transparent; color: var(--danger); }
 .confirmation-dialog { width: min(430px, calc(100% - 32px)); }
+#providerAccountDialog { width: min(640px, calc(100% - 32px)); }
+#providerAccountList { background-image: none; padding: 6px; }
+#providerAccountList option { padding: 7px; }
 .confirmation-dialog p { margin: 14px 0 4px; color: var(--muted); line-height: 1.6; white-space: pre-line; }
 .image-editor-dialog { width: min(1120px, calc(100% - 28px)); height: min(820px, calc(100vh - 28px)); max-width: none; max-height: none; padding: 18px; overflow: hidden; }
 .image-editor-dialog[open] { display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; gap: 12px; }

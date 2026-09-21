@@ -120,6 +120,9 @@ func (r *Registry) Definitions(_ context.Context, session domain.Session) ([]dom
 }
 
 func (r *Registry) Execute(ctx context.Context, session domain.Session, call domain.ToolCall, sink ports.ToolUpdateSink) (domain.ToolExecution, error) {
+	if err := ctx.Err(); err != nil {
+		return failedExecution(call, "工具未派送：操作已取消或逾時。"), err
+	}
 	name := strings.TrimSpace(call.Name)
 	if name == "" {
 		return failedExecution(call, "native tool name is required"), nil
@@ -155,6 +158,9 @@ func (r *Registry) Execute(ctx context.Context, session domain.Session, call dom
 	workspaceRoots := workspaceRootsFromSession(session)
 	if len(workspaceRoots) == 0 {
 		return failedExecution(call, "session workspace is unavailable"), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return failedExecution(call, "工具未派送：操作已取消或逾時。"), err
 	}
 	result, err := value.Execute(ctx, Invocation{
 		Session:        session,
@@ -335,6 +341,7 @@ func failedExecution(call domain.ToolCall, message string) domain.ToolExecution 
 		ToolName:   call.Name,
 		Content:    message,
 		IsError:    true,
+		Details:    map[string]any{"execution_state": domain.ToolNotDispatched},
 	}
 }
 

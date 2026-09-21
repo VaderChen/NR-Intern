@@ -19,7 +19,7 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 	if m == nil || m.client == nil {
 		return domain.ModelResponse{}, fmt.Errorf("OpenAI-compatible model is unavailable")
 	}
-	if m.authMode == "oauth" {
+	if m.useResponses {
 		return m.streamCodex(ctx, request, sink)
 	}
 	modelName := strings.TrimSpace(request.Model)

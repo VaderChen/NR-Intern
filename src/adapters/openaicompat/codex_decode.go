@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -38,6 +39,9 @@ type codexStreamState struct {
 	arguments       map[string]string
 	metadataEmitted map[string]bool
 	hasToolCalls    bool
+	refused         bool
+	refusalParts    map[string]string
+	reasoningItems  map[int]json.RawMessage
 }
 
 func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequestID string, sink ports.ModelEventSink) (domain.ModelResponse, error) {
@@ -47,6 +51,8 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		indexes:         map[string]int{},
 		arguments:       map[string]string{},
 		metadataEmitted: map[string]bool{},
+		reasoningItems:  map[int]json.RawMessage{},
+		refusalParts:    map[string]string{},
 	}
 	var content strings.Builder
 	var reasoning strings.Builder
@@ -56,7 +62,7 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 	eventName := ""
 	sawEvent := false
 	sawTerminal := false
-	responseID, responseModel := "", ""
+	var proxy proxyTerminalState
 
 	consume := func(name, data string) error {
 		data = strings.TrimSpace(data)
@@ -64,8 +70,10 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 			return nil
 		}
 		if data == "[DONE]" {
-			sawTerminal = true
-			return nil
+			if err := proxy.failure(requestID, clientRequestID); err != nil {
+				return err
+			}
+			return &ProviderError{Operation: "Codex stream read", Message: "stream ended before response.completed", RequestID: requestID, ClientRequestID: clientRequestID, Retryable: true}
 		}
 		var event map[string]any
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
@@ -73,25 +81,56 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		}
 		sawEvent = true
 		eventType := firstText(stringValue(event["type"]), name)
+		if response, ok := event["response"].(map[string]any); ok {
+			proxy.observe(stringValue(response["model"]), stringValue(response["id"]))
+		} else {
+			proxy.observe("", stringValue(event["response_id"]))
+		}
+		if proxy.active {
+			switch eventType {
+			case "response.output_text.delta", "response.refusal.delta":
+				proxy.add(stringValue(event["delta"]))
+				return nil
+			case "response.completed", "response.failed", "response.incomplete", "error":
+				// 在終態取得完整原因後才分類，不因首段只有警告標題而漏掉過載。
+			default:
+				return nil
+			}
+		}
 		switch eventType {
 		case "response.created":
-			response, _ := event["response"].(map[string]any)
-			responseID = stringValue(response["id"])
-			responseModel = stringValue(response["model"])
 			return nil
 		case "response.output_text.delta":
 			delta := stringValue(event["delta"])
-			if err := proxyTerminalError(responseModel, responseID, delta, requestID, clientRequestID); err != nil {
-				return err
-			}
 			content.WriteString(delta)
 			return emitModelDelta(sink, domain.ModelEventTextDelta, delta)
 		case "response.reasoning_text.delta", "response.reasoning_summary_text.delta":
 			delta := stringValue(event["delta"])
 			reasoning.WriteString(delta)
 			return emitModelDelta(sink, domain.ModelEventThinkingDelta, delta)
+		case "response.refusal.delta":
+			state.refused = true
+			delta := stringValue(event["delta"])
+			key := codexContentKey(event)
+			state.refusalParts[key] += delta
+			content.WriteString(delta)
+			return emitModelDelta(sink, domain.ModelEventTextDelta, delta)
+		case "response.refusal.done":
+			state.refused = true
+			complete := stringValue(event["refusal"])
+			key := codexContentKey(event)
+			if strings.HasPrefix(complete, state.refusalParts[key]) {
+				delta := strings.TrimPrefix(complete, state.refusalParts[key])
+				state.refusalParts[key] = complete
+				content.WriteString(delta)
+				return emitModelDelta(sink, domain.ModelEventTextDelta, delta)
+			}
+			return nil
 		case "response.output_item.added", "response.output_item.done":
 			item, _ := event["item"].(map[string]any)
+			if eventType == "response.output_item.done" {
+				captureCodexReasoning(&state, intValue(event["output_index"]), item)
+			}
 			if !strings.EqualFold(strings.TrimSpace(stringValue(item["type"])), "function_call") {
 				return nil
 			}
@@ -101,7 +140,17 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		case "response.function_call_arguments.done":
 			return consumeCodexArgumentDone(event, &state, sink)
 		case "response.completed":
+			if _, ok := event["response"].(map[string]any); !ok {
+				return &ProviderError{Operation: "Codex stream decode", Message: "response.completed is missing its response object", RequestID: requestID, ClientRequestID: clientRequestID}
+			}
 			if raw := event["response"]; raw != nil {
+				if response, ok := raw.(map[string]any); ok {
+					if outputs, ok := response["output"].([]any); ok {
+						for index, item := range outputs {
+							captureCodexReasoning(&state, index, item)
+						}
+					}
+				}
 				encoded, _ := json.Marshal(raw)
 				var completed codexCompletedResponse
 				if err := json.Unmarshal(encoded, &completed); err != nil {
@@ -110,12 +159,18 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 				if completed.Model != "" {
 					result.Model = completed.Model
 				}
-				for _, item := range completed.Output {
-					for _, part := range item.Content {
-						if err := proxyTerminalError(completed.Model, completed.ID, part.Text, requestID, clientRequestID); err != nil {
-							return err
+				if proxy.active {
+					var complete strings.Builder
+					for _, item := range completed.Output {
+						for _, part := range item.Content {
+							complete.WriteString(firstRawText(part.Text, part.Refusal))
 						}
 					}
+					if complete.Len() > 0 {
+						proxy.message.Reset()
+						proxy.add(complete.String())
+					}
+					return proxy.failure(requestID, clientRequestID)
 				}
 				if err := consumeCodexCompleted(completed, &content, &state, sink); err != nil {
 					return err
@@ -181,6 +236,9 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 	if err := flush(); err != nil {
 		return domain.ModelResponse{}, err
 	}
+	if err := proxy.failure(requestID, clientRequestID); err != nil {
+		return domain.ModelResponse{}, err
+	}
 	if !sawEvent {
 		return domain.ModelResponse{}, &ProviderError{Operation: "Codex stream read", Message: "stream ended without a Responses event", RequestID: requestID, ClientRequestID: clientRequestID, Retryable: true}
 	}
@@ -188,7 +246,25 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		return domain.ModelResponse{}, &ProviderError{Operation: "Codex stream read", Message: "stream ended before response.completed", RequestID: requestID, ClientRequestID: clientRequestID, Retryable: true}
 	}
 	result.Content = strings.TrimSpace(content.String())
+	if state.refused && result.Content == "" {
+		result.Content = "上游模型拒絕此要求，未提供進一步原因。"
+	}
 	result.Reasoning = strings.TrimSpace(reasoning.String())
+	if len(state.reasoningItems) > 0 {
+		indexes := make([]int, 0, len(state.reasoningItems))
+		for index := range state.reasoningItems {
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		result.Continuation = &domain.ModelContinuation{Protocol: "responses"}
+		for _, index := range indexes {
+			result.Continuation.Items = append(result.Continuation.Items, state.reasoningItems[index])
+		}
+	}
+	if state.refused {
+		result.StopReason = "refusal"
+		return result, nil // 拒答時不解析或派送伴隨的工具呼叫，也不觸發協定修復重試。
+	}
 	calls, err := finalizeCalls(state.partials)
 	if err != nil {
 		return domain.ModelResponse{}, err
@@ -200,6 +276,10 @@ func decodeCodexStream(reader io.Reader, fallbackModel, requestID, clientRequest
 		result.StopReason = "stop"
 	}
 	return result, nil
+}
+
+func codexContentKey(event map[string]any) string {
+	return fmt.Sprintf("%d:%d", intValue(event["output_index"]), intValue(event["content_index"]))
 }
 
 func consumeCodexFunctionItem(event, item map[string]any, state *codexStreamState, sink ports.ModelEventSink) error {
@@ -276,6 +356,9 @@ func consumeCodexCompleted(completed codexCompletedResponse, content *strings.Bu
 			for _, part := range output.Content {
 				if part.Type == "output_text" {
 					completedText.WriteString(part.Text)
+				} else if part.Type == "refusal" {
+					state.refused = true
+					completedText.WriteString(part.Refusal)
 				}
 			}
 		case "function_call":

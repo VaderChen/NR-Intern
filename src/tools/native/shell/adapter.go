@@ -13,6 +13,6 @@ type processGroup interface {
 type platformAdapter interface {
 	ShellCommand(string, string) (*exec.Cmd, error)
 	Prepare(*exec.Cmd)
-	Attach(*exec.Cmd) processGroup
+	Attach(*exec.Cmd) (processGroup, error)
 	DefaultShell() string
 }

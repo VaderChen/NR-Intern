@@ -64,6 +64,7 @@ type PlanStep struct {
 	CompletedAt           *time.Time     `json:"completed_at,omitempty"`
 	VerificationStartedAt *time.Time     `json:"verification_started_at,omitempty"`
 	VerifiedEvidence      []PlanEvidence `json:"verified_evidence,omitempty"`
+	AcceptanceType        string         `json:"acceptance_type,omitempty"`
 }
 
 // PlanEvidence 由後端查閱實際工具結果建立，不接受模型直接宣告。
@@ -91,6 +92,7 @@ type UpdatePlanStepInput struct {
 	Status           PlanStepStatus `json:"status"`
 	Evidence         string         `json:"evidence,omitempty"`
 	VerifiedEvidence []PlanEvidence `json:"-"`
+	UserConfirmation string         `json:"user_confirmation,omitempty"`
 }
 
 type ReorderPlansInput struct {
@@ -155,6 +157,7 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 	}
 	stepID = strings.TrimSpace(stepID)
 	input.Evidence = strings.TrimSpace(input.Evidence)
+	input.UserConfirmation = strings.TrimSpace(input.UserConfirmation)
 	index := -1
 	for stepIndex := range plan.Steps {
 		if plan.Steps[stepIndex].ID == stepID {
@@ -176,7 +179,7 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 	switch input.Status {
 	case PlanStepStatusInProgress:
 		if step.Status != PlanStepStatusPending && step.Status != PlanStepStatusBlocked {
-			return Plan{}, invalidPlanTransition(step.Status, input.Status)
+			return Plan{}, fmt.Errorf("%w: step %q is %s; legal next status is %s", ErrConflict, step.ID, step.Status, nextPlanStepStatus(step.Status))
 		}
 		if step.StartedAt == nil {
 			step.StartedAt = timePointer(now)
@@ -187,7 +190,7 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 		step.CompletedAt = nil
 	case PlanStepStatusVerifying:
 		if step.Status != PlanStepStatusInProgress {
-			return Plan{}, invalidPlanTransition(step.Status, input.Status)
+			return Plan{}, fmt.Errorf("%w: step %q is %s; legal next status is %s", ErrConflict, step.ID, step.Status, nextPlanStepStatus(step.Status))
 		}
 		step.VerificationStartedAt = timePointer(now)
 	case PlanStepStatusCompleted:
@@ -197,8 +200,19 @@ func TransitionPlanStep(plan Plan, stepID string, input UpdatePlanStepInput, now
 		if input.Evidence == "" {
 			return Plan{}, fmt.Errorf("%w: completing a plan step requires verification evidence", ErrInvalidInput)
 		}
-		if step.VerificationStartedAt == nil || len(input.VerifiedEvidence) == 0 {
-			return Plan{}, fmt.Errorf("%w: 完成步驟必須引用驗證階段之後的成功工具結果", ErrInvalidInput)
+		if input.UserConfirmation != "" {
+			step.AcceptanceType = "user_confirmation"
+			step.VerifiedEvidence = nil
+		} else if len(input.VerifiedEvidence) > 0 {
+			if step.VerificationStartedAt == nil {
+				return Plan{}, fmt.Errorf("%w: 工具驗證證據必須在 verifying 階段之後產生", ErrInvalidInput)
+			}
+			step.AcceptanceType = "tool_evidence"
+		} else {
+			// 在 Agent 與 USER 誠實合作的前提下，Agent 自身的確認也是有效驗收；
+			// evidence 保留為可稽核的簡短說明，但不強迫特定格式。
+			step.AcceptanceType = "agent_confirmation"
+			step.VerifiedEvidence = nil
 		}
 		for _, proof := range input.VerifiedEvidence {
 			if proof.ToolCallID == "" || proof.ToolName == "" || len(proof.ResultSHA256) != 64 || proof.ObservedAt.Before(*step.VerificationStartedAt) {
@@ -334,4 +348,17 @@ func planStepNextMove(from PlanStepStatus) string {
 func timePointer(value time.Time) *time.Time {
 	copy := value
 	return &copy
+}
+
+func nextPlanStepStatus(status PlanStepStatus) PlanStepStatus {
+	switch status {
+	case PlanStepStatusPending, PlanStepStatusBlocked:
+		return PlanStepStatusInProgress
+	case PlanStepStatusInProgress:
+		return PlanStepStatusVerifying
+	case PlanStepStatusVerifying:
+		return PlanStepStatusCompleted
+	default:
+		return ""
+	}
 }

@@ -174,6 +174,7 @@ const reverseProxyRefreshIntervalMilliseconds = 3_000;
 const memoStorageKey = "nrIntern.memo.v1";
 const memoSaveDelayMilliseconds = 250;
 let memoSaveTimer = 0;
+let memoNeedsSave = false;
 const imageEditorState = {
   image: null,
   operations: [],
@@ -2222,8 +2223,10 @@ function saveMemo() {
   clearTimeout(memoSaveTimer);
   memoSaveTimer = 0;
   const status = $("memoSaveState");
+  memoNeedsSave = true;
   try {
     localStorage.setItem(memoStorageKey, $("memoText").value);
+    memoNeedsSave = false;
     status.textContent = translate("已儲存");
     status.classList.remove("error");
   } catch (_) {
@@ -2231,9 +2234,11 @@ function saveMemo() {
     status.classList.add("error");
   }
   updateMemoActions();
+  return !memoNeedsSave;
 }
 
 function scheduleMemoSave() {
+  memoNeedsSave = true;
   clearTimeout(memoSaveTimer);
   $("memoSaveState").textContent = translate("儲存中…");
   $("memoSaveState").classList.remove("error");
@@ -2244,9 +2249,11 @@ function scheduleMemoSave() {
 function openMemo() {
   closeProviderUsagePopover();
   const editor = $("memoText");
-  editor.value = readMemo();
-  $("memoSaveState").textContent = translate("自動儲存在本機");
-  $("memoSaveState").classList.remove("error");
+  if (!memoNeedsSave) {
+    editor.value = readMemo();
+    $("memoSaveState").textContent = translate("自動儲存在本機");
+    $("memoSaveState").classList.remove("error");
+  }
   updateMemoActions();
   $("memoDialog").showModal();
   requestAnimationFrame(() => {
@@ -2256,7 +2263,7 @@ function openMemo() {
 }
 
 function closeMemo() {
-  if (memoSaveTimer) saveMemo();
+  if (memoNeedsSave) saveMemo();
   $("memoDialog").close();
 }
 
@@ -2264,8 +2271,7 @@ async function clearMemo() {
   if (!$("memoText").value) return;
   if (!(await confirmAction(translate("確定清除所有記事內容嗎？")))) return;
   $("memoText").value = "";
-  saveMemo();
-  toast(translate("記事已清除"));
+  if (saveMemo()) toast(translate("記事已清除"));
   $("memoText").focus();
 }
 
@@ -2810,6 +2816,8 @@ function attachExistingRun(run) {
 }
 
 async function finishActiveRun(runState) {
+  // 傳輸結束不代表任務終態；保留取消／審核入口，也不能放行下一筆佇列。
+  if (runState && !runState.terminal && runState.runId) return;
   if (!removeActiveRun(runState)) return;
   runState.eventController?.abort();
   // 連線中斷等情況不會送出 run.completed／run.failed，這裡用 console 自己的
@@ -5198,7 +5206,7 @@ async function runWithReconnect(task) {
   if (!runState) throw new Error("找不到此 Session 的執行狀態");
   const progress = { runId: task.runId || "", lastSequence: Number(task.lastSequence || 0), terminal: false };
   let reconnects = 0;
-  while (!progress.terminal && !runState.terminal) {
+  while (!progress.terminal && !runState.terminal && activeRunFor(sessionID) === runState) {
     try {
       const response = await openRunStream(task, progress);
       progress.runId = response.headers.get("X-Run-ID") || progress.runId;
@@ -5207,6 +5215,7 @@ async function runWithReconnect(task) {
       runState.runDraft.operationId = progress.runId;
       if (typeof task.onRunIdentified === "function") await task.onRunIdentified(progress.runId, progress.lastSequence);
       if (!runState.status) runState.status = "running";
+      runState.connectionLost = false;
       syncRunStateAliases();
       syncRunActionButton();
 		  setRunActivity("", sessionID);
@@ -5222,12 +5231,34 @@ async function runWithReconnect(task) {
       throw new Error("事件連線提前結束");
     } catch (error) {
       if (progress.terminal || runState.terminal || error.name === "AbortError") return;
-      if (reconnects >= 3) throw new Error(`重連 3 次仍失敗，連線已中斷：${error.message}`);
+      // 尚未建立 Run 的明確拒絕可以結束；已建立的 Run 必須向後端確認終態。
+      if (!progress.runId && error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status)) throw error;
+      runState.connectionLost = true;
+      if (progress.runId) {
+        try {
+          const run = await request(`/api/v1/runs/${encodeURIComponent(progress.runId)}`, { reconnects: 0 });
+          if (["completed", "failed", "canceled"].includes(run.status)) {
+            handleTerminalRun(run, sessionID);
+            return;
+          }
+          runState.status = run.status || runState.status;
+          if (run.pending_approval) showApproval(run.pending_approval, sessionID);
+        } catch (_) { /* 狀態仍未知，保留 Run 並持續退避重連。 */ }
+      }
       reconnects += 1;
-      setRunActivity(`連線中斷，正在重連並補回事件（${reconnects}/3）`, sessionID);
-      await delay(400 * (2 ** (reconnects - 1)));
+      setRunActivity(`連線中斷，後端狀態尚未確認；正在重連並補回事件（${reconnects}）`, sessionID);
+      await waitForRunReconnect(Math.min(30_000, 400 * (2 ** Math.min(reconnects - 1, 7))), runState.eventController?.signal);
     }
   }
+}
+
+function waitForRunReconnect(milliseconds, signal) {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => { clearTimeout(timer); signal?.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, milliseconds);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 }
 
 async function openRunStream(task, progress) {
@@ -5248,7 +5279,7 @@ async function openRunStream(task, progress) {
   if (!response.ok) {
     let detail = response.statusText;
     try { detail = (await response.json()).detail || detail; } catch (_) {}
-    throw new Error(detail);
+    throw Object.assign(new Error(detail), { status: response.status });
   }
   return response;
 }
@@ -5699,16 +5730,8 @@ async function cancelCurrentRun() {
     if (canceledRun?.status && ["completed", "failed", "canceled"].includes(canceledRun.status)) {
       handleTerminalRun(canceledRun, sessionID);
     } else {
-      // 舊版或反向代理可能只回覆「已接受」而沒有帶回完整 Run；取消要求
-      // 已送達時仍須停止本地串流，避免 UI 一直顯示執行中。
-      markRunTerminal(runState, "canceled");
-      setContextCompactionState(sessionID, false);
-      if (state.session?.id === sessionID) {
-        setAgentProcessing(runState.liveMessage, false);
-        appendRunOutcome({ id: runState.runId, status: "canceled" });
-      }
-      syncRunStateAliases();
-      syncSelectedRunUI();
+      setRunActivity("取消要求已送出，等待後端確認終態…", sessionID);
+      return;
     }
     runState.eventController?.abort();
     await finishActiveRun(runState);
@@ -7333,15 +7356,15 @@ async function checkForUpdates() {
 }
 
 async function restoreAdminBackup(file) {
-  if (!file || !(await confirmAction("確定還原備份嗎？目前資料會先保留一份備份，還原後必須重新啟動後端。"))) return;
+  if (!file || !(await confirmAction("確定準備還原備份嗎？檔案驗證後暫存，重新啟動後端時才會備份目前資料並套用。請先完成或取消執行中的任務；重新啟動前新增的資料也會被還原快照取代。"))) return;
   const form = new FormData(); form.append("file", file);
   try {
     $("adminDataState").textContent = "還原中…";
     const response = await fetch("/backend/api/v1/admin/restore", { method: "POST", body: form });
     const body = await response.json();
     if (!response.ok) throw new Error(body.detail || response.statusText);
-    $("adminDataState").textContent = "還原完成，請重新啟動後端";
-    toast("備份已還原；請重新啟動後端套用資料");
+    $("adminDataState").textContent = "備份已驗證並暫存，重新啟動後端時套用";
+    toast("尚未變更目前資料；請完成或取消任務後重新啟動後端套用還原");
   } catch (error) { $("adminDataState").textContent = "還原失敗"; toast(error.message); }
 }
 
@@ -7475,6 +7498,7 @@ function renderProviderSettings() {
   $("providerSettingEnabledLabel").classList.toggle("switch-disabled", !isNew && isDefault);
   $("providerSettingEnabledLabel").title = !isNew && isDefault ? "請先將其他 Provider 設為系統預設" : "";
   $("providerSettingBaseURL").value = settings.base_url || "";
+  $("providerSettingUseResponses").checked = Boolean(settings.use_responses);
   $("providerSettingAPIKey").value = "";
   $("providerSettingAPIKey").placeholder = settings.has_api_key ? "已設定；留空表示保留" : "尚未設定";
   $("providerSettingAPIKeyState").textContent = settings.has_api_key ? "API Key 已安全儲存，畫面不會顯示明文。" : "目前未設定 API Key；本機服務可保持空白。";
@@ -7535,20 +7559,29 @@ async function renderProviderLimitsHint(providerID, model) {
 	}
 }
 
+function renderProviderResponseFields() {
+  const isCodex = $("providerSettingType").value === "openai-codex-responses";
+  const responses = isCodex || $("providerSettingUseResponses").checked;
+  for (const id of ["providerSettingInstructionRoleField", "providerSettingDisableStreamingField", "providerSettingStreamUsageField", "providerSettingOmitToolChoiceField"]) {
+    $(id).classList.toggle("hidden", responses);
+  }
+  $("providerSettingResponsesHint").classList.toggle("hidden", !responses || isCodex);
+  $("providerSettingBaseURL").placeholder = responses ? "https://example.com/backend-api/codex/responses" : "https://api.openai.com/v1";
+}
+
 function renderProviderTypeFields(providerType, settings, isNew, providerID) {
 	const isCodex = providerType === "openai-codex-responses";
 	$("providerAPIKeyFields").classList.toggle("hidden", isCodex);
 	$("providerOAuthFields").classList.toggle("hidden", !isCodex);
 	$("providerSettingBaseURLField").classList.toggle("hidden", isCodex);
 	$("providerSettingBaseURL").required = !isCodex;
-	$("providerSettingInstructionRoleField").classList.toggle("hidden", isCodex);
-	$("providerSettingDisableStreamingField").classList.toggle("hidden", isCodex);
-	$("providerSettingStreamUsageField").classList.toggle("hidden", isCodex);
-	$("providerSettingOmitToolChoiceField").classList.toggle("hidden", isCodex);
+	renderProviderResponseFields();
 	// 切離 Codex 就收起重置入口，否則會殘留在不相干的 Provider 上。
 	if (!isCodex) hideProviderResetRateLimit();
 	if (isCodex) $("providerSettingDisableStreaming").checked = false;
-	$("connectProviderOAuth").disabled = isNew;
+	$("connectProviderOAuth").disabled = isNew || providerAccountImportBusy;
+	$("selectProviderAccountFile").dataset.pending = "false";
+	$("selectProviderAccountFile").disabled = isNew || providerAccountImportBusy;
 	const connected = Boolean(settings.has_oauth_token);
 	$("disconnectProviderOAuth").classList.toggle("hidden", !connected || isNew);
 	$("providerOAuthState").textContent = connected ? "已連線" : isNew ? "請先儲存 Provider" : "尚未連線";
@@ -7678,6 +7711,7 @@ function providerSettingFormValue() {
   } else {
     provider.openai_compatible = {
       base_url: $("providerSettingBaseURL").value.trim(),
+      use_responses: $("providerSettingUseResponses").checked,
       ...common,
       instruction_role: $("providerSettingInstructionRole").value,
       disable_streaming: $("providerSettingDisableStreaming").checked,
@@ -7851,7 +7885,9 @@ function updateProviderOAuthStatusUI(status = {}) {
 	  : pending ? "等待瀏覽器完成驗證…"
 	  : status.status === "failed" ? `驗證失敗${status.message ? ` · ${status.message}` : ""}`
 	  : "尚未連線";
-	$("connectProviderOAuth").disabled = pending;
+	$("connectProviderOAuth").disabled = pending || providerAccountImportBusy;
+	$("selectProviderAccountFile").dataset.pending = String(pending);
+	$("selectProviderAccountFile").disabled = pending || providerAccountImportBusy || Boolean(state.providerSettingsDraft);
 	$("connectProviderOAuth").textContent = connected ? "重新登入 ChatGPT／Codex" : "使用 ChatGPT 帳號登入";
 	$("disconnectProviderOAuth").classList.toggle("hidden", !connected);
 	if (!connected) hideProviderResetRateLimit();
@@ -7885,11 +7921,13 @@ async function loadProviderResetRateLimit(providerID) {
 	hideProviderResetRateLimit();
 	providerID = String(providerID || "").trim();
 	if (!providerID) return;
+	const oauthRequest = state.providerOAuthStatusRequests?.[providerID];
 	try {
 		const usage = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage`, { reconnects: 0 });
 		const credits = usage?.reset_credits;
 		if (!credits?.available) return;
 		if (state.selectedProviderSettingsID !== providerID) return;
+		if (state.providerOAuthStatusRequests?.[providerID] !== oauthRequest) return;
 		renderProviderResetCredits(providerID, credits);
 	} catch (_) {
 		// 讀不到額度不該影響其他設定，安靜略過即可。
@@ -7983,8 +8021,12 @@ function providerResetOutcomeMessage(result) {
 async function loadProviderOAuthStatus(providerID, { quiet = false } = {}) {
 	providerID = String(providerID || "").trim();
 	if (!providerID) return null;
+	state.providerOAuthStatusRequests ??= Object.create(null);
+	const requestID = (state.providerOAuthStatusRequests[providerID] || 0) + 1;
+	state.providerOAuthStatusRequests[providerID] = requestID;
 	try {
 	  const status = await request(`/api/v1/admin/provider-settings/${encodeURIComponent(providerID)}/oauth/status`, { reconnects: 0 });
+	  if (state.providerOAuthStatusRequests[providerID] !== requestID) return null;
 	  if (!state.providerSettingsDraft && state.selectedProviderSettingsID === providerID && $("providerSettingType").value === "openai-codex-responses") {
 		updateProviderOAuthStatusUI(status);
 	  }
@@ -8019,6 +8061,98 @@ function pollProviderOAuth(providerID, expiresAt) {
 	  providerOAuthPollTimer = window.setTimeout(poll, 1000);
 	};
 	void poll();
+}
+
+let providerAccountImportBusy = false;
+
+function selectProviderAccountFile() {
+	if (providerAccountImportBusy || state.providerSettingsDraft || $("providerSettingType").value !== "openai-codex-responses") return;
+	const input = $("providerAccountFile");
+	input.value = "";
+	input.dataset.providerId = state.selectedProviderSettingsID;
+	// 必須在使用者點擊事件中立即開啟原生選檔視窗，不預設檔案或路徑。
+	input.click();
+}
+
+function chooseProviderFileAccount(accounts, fileName) {
+	const dialog = $("providerAccountDialog");
+	if (dialog.open) return Promise.resolve("");
+	const list = $("providerAccountList");
+	list.replaceChildren();
+	$("providerAccountFileName").textContent = fileName;
+	for (const [index, account] of accounts.entries()) {
+		const option = document.createElement("option");
+		option.value = account.id;
+		option.disabled = Boolean(account.problem);
+		option.textContent = `${index + 1}. ${account.email || account.name || translate("未提供帳號名稱")}${account.email && account.name ? ` · ${account.name}` : ""}${account.problem ? ` — ${account.problem}` : ""}`;
+		option.title = option.textContent;
+		list.append(option);
+	}
+	list.selectedIndex = -1;
+	$("confirmProviderAccount").disabled = true;
+	$("providerAccountListState").textContent = translate(accounts.some(account => !account.problem) ? "請選擇一個帳號" : "檔案中沒有可匯入的帳號");
+	list.onchange = () => { $("confirmProviderAccount").disabled = !list.selectedOptions.length || list.selectedOptions[0].disabled; };
+	dialog.returnValue = "cancel";
+	return new Promise(resolve => {
+		dialog.addEventListener("close", () => {
+			const selected = list.selectedOptions[0];
+			const id = dialog.returnValue === "import" && selected && !selected.disabled ? selected.value : "";
+			list.replaceChildren();
+			list.onchange = null;
+			$("providerAccountFileName").textContent = "";
+			resolve(id);
+		}, { once: true });
+		dialog.showModal();
+	});
+}
+
+async function importSelectedProviderAccountFile() {
+	const input = $("providerAccountFile");
+	const file = input.files?.[0];
+	const providerID = input.dataset.providerId;
+	input.value = "";
+	if (!file || providerAccountImportBusy) return;
+	const isCurrentProvider = () => !state.providerSettingsDraft && state.selectedProviderSettingsID === providerID && $("providerSettingType").value === "openai-codex-responses";
+	if (!isCurrentProvider()) return;
+	if (file.size > 8 * 1024 * 1024) { toast(translate("帳號檔超過 8 MiB 上限")); return; }
+	providerAccountImportBusy = true;
+	$("selectProviderAccountFile").disabled = true;
+	$("connectProviderOAuth").disabled = true;
+	try {
+		const endpoint = `/api/v1/admin/provider-settings/${encodeURIComponent(providerID)}/oauth/accounts`;
+		// File 直接傳送後端解析；不把 Token 展開至 JS 物件、設定、日誌或 Browser Storage。
+		const accounts = await request(endpoint, { method: "POST", body: file, reconnects: 0 });
+		if (!isCurrentProvider()) return;
+		const selectionID = await chooseProviderFileAccount(accounts, file.name);
+		if (!selectionID || !isCurrentProvider()) return;
+		await request(`${endpoint}/${encodeURIComponent(selectionID)}`, { method: "POST", body: file, reconnects: 0 });
+		state.providerOAuthStatusRequests ??= Object.create(null);
+		state.providerOAuthStatusRequests[providerID] = (state.providerOAuthStatusRequests[providerID] || 0) + 1;
+		clearTimeout(providerOAuthPollTimer);
+		const setting = state.providerSettings?.providers?.find(item => item.id === providerID);
+		if (setting?.openai_codex_responses) setting.openai_codex_responses.has_oauth_token = true;
+		delete state.providerModelLists[providerID];
+		delete state.providerModelErrors[providerID];
+		delete state.providerTestedModels[providerID];
+		state.contextCapabilities = null;
+		state.contextCapabilityCache = {};
+		if (activeProviderID() === providerID) {
+			state.providerUsageRequest += 1;
+			renderProviderUsage(null);
+		}
+		if (!isCurrentProvider()) return;
+		hideProviderResetRateLimit();
+		toast(translate("帳號已匯入"));
+		await loadProviderOAuthStatus(providerID);
+		if (isCurrentProvider()) await loadProviderModels(providerID, { notify: false });
+	} catch (error) {
+		toast(error.message);
+	} finally {
+		providerAccountImportBusy = false;
+		const disabled = Boolean(state.providerSettingsDraft) || $("selectProviderAccountFile").dataset.pending === "true";
+		$("selectProviderAccountFile").disabled = disabled;
+		$("connectProviderOAuth").disabled = disabled;
+	}
 }
 
 async function connectProviderOAuth() {
@@ -8638,6 +8772,7 @@ function normalizeProviderImport(root, fileName) {
       type,
       enabled: source.enabled !== false,
       base_url: baseURL,
+      use_responses: source.use_responses === true,
       model: String(importSourceValue(source, ["model", "default_model", "defaultModel"]) || "").trim(),
       instruction_role: String(importSourceValue(source, ["instruction_role", "instructionRole"]) || "system").trim(),
       context_window: providerImportCapacity(
@@ -8747,6 +8882,7 @@ function providerImportFormValue() {
       } else {
         provider.openai_compatible = {
           base_url: read("base_url").value.trim(),
+          use_responses: item.use_responses === true,
           ...common,
           instruction_role: item.instruction_role || "system",
           stream_include_usage: true,
@@ -9885,7 +10021,7 @@ $("memoText").addEventListener("keydown", (event) => {
   saveMemo();
 });
 $("memoDialog").addEventListener("close", () => {
-  if (memoSaveTimer) saveMemo();
+  if (memoNeedsSave) saveMemo();
 });
 $("providerUsageButton").addEventListener("click", (event) => {
   event.stopPropagation();
@@ -9950,6 +10086,8 @@ $("deleteProviderSetting").addEventListener("click", deleteProviderSetting);
 $("refreshProviderModels").addEventListener("click", () => loadProviderModels(state.selectedProviderSettingsID));
 $("testProviderSetting").addEventListener("click", testProviderSetting);
 $("connectProviderOAuth").addEventListener("click", connectProviderOAuth);
+$("selectProviderAccountFile").addEventListener("click", selectProviderAccountFile);
+$("providerAccountFile").addEventListener("change", importSelectedProviderAccountFile);
 $("disconnectProviderOAuth").addEventListener("click", disconnectProviderOAuth);
 $("addMCPSetting").addEventListener("click", () => {
   state.mcpSettingsDraft = newMCPSetting();
@@ -10098,6 +10236,7 @@ $("openReverseProxyURL").addEventListener("click", () => {
   const target = $("reverseProxyPublicURL").value;
   if (target) void openResource({ kind: "url", target }, "open");
 });
+$("providerSettingUseResponses").addEventListener("change", renderProviderResponseFields);
 $("providerSettingType").addEventListener("change", (event) => {
   const isCodex = event.target.value === "openai-codex-responses";
   const settings = isCodex ? {
@@ -10128,6 +10267,7 @@ $("providerSettingType").addEventListener("change", (event) => {
   };
   $("providerSettingBaseURL").value = settings.base_url || "";
   $("providerSettingAPIKey").value = "";
+  $("providerSettingUseResponses").checked = Boolean(settings.use_responses);
   $("providerSettingModel").value = settings.model;
   $("providerSettingModel").dataset.configuredModel = settings.model;
   $("providerSettingInstructionRole").value = settings.instruction_role || "system";

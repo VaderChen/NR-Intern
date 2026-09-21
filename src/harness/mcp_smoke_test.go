@@ -30,6 +30,7 @@ type smokeMCPServer struct {
 	handler  http.Handler
 	calls    atomic.Int64
 	lastArgs atomic.Pointer[string]
+	readOnly bool
 }
 
 type workOrderQuery struct {
@@ -40,9 +41,12 @@ type workOrderResult struct {
 	Count int `json:"count"`
 }
 
-func newSmokeMCPServer(t *testing.T) *smokeMCPServer {
+func newSmokeMCPServer(t *testing.T, readOnly ...bool) *smokeMCPServer {
 	t.Helper()
 	harness := &smokeMCPServer{}
+	if len(readOnly) > 0 {
+		harness.readOnly = readOnly[0]
+	}
 	harness.reload()
 	harness.http = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		harness.mu.Lock()
@@ -57,7 +61,11 @@ func newSmokeMCPServer(t *testing.T) *smokeMCPServer {
 // reload 換掉背後的 MCP Server，模擬遠端服務重啟（舊 session id 失效）。
 func (s *smokeMCPServer) reload() {
 	server := mcp.NewServer(&mcp.Implementation{Name: "mars-mes", Version: "1.0.0"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "query_work_orders", Description: "查詢目前製令"},
+	tool := &mcp.Tool{Name: "query_work_orders", Description: "查詢目前製令"}
+	if s.readOnly {
+		tool.Annotations = &mcp.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true}
+	}
+	mcp.AddTool(server, tool,
 		func(_ context.Context, _ *mcp.CallToolRequest, input workOrderQuery) (*mcp.CallToolResult, workOrderResult, error) {
 			s.calls.Add(1)
 			value := input.Status
@@ -216,9 +224,9 @@ func TestSmokeUnknownMCPToolTriggersProtocolRepair(t *testing.T) {
 	}
 }
 
-// MCP Server 重啟後，同一個 Run 內的下一次呼叫必須自動重連，而不是整段失敗。
-func TestSmokeRunRecoversWhenMCPServerRestartsMidRun(t *testing.T) {
-	server := newSmokeMCPServer(t)
+// 即使唯讀且冪等，重啟後無法確認交付／契約時仍不能宣稱已完成或盲目重送。
+func TestSmokeMCPRestartDoesNotReplayUnconfirmedCall(t *testing.T) {
+	server := newSmokeMCPServer(t, true)
 	runtime := newSmokeToolRuntime(t, server)
 	session := smokeSession(t)
 	name := mcpToolName(t, runtime, session)
@@ -227,7 +235,7 @@ func TestSmokeRunRecoversWhenMCPServerRestartsMidRun(t *testing.T) {
 	model := &scriptedModel{responses: []domain.ModelResponse{
 		{Content: instruction(name, map[string]any{"status": "released"})},
 		{Content: instruction(name, map[string]any{"status": "closed"})},
-		{Content: "兩次查詢都完成了。"},
+		{Content: "第一次完成；第二次未完成，請先確認遠端狀態。"},
 	}}
 	model.onStream = func(turn int) {
 		if turn == 1 {
@@ -241,12 +249,28 @@ func TestSmokeRunRecoversWhenMCPServerRestartsMidRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if server.calls.Load() != 2 {
-		t.Fatalf("MCP server calls = %d, want 2 across the restart", server.calls.Load())
+	if server.calls.Load() != 1 {
+		t.Fatalf("MCP server calls = %d, want no blind replay after restart", server.calls.Load())
 	}
-	if result.Message.Content != "兩次查詢都完成了。" {
+	if result.Message.Content != "第一次完成；第二次未完成，請先確認遠端狀態。" {
 		t.Fatalf("final answer = %q", result.Message.Content)
 	}
+	if len(model.requests) != 3 {
+		t.Fatalf("turns=%d", len(model.requests))
+	}
+	// 指令模式會把 wire history 轉成文字，安全狀態應檢查原始 transcript。
+	messages, err := sessions.ListMessages(context.Background(), session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, message := range messages {
+		state := domain.ToolExecutionState(message.Metadata)
+		// 重啟可能先被目錄更新偵測到（未派送），或在派送後收到斷線（未知）。
+		if message.Role == "tool" && message.IsError && (state == domain.ToolOutcomeUnknown || state == domain.ToolNotDispatched) {
+			return
+		}
+	}
+	t.Fatal("MCP restart did not preserve dispatch safety state in the transcript")
 }
 
 // MCP 工具一律需要人工核准；核准後必須真的執行，拒絕則不得執行。
@@ -506,7 +530,7 @@ func TestSmokeReadOnlyToolsAreAvailableOnTheFirstTurn(t *testing.T) {
 // 唯讀 MCP 工具不再逐次要求核准；有副作用的 MCP 工具仍然要核准。
 // MCP 的唯讀屬性來自 Server 宣告的 readOnlyHint，只有開啟 trust_annotations 才採信。
 func TestSmokeReadOnlyMCPToolSkipsApproval(t *testing.T) {
-	server := newSmokeMCPServer(t)
+	server := newSmokeMCPServer(t, true)
 	runtime := newSmokeToolRuntime(t, server)
 	session := smokeSession(t)
 	name := mcpToolName(t, runtime, session)
@@ -518,15 +542,16 @@ func TestSmokeReadOnlyMCPToolSkipsApproval(t *testing.T) {
 	}}
 	runner := smokeRunner(sessions, model, runtime)
 	runner.Approvals = approval.NewCoordinator([]string{"mcp__*"})
-	// 模擬管理者已對這個 Server 開啟 trust_annotations：工具目錄標記為唯讀。
-	runner.Tools = readOnlyToolRuntime{Runtime: runtime}
+	// 用真正的 annotation 與預設 trust_annotations，讓列表與執行時重新解析一致。
 
 	skipped := 0
 	approvalRequests := 0
-	result, err := runner.Run(context.Background(), Input{RunID: "run_read_only", Session: session, UserInput: "查製令"}, func(event domain.EngineEvent) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := runner.Run(ctx, Input{RunID: "run_read_only", Session: session, UserInput: "查製令"}, func(event domain.EngineEvent) error {
 		switch event.Type {
 		case "run.approval_skipped":
-			if event.Payload["reason"] == "read_only_tool" {
+			if event.Payload["reason"] == "read_only_or_isolated_workspace" {
 				skipped++
 			}
 		case "run.approval_required":
@@ -546,25 +571,6 @@ func TestSmokeReadOnlyMCPToolSkipsApproval(t *testing.T) {
 	if server.calls.Load() != 1 || result.Message.Content != "目前製令共 42 筆。" {
 		t.Fatalf("calls=%d answer=%q", server.calls.Load(), result.Message.Content)
 	}
-}
-
-// readOnlyToolRuntime 把 MCP 工具目錄標成唯讀，等同於管理者開啟 trust_annotations
-// 且 Server 宣告了 readOnlyHint 的狀態。
-type readOnlyToolRuntime struct {
-	*tools.Runtime
-}
-
-func (r readOnlyToolRuntime) Definitions(ctx context.Context, session domain.Session) ([]domain.ToolDefinition, error) {
-	definitions, err := r.Runtime.Definitions(ctx, session)
-	if err != nil {
-		return nil, err
-	}
-	for index := range definitions {
-		if strings.HasPrefix(definitions[index].Name, "mcp__") {
-			definitions[index].ReadOnly = true
-		}
-	}
-	return definitions, nil
 }
 
 // 沒有開啟 trust_annotations 時，MCP 工具不算唯讀，仍然逐次核准。

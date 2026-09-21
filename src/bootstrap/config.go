@@ -27,6 +27,8 @@ const (
 )
 
 type Config struct {
+	// 保留套用管理設定前的基底，啟動還原後從基底重載，避免殘留舊設定或蓋掉環境覆寫。
+	settingsBase         *Config
 	ServiceName          string                  `json:"service_name"`
 	UILanguage           string                  `json:"ui_language,omitempty"`
 	NotificationsEnabled bool                    `json:"notifications_enabled,omitempty"`
@@ -213,6 +215,8 @@ func LoadConfig(path string) (Config, error) {
 		config.LegacyMCPToolRetrieval = nil
 	}
 	applyEnvironment(&config)
+	base := config
+	config.settingsBase = &base
 	if err := loadPersistedServiceSettings(&config); err != nil {
 		return Config{}, err
 	}

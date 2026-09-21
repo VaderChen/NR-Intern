@@ -622,6 +622,15 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			}
 			return domain.RunResult{}, err
 		}
+		if response.StopReason == "refusal" {
+			// 拒答是終態；即使回覆含工具範例，也不可解析成可執行指令。
+			response.ToolCalls = nil
+			if instructionStream != nil {
+				if err := instructionStream.Finish(response.Content, emitAssistantDelta); err != nil {
+					return domain.RunResult{}, err
+				}
+			}
+		}
 		response.ToolCalls, err = normalizeToolCalls(response.ToolCalls)
 		if err != nil {
 			_ = r.finishTurn(context.WithoutCancel(ctx), input.Session.ID, operationID, turnID, turn, turnStartedAt, "failed", 0, response, err)
@@ -632,11 +641,11 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		// 幾百個 {"cell":...,"sheet":...,"value":...} 而不是一份 Excel。
 		// 這種輸出是協定錯誤，不是答案，要走與指令模式相同的修復流程。
 		nativeArgumentsTool := ""
-		if toolCallMode == ToolCallModeNative && len(response.ToolCalls) == 0 && !forceFinalization {
+		if response.StopReason != "refusal" && toolCallMode == ToolCallModeNative && len(response.ToolCalls) == 0 && !forceFinalization {
 			nativeArgumentsTool = toolArgumentsLeak(response.Content, callableDefinitions)
 		}
 		protocolRepairExhausted := false
-		if len(response.ToolCalls) == 0 && (toolCallMode == ToolCallModeInstruction || nativeArgumentsTool != "") {
+		if response.StopReason != "refusal" && len(response.ToolCalls) == 0 && (toolCallMode == ToolCallModeInstruction || nativeArgumentsTool != "") {
 			instructionDefinitions := callableDefinitions
 			if forceFinalization {
 				// 收斂輪仍辨識完整目錄中的工具指令，才能將違反收斂要求的輸出
@@ -738,7 +747,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			response.Content = forcedFinalizationFallback(toolTurns, loopGuardReason)
 			response.StopReason = "stop"
 		}
-		if toolCallMode == ToolCallModeNative && len(response.ToolCalls) == 0 {
+		if response.StopReason != "refusal" && toolCallMode == ToolCallModeNative && len(response.ToolCalls) == 0 {
 			if toolName := imitatedToolCallName(response.Content, definitions); toolName != "" {
 				err := fmt.Errorf("%w: Provider 將原生工具呼叫 %q 輸出成普通文字，而不是 OpenAI-compatible 的 tool_calls 欄位；請在 Provider 設定中測試目前的 Endpoint、模型與代理轉換器", domain.ErrProviderProtocol, toolName)
 				_ = emitEvent(emit, "message.end", map[string]any{
@@ -759,7 +768,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		)
 		pendingPlanDirective := ""
 		pendingPlan := domain.Plan{}
-		if !protocolRepairExhausted && len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
+		if response.StopReason != "refusal" && !protocolRepairExhausted && len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
 			pendingPlanDirective, pendingPlan, err = r.planCompletionDirective(ctx, input.Session.ID, input.Session.LockPlans)
 			if err != nil {
 				_ = emitEvent(emit, "message.end", map[string]any{
@@ -775,7 +784,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		// 如果照一般回答寫進 transcript，使用者就會在對話裡看到兩份幾乎一樣的答案。
 		completionCheckDirective := ""
 		completionCheckReason := ""
-		if len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" && !continuePlanCompletion && !protocolRepairExhausted {
+		if response.StopReason != "refusal" && len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" && !continuePlanCompletion && !protocolRepairExhausted {
 			if directive := completion.challenge(r.MaxCompletionChecks); directive != "" {
 				completionCheckDirective, completionCheckReason = directive, "unresolved_tool_failure"
 			} else if directive := completion.challengeToolless(r.MaxCompletionChecks, len(activeDefinitions) > 0); directive != "" {
@@ -783,6 +792,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			}
 		}
 		assistant := domain.Message{
+			Continuation:      response.Continuation.Clone(),
 			ID:                assistantID,
 			SessionID:         input.Session.ID,
 			Role:              "assistant",
@@ -997,10 +1007,11 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			}
 			budget.addToolCalls(len(group))
 			outcomes := r.runToolGroup(ctx, input.Session, group, sink, strings.TrimSpace(input.RunID), activeTools, approvalExemptTools, approvalState, loopGuard, retriever)
-			for _, outcome := range outcomes {
-				if outcome.err != nil {
-					return domain.RunResult{}, outcome.err
-				}
+			toolMessages, persistErr := r.persistToolOutcomes(ctx, input.Session.ID, operationID, turnID, outcomes, readOnlyContracts)
+			if persistErr != nil {
+				return domain.RunResult{}, persistErr
+			}
+			for index, outcome := range outcomes {
 				call, result := outcome.call, outcome.result
 				toolResultsObserved = true
 				completion.observe(call, result)
@@ -1017,30 +1028,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 						return domain.RunResult{}, err
 					}
 				}
-				toolMessage := domain.Message{
-					ID:         domain.NewID("msg"),
-					SessionID:  input.Session.ID,
-					Role:       "tool",
-					Content:    result.Content,
-					ToolCallID: call.ID,
-					ToolName:   call.Name,
-					IsError:    result.IsError,
-					Metadata:   valueutil.CloneMap(result.Details),
-					CreatedAt:  time.Now().UTC(),
-				}
-				if toolMessage.Metadata == nil {
-					toolMessage.Metadata = map[string]any{}
-				}
-				toolMessage.Metadata["internal"] = true
-				toolMessage.Metadata["phase"] = "tool_observation"
-				toolMessage.Metadata["tool_read_only"] = readOnlyContracts[call.Name]
-				toolMessage.Metadata["tool_contract_id"] = call.ExpectedContractID
-				persistCtx, cancelPersist := persistContext(ctx)
-				_, persistErr := appendMessage(persistCtx, r.Sessions, input.Session.ID, toolMessage)
-				cancelPersist()
-				if persistErr != nil {
-					return domain.RunResult{}, persistErr
-				}
+				toolMessage := toolMessages[index]
 				if failureRecallTracker.Observe(call.Name, result.IsError) && r.Memory.SpaceEnabled() {
 					// 「這個錯以前遇過」是記憶最有價值的時刻，值得為它多打一次檢索。
 					retry, recallErr := r.recallMemory(ctx, input.Session, memory.FailureRecallQuery(call.Name, result.Content), operationID)
@@ -1069,20 +1057,6 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 					"duration_ms", outcome.duration.Milliseconds(),
 					"result_bytes", len(result.Content),
 				)
-				persistCtx, cancelPersist = persistContext(ctx)
-				_, persistErr = appendRecord(persistCtx, r.Sessions, input.Session.ID, domain.SessionEntryToolFinished, map[string]any{
-					"operation_id": operationID,
-					"turn_id":      turnID,
-					"tool_call_id": call.ID,
-					"tool_name":    call.Name,
-					"status":       toolStatus,
-					"duration_ms":  outcome.duration.Milliseconds(),
-					"result":       result,
-				})
-				cancelPersist()
-				if persistErr != nil {
-					return domain.RunResult{}, persistErr
-				}
 				if err := sink.emitEvent("tool.execution.end", map[string]any{"result": result}); err != nil {
 					return domain.RunResult{}, err
 				}

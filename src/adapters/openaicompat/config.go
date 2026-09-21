@@ -1,5 +1,5 @@
-// Package openaicompat 實作 OpenAI Chat Completions 相容介面，並在
-// ChatGPT/Codex OAuth 模式下切換為 Codex Responses 協定。
+// Package openaicompat 實作 OpenAI Chat Completions 與 Responses 相容介面。
+// Responses 可使用自訂 API Key 端點，或 ChatGPT/Codex OAuth 固定端點。
 package openaicompat
 
 import (
@@ -24,6 +24,7 @@ const (
 )
 
 type Config struct {
+	UseResponses                 bool                                  `json:"use_responses,omitempty"`
 	BaseURL                      string                                `json:"base_url"`
 	APIKey                       string                                `json:"api_key,omitempty"`
 	AuthMode                     string                                `json:"auth_mode,omitempty"`
@@ -74,6 +75,8 @@ type Diagnostics struct {
 }
 
 type Model struct {
+	continuationScope    string
+	useResponses         bool
 	endpoint             string
 	apiKey               string
 	authMode             string
@@ -112,7 +115,11 @@ func New(config Config) (*Model, error) {
 	endpoint := CodexResponsesEndpoint
 	if authMode != "oauth" {
 		var err error
-		endpoint, err = completionEndpoint(config.BaseURL)
+		if config.UseResponses {
+			endpoint, err = responsesEndpoint(config.BaseURL)
+		} else {
+			endpoint, err = completionEndpoint(config.BaseURL)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -166,6 +173,8 @@ func New(config Config) (*Model, error) {
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 	return &Model{
+		continuationScope:    domain.NewID("provider_state"),
+		useResponses:         config.UseResponses || authMode == "oauth",
 		endpoint:             endpoint,
 		apiKey:               strings.TrimSpace(config.APIKey),
 		authMode:             authMode,
@@ -173,7 +182,7 @@ func New(config Config) (*Model, error) {
 		defaultModel:         strings.TrimSpace(config.Model),
 		instructionRole:      role,
 		extraHeaders:         headers,
-		disableStreaming:     config.DisableStreaming && authMode != "oauth",
+		disableStreaming:     config.DisableStreaming && authMode != "oauth" && !config.UseResponses,
 		streamIncludeUsage:   config.StreamIncludeUsage,
 		omitToolChoice:       config.OmitToolChoice,
 		maxAttempts:          maxAttempts,
