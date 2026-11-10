@@ -91,6 +91,9 @@ const state = {
   sessionRuntimeSaving: false,
   messageAutoScroll: true,
   providerUsageRequest: 0,
+  providerUsageIdentity: "",
+  providerUsagePending: "",
+  providerUsageSnapshot: null,
   contextUsage: null,
   contextCapabilities: null,
   contextCapabilitiesRequest: 0,
@@ -155,6 +158,7 @@ const mcpAuthModeLabels = Object.freeze({
   headers: "自訂 HTTP Headers",
 });
 const displayModes = new Set(["auto", "light", "dark"]);
+const fontSizeModes = new Set(["small", "medium", "large"]);
 const uiLanguagePreferences = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
 const systemColorScheme = window.matchMedia("(prefers-color-scheme: dark)");
 const applePlatform = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgentData?.platform || navigator.platform || navigator.userAgent);
@@ -434,11 +438,19 @@ function applyDisplayMode(value, persist = true) {
   if (persist) localStorage.setItem("displayMode", mode);
 }
 
+function applyFontSizeMode(value, persist = true) {
+  const mode = fontSizeModes.has(value) ? value : "small";
+  document.documentElement.dataset.fontSize = mode;
+  $("fontSizeMode").value = mode;
+  if (persist) localStorage.setItem("fontSize", mode);
+}
+
 function refreshAutomaticDisplayMode() {
   if (document.documentElement.dataset.displayMode === "auto") applyDisplayMode("auto", false);
 }
 
 applyDisplayMode(document.documentElement.dataset.displayMode || "auto", false);
+applyFontSizeMode(document.documentElement.dataset.fontSize || "small", false);
 applyUILanguage(document.documentElement.dataset.uiLanguage || "auto", false);
 if (typeof systemColorScheme.addEventListener === "function") {
   systemColorScheme.addEventListener("change", refreshAutomaticDisplayMode);
@@ -1134,7 +1146,7 @@ async function loadSessions() {
 }
 
 function renderNavigation() {
-  const pinned = [...state.sessions]
+  const pinned = state.sessions
     .filter((session) => session.pinned)
     .sort((a, b) => new Date(b.pinned_at || b.updated_at) - new Date(a.pinned_at || a.updated_at));
   $("pinnedSection").classList.toggle("hidden", pinned.length === 0);
@@ -1148,11 +1160,21 @@ function renderNavigation() {
   projectList.classList.toggle("hidden", projectSectionCollapsed);
   projectList.replaceChildren();
   if (!projectSectionCollapsed) {
+    // 每次渲染建立一次分組；不保留跨次快取，以免移動／釘選後使用舊資料。
+    const byProject = new Map();
+    const ungroupedSessions = [];
+    for (const session of state.sessions) {
+      if (session.pinned) continue;
+      const group = byProject.get(session.project_id);
+      if (group) group.push(session);
+      else byProject.set(session.project_id, [session]);
+      if (!session.project_id) ungroupedSessions.push(session);
+    }
     for (const project of state.projects) {
-      const sessions = orderedProjectSessions(state.sessions.filter((session) => session.project_id === project.id && !session.pinned));
+      const sessions = orderedProjectSessions(byProject.get(project.id) || []);
       projectList.append(projectNode(project, sessions));
     }
-    const ungrouped = orderedProjectSessions(state.sessions.filter((session) => !session.project_id && !session.pinned));
+    const ungrouped = orderedProjectSessions(ungroupedSessions);
     if (ungrouped.length > 0) projectList.append(projectNode(null, ungrouped));
     if (state.projects.length === 0 && ungrouped.length === 0 && state.backendHealthy) {
       const empty = document.createElement("p");
@@ -1166,12 +1188,11 @@ function renderNavigation() {
 
 function orderedProjectSessions(sessions) {
   return sessions
-    .map((session, index) => ({ session, index }))
-    .sort((left, right) => {
-      const leftPosition = Number.isFinite(Number(left.session.position)) ? Number(left.session.position) : 0;
-      const rightPosition = Number.isFinite(Number(right.session.position)) ? Number(right.session.position) : 0;
-      return leftPosition - rightPosition || left.index - right.index;
+    .map((session, index) => {
+      const value = Number(session.position);
+      return { session, index, position: Number.isFinite(value) ? value : 0 };
     })
+    .sort((left, right) => left.position - right.position || left.index - right.index)
     .map((value) => value.session);
 }
 
@@ -1971,6 +1992,7 @@ function contextUsageSnapshot() {
 }
 
 function renderContextUsage() {
+  syncProviderUsageSummary();
   const control = $("contextUsageControl");
   if (!control) return;
   const visible = Boolean(state.session);
@@ -2143,6 +2165,10 @@ function formatProviderUsageReset(value, includeDate) {
     : { hour: "2-digit", minute: "2-digit" }).format(date);
 }
 
+function formatProviderRemainingPercent(value) {
+  return String(Number(Math.max(0, Math.min(100, value)).toFixed(2)));
+}
+
 function renderProviderUsageWindow(prefix, windowValue, includeDate) {
   const available = Boolean(windowValue?.available) && Number.isFinite(Number(windowValue?.remaining_percent));
   const track = $(`providerUsage${prefix}Track`);
@@ -2159,7 +2185,7 @@ function renderProviderUsageWindow(prefix, windowValue, includeDate) {
     return;
   }
   const remaining = Math.max(0, Math.min(100, Number(windowValue.remaining_percent)));
-  const text = `${formatProviderUsagePercent(remaining)}%`;
+  const text = `${formatProviderRemainingPercent(remaining)}%`;
   track.classList.remove("unknown");
   track.setAttribute("aria-valuenow", String(remaining));
   track.setAttribute("aria-valuetext", text);
@@ -2169,31 +2195,142 @@ function renderProviderUsageWindow(prefix, windowValue, includeDate) {
 }
 
 function renderProviderUsage(usage) {
+  state.providerUsageSnapshot = usage;
   renderProviderUsageWindow("FiveHour", usage?.five_hour, false);
   renderProviderUsageWindow("SevenDay", usage?.seven_day, true);
+  const view = providerUsageView(usage, activeContextIdentity().model);
+  $("providerUsageSummaryLabel").textContent = view.label;
+  $("providerUsageSummaryValue").textContent = view.value;
+  $("providerUsageSummaryButton").title = view.note;
+  $("providerUsageSummaryControl").classList.toggle("hidden", !state.session || view.hidden);
+  if (view.hidden) {
+    $("providerUsageSummaryPopover").classList.add("hidden");
+    $("providerUsageSummaryButton").setAttribute("aria-expanded", "false");
+  }
+  $("providerUsageFiveHourRow").classList.toggle("hidden", view.hidden);
+  $("providerUsageSevenDayRow").classList.toggle("hidden", view.hidden);
+  for (const [id, rows] of [["providerUsageSummaryDetails", view.rows], ["providerUsageRateLimits", []]]) {
+    const list = $(id);
+    list.replaceChildren();
+    for (const row of rows) {
+      const term = document.createElement("dt");
+      term.textContent = row.label;
+      const value = document.createElement("dd");
+      const amount = document.createElement("span");
+      amount.textContent = providerUsageRowValue(row);
+      if (row.percent !== null) {
+        const meter = document.createElement("div");
+        meter.className = "provider-usage-meter-group";
+        const track = document.createElement("div");
+        track.className = "provider-usage-track";
+        track.setAttribute("role", "progressbar");
+        track.setAttribute("aria-label", row.label);
+        track.setAttribute("aria-valuemin", "0");
+        track.setAttribute("aria-valuemax", "100");
+        track.setAttribute("aria-valuenow", String(row.percent));
+        track.setAttribute("aria-valuetext", amount.textContent);
+        const bar = document.createElement("span");
+        bar.style.width = `${row.percent}%`;
+        track.append(bar);
+        meter.append(track, amount);
+        value.append(meter);
+      } else {
+        value.append(amount);
+      }
+      if (Number.isFinite(Date.parse(usage?.updated_at || ""))) {
+        const updated = document.createElement("span");
+        updated.className = "provider-usage-detail-updated";
+        updated.textContent = `更新時間 ${formatProviderUsageReset(usage.updated_at, true)}`;
+        value.append(updated);
+      }
+      list.append(term, value);
+    }
+  }
+  if (view.hidden) {
+    const term = document.createElement("dt");
+    term.textContent = "Claude Platform API";
+    const value = document.createElement("dd");
+    value.textContent = "不顯示用量：上游沒有可查詢的組織點數。";
+    $("providerUsageRateLimits").append(term, value);
+  }
+}
+
+function providerUsageRowValue(row) {
+  return row.percent !== null ? `${formatProviderRemainingPercent(row.percent)}%`
+    : `${row.remaining.toLocaleString()} ${row.resource === "requests" ? "次" : "tokens"}`;
+}
+
+// Claude Platform 的推論回應只帶每分鐘速率額度，幾秒就重設，不是帳戶的組織點數；
+// 官方也沒有可查詢點數餘額的介面。顯示它只會誤導，所以 Claude 不顯示用量。
+// 速率快照仍保留在 state.providerUsageSnapshot，只是不呈現。
+function providerUsageHidden(usage) {
+  return usage?.kind === "rate_limit";
+}
+
+function providerUsageView(usage, model, now = Date.now()) {
+  if (providerUsageHidden(usage)) return { rows: [], value: "", label: "剩餘用量", note: "", hidden: true };
+  const rows = [];
+  for (const [key, label] of [["five_hour", "5 小時剩餘"], ["seven_day", "每週剩餘"]]) {
+    const item = usage?.[key];
+    if (item?.available && Number.isFinite(item.remaining_percent) && item.remaining_percent >= 0 && item.remaining_percent <= 100) {
+      rows.push({ label, percent: item.remaining_percent, reset: item.reset_at });
+    }
+  }
+  const updated = Date.parse(usage?.updated_at || "");
+  const stale = rows.length > 0 && (!Number.isFinite(updated) || now - updated > 600_000 || rows.some(row => Date.parse(row.reset || "") <= now));
+  const summary = rows.length ? `${formatProviderRemainingPercent(Math.min(...rows.map(row => row.percent)))}%` : "未知";
+  const value = `${summary}${stale ? "*" : ""}`;
+  let note = "帳戶配額；百分比取剩餘比例最低的視窗。";
+  if (!rows.length) note += " 上游尚未提供可用配額資料。";
+  if (Number.isFinite(updated)) note += ` 更新：${formatProviderUsageReset(usage.updated_at, true)}。`;
+  if (stale) note += " * 快照已過重設時間或較久未更新，非即時額度。";
+  return { rows, value, label: "剩餘用量", note, hidden: false };
+}
+
+function providerUsageIdentity() {
+  return `${activeProviderID()}\u0000${activeContextIdentity().model}`;
+}
+
+function syncProviderUsageSummary() {
+  $("providerUsageSummaryControl").classList.toggle("hidden", !state.session || providerUsageHidden(state.providerUsageSnapshot));
+  $("providerUsageSummaryButton").disabled = !state.backendHealthy;
+  const identity = providerUsageIdentity();
+  if (state.providerUsageIdentity !== identity) {
+    state.providerUsageIdentity = identity;
+    closeProviderUsagePopover();
+    renderProviderUsage(null);
+    if (state.session) void loadActiveProviderUsage();
+  }
 }
 
 async function loadActiveProviderUsage() {
   const providerID = activeProviderID();
+  const identity = providerUsageIdentity();
+  if (state.providerUsagePending === identity) return;
   const requestID = ++state.providerUsageRequest;
-  renderProviderUsage(null);
-  if (!providerID || !state.backendHealthy) return;
+  if (!providerID || !state.backendHealthy) { renderProviderUsage(null); return; }
+  state.providerUsagePending = identity;
   try {
     const usage = await request(`/api/v1/providers/${encodeURIComponent(providerID)}/usage`, { reconnects: 0 });
-    if (requestID !== state.providerUsageRequest || activeProviderID() !== providerID) return;
+    if (requestID !== state.providerUsageRequest || providerUsageIdentity() !== identity) return;
     renderProviderUsage(usage);
   } catch (_) {
-    if (requestID === state.providerUsageRequest) renderProviderUsage(null);
+    if (requestID === state.providerUsageRequest && providerUsageIdentity() === identity) renderProviderUsage(null);
+  } finally {
+    if (requestID === state.providerUsageRequest) state.providerUsagePending = "";
   }
 }
 
 function closeProviderUsagePopover() {
   $("providerUsagePopover").classList.add("hidden");
   $("providerUsageButton").setAttribute("aria-expanded", "false");
+  $("providerUsageSummaryPopover").classList.add("hidden");
+  $("providerUsageSummaryButton").setAttribute("aria-expanded", "false");
 }
 
 function refreshOpenProviderUsage() {
-  if (!$("providerUsagePopover").classList.contains("hidden")) void loadActiveProviderUsage();
+  if (document.hidden) return;
+  if (state.session || !$("providerUsagePopover").classList.contains("hidden")) void loadActiveProviderUsage();
 }
 
 function toggleProviderUsagePopover() {
@@ -2202,8 +2339,18 @@ function toggleProviderUsagePopover() {
     closeProviderUsagePopover();
     return;
   }
+  closeProviderUsagePopover();
   popover.classList.remove("hidden");
   $("providerUsageButton").setAttribute("aria-expanded", "true");
+  void loadActiveProviderUsage();
+}
+
+function toggleProviderUsageSummary() {
+  const open = $("providerUsageSummaryPopover").classList.contains("hidden");
+  closeProviderUsagePopover();
+  if (!open) return;
+  $("providerUsageSummaryPopover").classList.remove("hidden");
+  $("providerUsageSummaryButton").setAttribute("aria-expanded", "true");
   void loadActiveProviderUsage();
 }
 
@@ -2328,31 +2475,84 @@ function displayedModelForProvider(providerID, explicitModel = "") {
 }
 
 async function initializeWorkspaceModels(workspaceID) {
-  let workspace = state.workspaces.find((item) => item.id === workspaceID);
+  const workspace = state.workspaces.find((item) => item.id === workspaceID);
   if (!workspace) return;
   const providerIDs = [...new Set(workspace.provider_ids || [])];
   await Promise.all(providerIDs.map((providerID) => loadProviderModels(providerID, { notify: false })));
-  workspace = state.workspaces.find((item) => item.id === workspaceID) || workspace;
-  const providerID = workspace.default_provider_id || "";
-  const catalog = providerModelCatalog(providerID);
-  const configured = String(workspace.model || "").trim();
-  if (catalog?.length && !catalog.includes(configured)) {
-    try {
-      const updated = await request(`/api/v1/workspaces/${encodeURIComponent(workspaceID)}`, {
-        method: "PATCH",
-        body: JSON.stringify({ model: catalog[0] }),
-      });
-      state.workspaces = state.workspaces.map((item) => item.id === updated.id ? updated : item);
-      workspace = updated;
-    } catch (error) {
-      // 顯示層仍會採用模型目錄的第一個有效模型；持久化失敗時交由設定頁重試。
-    }
-  }
   if (state.workspace?.id !== workspaceID) return;
-  state.workspace = workspace;
-  syncWorkspaceSettings();
+  // 載入目錄只更新選項，不寫入預設值，也不重填使用者正在編輯的表單。
+  renderWorkspaceModelChoices("setting");
   renderNavigation();
   if (state.session) syncSessionUI();
+}
+
+function renderWorkspaceModelChoices(mode) {
+  renderModelChoices(mode);
+}
+
+function modelChoiceContext(mode) {
+  const prefix = mode === "session" ? "new" : mode === "new" ? "newWorkspace" : "settingWorkspace";
+  const providerID = $(`${prefix}Provider`).value || (mode === "session" ? state.workspace?.default_provider_id || "" : "");
+  const inheritedModel = mode === "session"
+    ? (providerID === state.workspace?.default_provider_id ? state.workspace?.model : "") || providerDescriptor(providerID)?.default_model || ""
+    : "";
+  const defaultLabel = mode === "session"
+    ? `使用預設模型${inheritedModel ? `（${inheritedModel}）` : ""}`
+    : "使用 Provider 預設模型";
+  return { prefix, providerID, defaultLabel };
+}
+
+// Workspace 與新 Session 共用目錄選擇、手動輸入及非同步競態保護。
+function renderModelChoices(mode) {
+  const { prefix, providerID, defaultLabel } = modelChoiceContext(mode);
+  const input = $(`${prefix}Model`);
+  const select = $(`${prefix}ModelCatalog`);
+  const model = input.value.trim();
+  const catalog = providerModelCatalog(providerID);
+  const manual = input.dataset.manual === "true";
+  select.replaceChildren(new Option(defaultLabel, ""));
+  for (const value of catalog || []) select.add(new Option(value, value));
+  if (model && !(catalog || []).includes(model)) select.add(new Option(`${model}（目前設定）`, model));
+  const custom = new Option("手動輸入模型…", "__custom_model__");
+  select.add(custom);
+  select.value = manual ? custom.value : model;
+  input.classList.toggle("hidden", !manual);
+  $(`${prefix}ModelState`).textContent = state.providerModelErrors[providerID]
+    ? "模型列表讀取失敗，可保留目前設定或手動輸入。"
+    : !providerID ? "請先選擇 Provider。"
+    : catalog === null ? "正在載入模型列表…"
+    : catalog.length ? `已載入 ${catalog.length} 個模型。` : "未取得模型列表，可使用 Provider 預設值或手動輸入。";
+}
+
+async function refreshWorkspaceModelChoices(mode, resetModel = false) {
+  return refreshModelChoices(mode, resetModel);
+}
+
+async function refreshModelChoices(mode, resetModel = false) {
+  const { prefix, providerID } = modelChoiceContext(mode);
+  const input = $(`${prefix}Model`);
+  const select = $(`${prefix}ModelCatalog`);
+  const version = (Number(select.dataset.requestVersion) || 0) + 1;
+  select.dataset.requestVersion = String(version);
+  if (resetModel) { input.value = ""; input.dataset.manual = "false"; }
+  renderModelChoices(mode);
+  if (providerID && providerModelCatalog(providerID) === null) await loadProviderModels(providerID, { notify: false });
+  if (Number(select.dataset.requestVersion) !== version || modelChoiceContext(mode).providerID !== providerID) return;
+  renderModelChoices(mode);
+}
+
+function selectWorkspaceModel(mode) {
+  selectModelChoice(mode);
+}
+
+function selectModelChoice(mode) {
+  const { prefix } = modelChoiceContext(mode);
+  const input = $(`${prefix}Model`);
+  const manual = $(`${prefix}ModelCatalog`).value === "__custom_model__";
+  input.dataset.manual = String(manual);
+  input.classList.toggle("hidden", !manual);
+  if (manual) { input.focus(); input.select(); }
+  else input.value = $(`${prefix}ModelCatalog`).value;
 }
 
 function providerModelCatalog(providerID) {
@@ -2657,6 +2857,8 @@ function syncWorkspaceSettings() {
   $("settingWorkspaceDescription").value = workspace.description || "";
   $("settingWorkspaceProvider").value = workspace.default_provider_id || "";
   $("settingWorkspaceModel").value = workspace.model || "";
+  $("settingWorkspaceModel").dataset.manual = "false";
+  void refreshWorkspaceModelChoices("setting");
   $("settingWorkspaceInstructions").value = workspace.instructions || "";
   if (!state.session) clearSessionUI();
 }
@@ -2928,6 +3130,7 @@ function newRunState(sessionID, run = {}) {
       reasoning: "",
       internal: false,
       processing: true,
+      startedAt: Date.now(),
     },
     liveMessage: null,
   };
@@ -2961,6 +3164,8 @@ function addActiveRun(runState) {
 
 function removeActiveRun(runState) {
   if (!runState || state.activeRuns.get(runState.sessionId) !== runState) return false;
+  const reasoning = runState.liveMessage?.querySelector(".reasoning-content");
+  if (reasoning) reasoningRenderInputs.delete(reasoning);
   state.activeRuns.delete(runState.sessionId);
   syncRunStateAliases();
   return true;
@@ -3792,16 +3997,22 @@ function dedupeRepeatedReasoningBlocks(value) {
     .map((block) => block.trim())
     .filter(Boolean);
   const result = [];
+  const keys = blocks.map(reasoningSegmentKey);
+  const resultKeys = [];
+  const positionsByKey = new Map();
   for (let index = 0; index < blocks.length;) {
     let repeatedLength = 0;
     const maximumLength = Math.min(result.length, blocks.length - index);
     // Provider 有時會把同一組「標題＋說明」連續送兩次；只比對目前
     // 結尾的連續區塊，避免誤刪不同階段中刻意重複的單句。
-    for (let length = maximumLength; length > 0; length -= 1) {
+    // 只檢查首段相同的候選，且沿用最長優先；一般不同段落不再全排列比較，
+    // 比較過程也不反覆對同一段執行空白正規化。
+    for (const start of positionsByKey.get(keys[index]) || []) {
+      const length = result.length - start;
+      if (length > maximumLength) continue;
       let matched = true;
       for (let offset = 0; offset < length; offset += 1) {
-        if (reasoningSegmentKey(result[result.length - length + offset])
-          !== reasoningSegmentKey(blocks[index + offset])) {
+        if (resultKeys[start + offset] !== keys[index + offset]) {
           matched = false;
           break;
         }
@@ -3815,7 +4026,11 @@ function dedupeRepeatedReasoningBlocks(value) {
       index += repeatedLength;
       continue;
     }
+    const positions = positionsByKey.get(keys[index]) || [];
+    positions.push(result.length);
+    positionsByKey.set(keys[index], positions);
     result.push(blocks[index]);
+    resultKeys.push(keys[index]);
     index += 1;
   }
   return result.join("\n\n");
@@ -4221,7 +4436,9 @@ function createReasoningBlock(value, className = "message-reasoning") {
   return block;
 }
 
-function setMessageReasoning(messageNode, value, append = false) {
+const reasoningRenderInputs = new WeakMap();
+
+function setMessageReasoning(messageNode, value, append = false, deferred = false) {
   if (!messageNode || !value) return;
   let block = messageNode.querySelector(".message-reasoning");
   if (!block) {
@@ -4229,13 +4446,24 @@ function setMessageReasoning(messageNode, value, append = false) {
     messageNode.prepend(block);
   }
   const content = block.querySelector(".reasoning-content");
+  if (!append && reasoningRenderInputs.get(content) === value) {
+    // message.end 等同步收尾仍須立即沖出先前排程的最後一幀。
+    if (!deferred) {
+      renderRichContent(content, richContentSource(content));
+      reasoningRenderInputs.delete(content);
+    }
+    return;
+  }
   const existing = richContentSource(content).trim();
   const hasExistingSegment = Boolean(existing);
   const source = normalizeReasoningMarkdown(append && hasExistingSegment
     ? mergeReasoningText(existing, value, "\n\n---\n\n")
     : dedupeReasoningContent(value));
-  if (append) scheduleRichContent(content, source);
+  if (append || deferred) scheduleRichContent(content, source);
   else renderRichContent(content, source);
+  // 原始輸入只在串流期間短暫保留；收尾後不再把去重前的大段文字掛在 DOM 上。
+  if (!append && deferred) reasoningRenderInputs.set(content, value);
+  else reasoningRenderInputs.delete(content);
   block.dataset.segmentCount = String(reasoningSegments(source).length);
   block.classList.remove("hidden");
   updateReasoningSummary(block);
@@ -4272,6 +4500,7 @@ function finalizeReasoningGroup(operationID, durationMilliseconds) {
   for (const node of assistantNodesForOperation(operationID)) {
     const block = node.querySelector(".message-reasoning");
     if (block) {
+      delete block.dataset.liveStartedAt;
       block.dataset.durationMilliseconds = String(Math.round(durationMilliseconds));
       updateReasoningSummary(block, durationMilliseconds);
     }
@@ -4296,16 +4525,45 @@ function assistantNodesForOperation(operationID) {
   return $("messages").querySelectorAll(`.message.assistant[data-operation-id="${CSS.escape(operationID)}"]`);
 }
 
+// markLiveReasoning 把目前草稿的過程區塊標成「正在處理」，並記下這一段的開始時間；
+// startedAt 為 null 時清除標記，區塊回到「處理過程」。同一時間只會有一個正在處理的區塊。
+function markLiveReasoning(messageNode, startedAt) {
+  const block = messageNode?.querySelector(":scope > .message-reasoning");
+  for (const other of $("messages").querySelectorAll(".message-reasoning[data-live-started-at]")) {
+    if (other !== block) clearLiveReasoningBlock(other);
+  }
+  if (!block) return;
+  if (Number.isFinite(startedAt) && startedAt > 0) {
+    if (block.dataset.liveStartedAt !== String(startedAt)) {
+      block.dataset.liveStartedAt = String(startedAt);
+      updateReasoningSummary(block);
+    }
+  } else {
+    clearLiveReasoningBlock(block);
+  }
+}
+
+function clearLiveReasoningBlock(block) {
+  if (!block?.dataset.liveStartedAt) return;
+  delete block.dataset.liveStartedAt;
+  updateReasoningSummary(block);
+}
+
 function updateReasoningSummary(block, durationMilliseconds = null) {
   const summary = block?.querySelector(".reasoning-summary");
   if (!summary) return;
   const segmentCount = Math.max(0, Number(block.dataset.segmentCount) || 0);
-  let label = translate("處理過程");
+  // 「正在處理」是目前這一段，時間從這一段開始算；「處理過程」是已完成段落的整體累積。
+  const liveStartedAt = Number(block.dataset.liveStartedAt);
+  const live = Number.isFinite(liveStartedAt) && liveStartedAt > 0;
+  let label = translate(live ? "正在處理" : "處理過程");
   if (segmentCount > 0) label += ` · ${segmentCount}段`;
   const storedDuration = Number(block.dataset.durationMilliseconds);
-  const duration = Number.isFinite(durationMilliseconds) && durationMilliseconds >= 0
-    ? durationMilliseconds
-    : storedDuration;
+  const duration = live
+    ? Math.max(0, Date.now() - liveStartedAt)
+    : Number.isFinite(durationMilliseconds) && durationMilliseconds >= 0
+      ? durationMilliseconds
+      : storedDuration;
   if (Number.isFinite(duration) && duration >= 0) label += ` · ${formatProcessingDuration(duration)}`;
   const summaryLabel = summary.querySelector(".reasoning-summary-label") || summary;
   summaryLabel.textContent = label;
@@ -4494,6 +4752,7 @@ function ensureRunDraft(sessionID, operationID = "", messageID = "") {
       reasoning: "",
       internal: false,
       processing: true,
+      startedAt: Date.now(),
     };
     syncRunStateAliases();
     return runState.runDraft;
@@ -4515,6 +4774,7 @@ function continueRunProcessing(sessionID, operationID = activeRunFor(sessionID)?
     reasoning: "",
     internal: false,
     processing: true,
+    startedAt: Date.now(),
   };
   syncRunStateAliases();
   if (state.session?.id === sessionID) {
@@ -4549,10 +4809,11 @@ function renderSelectedRunDraft() {
   const content = messageNode.querySelector(".content");
   if (content && richContentSource(content) !== draft.content) scheduleRichContent(content, draft.content);
   if (draft.reasoning) {
-    setMessageReasoning(messageNode, draft.reasoning);
+    setMessageReasoning(messageNode, draft.reasoning, false, true);
     revealLatestReasoning(messageNode, draft.operationId);
   }
   messageNode.classList.toggle("reasoning-only", Boolean(draft.internal));
+  markLiveReasoning(messageNode, draft.processing ? draft.startedAt : null);
   setAgentProcessing(messageNode, draft.processing);
   // 動畫在狀態列，草稿狀態一變就要同步那一列。
   showActivity(state.runActivityText || "");
@@ -5376,6 +5637,7 @@ function handleEvent(event, sessionID) {
 	if (visible && event.type === "turn.usage" && payload.usage) {
 	  const identity = activeContextIdentity();
 	  recordContextUsage(payload.usage, sessionID, identity.providerID, identity.model);
+	  void loadActiveProviderUsage();
 	}
 	if (visible && event.type === "tool.execution.end" && String(payload.result?.tool_name || "").startsWith("plan_")) {
 	  loadPlans(sessionID).catch(() => {});
@@ -5480,6 +5742,7 @@ function handleEvent(event, sessionID) {
         setMessageReasoning(runState.liveMessage, draft.reasoning);
         runState.liveMessage.classList.add("reasoning-only");
         renderRichContent(runState.liveMessage.querySelector(".content"), "");
+        markLiveReasoning(runState.liveMessage, null);
         setAgentProcessing(runState.liveMessage, false);
         mergeReasoningIntoPrevious(runState.liveMessage, operationID);
       } else {
@@ -5496,6 +5759,7 @@ function handleEvent(event, sessionID) {
         if (message.reasoning) setMessageReasoning(runState.liveMessage, message.reasoning);
         if (message.reasoning) mergeReasoningIntoPrevious(runState.liveMessage, operationID);
       }
+      markLiveReasoning(runState.liveMessage, null);
       setAgentProcessing(runState.liveMessage, false);
     }
 	} else if (event.type === "tool.execution.start") {
@@ -5614,6 +5878,9 @@ function handleEvent(event, sessionID) {
 }
 
 function finalizeLiveReasoningDuration(event, operationID, visible, sessionID = "") {
+  for (const node of assistantNodesForOperation(operationID)) {
+    clearLiveReasoningBlock(node.querySelector(".message-reasoning"));
+  }
   const startedAt = state.runStartedAt.get(operationID);
   const completedAt = Date.parse(event.created_at);
   if (Number.isFinite(startedAt) && Number.isFinite(completedAt) && completedAt > startedAt) {
@@ -6124,7 +6391,7 @@ function openSessionDialog(projectID = state.session?.project_id || "") {
   $("newSessionProject").value = projectID;
   $("newTitle").value = defaultSessionTitle();
   $("newProvider").value = state.workspace?.default_provider_id || "";
-  $("newModel").value = defaultModelForProvider($("newProvider").value);
+  void refreshModelChoices("session", true);
   $("sessionDialog").showModal();
   $("newTitle").focus();
 }
@@ -7481,12 +7748,13 @@ function renderProviderSettings() {
   $("noProviderSettings").classList.toggle("hidden", Boolean(selected));
   if (!selected) return;
   const isNew = selected === state.providerSettingsDraft;
-  const providerType = selected.type === "openai-codex-responses" ? "openai-codex-responses" : "openai-compatible";
+  const providerType = selected.type === "openai-codex-responses" ? "openai-codex-responses" : selected.openai_compatible?.use_claude ? "claude-platform" : "openai-compatible";
   const settings = providerType === "openai-codex-responses"
     ? selected.openai_codex_responses || {}
     : selected.openai_compatible || {};
   $("providerSettingsEditorTitle").textContent = isNew ? "新增 Provider" : `編輯 ${selected.display_name || selected.id}`;
   $("providerSettingsState").textContent = "";
+  showProviderSettingsError("");
   $("providerTestState").textContent = "";
   $("providerSettingID").value = selected.id || "";
   $("providerSettingID").disabled = !isNew;
@@ -7560,13 +7828,17 @@ async function renderProviderLimitsHint(providerID, model) {
 }
 
 function renderProviderResponseFields() {
+  const isClaude = $("providerSettingType").value === "claude-platform";
+  $("providerSettingUseResponses").disabled = isClaude;
+  if (isClaude) $("providerSettingUseResponses").checked = false;
   const isCodex = $("providerSettingType").value === "openai-codex-responses";
   const responses = isCodex || $("providerSettingUseResponses").checked;
   for (const id of ["providerSettingInstructionRoleField", "providerSettingDisableStreamingField", "providerSettingStreamUsageField", "providerSettingOmitToolChoiceField"]) {
-    $(id).classList.toggle("hidden", responses);
+    $(id).classList.toggle("hidden", responses || (isClaude && id !== "providerSettingDisableStreamingField"));
   }
   $("providerSettingResponsesHint").classList.toggle("hidden", !responses || isCodex);
-  $("providerSettingBaseURL").placeholder = responses ? "https://example.com/backend-api/codex/responses" : "https://api.openai.com/v1";
+  $("providerSettingClaudeHint").classList.toggle("hidden", !isClaude);
+  $("providerSettingBaseURL").placeholder = isClaude ? "https://api.anthropic.com/v1" : responses ? "https://example.com/backend-api/codex/responses" : "https://api.openai.com/v1";
 }
 
 function renderProviderTypeFields(providerType, settings, isNew, providerID) {
@@ -7575,6 +7847,7 @@ function renderProviderTypeFields(providerType, settings, isNew, providerID) {
 	$("providerOAuthFields").classList.toggle("hidden", !isCodex);
 	$("providerSettingBaseURLField").classList.toggle("hidden", isCodex);
 	$("providerSettingBaseURL").required = !isCodex;
+	$("providerSettingBaseURL").disabled = isCodex;
 	renderProviderResponseFields();
 	// 切離 Codex 就收起重置入口，否則會殘留在不相干的 Provider 上。
 	if (!isCodex) hideProviderResetRateLimit();
@@ -7710,6 +7983,7 @@ function providerSettingFormValue() {
     provider.openai_codex_responses = common;
   } else {
     provider.openai_compatible = {
+      use_claude: $("providerSettingType").value === "claude-platform",
       base_url: $("providerSettingBaseURL").value.trim(),
       use_responses: $("providerSettingUseResponses").checked,
       ...common,
@@ -7737,17 +8011,30 @@ function providerSettingsPayload(providers, defaultProviderID) {
   };
 }
 
+function showProviderSettingsError(message) {
+  $("providerSettingsError").textContent = message;
+  $("providerSettingsError").classList.toggle("hidden", !message);
+}
+
 async function persistProviderSetting({ showToast = true, refreshModels = true } = {}) {
   if (!state.providerSettings) return;
-  if (!$("providerSettingsForm").reportValidity()) return null;
+  showProviderSettingsError("");
+  if (!$("providerSettingsForm").reportValidity()) {
+    showProviderSettingsError("欄位驗證未通過，請檢查必填欄位、URL 與進階設定中的數值範圍。");
+    return null;
+  }
   const provider = providerSettingFormValue();
   const isNew = Boolean(state.providerSettingsDraft);
   const settings = provider.type === "openai-codex-responses"
     ? provider.openai_codex_responses
     : provider.openai_compatible;
   if (!provider.id || !settings?.model
-    || (provider.type === "openai-compatible" && !provider.openai_compatible.base_url)) return;
+    || (provider.type === "openai-compatible" && !provider.openai_compatible.base_url)) {
+    showProviderSettingsError("請確認 Provider ID、Base URL 與預設模型。模型列表尚未載入時，既有模型設定會保留。若未設定模型，請先選擇 Provider 類型以建立預設值。");
+    return null;
+  }
   if (isNew && state.providerSettings.providers.some((item) => item.id === provider.id)) {
+    showProviderSettingsError(`Provider ID ${provider.id} 已存在`);
     toast(`Provider ID ${provider.id} 已存在`);
     return null;
   }
@@ -7760,11 +8047,13 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
   $("saveProviderSetting").disabled = true;
   $("testProviderSetting").disabled = true;
   $("providerSettingsState").textContent = "儲存中…";
+  let saved = false;
   try {
     state.providerSettings = await request("/api/v1/admin/provider-settings", {
       method: "PUT",
       body: JSON.stringify(providerSettingsPayload(providers, defaultProviderID)),
     });
+    saved = true;
     state.providerSettingsDraft = null;
     state.selectedProviderSettingsID = provider.id;
     state.contextCapabilities = null;
@@ -7772,8 +8061,8 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
     delete state.providerModelLists[provider.id];
     delete state.providerModelErrors[provider.id];
     delete state.providerTestedModels[provider.id];
-    await refreshProviderCatalog();
     renderProviderSettings();
+    await refreshProviderCatalog();
     let models = null;
     if (refreshModels && provider.enabled) {
       $("providerSettingsState").textContent = "已套用，更新模型列表中…";
@@ -7793,7 +8082,8 @@ async function persistProviderSetting({ showToast = true, refreshModels = true }
     }
     return provider;
   } catch (error) {
-    $("providerSettingsState").textContent = "儲存失敗";
+    $("providerSettingsState").textContent = saved ? "已儲存 · 畫面更新失敗" : "儲存失敗";
+    showProviderSettingsError(`${saved ? "設定已儲存，但更新畫面失敗" : "儲存失敗"}：${error.message}`);
     toast(error.message);
     return null;
   } finally {
@@ -7834,6 +8124,7 @@ async function testProviderSetting() {
   } catch (error) {
     $("providerTestState").textContent = "測試失敗";
     $("providerSettingsState").textContent = "測試失敗";
+    showProviderSettingsError(`測試失敗：${error.message}`);
     toast(error.message);
   } finally {
     $("testProviderSetting").disabled = false;
@@ -7843,33 +8134,42 @@ async function testProviderSetting() {
 
 async function deleteProviderSetting() {
   if (!state.providerSettings || !state.selectedProviderSettingsID) return;
+  showProviderSettingsError("");
   const id = state.selectedProviderSettingsID;
   if (state.providerSettings.providers.length <= 1) {
+    showProviderSettingsError("系統至少必須保留一個 Provider");
     toast("系統至少必須保留一個 Provider");
     return;
   }
   if (id === state.providerSettings.default_provider_id) {
+    showProviderSettingsError("請先將其他 Provider 設為系統預設，再刪除此 Provider");
     toast("請先將其他 Provider 設為系統預設，再刪除此 Provider");
     return;
   }
-  if (!(await confirmAction(`確定刪除 Provider「${id}」？`))) return;
+  if (!(await confirmAction(`確定刪除 Provider「${id}」？引用它的對話將改用系統預設 Provider 與模型，並保留對話紀錄。`))) return;
   const providers = state.providerSettings.providers.filter((item) => item.id !== id);
   $("deleteProviderSetting").disabled = true;
+  $("providerSettingsState").textContent = "刪除中…";
+  let deleted = false;
   try {
     state.providerSettings = await request("/api/v1/admin/provider-settings", {
       method: "PUT",
       body: JSON.stringify(providerSettingsPayload(providers, state.providerSettings.default_provider_id)),
     });
+    deleted = true;
     delete state.providerModelLists[id];
     delete state.providerModelErrors[id];
     delete state.providerTestedModels[id];
     state.contextCapabilities = null;
     state.contextCapabilityCache = {};
     state.selectedProviderSettingsID = state.providerSettings.providers[0]?.id || "";
-    await refreshProviderCatalog();
     renderProviderSettings();
+    await refreshProviderCatalog();
     toast(`已刪除 Provider ${id}`);
+    await loadSessions();
   } catch (error) {
+    $("providerSettingsState").textContent = deleted ? "已刪除 · 畫面更新失敗" : "刪除失敗";
+    showProviderSettingsError(`${deleted ? "Provider 已刪除，但更新畫面失敗" : "刪除失敗"}：${error.message}`);
     toast(error.message);
   } finally {
     $("deleteProviderSetting").disabled = false;
@@ -8138,6 +8438,7 @@ async function importSelectedProviderAccountFile() {
 		state.contextCapabilityCache = {};
 		if (activeProviderID() === providerID) {
 			state.providerUsageRequest += 1;
+			state.providerUsagePending = "";
 			renderProviderUsage(null);
 		}
 		if (!isCurrentProvider()) return;
@@ -8773,6 +9074,7 @@ function normalizeProviderImport(root, fileName) {
       enabled: source.enabled !== false,
       base_url: baseURL,
       use_responses: source.use_responses === true,
+      use_claude: source.use_claude === true,
       model: String(importSourceValue(source, ["model", "default_model", "defaultModel"]) || "").trim(),
       instruction_role: String(importSourceValue(source, ["instruction_role", "instructionRole"]) || "system").trim(),
       context_window: providerImportCapacity(
@@ -8883,6 +9185,7 @@ function providerImportFormValue() {
         provider.openai_compatible = {
           base_url: read("base_url").value.trim(),
           use_responses: item.use_responses === true,
+          use_claude: item.use_claude === true,
           ...common,
           instruction_role: item.instruction_role || "system",
           stream_include_usage: true,
@@ -9637,6 +9940,7 @@ $("startBackend").addEventListener("click", () => controlBackend("start"));
 $("restartBackend").addEventListener("click", () => controlBackend("restart"));
 $("stopBackend").addEventListener("click", () => controlBackend("stop"));
 $("displayMode").addEventListener("change", (event) => applyDisplayMode(event.target.value));
+$("fontSizeMode").addEventListener("change", (event) => applyFontSizeMode(event.target.value));
 $("modelControlButton").addEventListener("click", (event) => {
   event.stopPropagation();
   toggleModelPopover();
@@ -9667,11 +9971,10 @@ async function openNewWorkspaceDialog() {
   renderProviderOptions();
   const provider = selectableProviders()[0];
   if (provider) {
-    await loadProviderModels(provider.id, { notify: false });
     $("newWorkspaceProvider").value = provider.id;
-    $("newWorkspaceModel").value = displayedModelForProvider(provider.id);
   }
   $("workspaceDialog").showModal();
+  void refreshWorkspaceModelChoices("new", true);
 }
 $("newWorkspace").addEventListener("click", openNewWorkspaceDialog);
 $("newManagementWorkspace").addEventListener("click", openNewWorkspaceDialog);
@@ -9744,13 +10047,10 @@ $("settingServiceName").addEventListener("input", (event) => {
   }
 });
 $("settingUILanguage").addEventListener("change", (event) => applyUILanguage(event.target.value));
-$("newWorkspaceProvider").addEventListener("change", async (event) => {
-  const provider = selectableProviders().find((item) => item.id === event.target.value);
-  if (provider) {
-    await loadProviderModels(provider.id, { notify: false });
-    $("newWorkspaceModel").value = displayedModelForProvider(provider.id);
-  }
-});
+$("newWorkspaceProvider").addEventListener("change", () => { void refreshWorkspaceModelChoices("new", true); });
+$("settingWorkspaceProvider").addEventListener("change", () => { void refreshWorkspaceModelChoices("setting", true); });
+$("newWorkspaceModelCatalog").addEventListener("change", () => selectWorkspaceModel("new"));
+$("settingWorkspaceModelCatalog").addEventListener("change", () => selectWorkspaceModel("setting"));
 $("newProject").addEventListener("click", () => {
   resetProjectForm();
   syncMemoryIsolationAvailability();
@@ -9865,10 +10165,8 @@ $("sessionSettings").addEventListener("submit", saveSessionSettings);
 $("sessionProviderSelect").addEventListener("change", changeSessionProvider);
 $("sessionModelSelect").addEventListener("change", changeSessionModel);
 $("sessionThinkingSelect").addEventListener("change", changeSessionThinking);
-$("newProvider").addEventListener("change", (event) => {
-  const providerID = event.target.value || state.workspace?.default_provider_id || "";
-  $("newModel").value = defaultModelForProvider(providerID);
-});
+$("newProvider").addEventListener("change", () => { void refreshModelChoices("session", true); });
+$("newModelCatalog").addEventListener("change", () => selectModelChoice("session"));
 $("composer").addEventListener("submit", sendPrompt);
 $("hideWindowDuringCapture").checked = state.screenCaptureHideWindow;
 $("captureScreen").addEventListener("click", () => { closeScreenCaptureMenu(); void captureScreenToClipboard(); });
@@ -10026,6 +10324,10 @@ $("memoDialog").addEventListener("close", () => {
 $("providerUsageButton").addEventListener("click", (event) => {
   event.stopPropagation();
   toggleProviderUsagePopover();
+});
+$("providerUsageSummaryButton").addEventListener("click", (event) => {
+  event.stopPropagation();
+  toggleProviderUsageSummary();
 });
 $("notificationButton").addEventListener("click", (event) => {
   event.stopPropagation();
@@ -10238,6 +10540,7 @@ $("openReverseProxyURL").addEventListener("click", () => {
 });
 $("providerSettingUseResponses").addEventListener("change", renderProviderResponseFields);
 $("providerSettingType").addEventListener("change", (event) => {
+  const isClaude = event.target.value === "claude-platform";
   const isCodex = event.target.value === "openai-codex-responses";
   const settings = isCodex ? {
     has_oauth_token: false,
@@ -10268,6 +10571,13 @@ $("providerSettingType").addEventListener("change", (event) => {
   $("providerSettingBaseURL").value = settings.base_url || "";
   $("providerSettingAPIKey").value = "";
   $("providerSettingUseResponses").checked = Boolean(settings.use_responses);
+  if (isClaude) {
+    settings.base_url = "https://api.anthropic.com/v1";
+    settings.model = "claude-sonnet-4-5";
+    settings.context_window = 0;
+    settings.max_output_tokens = 4096;
+    $("providerSettingBaseURL").value = settings.base_url;
+  }
   $("providerSettingModel").value = settings.model;
   $("providerSettingModel").dataset.configuredModel = settings.model;
   $("providerSettingInstructionRole").value = settings.instruction_role || "system";
@@ -10316,7 +10626,7 @@ document.addEventListener("pointerdown", (event) => {
   if (!$("projectContextMenu").contains(event.target)) closeProjectContextMenu();
   if (!$("sessionContextMenu").contains(event.target)) closeSessionContextMenu();
   if (!$("resourceContextMenu").contains(event.target)) closeResourceContextMenu();
-  if (!$("providerUsagePopover").contains(event.target) && !$("providerUsageButton").contains(event.target)) closeProviderUsagePopover();
+  if (!$("providerUsagePopover").contains(event.target) && !$("providerUsageButton").contains(event.target) && !$("providerUsageSummaryControl").contains(event.target)) closeProviderUsagePopover();
   if (!$("notificationPopover").contains(event.target) && !$("notificationButton").contains(event.target)) closeNotificationPopover();
   if (!$("sessionRuntimeControls").contains(event.target) && !$("modelControlButton").contains(event.target)) closeModelPopover();
   if (!$("globalSearchPopover").contains(event.target) && !$("globalSearchInput").contains(event.target) && !$("globalSearchButton").contains(event.target)) $("globalSearchPopover").classList.add("hidden");

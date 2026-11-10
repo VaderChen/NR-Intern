@@ -1,0 +1,46 @@
+name: Go tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/go-test.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/go-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 桌面套件使用 macOS 原生元件（WebView、狀態列、檔案選擇器），
+    # 因此在 macOS ARM64 執行，與本機開發與發行環境一致。
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      GOFLAGS: -buildvcs=false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./src/...
+      - name: Vet
+        run: go vet ./src/...
+      - name: Test
+        run: go test -count=1 ./src/...

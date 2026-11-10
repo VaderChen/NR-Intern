@@ -1,5 +1,6 @@
 (() => {
   const sources = new WeakMap();
+  const renderedSources = new WeakMap();
   const frames = new WeakMap();
   const bareResourcePattern = /https?:\/\/[^\s<>"'`]+|(?:[A-Za-z]:[\\/]|\\\\[^\\\s]+[\\/]|\/)[^\s<>"'`]+/gi;
   const trailingPunctuation = /[.,;:!?\)\]\}，。；：！？）】》」』]+$/u;
@@ -152,8 +153,10 @@
     }
     const value = source || "";
     sources.set(element, value);
+    if (renderedSources.get(element) === value) return;
     const safeHTML = markdownHTML(value);
     if (safeHTML === null) {
+      renderedSources.delete(element);
       element.textContent = value;
       enhanceResources(element);
       return;
@@ -175,11 +178,18 @@
         trust: false,
       });
     }
+    renderedSources.set(element, value);
   }
 
   function schedule(element, source) {
     if (!element) return;
-    sources.set(element, source || "");
+    const value = source || "";
+    sources.set(element, value);
+    if (renderedSources.get(element) === value) {
+      if (frames.has(element)) cancelAnimationFrame(frames.get(element));
+      frames.delete(element);
+      return;
+    }
     if (frames.has(element)) return;
     const frame = requestAnimationFrame(() => {
       frames.delete(element);

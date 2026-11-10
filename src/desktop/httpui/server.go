@@ -3,7 +3,6 @@ package httpui
 import (
 	"AgenticService/src/desktop/folderpicker"
 	"AgenticService/src/desktop/supervisor"
-	"AgenticService/src/domain"
 	"AgenticService/src/internal/systeminfo"
 	"AgenticService/src/web/console"
 	"crypto/subtle"
@@ -53,7 +52,11 @@ func New(config Config) (*Server, error) {
 		return nil, fmt.Errorf("desktop supervisor is required")
 	}
 	if strings.TrimSpace(config.ControlToken) == "" {
-		config.ControlToken = domain.NewID("desktop")
+		token, err := newControlToken()
+		if err != nil {
+			return nil, err
+		}
+		config.ControlToken = token
 	}
 	assets, err := console.Assets()
 	if err != nil {

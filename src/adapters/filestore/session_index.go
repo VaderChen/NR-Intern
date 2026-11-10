@@ -26,8 +26,8 @@ type entryIndexRecord struct {
 // entryIndex 是單一 session transcript 的位置索引。
 //
 // 只存在於記憶體，不落地。落地要處理版本、損毀與跟 transcript 不同步三種狀況，
-// 而重建一次只要掃一遍 header（21 MB 的 transcript 約 11 ms），一個程序週期內
-// 每個 session 也只付一次。檔案身分、大小或修改時間不同就重建。
+// 而重建只需要掃一遍 header。最近使用的索引由有界 LRU 保留；遭淘汰或
+// 檔案身分、大小、修改時間不同時才重建。
 type entryIndex struct {
 	records []entryIndexRecord
 	size    int64
@@ -46,7 +46,7 @@ func (r *SessionRepository) entryIndexFor(ctx context.Context, sessionID, path s
 		return nil, err
 	}
 	r.mu.Lock()
-	cached, ok := r.indexes[sessionID]
+	cached, ok := r.indexes.get(sessionID)
 	r.mu.Unlock()
 	if ok && sameTranscript(cached.info, info) {
 		return cached, nil
@@ -56,7 +56,7 @@ func (r *SessionRepository) entryIndexFor(ctx context.Context, sessionID, path s
 		return nil, err
 	}
 	r.mu.Lock()
-	r.indexes[sessionID] = built
+	r.indexes.set(sessionID, built)
 	r.mu.Unlock()
 	return built, nil
 }
@@ -68,14 +68,14 @@ func (r *SessionRepository) entryIndexFor(ctx context.Context, sessionID, path s
 func (r *SessionRepository) noteAppendedEntry(sessionID string, sequence int64, entryType string, before, after os.FileInfo, written, separator int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	index, ok := r.indexes[sessionID]
+	index, ok := r.indexes.get(sessionID)
 	if !ok {
 		return
 	}
 	offset := before.Size()
 	previousMatches := sameTranscript(index.info, before) || (index.info == nil && offset == 0)
 	if !previousMatches || after == nil || !os.SameFile(before, after) || after.Size() != offset+int64(written+separator) {
-		delete(r.indexes, sessionID)
+		r.indexes.delete(sessionID)
 		return
 	}
 	index.records = append(index.records, entryIndexRecord{sequence: sequence, entryType: entryType, offset: offset + int64(separator)})

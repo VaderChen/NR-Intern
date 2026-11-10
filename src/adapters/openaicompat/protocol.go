@@ -25,13 +25,14 @@ type streamOptions struct {
 }
 
 type chatMessage struct {
-	Role             string     `json:"role"`
-	Content          any        `json:"content,omitempty"`
-	Refusal          string     `json:"refusal,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
-	Reasoning        string     `json:"reasoning,omitempty"`
-	ToolCalls        []toolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
+	Continuation     *domain.ModelContinuation `json:"-"`
+	Role             string                    `json:"role"`
+	Content          any                       `json:"content,omitempty"`
+	Refusal          string                    `json:"refusal,omitempty"`
+	ReasoningContent string                    `json:"reasoning_content,omitempty"`
+	Reasoning        string                    `json:"reasoning,omitempty"`
+	ToolCalls        []toolCall                `json:"tool_calls,omitempty"`
+	ToolCallID       string                    `json:"tool_call_id,omitempty"`
 }
 
 type functionTool struct {
@@ -135,7 +136,7 @@ func (m *Model) messages(request domain.ModelRequest) []chatMessage {
 		case "user":
 			messages = append(messages, chatMessage{Role: "user", Content: message.Content})
 		case "assistant":
-			messages = append(messages, chatMessage{Role: "assistant", Content: message.Content, ToolCalls: encodeToolCalls(message.ToolCalls)})
+			messages = append(messages, chatMessage{Role: "assistant", Content: message.Content, ToolCalls: encodeToolCalls(message.ToolCalls), Continuation: message.Continuation})
 		case "tool":
 			// 空的工具結果要換成明確的文字。工具正常完成卻沒有輸出是常態
 			// （讀到空檔案、grep 沒有命中），但把空字串原樣送出去，上游或

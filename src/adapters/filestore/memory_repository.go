@@ -4,6 +4,7 @@ import (
 	"AgenticService/src/domain"
 	"AgenticService/src/internal/valueutil"
 	"AgenticService/src/ports"
+	"container/heap"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 var _ ports.MemoryRepository = (*MemoryRepository)(nil)
@@ -33,6 +35,31 @@ type memoryFile struct {
 type scoredMemory struct {
 	value domain.Memory
 	score float64
+}
+
+// 最差候選放在根節點；只保留使用者要求的前 limit 筆，不複製整個資料庫。
+type memorySearchHeap []scoredMemory
+
+func (h memorySearchHeap) Len() int           { return len(h) }
+func (h memorySearchHeap) Less(i, j int) bool { return betterMemory(h[j], h[i]) }
+func (h memorySearchHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *memorySearchHeap) Push(value any)    { *h = append(*h, value.(scoredMemory)) }
+func (h *memorySearchHeap) Pop() any {
+	last := len(*h) - 1
+	value := (*h)[last]
+	(*h)[last] = scoredMemory{}
+	*h = (*h)[:last]
+	return value
+}
+
+func betterMemory(left, right scoredMemory) bool {
+	if left.score != right.score {
+		return left.score > right.score
+	}
+	if !left.value.UpdatedAt.Equal(right.value.UpdatedAt) {
+		return left.value.UpdatedAt.After(right.value.UpdatedAt)
+	}
+	return left.value.ID < right.value.ID
 }
 
 func NewMemoryRepository(dataDir string) (*MemoryRepository, error) {
@@ -80,11 +107,12 @@ func (r *MemoryRepository) Remember(ctx context.Context, input domain.RememberMe
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	previous := cloneMemories(r.items)
 	for id, existing := range r.items {
 		if existing.Scope != input.Scope || existing.Kind != input.Kind || existing.Status != domain.MemoryStatusActive || normalizeText(existing.Content) != normalizedContent {
 			continue
 		}
+		// 更新使用新容器，不改動原紀錄的切片／map；回復只需保留被改動的項目。
+		previous := existing
 		existing.Content = input.Content
 		existing.Tags = mergeStrings(existing.Tags, input.Tags)
 		if input.Confidence > existing.Confidence {
@@ -96,7 +124,7 @@ func (r *MemoryRepository) Remember(ctx context.Context, input domain.RememberMe
 		existing.UpdatedAt = now
 		r.items[id] = existing
 		if err := r.persistLocked(); err != nil {
-			r.items = previous
+			r.items[id] = previous
 			return domain.Memory{}, err
 		}
 		return cloneMemory(existing), nil
@@ -117,19 +145,43 @@ func (r *MemoryRepository) Remember(ctx context.Context, input domain.RememberMe
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
+	type originalItem struct {
+		value  domain.Memory
+		exists bool
+	}
+	var previous map[string]originalItem
 	for _, supersededID := range input.Supersedes {
 		existing, ok := r.items[supersededID]
 		if !ok || existing.Scope != input.Scope || existing.Status != domain.MemoryStatusActive {
 			continue
+		}
+		if previous == nil {
+			previous = make(map[string]originalItem)
+		}
+		if _, captured := previous[existing.ID]; !captured {
+			original, exists := r.items[existing.ID]
+			previous[existing.ID] = originalItem{value: original, exists: exists}
 		}
 		existing.Status = domain.MemoryStatusSuperseded
 		existing.SupersededBy = value.ID
 		existing.UpdatedAt = now
 		r.items[existing.ID] = existing
 	}
+	displaced, displacedExists := r.items[value.ID]
 	r.items[value.ID] = value
 	if err := r.persistLocked(); err != nil {
-		r.items = previous
+		if displacedExists {
+			r.items[value.ID] = displaced
+		} else {
+			delete(r.items, value.ID)
+		}
+		for id, original := range previous {
+			if original.exists {
+				r.items[id] = original.value
+			} else {
+				delete(r.items, id)
+			}
+		}
 		return domain.Memory{}, err
 	}
 	return cloneMemory(value), nil
@@ -168,14 +220,16 @@ func (r *MemoryRepository) Search(ctx context.Context, query domain.MemoryQuery)
 		wantedKinds[normalizeMemoryKind(kind)] = struct{}{}
 	}
 	wantedTags := normalizeStrings(query.Tags)
+	wantedTagSet := stringSet(wantedTags)
 	queryText := normalizeText(query.Text)
 	queryTerms := termSet(query.Text)
+	matcher := newMemoryTermMatcher(queryTerms)
 
 	r.mu.RLock()
-	scored := make([]scoredMemory, 0, len(r.items))
+	defer r.mu.RUnlock()
+	scored := make(memorySearchHeap, 0, min(limit, len(r.items)))
 	for _, value := range r.items {
 		if err := ctx.Err(); err != nil {
-			r.mu.RUnlock()
 			return nil, err
 		}
 		if value.Scope != query.Scope || value.Status != domain.MemoryStatusActive {
@@ -186,18 +240,21 @@ func (r *MemoryRepository) Search(ctx context.Context, query domain.MemoryQuery)
 				continue
 			}
 		}
-		tagMatches := overlapCount(stringSet(value.Tags), stringSet(wantedTags))
+		tagMatches := 0
+		if len(wantedTags) > 0 {
+			tagMatches = overlapCount(stringSet(value.Tags), wantedTagSet)
+		}
 		if len(wantedTags) > 0 && tagMatches == 0 {
 			continue
 		}
 		score := float64(tagMatches * 4)
-		content := normalizeText(value.Content)
 		if queryText != "" {
-			termMatches := overlapCount(termSet(value.Content+" "+strings.Join(value.Tags, " ")), queryTerms)
+			content := normalizeText(value.Content)
+			termMatches := matcher.match(value)
 			if strings.Contains(content, queryText) {
 				score += 12
 			}
-			if strings.Contains(queryText, content) && len([]rune(content)) > 4 {
+			if strings.Contains(queryText, content) && utf8.RuneCountInString(content) > 4 {
 				score += 5
 			}
 			score += float64(termMatches * 2)
@@ -206,21 +263,19 @@ func (r *MemoryRepository) Search(ctx context.Context, query domain.MemoryQuery)
 			}
 		}
 		score += value.Confidence
-		scored = append(scored, scoredMemory{value: cloneMemory(value), score: score})
-	}
-	r.mu.RUnlock()
-	sort.Slice(scored, func(i, j int) bool {
-		if scored[i].score == scored[j].score {
-			return scored[i].value.UpdatedAt.After(scored[j].value.UpdatedAt)
+		candidate := scoredMemory{value: value, score: score}
+		if len(scored) < limit {
+			heap.Push(&scored, candidate)
+		} else if betterMemory(candidate, scored[0]) {
+			scored[0] = candidate
+			heap.Fix(&scored, 0)
 		}
-		return scored[i].score > scored[j].score
-	})
-	if len(scored) > limit {
-		scored = scored[:limit]
 	}
+	sort.Slice(scored, func(i, j int) bool { return betterMemory(scored[i], scored[j]) })
 	result := make([]domain.Memory, len(scored))
 	for index, item := range scored {
-		result[index] = item.value
+		// 持有讀鎖直到結果完成複製，避免淘汰／遺忘與回傳內容交錯。
+		result[index] = cloneMemory(item.value)
 	}
 	return result, nil
 }
@@ -277,7 +332,6 @@ func (r *MemoryRepository) Forget(ctx context.Context, scope, id, reason string)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	previous := cloneMemories(r.items)
 	value, ok := r.items[strings.TrimSpace(id)]
 	if !ok || value.Scope != strings.TrimSpace(scope) {
 		return domain.Memory{}, fmt.Errorf("%w: memory %q", domain.ErrNotFound, id)
@@ -285,6 +339,7 @@ func (r *MemoryRepository) Forget(ctx context.Context, scope, id, reason string)
 	if value.Status == domain.MemoryStatusForgotten {
 		return cloneMemory(value), nil
 	}
+	previous, previousExists := r.items[value.ID]
 	now := time.Now().UTC()
 	value.Status = domain.MemoryStatusForgotten
 	value.ForgetReason = strings.TrimSpace(reason)
@@ -292,7 +347,11 @@ func (r *MemoryRepository) Forget(ctx context.Context, scope, id, reason string)
 	value.UpdatedAt = now
 	r.items[value.ID] = value
 	if err := r.persistLocked(); err != nil {
-		r.items = previous
+		if previousExists {
+			r.items[value.ID] = previous
+		} else {
+			delete(r.items, value.ID)
+		}
 		return domain.Memory{}, err
 	}
 	return cloneMemory(value), nil
@@ -309,23 +368,27 @@ func (r *MemoryRepository) PurgeInactive(ctx context.Context, before time.Time) 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	previous := cloneMemories(r.items)
-	removed := 0
+	var removed map[string]domain.Memory
 	for id, value := range r.items {
 		if value.Status == domain.MemoryStatusActive || !value.UpdatedAt.Before(before) {
 			continue
 		}
+		if removed == nil {
+			removed = make(map[string]domain.Memory)
+		}
+		removed[id] = value
 		delete(r.items, id)
-		removed++
 	}
-	if removed == 0 {
+	if len(removed) == 0 {
 		return 0, nil
 	}
 	if err := r.persistLocked(); err != nil {
-		r.items = previous
+		for id, value := range removed {
+			r.items[id] = value
+		}
 		return 0, err
 	}
-	return removed, nil
+	return len(removed), nil
 }
 
 func (r *MemoryRepository) load() error {
@@ -407,34 +470,111 @@ func validMemoryKind(kind domain.MemoryKind) bool {
 }
 
 func normalizeText(value string) string {
-	return strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(value))), " ")
+	value = strings.ToLower(strings.TrimSpace(value))
+	previousSpace := false
+	for _, character := range value {
+		space := unicode.IsSpace(character)
+		if space && (character != ' ' || previousSpace) {
+			var output strings.Builder
+			output.Grow(len(value))
+			for field := range strings.FieldsSeq(value) {
+				if output.Len() > 0 {
+					output.WriteByte(' ')
+				}
+				output.WriteString(field)
+			}
+			return output.String()
+		}
+		previousSpace = space
+	}
+	return value
 }
 
 func termSet(value string) map[string]struct{} {
 	result := map[string]struct{}{}
-	var word []rune
-	flush := func() {
-		if len(word) == 0 {
-			return
+	visitMemoryTerms(value, func(term string) bool { result[term] = struct{}{}; return true })
+	return result
+}
+
+// 逐詞拜訪，保留既有「完整詞＋不超過 128 字的雙字詞」語意。
+// 以 UTF-8 邊界切片，不為每個字／詞配置 []rune 與暫存字串。
+func visitMemoryTerms(value string, visit func(string) bool) {
+	value = strings.ToLower(value)
+	start, count := -1, 0
+	flush := func(end int) bool {
+		if start < 0 {
+			return true
 		}
-		text := string(word)
-		result[text] = struct{}{}
-		if len(word) <= 128 {
-			for index := 0; index+1 < len(word); index++ {
-				result[string(word[index:index+2])] = struct{}{}
+		word := value[start:end]
+		if !visit(word) {
+			return false
+		}
+		if count <= 128 {
+			previous := -1
+			for index, character := range word {
+				if previous >= 0 && !visit(word[previous:index+utf8.RuneLen(character)]) {
+					return false
+				}
+				previous = index
 			}
 		}
-		word = nil
+		start, count = -1, 0
+		return true
 	}
-	for _, value := range []rune(strings.ToLower(value)) {
-		if unicode.IsLetter(value) || unicode.IsNumber(value) || value == '_' || value == '-' {
-			word = append(word, value)
-			continue
+	for index, character := range value {
+		if unicode.IsLetter(character) || unicode.IsNumber(character) || character == '_' || character == '-' {
+			if start < 0 {
+				start = index
+			}
+			count++
+		} else if !flush(index) {
+			return
 		}
-		flush()
 	}
-	flush()
-	return result
+	flush(len(value))
+}
+
+// 每次搜尋共用一份命中標記；不為資料庫裡的每一筆記憶配置一個 map。
+// 代次只活在單一 Search 呼叫，並行搜尋不共用可變狀態。
+type memoryTermMatcher struct {
+	indexes    map[string]int
+	seen       []uint64
+	generation uint64
+}
+
+func newMemoryTermMatcher(wanted map[string]struct{}) memoryTermMatcher {
+	matcher := memoryTermMatcher{indexes: make(map[string]int, len(wanted)), seen: make([]uint64, len(wanted))}
+	for term := range wanted {
+		matcher.indexes[term] = len(matcher.indexes)
+	}
+	return matcher
+}
+
+func (m *memoryTermMatcher) match(value domain.Memory) int {
+	if len(m.indexes) == 0 {
+		return 0
+	}
+	m.generation++
+	if m.generation == 0 {
+		clear(m.seen)
+		m.generation = 1
+	}
+	matched := 0
+	visit := func(term string) bool {
+		if index, ok := m.indexes[term]; ok && m.seen[index] != m.generation {
+			m.seen[index] = m.generation
+			matched++
+		}
+		return matched < len(m.indexes)
+	}
+	visitMemoryTerms(value.Content, visit)
+	for _, tag := range value.Tags {
+		if matched == len(m.indexes) {
+			break
+		}
+		visitMemoryTerms(tag, visit)
+	}
+	return matched
 }
 
 func stringSet(values []string) map[string]struct{} {
@@ -503,14 +643,6 @@ func cloneMemory(value domain.Memory) domain.Memory {
 	if value.ForgottenAt != nil {
 		copyTime := *value.ForgottenAt
 		result.ForgottenAt = &copyTime
-	}
-	return result
-}
-
-func cloneMemories(values map[string]domain.Memory) map[string]domain.Memory {
-	result := make(map[string]domain.Memory, len(values))
-	for key, value := range values {
-		result[key] = cloneMemory(value)
 	}
 	return result
 }

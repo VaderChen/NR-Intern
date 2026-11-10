@@ -62,8 +62,19 @@ func (t *completionTracker) observe(call domain.ToolCall, result domain.ToolExec
 	}
 	if parent, _ := result.Details["mcp_resumed_tool_call_id"].(string); parent != "" {
 		// 續接關係由 Runtime 驗證，不能以同名工具或模型自行填寫的文字取代。
-		if previous := t.failures[parent]; previous != nil && previous.awaitingInput && previous.toolName == name {
-			delete(t.failures, parent)
+		matched := ""
+		for key, previous := range t.failures {
+			if previous.toolCallID == parent && previous.awaitingInput && previous.toolName == name {
+				if matched != "" {
+					// 跨回合重用 ID 造成歧義時，不猜測哪一次等待已被續接。
+					matched = ""
+					break
+				}
+				matched = key
+			}
+		}
+		if matched != "" {
+			delete(t.failures, matched)
 		}
 	}
 	if domain.ToolExecutionState(result.Details) != domain.ToolNotDispatched {
@@ -83,10 +94,8 @@ func (t *completionTracker) observe(call domain.ToolCall, result domain.ToolExec
 		return
 	}
 	t.sequence++
-	id := call.ID
-	if id == "" {
-		id = toolCallSignature(call)
-	}
+	// Provider 只保證單輪呼叫 ID 不重複；跨回合不能拿同一 ID 覆蓋舊失敗。
+	id := fmt.Sprintf("%d:%s", t.sequence, call.ID)
 	t.failures[id] = &failureRecord{
 		order:         t.sequence,
 		toolCallID:    call.ID,

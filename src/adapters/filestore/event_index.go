@@ -21,7 +21,7 @@ type eventOffsetIndex struct {
 // 呼叫端持有該 Run 的 runLock，因此索引不會在讀取期間被 Append 修改。
 func (r *RunEventRepository) validEventIndex(runID, path string) *eventOffsetIndex {
 	r.mu.Lock()
-	index := r.indexes[runID]
+	index, _ := r.indexes.get(runID)
 	r.mu.Unlock()
 	if index == nil || index.info == nil {
 		return nil

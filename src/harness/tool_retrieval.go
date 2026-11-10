@@ -1,15 +1,16 @@
 package harness
 
 import (
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
 	"sync"
-	"unicode"
 
 	"AgenticService/src/domain"
+	"AgenticService/src/internal/textutil"
 )
 
 const (
@@ -66,12 +67,13 @@ var coreToolNames = map[string]bool{
 // schema 都不小，而任何一次需求通常只會用到其中一兩個。核心工具（coreToolNames）
 // 不參與檢索。
 type toolRetriever struct {
-	active  bool
-	entries []toolIndexEntry
-	idf     map[string]float64
-	// known 是所有 MCP 工具，檢索沒命中也仍然可以被呼叫：讓模型多跑一輪去
+	active    bool
+	entries   []toolIndexEntry
+	idf       map[string]float64
+	indexOnce sync.Once
+	// known 只保留可選工具名稱，定義統一由 entries 持有。檢索沒命中仍可被呼叫：讓模型多跑一輪去
 	// 「重新找一次已經知道名字的工具」，就是把省下來的 token 又賠回去。
-	known map[string]domain.ToolDefinition
+	known map[string]struct{}
 
 	mu sync.Mutex
 	// revealed 是本 run 已進入目錄的 MCP 工具：第一層命中的、探索取回的、
@@ -86,24 +88,25 @@ type toolIndexEntry struct {
 
 func newToolRetriever(definitions []domain.ToolDefinition, query string, enabled bool) *toolRetriever {
 	retriever := &toolRetriever{
-		known:    map[string]domain.ToolDefinition{},
+		known:    make(map[string]struct{}, len(definitions)),
+		entries:  make([]toolIndexEntry, 0, len(definitions)),
 		revealed: map[string]bool{},
 	}
 	for _, definition := range definitions {
 		if retrievalExempt(definition.Name) {
 			continue
 		}
-		retriever.known[definition.Name] = definition
+		retriever.known[definition.Name] = struct{}{}
 		retriever.entries = append(retriever.entries, toolIndexEntry{
 			definition: definition,
-			terms:      indexToolTerms(definition),
 		})
 	}
 	if !enabled || len(retriever.entries) <= mcpRetrievalThreshold {
 		return retriever
 	}
+	// 啟用的索引在公開 retriever 前完成，recognizable 可安全讀取完整 entry。
+	retriever.ensureIndex()
 	retriever.active = true
-	retriever.idf = inverseDocumentFrequency(retriever.entries)
 	for _, definition := range retriever.search(query, mcpRetrievalLimit) {
 		retriever.revealed[definition.Name] = true
 	}
@@ -118,13 +121,15 @@ func (t *toolRetriever) stage(definitions []domain.ToolDefinition) []domain.Tool
 	if !t.enabled() {
 		return definitions
 	}
-	result := make([]domain.ToolDefinition, 0, len(definitions))
+	t.mu.Lock()
+	result := make([]domain.ToolDefinition, 0, min(len(definitions)+1, len(t.revealed)+len(coreToolNames)+1))
 	for _, definition := range definitions {
-		if !retrievalExempt(definition.Name) && !t.isRevealed(definition.Name) {
+		if !retrievalExempt(definition.Name) && !t.revealed[definition.Name] {
 			continue
 		}
 		result = append(result, definition)
 	}
+	t.mu.Unlock()
 	return append(result, findToolsDefinition(len(t.entries)))
 }
 
@@ -162,16 +167,52 @@ func (t *toolRetriever) reveal(names ...string) {
 	}
 }
 
-func (t *toolRetriever) isRevealed(name string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.revealed[name]
-}
-
 func (t *toolRetriever) revealedCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.revealed)
+}
+
+// 關閉／小目錄不需要索引；若直接搜尋才補建，並保留並行搜尋的安全性。
+func (t *toolRetriever) ensureIndex() {
+	t.indexOnce.Do(func() {
+		for index := range t.entries {
+			t.entries[index].terms = indexToolTerms(t.entries[index].definition)
+		}
+		t.idf = inverseDocumentFrequency(t.entries)
+	})
+}
+
+type toolSearchMatch struct {
+	entry int
+	score float64
+}
+
+type toolSearchHeap struct {
+	entries []toolIndexEntry
+	matches []toolSearchMatch
+}
+
+func (h toolSearchHeap) better(left, right toolSearchMatch) bool {
+	if left.score != right.score {
+		return left.score > right.score
+	}
+	leftName, rightName := h.entries[left.entry].definition.Name, h.entries[right.entry].definition.Name
+	if leftName != rightName {
+		return leftName < rightName
+	}
+	return left.entry < right.entry // 保留原本穩定排序的同名次序。
+}
+
+func (h toolSearchHeap) Len() int           { return len(h.matches) }
+func (h toolSearchHeap) Less(i, j int) bool { return h.better(h.matches[j], h.matches[i]) }
+func (h toolSearchHeap) Swap(i, j int)      { h.matches[i], h.matches[j] = h.matches[j], h.matches[i] }
+func (h *toolSearchHeap) Push(value any)    { h.matches = append(h.matches, value.(toolSearchMatch)) }
+func (h *toolSearchHeap) Pop() any {
+	last := len(h.matches) - 1
+	value := h.matches[last]
+	h.matches = h.matches[:last]
+	return value
 }
 
 // search 依相關度排序回傳工具，分數為 0 的不回傳。
@@ -180,44 +221,38 @@ func (t *toolRetriever) search(query string, limit int) []domain.ToolDefinition 
 		return nil
 	}
 	terms := map[string]bool{}
-	for _, term := range tokenizeForRetrieval(query) {
+	textutil.VisitSearchTerms(query, func(term string) {
 		terms[term] = true
-	}
+	})
 	if len(terms) == 0 {
 		return nil
 	}
-	idf := t.idf
-	if idf == nil {
-		idf = inverseDocumentFrequency(t.entries)
-	}
-	type scored struct {
-		definition domain.ToolDefinition
-		score      float64
-	}
-	matches := make([]scored, 0, len(t.entries))
-	for _, entry := range t.entries {
+	t.ensureIndex()
+	matches := &toolSearchHeap{entries: t.entries, matches: make([]toolSearchMatch, 0, min(limit, len(t.entries)))}
+	for index := range t.entries {
+		entry := &t.entries[index]
 		score := 0.0
 		for term := range terms {
 			if weight, ok := entry.terms[term]; ok {
-				score += weight * idf[term]
+				score += weight * t.idf[term]
 			}
 		}
 		if score > 0 {
-			matches = append(matches, scored{definition: entry.definition, score: score})
+			match := toolSearchMatch{entry: index, score: score}
+			if matches.Len() < limit {
+				heap.Push(matches, match)
+			} else if matches.better(match, matches.matches[0]) {
+				matches.matches[0] = match
+				heap.Fix(matches, 0)
+			}
 		}
 	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		if matches[i].score != matches[j].score {
-			return matches[i].score > matches[j].score
-		}
-		return matches[i].definition.Name < matches[j].definition.Name
+	sort.Slice(matches.matches, func(i, j int) bool {
+		return matches.better(matches.matches[i], matches.matches[j])
 	})
-	if len(matches) > limit {
-		matches = matches[:limit]
-	}
-	result := make([]domain.ToolDefinition, 0, len(matches))
-	for _, match := range matches {
-		result = append(result, match.definition)
+	result := make([]domain.ToolDefinition, 0, matches.Len())
+	for _, match := range matches.matches {
+		result = append(result, t.entries[match.entry].definition)
 	}
 	return result
 }
@@ -353,11 +388,11 @@ func compactSchema(schema map[string]any) map[string]any {
 func indexToolTerms(definition domain.ToolDefinition) map[string]float64 {
 	terms := map[string]float64{}
 	add := func(text string, weight float64) {
-		for _, term := range tokenizeForRetrieval(text) {
+		textutil.VisitSearchTerms(text, func(term string) {
 			if terms[term] < weight {
-				terms[term] = weight
+				terms[strings.Clone(term)] = weight
 			}
-		}
+		})
 	}
 	add(definition.Description, 1)
 	add(definition.Label, 2)
@@ -394,48 +429,8 @@ func inverseDocumentFrequency(entries []toolIndexEntry) map[string]float64 {
 // 「製令」「令狀」「狀態」，足以對上工具說明裡的同一組字。
 func tokenizeForRetrieval(text string) []string {
 	terms := []string{}
-	ascii := make([]rune, 0, 16)
-	cjk := make([]rune, 0, 16)
-	flushASCII := func() {
-		if len(ascii) >= 2 {
-			terms = append(terms, string(ascii))
-		}
-		ascii = ascii[:0]
-	}
-	flushCJK := func() {
-		switch {
-		case len(cjk) == 1:
-			terms = append(terms, string(cjk))
-		default:
-			for index := 0; index+1 < len(cjk); index++ {
-				terms = append(terms, string(cjk[index:index+2]))
-			}
-		}
-		cjk = cjk[:0]
-	}
-	for _, value := range strings.ToLower(text) {
-		switch {
-		case isCJKRune(value):
-			flushASCII()
-			cjk = append(cjk, value)
-		case unicode.IsLetter(value) || unicode.IsDigit(value):
-			flushCJK()
-			ascii = append(ascii, value)
-		default:
-			flushASCII()
-			flushCJK()
-		}
-	}
-	flushASCII()
-	flushCJK()
+	textutil.VisitSearchTerms(text, func(term string) { terms = append(terms, strings.Clone(term)) })
 	return terms
-}
-
-func isCJKRune(value rune) bool {
-	return unicode.Is(unicode.Han, value) ||
-		unicode.Is(unicode.Hiragana, value) ||
-		unicode.Is(unicode.Katakana, value) ||
-		unicode.Is(unicode.Hangul, value)
 }
 
 // retrievalExempt 回報這個工具是否不參與檢索（核心工具與 find_tools 本身）。

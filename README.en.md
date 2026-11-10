@@ -8,7 +8,7 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 
 ## Highlights
 
-- Extensible provider routing for OpenAI-compatible Chat Completions and OpenAI Codex Responses authenticated through ChatGPT/Codex OAuth. When a Codex account has usage-limit reset credits, they can be redeemed from the provider settings; the confirmation shows how many remain and when the next one expires.
+- Extensible provider routing for OpenAI-compatible Chat Completions, custom Responses endpoints, OpenAI Codex Responses authenticated through ChatGPT/Codex OAuth, and native Claude Platform Messages API. When a Codex account has usage-limit reset credits, they can be redeemed from the provider settings; the confirmation shows how many remain and when the next one expires.
 - A `Workspace → Project → Session` hierarchy with per-conversation provider and model selection.
 - Standing instructions on workspaces and projects: write the working rules once and every conversation and schedule carries them.
 - Multiple ordered work plans with drag-and-drop ordering, step states, and tool-backed evidence.
@@ -40,6 +40,8 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - Screen capture is available beside the conversation input. On macOS it opens the system region capture and an editor for rectangles, lines, and text; copying or closing the editor updates the clipboard with the edited image. Windows opens the system snipping interface.
 
 The interface language controls only the UI and an uncustomized default name. The agent infers the user's preferred language from the current message, recent conversation, and explicit preferences.
+
+Latest update: **1.26.1110 build 1637** adds Claude API support, provider/model selection improvements, safer tool and run completion, and performance optimizations. See the [release notes (Traditional Chinese)](docs/ai-agent/CHANGELOG.md) for validation and upgrade limits.
 
 ## Getting started
 

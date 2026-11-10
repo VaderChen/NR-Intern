@@ -62,7 +62,7 @@ type SessionRepository struct {
 	mu    sync.Mutex
 	locks [64]sync.Mutex
 	// indexes 是各 session transcript 的位置索引，見 session_index.go。
-	indexes map[string]*entryIndex
+	indexes indexCache[*entryIndex]
 }
 
 // SetProjectRoots 注入根目錄解析。傳入 nil 會回到單一根目錄的行為。
@@ -150,10 +150,7 @@ func NewSessionRepository(dataDir string) (*SessionRepository, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create session store: %w", err)
 	}
-	return &SessionRepository{
-		root:    root,
-		indexes: map[string]*entryIndex{},
-	}, nil
+	return &SessionRepository{root: root}, nil
 }
 
 func (r *SessionRepository) Create(ctx context.Context, agentID string, input domain.CreateSessionInput) (domain.Session, error) {
@@ -344,7 +341,7 @@ func (r *SessionRepository) Delete(ctx context.Context, sessionID string) error 
 		return fmt.Errorf("delete session: %w", err)
 	}
 	r.mu.Lock()
-	delete(r.indexes, sessionID)
+	r.indexes.delete(sessionID)
 	r.mu.Unlock()
 	return nil
 }
@@ -418,7 +415,7 @@ func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, e
 	defer func() {
 		if !indexed {
 			r.mu.Lock()
-			delete(r.indexes, sessionID)
+			r.indexes.delete(sessionID)
 			r.mu.Unlock()
 		}
 	}()
@@ -922,7 +919,7 @@ func (r *SessionRepository) PurgeVolatileResidue() (int, error) {
 			return removed, fmt.Errorf("delete memory-isolated session residue: %w", err)
 		}
 		r.mu.Lock()
-		delete(r.indexes, entry.Name())
+		r.indexes.delete(entry.Name())
 		r.mu.Unlock()
 		removed++
 	}

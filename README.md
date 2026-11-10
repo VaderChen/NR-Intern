@@ -8,8 +8,8 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 ## 主要能力
 
-- 可擴充的 Provider Router，支援 OpenAI-compatible Chat Completions，以及使用 ChatGPT／Codex OAuth 的 OpenAI Codex Responses。Codex 帳號若有用量上限重置額度，可在 Provider 設定直接兌換，確認前會揭露可用次數與最早到期時間。
-- `Workspace → Project → Session` 管理結構，以及每個對話獨立的 Provider 與模型選擇。
+- 可擴充的 Provider Router，支援 OpenAI-compatible Chat Completions、自訂 Responses 端點、使用 ChatGPT／Codex OAuth 的 OpenAI Codex Responses，以及 Claude Platform 原生 Messages API。Codex 帳號若有用量上限重置額度，可在 Provider 設定直接兌換，確認前會揭露可用次數與最早到期時間。
+- `Workspace → Project → Session` 管理結構；Workspace 與建立 Session 時可依 Provider 選取模型列表，也保留手動輸入與預設繼承。
 - Workspace 與 Project 的職務說明：常駐工作規則只寫一次，之後每次對話與排程都自動帶入。
 - 多份有序工作計畫、拖曳排序、步驟狀態與工具驗證證據。
 - 可選的 Thinking 思考程度；Session 可鎖定計畫依序執行，或解除鎖定以切換未完成計畫；不同 Session 可同時工作。
@@ -50,6 +50,17 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 - MCP 追加輸入透過受限續接 ID 處理，執行前再次核對工具契約。互動 HTML 使用原始碼寫入工具，與文字文件產生器分流。
 
 本輪變更與升級限制見 [更新紀錄](docs/ai-agent/CHANGELOG.md)。
+
+## 本次更新：1.26.1110 build 1637
+
+- **Claude Platform API**：支援模型列表、串流與非串流、原生工具、思考續接與 effort；固定指示及工具定義支援 prompt caching，記錄快取讀寫 token。Claude 使用 Messages，設定中的「使用 Response」則屬於 OpenAI Responses 協定。
+- **Provider 管理**：修正儲存／刪除後的計價參照；刪除時，受影響且未執行工作的 Session 回到系統預設 Provider／模型。Workspace 仍引用或工作執行中時會保護原設定。
+- **長任務可靠性**：工具批次完整驗證後才派送；取消或事件失敗時補齊未派送結果，改善 Run 終態與截斷回覆處理。Context 裁切保留完整工具呼叫／結果群組，避免不完整歷史造成重做。
+- **效能與記憶體**：改善工具檢索、串流文字判讀、記憶搜尋、日誌緩衝與前端渲染；Session／事件索引採有界 LRU。實測條件及限制見[開發說明](docs/ai-agent/DEVELOPMENT.md#效能與記憶體檢查)，合成基準不代表整個 APP 的加速比例。
+- **剩餘用量**：Codex 顯示百分比、進度條及實際資料更新時間。Claude 速率快照供內部使用，不顯示為帳戶點數或金額餘額。
+
+Claude 最大輸出 Tokens 應依模型能力設定；預設 4096 可能不足以一次生成完整程式。
+截斷的工具參數不會執行。模型支援的思考程度、輸入類型與其他限制請見[Claude 設定說明](docs/ai-agent/DEVELOPMENT.md#claude-platform-api)。
 
 ## 開始使用
 

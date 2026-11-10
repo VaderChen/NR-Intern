@@ -1,5 +1,36 @@
 # 更新紀錄
 
+## 1.26.1110 build 1637
+
+本版整合 Claude Platform API、Provider 管理、Harness 可靠性與效能優化。
+
+### Provider 與模型
+
+- 新增 Claude 原生 Messages API：模型分頁列表、串流／非串流、工具呼叫與結果、思考簽章續接、effort 與用量統計。
+- Claude 固定指示與工具定義加入 prompt caching；快取讀取／寫入 token 個別記錄，成本估算仍使用單一輸入單價。
+- 前綴內容變動時省略失效的思考區塊；工具配對維持完整，不因簽章錯誤重做工具。
+- 修正 Claude 連線測試的工具選擇方式、串流終態及輸出截斷判讀；截斷參數不交付執行。
+- 修正 Provider 計價殘留參照；刪除 Provider 後，閒置 Session 遷移至系統預設 Provider／模型。執行中工作與 Workspace 引用仍受保護。
+- Workspace 與建立 Session 的模型列表隨 Provider 更新，保留手動輸入／預設繼承，避免舊請求覆蓋新選擇。
+- Codex 剩餘用量加入百分比、進度條與資料更新時間；Claude 速率快照僅供內部使用，不當成帳戶餘額。
+
+### Harness、效能與架構
+
+- 工具指令整批驗證，取消或提早離開時保存尚未派送的結果；展示 hook 不得改寫真實失敗或未知狀態。
+- 改善回合及 Run 終態收尾、panic 邊界與儲存失敗處理；輸出截斷最多一次要求縮小工作，仍受原有預算限制。
+- Context 裁切保留完整工具群組，摘要輸入不回送原 Provider 的不透明續接狀態。
+- 改善串流判讀、工具檢索、記憶搜尋、字型讀取、試算表定位與前端渲染；Session／事件索引採 128 份 LRU，日誌使用可重用緩衝。
+- Application、Harness 與 MCP Client 依職責拆分；加入套件相依白名單檢查及 GitHub Go 檢查工作流程。
+
+### 升級與驗證範圍
+
+- 升級前備份所需資料；RAM 工作區不跨重啟保留，已執行的舊 APP 不會自動載入新程式。
+- Claude 使用 Platform API Key 與 Messages；「使用 Response」是另一種協定。圖片／PDF 輸入、手動 thinking budget 及伺服器端工具尚未支援。
+- 最大輸出須符合模型能力，未設定時仍為 4096。歷次授權 API 實測及合成效能資料記錄於開發說明，不代表整體正確率、併發容量或長時間穩定性驗收。
+- 本次發布重新執行 Go 編譯、對應 Smoke 與 JavaScript 語法檢查；未另行呼叫付費模型。具體發布驗證結果見本版 GitHub Release。
+- macOS ARM64 使用簽章及公證 DMG；Windows x64／ARM64 使用 NSIS `setup.exe`，目前未具備 Authenticode 簽章，可能出現 SmartScreen 警告。Windows 實機安裝、升級及移除仍未驗收。
+- Release 附件以 `RELEASE-SHA256SUMS` 核對完整性；`PACKAGES-SHA256SUMS` 僅列通過簽章驗證的產物。
+
 ## 1.26.0912 build 1635
 
 本版聚焦任務約束、工具執行、長任務恢復與交付結果。

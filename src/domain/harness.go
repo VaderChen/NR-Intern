@@ -36,6 +36,11 @@ type Usage struct {
 	InputTokens  int `json:"input_tokens,omitempty"`
 	OutputTokens int `json:"output_tokens,omitempty"`
 	TotalTokens  int `json:"total_tokens,omitempty"`
+	// CacheReadTokens 與 CacheWriteTokens 是 Provider 回報的 prompt caching 用量，
+	// 已包含在 InputTokens 內，不可再加進總量。只有 Provider 有回報時才非零，
+	// 用來確認快取是否真的命中。
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 }
 
 // Add 累加 Provider 回報的單輪用量；Provider 偶爾不提供 total_tokens，
@@ -46,6 +51,8 @@ func (usage *Usage) Add(value Usage) {
 	}
 	usage.InputTokens += value.InputTokens
 	usage.OutputTokens += value.OutputTokens
+	usage.CacheReadTokens += value.CacheReadTokens
+	usage.CacheWriteTokens += value.CacheWriteTokens
 	if value.TotalTokens > 0 {
 		usage.TotalTokens += value.TotalTokens
 	} else {

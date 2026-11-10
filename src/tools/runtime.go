@@ -2,7 +2,6 @@ package tools
 
 import (
 	"AgenticService/src/domain"
-	"AgenticService/src/mcpclient"
 	"AgenticService/src/ports"
 	"context"
 	"fmt"
@@ -14,7 +13,19 @@ import (
 // 唯一看見的 ToolRuntime，並以公開工具名稱將呼叫路由回正確來源。
 type Runtime struct {
 	Native *Registry
-	MCP    *mcpclient.Manager
+	MCP    RemoteToolSource
+}
+
+// RemoteToolSource 是 Runtime 對外部工具來源（目前是 MCP Client）的全部需求。
+// 介面定義在使用端，tools 因此不必 import mcpclient，外部工具的連線、設定與
+// 狀態管理留在 bootstrap 與 mcpclient。
+//
+// 欄位不可放入型別為指標、值為 nil 的實作：介面值不等於 nil，Runtime 會照常
+// 轉發而在實作內部 panic。沒有外部工具來源時讓欄位保持未設定。
+type RemoteToolSource interface {
+	ports.ToolRuntime
+	ports.ToolContractResolver
+	Catalog(session *domain.Session) []domain.ToolCatalogEntry
 }
 
 func (r *Runtime) ResolveDefinition(ctx context.Context, session domain.Session, name string) (domain.ToolDefinition, error) {

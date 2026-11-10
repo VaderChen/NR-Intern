@@ -11,6 +11,8 @@ import (
 type instructionTextStream struct {
 	buffer      strings.Builder
 	candidate   strings.Builder
+	leading     int
+	holding     bool
 	released    bool
 	suppressing bool
 }
@@ -22,12 +24,25 @@ func (stream *instructionTextStream) Push(delta string, emit func(string) error)
 	if stream.released {
 		return stream.pushReleased(delta, emit)
 	}
+	if stream.holding {
+		return nil
+	}
 	stream.buffer.WriteString(delta)
-	if instructionPrefixMayBeTool(stream.buffer.String()) {
+	buffered := stream.buffer.String()
+	prefix := strings.TrimLeftFunc(buffered[stream.leading:], unicode.IsSpace)
+	stream.leading = len(buffered) - len(prefix)
+	possible, matched := instructionPrefixStatus(prefix)
+	if matched {
+		// 已確認是整段保留的協定／程式碼前綴。最終內容由 Provider 回傳，
+		// 這層不用再保存一份完整工具參數；一般 JSON 仍由 Finish 放行。
+		stream.holding = true
+		stream.buffer.Reset()
+		return nil
+	}
+	if possible {
 		return nil
 	}
 	stream.released = true
-	buffered := stream.buffer.String()
 	stream.buffer.Reset()
 	return stream.pushReleased(buffered, emit)
 }
@@ -67,8 +82,9 @@ func (stream *instructionTextStream) pushReleased(delta string, emit func(string
 		return nil
 	}
 	stream.candidate.WriteString(delta)
-	for stream.candidate.Len() > 0 {
-		value := stream.candidate.String()
+	value := stream.candidate.String()
+	// 已判定的一般文字只前移游標，不在每個大括號後重複複製剩餘全文。
+	for value != "" {
 		brace := strings.IndexByte(value, '{')
 		if brace < 0 {
 			stream.candidate.Reset()
@@ -79,55 +95,68 @@ func (stream *instructionTextStream) pushReleased(delta string, emit func(string
 				return err
 			}
 			value = value[brace:]
-			stream.candidate.Reset()
-			stream.candidate.WriteString(value)
 		}
-		possible, matched := embeddedInstructionToolPrefix(stream.candidate.String())
+		possible, matched := embeddedInstructionToolPrefix(value)
 		if matched {
 			stream.candidate.Reset()
 			stream.suppressing = true
 			return nil
 		}
 		if possible {
+			if len(value) != stream.candidate.Len() {
+				stream.candidate.Reset()
+				stream.candidate.WriteString(value)
+			}
 			return nil
 		}
 		// 不是工具 JSON；先放行左大括號，再繼續檢查後方是否另有工具指令。
 		if err := emit("{"); err != nil {
 			return err
 		}
-		value = stream.candidate.String()
-		stream.candidate.Reset()
-		stream.candidate.WriteString(strings.TrimPrefix(value, "{"))
+		value = value[1:]
 	}
+	stream.candidate.Reset()
 	return nil
 }
 
 func embeddedInstructionToolPrefix(value string) (possible, matched bool) {
-	var compact strings.Builder
+	const longestMarker = len(`{"type":"tool_call"`)
+	var compact [longestMarker]byte
+	length := 0
 	for _, character := range value {
 		if unicode.IsSpace(character) {
 			continue
 		}
-		compact.WriteRune(unicode.ToLower(character))
-	}
-	prefix := compact.String()
-	for _, marker := range []string{`{"type":"tool_use"`, `{"type":"tool_call"`, `{"type":"tool"`} {
-		if strings.HasPrefix(marker, prefix) {
-			possible = true
+		character = unicode.ToLower(character)
+		if character > unicode.MaxASCII {
+			return false, false
 		}
-		if strings.HasPrefix(prefix, marker) {
-			return true, true
+		compact[length] = byte(character)
+		length++
+		prefix := string(compact[:length])
+		possible = false
+		for _, marker := range []string{`{"type":"tool_use"`, `{"type":"tool_call"`, `{"type":"tool"`} {
+			if marker == prefix {
+				return true, true
+			}
+			if strings.HasPrefix(marker, prefix) {
+				possible = true
+			}
+		}
+		if !possible {
+			return false, false
 		}
 	}
-	return possible, false
+	return true, false
 }
 
-func instructionPrefixMayBeTool(value string) bool {
+func instructionPrefixStatus(value string) (possible, matched bool) {
 	trimmed := strings.TrimLeftFunc(value, unicode.IsSpace)
 	if trimmed == "" {
-		return true
+		return true, false
 	}
-	lower := strings.ToLower(trimmed)
+	// 標記最長只有 10 bytes；不能對累積中的整份工具參數做 ToLower。
+	lower := strings.ToLower(trimmed[:min(len(trimmed), len("[tool_call"))])
 	for _, marker := range []string{
 		"{",
 		"```",
@@ -138,9 +167,12 @@ func instructionPrefixMayBeTool(value string) bool {
 		"[tool_use",
 		"to=",
 	} {
-		if strings.HasPrefix(marker, lower) || strings.HasPrefix(lower, marker) {
-			return true
+		if strings.HasPrefix(lower, marker) {
+			return true, true
+		}
+		if strings.HasPrefix(marker, lower) {
+			possible = true
 		}
 	}
-	return false
+	return possible, false
 }

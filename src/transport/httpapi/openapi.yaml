@@ -639,7 +639,8 @@ paths:
     get:
       summary: 取得 Provider 最近一次配額快照
       description: >-
-        回傳唯讀帳號 API 最近一次驗證成功的 5 小時與 7 天快照，不從推論 Header 取值。
+        Codex 回傳唯讀帳號 API 最近一次驗證成功的 5 小時與 7 天快照。
+        Claude Platform 回傳最近一次推論回應的速率限制標頭，包含請求與 token 額度；不是帳戶金額餘額。
         available=false 代表未知；明確 null 視窗會清除舊值。一般刷新失敗保留原 UpdatedAt，
         授權失效清除快照。此端點只讀取快取，不觸發推論或兌換重置額度。
       responses:
@@ -2080,10 +2081,23 @@ components:
       required: [provider_id, five_hour, seven_day]
       properties:
         provider_id: { type: string }
+        kind: { type: string, enum: [quota, rate_limit], description: 帳戶配額或 API 速率額度。 }
+        model: { type: string, description: 速率快照來源模型。 }
+        rate_limits:
+          type: array
+          items: { $ref: "#/components/schemas/ProviderRateLimit" }
         updated_at: { type: string, format: date-time }
         five_hour: { $ref: "#/components/schemas/ProviderUsageWindow" }
         seven_day: { $ref: "#/components/schemas/ProviderUsageWindow" }
         reset_credits: { $ref: "#/components/schemas/ProviderResetCredits" }
+    ProviderRateLimit:
+      type: object
+      required: [resource, remaining]
+      properties:
+        resource: { type: string, enum: [requests, input_tokens, output_tokens, tokens] }
+        limit: { type: integer, minimum: 1, description: 上游未提供有效上限時省略；此時只顯示剩餘數量。 }
+        remaining: { type: integer, minimum: 0 }
+        reset_at: { type: string, format: date-time }
     ProviderResetCredits:
       type: object
       required: [available, count]

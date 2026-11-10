@@ -17,6 +17,14 @@
       document.documentElement.dataset.displayMode = mode;
       document.documentElement.dataset.theme = mode === "auto" ? (systemDark ? "dark" : "light") : mode;
 
+      const supportedFontSizes = new Set(["small", "medium", "large"]);
+      let fontSize = "small";
+      try {
+        const storedFontSize = localStorage.getItem("fontSize");
+        if (supportedFontSizes.has(storedFontSize)) fontSize = storedFontSize;
+      } catch (_) {}
+      document.documentElement.dataset.fontSize = fontSize;
+
       const supportedLanguages = new Set(["auto", "zh-TW", "en", "ja", "ko"]);
       let uiLanguage = "auto";
       try {
@@ -86,7 +94,8 @@
           </button>
         </div>
         <section id="providerUsagePopover" class="provider-usage-popover hidden" role="dialog" aria-label="Provider 用量">
-          <div class="provider-usage-row">
+          <dl id="providerUsageRateLimits" class="context-usage-details provider-rate-limits"></dl>
+          <div id="providerUsageFiveHourRow" class="provider-usage-row">
             <div class="provider-usage-copy">
               <strong>5 小時使用情況限制</strong>
               <small><span>重設時間</span> <span id="providerUsageFiveHourReset">-</span></small>
@@ -98,7 +107,7 @@
               <span class="provider-usage-remaining"><span>剩餘</span> <strong id="providerUsageFiveHourValue">-</strong></span>
             </div>
           </div>
-          <div class="provider-usage-row">
+          <div id="providerUsageSevenDayRow" class="provider-usage-row">
             <div class="provider-usage-copy">
               <strong>每週使用上限</strong>
               <small><span>重設時間</span> <span id="providerUsageSevenDayReset">-</span></small>
@@ -135,6 +144,14 @@
             <button id="globalSearchButton" class="icon-button" type="button" title="搜尋" aria-label="搜尋">⌕</button>
             <div id="globalSearchPopover" class="global-search-popover hidden" role="dialog" aria-label="搜尋結果"><div id="globalSearchResults"></div></div>
           </div>
+          <label class="display-mode-control font-size-control" title="字型大小">
+            <span>字體</span>
+            <select id="fontSizeMode" aria-label="字型大小">
+              <option value="small">小</option>
+              <option value="medium">中</option>
+              <option value="large">大</option>
+            </select>
+          </label>
           <label class="display-mode-control" title="顯示模式">
             <span>外觀</span>
             <select id="displayMode" aria-label="顯示模式">
@@ -196,6 +213,15 @@
           <span id="activityText"></span>
           <button id="retryRun" class="small hidden" type="button">重試 Run</button>
         </section>
+        <div id="providerUsageSummaryControl" class="context-usage-control hidden">
+          <button id="providerUsageSummaryButton" class="context-usage-trigger ghost" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="providerUsageSummaryPopover" aria-label="查看剩餘用量">
+            <span id="providerUsageSummaryLabel">剩餘用量</span><strong id="providerUsageSummaryValue">未知</strong>
+          </button>
+          <section id="providerUsageSummaryPopover" class="context-usage-popover hidden" role="dialog" aria-label="剩餘用量">
+            <div class="context-usage-head"><strong>剩餘用量</strong></div>
+            <dl id="providerUsageSummaryDetails" class="context-usage-details provider-rate-limits"></dl>
+          </section>
+        </div>
         <div id="contextUsageControl" class="context-usage-control hidden">
           <button id="contextUsageButton" class="context-usage-trigger ghost" type="button" aria-haspopup="true" aria-expanded="false" title="查看上下文用量" aria-label="查看上下文用量">
             <span>上下文</span><strong id="contextUsagePercent">-</strong>
@@ -262,7 +288,6 @@
           </div>
         </div>
       </form>
-      <div id="toast" class="toast hidden" role="status"></div>
     </main>
 
     <section id="managementPanel" class="management-page hidden" aria-label="系統管理">
@@ -350,7 +375,8 @@
           <label>名稱<input id="settingWorkspaceName" autocomplete="off"></label>
           <label>說明<textarea id="settingWorkspaceDescription" rows="2"></textarea></label>
           <label>預設 Provider<select id="settingWorkspaceProvider"></select></label>
-          <label>預設模型<input id="settingWorkspaceModel" placeholder="使用 Provider 預設模型" autocomplete="off"></label>
+          <label>預設模型<select id="settingWorkspaceModelCatalog" aria-label="Workspace 可用模型"></select><input id="settingWorkspaceModel" class="hidden" placeholder="使用 Provider 預設模型" autocomplete="off"></label>
+          <small id="settingWorkspaceModelState" class="hint"></small>
           <label>職務說明<textarea id="settingWorkspaceInstructions" rows="4" placeholder="這個 Workspace 的常駐工作規則；底下所有對話都會自動套用"></textarea></label>
           <p class="hint">職務說明只寫一次，之後每次對話與每個排程都會自動帶入，不必重述工作規則；Project 也可以再寫自己的說明，範圍較小者優先。上限 8000 字，內容每一輪都會佔用 Context 預算。</p>
           <p class="hint">不同前端分頁可同時選擇不同 Workspace；此處更新只影響之後未指定 override 的 Run。</p>
@@ -442,7 +468,7 @@
             <div id="providerSettingsList" class="provider-settings-list"></div>
           </section>
 
-          <form id="providerSettingsForm" class="management-section provider-settings-editor hidden">
+          <form id="providerSettingsForm" class="management-section provider-settings-editor hidden" novalidate>
             <div class="section-head">
               <div><h2 id="providerSettingsEditorTitle">Provider 設定</h2><p class="hint">設定儲存後會直接套用到新的模型請求。</p></div>
               <div class="provider-editor-head-actions">
@@ -458,6 +484,7 @@
               <label>Provider ID<input id="providerSettingID" maxlength="80" autocomplete="off" required></label>
               <label>類型<select id="providerSettingType">
                 <option value="openai-compatible">OpenAI Compatible</option>
+				<option value="claude-platform">Claude Platform API</option>
                 <option value="openai-codex-responses">OpenAI Codex Responses</option>
               </select></label>
               <label class="provider-field-full">顯示名稱<input id="providerSettingDisplayName" maxlength="80" autocomplete="off"></label>
@@ -468,6 +495,7 @@
                   <label class="switch-label"><input id="providerSettingUseResponses" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span>使用 Response</span></label>
                 </div>
                 <small id="providerSettingResponsesHint" class="hidden">請填完整 Responses URL，不會附加路徑；模型列表使用同站台 /v1/models。此模式使用串流。</small>
+                <small id="providerSettingClaudeHint" class="hidden">Claude Platform API 使用原生 Messages 協定，支援串流與工具呼叫。若代理提供 OpenAI Responses 端點，請選 OpenAI Compatible 並開啟「使用 Response」。</small>
               </div>
               <div id="providerAPIKeyFields" class="provider-field-full provider-auth-fields">
                 <label>API Key
@@ -527,6 +555,7 @@
               <p id="providerSettingLimitsHint" class="hint">選「自動」表示採用 Provider 自己回報的值。</p>
               <p class="hint">歷史字元上限管的是<strong>對話歷史的字元數</strong>，與上面以 token 計的 Context window 是同一批內容的兩種量法——token 估算對 JSON 與代碼容易低估一半以上，這道字元閘門是估算失準時的最後防線，超過就強制壓縮。全域預設 60,000 是為本機模型的 prefill 時間而訂；視窗大的 Provider 可在這裡調高。選「自動」表示採用該類型的預設值（Codex 為 200,000，其餘沿用全域）。</p>
             </details>
+            <p id="providerSettingsError" class="hint hidden" role="alert"></p>
             <div class="provider-editor-actions">
               <div class="provider-editor-action-start">
                 <button id="deleteProviderSetting" class="danger ghost" type="button">刪除 Provider</button>
@@ -920,8 +949,12 @@
       <h2>建立新 Session</h2>
       <label>名稱<input id="newTitle" placeholder="例如：程式碼檢查" required></label>
       <label>所屬專案<select id="newSessionProject"></select></label>
-      <label>Provider override<select id="newProvider"></select></label>
-      <label>模型<input id="newModel" placeholder="省略時使用後端預設"></label>
+      <label>Provider<select id="newProvider"></select></label>
+      <label>模型
+        <select id="newModelCatalog" aria-describedby="newModelState"></select>
+        <input id="newModel" class="hidden" aria-label="手動輸入模型" placeholder="省略時使用後端預設">
+        <small id="newModelState" role="status"></small>
+      </label>
       <label>工具權限
         <select id="newPermission"><option value="default">標準權限</option><option value="trusted">信任工具權限</option></select>
       </label>
@@ -1109,7 +1142,8 @@
       <label>名稱<input id="newWorkspaceName" placeholder="例如：產品開發" required></label>
       <label>說明<textarea id="newWorkspaceDescription" rows="3" placeholder="選填"></textarea></label>
       <label>Provider<select id="newWorkspaceProvider"></select></label>
-      <label>預設模型<input id="newWorkspaceModel" placeholder="省略時使用 Provider 預設模型"></label>
+      <label>預設模型<select id="newWorkspaceModelCatalog" aria-label="新 Workspace 可用模型"></select><input id="newWorkspaceModel" class="hidden" placeholder="省略時使用 Provider 預設模型"></label>
+      <small id="newWorkspaceModelState" class="hint"></small>
       <div class="dialog-actions"><button type="button" id="cancelWorkspace" class="ghost">取消</button><button id="createWorkspace" value="default" class="primary">建立</button></div>
     </form>
   </dialog>
@@ -1325,6 +1359,7 @@
     </div>
   </dialog>
 
+  <div id="toast" class="toast hidden" role="status"></div>
   <script src="/vendor/marked/marked.umd.js" defer></script>
   <script src="/vendor/dompurify/purify.min.js" defer></script>
   <script src="/vendor/katex/katex.min.js" defer></script>

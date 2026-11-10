@@ -64,6 +64,49 @@ src/
 
 新增 Provider 類型時，在 `adapters/<provider>/` 實作 `ports.Model`，並只在 bootstrap 工廠註冊 type；Workspace、Harness 與 HTTP 不依賴個別 Provider。新增 Agent 工具放在 `tools/native/<類別>`，Harness、HTTP 與前端都不直接 import 個別工具。
 
+### 套件相依規則
+
+`src` 下各套件允許 import 的內部套件是白名單，由 `src/internal/layering/layering_test.go` 的
+`rules` 表定義，`go test ./src/...` 會一併檢查。下表是摘要，以測試內的規則表為準。
+
+| 套件 | 允許依賴的內部套件 |
+|---|---|
+| `domain` | 無 |
+| `ports` | `domain` |
+| `internal/*`、`schemaargs`、`providerauth`、`netpass`、`web/console` | 無 |
+| `tokens`、`approval`、`question` | `domain` |
+| `memory` | `domain`、`ports`、`internal/*` |
+| `modelrouter` | `domain`、`ports` |
+| `harness` | `domain`、`ports`、`memory`、`tokens`、`internal/*` |
+| `agents/harness` | `domain`、`ports`、`harness` |
+| `application` | `domain`、`ports`、`internal/*` |
+| `adapters/*` | `domain`、`ports`、`internal/*`、`providerauth` |
+| `mcpclient` | `domain`、`ports`、`internal/*`、`schemaargs` |
+| `tools` | `domain`、`ports`、`internal/*`、`schemaargs` |
+| `tools/native/*` | `domain`、`ports`、`tools`、`tools/native/internal/*`（`memories` 另可依賴 `memory`） |
+| `transport/httpapi` | `domain`、`ports`、`application` |
+| `bootstrap` | 後端全部套件；不得依賴 `desktop`、`web`、`cmd` |
+| `desktop/*` | `desktop/*`、`internal/*`、`web/console` |
+| `cmd/server`、`cmd/desktop` | `bootstrap`（`cmd/desktop` 另可依賴 `desktop/*`） |
+
+由此得到的幾條邊界：
+
+- `tools` 聚合層不認識 MCP Client 實作，只依賴自己定義的 `tools.RemoteToolSource` 介面；
+  `mcpclient.Manager` 由 bootstrap 注入。
+- `desktop` 只透過 HTTP 與後端溝通，不 import `domain` 或任何後端套件。
+- 個別原生工具（`tools/native/<類別>`）之間不互相 import，共用程式放在 `tools/native/internal`。
+
+檢查的範圍與限制：
+
+- 直接解析原始碼的 import，因此其他作業系統專用的檔案（`*_windows.go` 等）也會被檢查。
+- 只檢查非測試檔；測試為了整合驗證可以跨層。
+- 新增套件時必須在規則表宣告它屬於哪一層，否則測試失敗；規則沒有對應任何套件時也會失敗。
+- 放寬規則等同修改架構，應與本節一併更新。
+
+`application.Service` 的方法依職責分散在同套件的多個檔案：`service.go`（型別與建構）、
+`service_sessions.go`、`service_projects.go`、`service_providers.go`、`service_runs.go`、
+`service_run_execution.go`、`service_session_gate.go`。
+
 ## Harness 工作迴圈
 
 ```text
@@ -90,6 +133,11 @@ src/
 - `run.approval_required` / `run.approval_resolved`：高風險工具的人工審核生命週期
 
 同一個 session 採 single-writer gate，避免兩個 run 同時寫入同一份 transcript。不同 session 可並行。
+
+Harness 的回合與操作收尾另有共用保險：中途事件失敗或取消時，補齊尚未結束的
+`turn_finished`；模型或其他同步依賴發生 panic 時，保存脫敏失敗狀態，再交由 Application
+既有 panic 邊界處理。`operation_finished` 先嘗試保存，再發送 `agent.end`；終態寫入失敗
+不得先宣告成功。這些保險仍仰賴儲存與事件實作遵守 context，不能保證程序被強制中止時完成收尾。
 
 ### Session 計畫
 
@@ -320,7 +368,11 @@ Shell 未派送或結果未知不啟用備援工具階段；只有確認失敗�
 執行的 tool call 不會留下假成功。整批工具返回後，先依序保存所有已知結果與 `tool_finished`，
 再發送結果事件；某筆寫入失敗仍嘗試保存同批其餘結果，最後回報彙總錯誤。整批共用 10 秒
 收尾 context，不因逐筆失敗重設期限。派送前失敗明確保存 `not_dispatched`；展示 hook
-不得抹除既有的 `not_dispatched`／`unknown` 狀態或把它改成成功。這是有界的盡力保存，
+執行前先確立執行狀態，不得抹除 `not_dispatched`／`unknown`／`failed` 或等待輸入狀態，
+也不得撤銷既有錯誤與停止訊號。已保存 assistant 呼叫、但尚未進入執行群組的其餘呼叫，
+在取消、事件中斷或早退時整批補上 `not_dispatched`；不以此覆蓋已派送卻保存失敗的結果。
+預算耗盡時亦先保存所有未派送結果，再送出展示事件。派送意圖保存後會再次檢查取消，
+只有有效的 `approve` 決策能通過需要人工核准的路徑。這是有界的盡力保存，
 不是整批磁碟交易；永久 I/O 故障、儲存實作不配合 context 或程序中止仍可能留下未知結果。
 
 Run 建立與 HTTP request 生命週期分離：`POST` 先回傳 durable queued Run，背景 worker 使用後端持有的 context 繼續執行。所有 event 先 append 到 `runs/events/<run-id>.jsonl`，再通知目前的 SSE 訂閱者；訂閱通知只負責喚醒，Client 一律依最後 sequence 從 durable log 取資料，因此通知合併或短暫離線不會形成事件缺口。
@@ -333,6 +385,7 @@ SSE 使用 event sequence 作為 `Last-Event-ID`。Browser Console 斷線後持�
 
 事件儲存首次掃描後建立 sequence → 位移索引，只保留每筆 8 bytes 的位置，不快取事件本文。
 增量重播直接 seek；檔案身分、大小或修改時間改變會重新驗證，讀取異常回到完整掃描與損壞隔離。
+事件索引採 128 份檔案的 LRU 快取，序號直接由已驗證索引取得，不另外保留無界的序號 map。
 application 與儲存層均依 Run 分條帶鎖定，避免所有 Run 共用一把磁碟寫入鎖。
 終態保存與終止事件追加共用事件鎖；SSE 與 `WaitRun` 在同一同步邊界讀取狀態和事件，
 不會因先讀到舊事件、後看到新終態而提前關閉。終止事件追加失敗仍喚醒等待者；重連時
@@ -564,6 +617,11 @@ compaction 在既有摘要上增量合併。摘要輸入依時間採平方遞增
 越少字元、壓縮越重，越新的工作狀態保留越多細節；模型摘要全部失敗時改用可重現的本機摘要，
 避免單一摘要 Provider 的憑證或連線問題中止 Agent Run。
 
+摘要專用輸入將工具呼叫與結果轉為標示來源的歷史文字，工具參數一併受總字元額度限制；
+不回送原 Provider 的不透明 continuation，也不把裁切後的 JSON 當成原生工具協定。
+這不改寫原始 transcript 或主模型的近期工具紀錄。摘要遭拒答、截斷或要求工具時，視為
+該摘要路由失敗，改走下一路由或本機備援，不以拒答文字取代歷史。
+
 `context.summary_provider_id` 與 `summary_model` 可把摘要路由到較便宜的 Provider／Model；未指定時
 沿用 Session 的模型。模型宣告的 context window 若連輸出保留額都容納不下，後端會明確拒絕，
 不會虛構最低輸入容量後再交給 Provider 失敗。
@@ -793,11 +851,14 @@ diff 都在 `arguments` 裡，那種 assistant 訊息的 `content` 反而是空�
 
 字元條件超量時會縮小保留訊息數，再依既有摘要流程壓縮。組合 prompt 前的
 `Runner.enforceHistoryCharacterLimit` 再檢查一次，必要時由舊而新移除模型可見的歷史，
-並修補 tool call／result 配對。它不刪除持久化 transcript，也不改變 Run 的累計 token、
+與壓縮共用 assistant tool call／連續 results 的完整邊界，不先丟掉呼叫再移除孤立結果。
+兩道檢查使用當次實際 Provider／Model 的宣告值，並計入 continuation 大小。
+它不刪除持久化 transcript，也不改變 Run 的累計 token、
 工具呼叫或 wall-clock 預算。
 
-這不是整份模型請求的硬性上限：至少保留最新一則，且 system prompt、工具 schema、當前輸入
+這不是整份模型請求的硬性上限：至少保留最新一則或完整工具群組，且 system prompt、工具 schema、當前輸入
 與配對修補仍可能增加大小。因此仍需依 Provider 能力設定預算，不應把字元上限當成容量保證。
+最新完整群組即使超量也不拆散；超過最終 token 預算時明確停止，避免失去剛取得的執行證據後重做副作用。
 
 每輪送出前的 `model request` 日誌提供 `tools`、`tool_chars`、`steering_chars`、
 `history_messages`、`history_chars`、`user_chars` 與工具名稱，不記錄本文。歷史被最後防線
@@ -827,6 +888,11 @@ API 的記憶體檢視——後者是脫敏過的，從那裡匯出永遠拿不�
 原生模式沒有 `tool_calls`、卻在回答中輸出疑似工具參數時，Harness 會依可呼叫工具的 schema
 比對 JSON 物件或陣列，進入有限次數的協定修正，要求模型改用工具呼叫欄位。修正耗盡會以
 部分完成收尾；JSON 文字本身不代表檔案已建立或工具已執行。這是啟發式偵測，不是語意理解保證。
+
+指令模式在派送前驗證完整批次：不完整 object／array、無效 JSON、不可用工具或重複 call ID
+均進入有限的協定修正，不先執行合法前段。每組最多並行 8 筆只是併行上限，不會靜默丟棄第 9 筆
+以後的呼叫；實際數量仍受 Run 工具預算約束。JSON 數字保留原精度，工具名稱對齊目錄的確切拼寫；
+一般 `name`／非工具 `type` 資料不自行推定為工具指令。Run 內目錄仍可更新，但檢索開關保留啟動快照。
 
 參數校正集中在 `src/schemaargs`，原生工具（`tools.Registry`）與 MCP 呼叫共用同一份。
 先前兩邊各有一份幾乎相同的實作然後開始分岔——原生端陸續補上布林、數字與巢狀遞迴，
@@ -867,6 +933,9 @@ header，後續以二分搜尋及 seek 讀取指定頁。append 同步更新索�
 不同即重建，不以「較大的舊索引」覆蓋截短後的新狀態。取號與查詢使用同一份已驗證索引，
 沒有獨立且可能過期的序號快取。讀取／追加／刪除共用固定 64 個 Session 鎖分片，不在
 全域索引 map 鎖內做磁碟 I/O；索引記錄的身分來自實際掃描的檔案，掃描前後必須一致。
+Session 與 Run 事件各保留最近使用的 128 份索引，淘汰只移除記憶體參照，不刪除原始紀錄；
+再次讀取或追加會依原檔重建，仍核對檔案身分、時間、序號與損毀。這是快取檔案數上限，
+不是整個程序的記憶體上限：單一大型 transcript 的索引與進行中的讀取仍按檔案筆數佔用空間。
 合法尾筆缺換行時先補分隔；不完整尾筆拒絕追加並保留原檔，不靜默略過。讀取索引不可用時
 仍可退回掃描，不掩蓋真正的 JSON 損毀。`ListEntriesPage` 從 HTTP 經 application、agent
 一路傳到 Repository，避免每翻一頁都完整解碼 transcript；既有游標契約不變。
@@ -875,7 +944,29 @@ header，後續以二分搜尋及 seek 讀取指定頁。append 同步更新索�
 前端訊息查找直接使用 ID 屬性選擇器，處理計時只查當前 operation 的節點；段落刻度保存目標
 節點參照，減少長對話捲動時的重複查找。
 
-RunRepository 在啟動與 Save 時，以總數 500 為整理基準，依建立時間淘汰最舊範圍中已結束的
+高頻文字與搜尋路徑採以下記憶體界線，不改變工具授權、認證、事件落盤或原始 transcript：
+
+- 摘要預算二分搜尋只重新估算變動的 system prompt；同一次搜尋內，工具 schema 與歷史訊息只估算一次。
+- 文字中段截斷只掃描要保留的 UTF-8 邊界，截斷結果不持有大型原文的底層儲存；保留原本字數、標記與無效 UTF-8 的處理語意。
+- instruction 串流只辨識協定前綴；確認需整段保留後，由 Provider 的最終內容負責解析，不再於過濾層重存全文。一般文字的大括號以游標前移，不反覆複製剩餘內容。
+- 記憶搜尋以大小為 `limit` 的 heap 保留最佳候選，最多 100 筆，最後才複製回傳值；詞彙命中標記由單次搜尋重用。相關度與更新時間排序不變，同分同時間時依 ID 穩定排序。scope、種類、標籤、取消與回傳容器隔離仍維持。
+- 字型覆蓋檢查以有界 `ReaderAt` 讀取所需字型表，開檔後先驗證一般檔案及 64 MiB 上限，不整份載入大型字型。
+- 前端去重先建立段落比對鍵與候選位置；相同內容略過 Markdown／清理器／數學式重繪，串流思考渲染合併到同一畫面幀。收尾同步沖出最後一幀；快取採 WeakMap，原始思考輸入在收尾清除，不改變清理器與連結安全規則。
+
+函式級的額外界線：
+
+- `Registry.ResolveDefinition` 直接定位單一原生工具，每次仍檢查白名單、啟用狀態、提權策略與當前契約指紋；不以跨 Run 快取取代派送前重驗。
+- 工具檢索未啟用或目錄不超過 12 個可選工具時，不建立詞彙索引。啟用時於公開 retriever 前初始化；直接搜尋未啟用的 retriever 則以 `sync.Once` 補建。名稱集合不再重存整份定義，搜尋只保留前 `limit` 個候選，保留分數、名稱及同名原始次序。
+- 工具／回憶空間共用 UTF-8 游標分詞；保留 CJK bigram、單字與原有非 CJK 英數規則，索引僅複製實際新增的詞彙，不藉子字串持有大型輸入。filestore 記憶搜尋原有的另一套比對規則不變。
+- `Remember`、`Forget`、`PurgeInactive` 的失敗回復只記錄本次受影響項目，仍在同一鎖內提交或回復；檔案原子替換、隔離資料過濾與回傳值複製維持原流程。沒有變動時不複製整庫，也不寫入檔案。
+- Run 留存未超過門檻時直接返回；超過後只為可淘汰的終態項目配置 ID／建立時間排序資料。配額仍包含未終態與受保護項目，持久／揮發分組與淘汰順序不變。
+- 桌面日誌改為逐步擴充、最多 `maxBytes` 的環狀緩衝（預設 512 KiB），暖機後重用配置；超大單次寫入只複製有效尾段。超限換行截斷規則不變，`String` 回傳獨立快照。保留已配置容量供後續使用，不保證每次清空內容就釋放記憶體。
+- XLSX 的固定規則只編譯一次；列／欄插入位置找到首個合適候選即停止，不收集整份 XML 的所有 matches。動態儲存格定位、樣式、維度與封裝流程不變。
+- 導覽每次渲染只分組 Session 一次，排序位置只轉成數字一次；不新增跨次快取，不改變釘選、未分類、同位置排序或原始資料陣列。
+
+合成基準與限制見 [開發文件的效能檢查](DEVELOPMENT.md#效能與記憶體檢查)。
+
+RunRepository 在啟動與 Save 時，以持久／揮發兩組各 500 筆為整理基準，依建立時間淘汰最舊範圍中已結束的
 Run，未終態一律保留，所以不是硬性上限。Runtime 啟動後及每 30 分鐘另清理事件檔：保留最新
 50 筆 Run 與所有未終態 Run 的事件，其餘及孤兒事件檔移除。非 active 且 UpdatedAt 早於
 30 天前的記憶也會永久移除，與回憶空間開關無關。
@@ -899,6 +990,8 @@ completed，也不會在收尾尚需讀取它時遭淘汰。取消、暫停與�
 派送意圖不代表遠端已收到，工具失敗也不代表沒有副作用。結果遺失／取消時保守標為未知；
 新 Run 從原始分頁稽核紀錄恢復未知呼叫指紋，不依賴模型摘要。相同未知副作用不自動重送，
 先唯讀查證，再由使用者逐次決定是否接受重試風險。
+恢復掃描支援取消；頁面序號不遞增或宣告有下一頁卻回傳空頁時明確停止，不無限重讀或忽略剩餘紀錄。
+已保存的未知結果不因晚到的同 ID 成功訊息而消失。
 
 ## 完成度判定
 
@@ -908,6 +1001,7 @@ Harness 過去只看「這一輪有沒有 tool_calls」就接受模型的完成�
 `completionTracker` 追蹤本次 run 內尚未解決的工具失敗，判定完全來自執行記錄，不解讀模型文字：
 逐 call 保留失敗，只由同一工具契約、目標資源及操作策略的成功解決；沒有資源契約時使用完整參數指紋。
 寫入 B 成功不能清除寫入 A 失敗，略過不能當成功，未知結果不自動被成功覆蓋。
+內部失敗索引以觀察次序區分，Provider 跨回合重用 call ID 不會覆蓋較早的未知或其他目標失敗。
 MCP 追加輸入只透過 Runtime 驗證的續接關係替換前一個 `awaiting_input` 紀錄。
 
 模型給出不含 tool_calls 的最終回覆時，若仍有未解決的失敗，Harness 會：

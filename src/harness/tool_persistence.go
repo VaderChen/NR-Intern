@@ -9,7 +9,7 @@ import (
 )
 
 // 整批已執行的結果優先保存；事件通道或其中一筆失敗，不能丟掉其他工具的真實觀察。
-// 一批最多 8 筆，共用有界收尾 context，不因每筆失敗重設逾時。
+// 並行群組最多 8 筆，未派送收尾可有更多筆；皆共用有界 context，不因每筆失敗重設逾時。
 func (r *Runner) persistToolOutcomes(ctx context.Context, sessionID, operationID, turnID string, outcomes []toolOutcome, readOnly map[string]bool) ([]domain.Message, error) {
 	persistCtx, cancel := persistContext(ctx)
 	defer cancel()
@@ -46,4 +46,23 @@ func (r *Runner) persistToolOutcomes(ctx context.Context, sessionID, operationID
 		}
 	}
 	return messages, errors.Join(failures...)
+}
+
+// 僅供尚未進入執行群組的呼叫使用。整批先保存，再由呼叫端輸出事件；
+// 一律共用有界 context，事件中斷不能讓後半批次消失。
+func (r *Runner) persistUndispatched(ctx context.Context, sessionID, operationID, turnID string, calls []domain.ToolCall, content, budgetResource string) ([]domain.Message, error) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	outcomes := make([]toolOutcome, len(calls))
+	for i, call := range calls {
+		details := map[string]any{"synthesized": true, "execution_state": domain.ToolNotDispatched, "operation_id": operationID}
+		if budgetResource != "" {
+			details["budget_exceeded"] = budgetResource
+		}
+		outcomes[i] = toolOutcome{call: call, result: domain.ToolExecution{
+			ToolCallID: call.ID, ToolName: call.Name, IsError: true, Content: content, Details: details,
+		}}
+	}
+	return r.persistToolOutcomes(ctx, sessionID, operationID, turnID, outcomes, nil)
 }

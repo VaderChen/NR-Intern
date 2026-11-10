@@ -107,7 +107,7 @@ func TestRunSkipsIdenticalRepeatedSideEffectAndFinalizes(t *testing.T) {
 	}}
 	executed := 0
 	tools := &fakeTools{
-		definitions: []domain.ToolDefinition{{Name: "file_edit", Capabilities: []string{"atomic-replace"}}},
+		definitions: []domain.ToolDefinition{{Name: "file_edit", Capabilities: []string{"atomic-replace"}}, {Name: "file_read", ReadOnly: true}},
 		execute: func(_ context.Context, _ domain.Session, call domain.ToolCall) (domain.ToolExecution, error) {
 			executed++
 			return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: "ok"}, nil
@@ -125,12 +125,12 @@ func TestRunSkipsIdenticalRepeatedSideEffectAndFinalizes(t *testing.T) {
 	if result.Message.Content != "已使用第一次成功寫入的結果完成。" {
 		t.Fatalf("result = %q", result.Message.Content)
 	}
-	if len(model.requests) != 3 || len(model.requests[2].Tools) != 0 || !strings.Contains(model.requests[2].PhasePrompt, "重複操作防護") {
-		t.Fatalf("finalization request = %+v", model.requests[2])
+	if len(model.requests) != 3 {
+		t.Fatalf("requests = %d, want 3", len(model.requests))
 	}
 	finalRequest := model.requests[2]
-	if !strings.Contains(finalRequest.ToolPrompt, "Session 工具能力目錄") || !strings.Contains(finalRequest.ToolPrompt, "file_edit") || strings.Contains(finalRequest.ToolPrompt, "本輪沒有可用") {
-		t.Fatalf("finalization lost the session tool catalog: %q", finalRequest.ToolPrompt)
+	if names := strings.Join(availableToolNamesSorted(finalRequest.Tools), ","); names != "file_read" || !strings.Contains(finalRequest.PhasePrompt, "停止新的副作用操作") {
+		t.Fatalf("重複操作只能停止副作用，仍須保留唯讀查證：tools=%s", names)
 	}
 	if !strings.Contains(finalRequest.PhasePrompt, "已確認的工具執行事實") || !strings.Contains(finalRequest.PhasePrompt, "file_edit → story.md：ok") {
 		t.Fatalf("finalization lost confirmed mutation facts: %q", finalRequest.PhasePrompt)
@@ -177,7 +177,7 @@ func TestRunAllowsDistinctSuccessfulEditsToSameResource(t *testing.T) {
 	}
 }
 
-func TestRunFinalizesAfterRepeatedSuccessfulMutationStrategy(t *testing.T) {
+func TestRunAllowsDistinctSuccessfulWritesToSameResource(t *testing.T) {
 	sessions := newMemorySessions(testSession())
 	responses := make([]domain.ModelResponse, 0, maxSuccessfulMutationsPerStrategy+1)
 	for index := 1; index <= maxSuccessfulMutationsPerStrategy; index++ {
@@ -212,8 +212,8 @@ func TestRunFinalizesAfterRepeatedSuccessfulMutationStrategy(t *testing.T) {
 		t.Fatalf("result = %q", result.Message.Content)
 	}
 	finalRequest := model.requests[len(model.requests)-1]
-	if len(finalRequest.Tools) != 0 || !strings.Contains(finalRequest.PhasePrompt, "相同控制策略") {
-		t.Fatalf("repeated successful strategy did not force finalization: %+v", finalRequest)
+	if !definitionNamed(finalRequest.Tools, "file_write") || strings.Contains(finalRequest.PhasePrompt, "停止新的副作用操作") {
+		t.Fatalf("不同內容的成功修改不可被停止：%+v", finalRequest)
 	}
 }
 
@@ -333,8 +333,8 @@ func TestRunStartsWithReadOnlyToolsAndSystemShell(t *testing.T) {
 			t.Errorf("answer audience prompt does not contain %q: %s", expected, request.PhasePrompt)
 		}
 	}
-	if names := strings.Join(availableToolNamesSorted(request.Tools), ","); names != "directory_list,file_read,shell_exec" {
-		t.Fatalf("request tools = %s, want the read-only tools plus shell_exec", names)
+	if names := strings.Join(availableToolNamesSorted(request.Tools), ","); names != "directory_list,file_read,file_write,shell_exec" {
+		t.Fatalf("request tools = %s, want read-only, source writing, and shell tools", names)
 	}
 	for _, event := range events {
 		if event.Type != "turn.start" {
@@ -344,8 +344,8 @@ func TestRunStartsWithReadOnlyToolsAndSystemShell(t *testing.T) {
 		if !ok {
 			t.Fatalf("available_tools = %#v, want []string", event.Payload["available_tools"])
 		}
-		if strings.Join(names, ",") != "directory_list,file_read,shell_exec" {
-			t.Fatalf("available_tools = %v, want the read-only tools plus shell_exec", names)
+		if strings.Join(names, ",") != "directory_list,file_read,file_write,shell_exec" {
+			t.Fatalf("available_tools = %v, want read-only, source writing, and shell tools", names)
 		}
 		if event.Payload["tool_stage"] != toolStageSystemShell {
 			t.Fatalf("tool_stage = %v, want %s", event.Payload["tool_stage"], toolStageSystemShell)
@@ -1044,7 +1044,7 @@ func TestRunFinalAnswerAtTurnLimitCompletesWithoutBudgetMarker(t *testing.T) {
 
 // TestRunCancelDuringToolLeavesReplayableTranscript 覆蓋原本會讓 session 永久壞掉的路徑：
 // 工具執行中取消時，已完成工具的結果仍必須寫進 transcript，
-// 而未執行的 tool_call 必須能在下一次組裝 context 時補齊，否則 Provider 會拒絕整個 session。
+// 而未執行的 tool_call 必須保存 not_dispatched，不留給下次修復誤判為未知。
 func TestRunCancelDuringToolLeavesReplayableTranscript(t *testing.T) {
 	sessions := newMemorySessions(testSession())
 	model := &scriptedModel{responses: []domain.ModelResponse{{ToolCalls: []domain.ToolCall{
@@ -1075,8 +1075,13 @@ func TestRunCancelDuringToolLeavesReplayableTranscript(t *testing.T) {
 	if !hasToolResult(messages, "call_1") {
 		t.Error("the executed tool result was lost; its side effect is now unrecorded")
 	}
-	if hasToolResult(messages, "call_2") {
-		t.Error("call_2 never ran and must not have a recorded result")
+	if !hasToolResult(messages, "call_2") {
+		t.Error("未執行的 call_2 必須保存明確的未派送結果")
+	}
+	for _, message := range messages {
+		if message.Role == "tool" && message.ToolCallID == "call_2" && domain.ToolExecutionState(message.Metadata) != domain.ToolNotDispatched {
+			t.Error("call_2 不可被記為成功或未知")
+		}
 	}
 
 	repaired := repairMessages(messages)

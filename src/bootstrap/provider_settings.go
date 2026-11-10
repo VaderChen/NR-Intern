@@ -1,11 +1,13 @@
 package bootstrap
 
 import (
+	"AgenticService/src/domain"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const providerSettingsFilename = "providers.json"
@@ -13,6 +15,8 @@ const providerSettingsFilename = "providers.json"
 type storedProviderSettings struct {
 	DefaultProviderID string                    `json:"default_provider_id"`
 	Providers         map[string]ProviderConfig `json:"providers"`
+	// nil 表示舊版檔案，沿用基底價格；空 map 表示已明確清除所有價格。
+	ModelPrices *map[string]map[string]domain.ModelPrice `json:"model_prices,omitempty"`
 }
 
 func loadPersistedProviderSettings(config *Config) error {
@@ -37,14 +41,35 @@ func loadPersistedProviderSettings(config *Config) error {
 	}
 	config.DefaultProviderID = stored.DefaultProviderID
 	config.Providers = stored.Providers
+	if stored.ModelPrices != nil {
+		config.ModelPrices = *stored.ModelPrices
+	}
+	config.ModelPrices = modelPricesForProviders(config.ModelPrices, config.Providers)
 	return nil
 }
 
-func persistProviderSettings(dataDir, defaultProviderID string, providers map[string]ProviderConfig) error {
+// 重新建立 map，驗證失敗或寫入失敗時不得提前改動使用中的設定。
+func modelPricesForProviders(prices map[string]map[string]domain.ModelPrice, providers map[string]ProviderConfig) map[string]map[string]domain.ModelPrice {
+	filtered := make(map[string]map[string]domain.ModelPrice)
+	for id, models := range prices {
+		if _, exists := providers[strings.TrimSpace(id)]; !exists {
+			continue
+		}
+		copyModels := make(map[string]domain.ModelPrice, len(models))
+		for model, price := range models {
+			copyModels[model] = price
+		}
+		filtered[id] = copyModels
+	}
+	return filtered
+}
+
+func persistProviderSettings(dataDir, defaultProviderID string, providers map[string]ProviderConfig, prices map[string]map[string]domain.ModelPrice) error {
 	if err := os.MkdirAll(dataDir, 0o750); err != nil {
 		return fmt.Errorf("create provider settings directory: %w", err)
 	}
-	value := storedProviderSettings{DefaultProviderID: defaultProviderID, Providers: providers}
+	prices = modelPricesForProviders(prices, providers)
+	value := storedProviderSettings{DefaultProviderID: defaultProviderID, Providers: providers, ModelPrices: &prices}
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode provider settings: %w", err)

@@ -6,6 +6,21 @@ import (
 	"strings"
 )
 
+// UpdateModelPrices 替換後續用量計算的價格快照，不回寫歷史 Run 的成本。
+func (s *Service) UpdateModelPrices(values map[string]map[string]domain.ModelPrice) {
+	prices := cloneModelPrices(values)
+	s.mu.Lock()
+	s.modelPrices = prices
+	s.mu.Unlock()
+}
+
+func (s *Service) saveRunUsage(run *domain.Run, result *domain.RunResult) {
+	s.mu.Lock()
+	prices := s.modelPrices
+	s.mu.Unlock()
+	saveRunUsage(run, result, prices)
+}
+
 // cloneModelPrices 複製設定值，讓 Service 不會持有可被呼叫端改寫的 map。
 func cloneModelPrices(values map[string]map[string]domain.ModelPrice) map[string]map[string]domain.ModelPrice {
 	if len(values) == 0 {

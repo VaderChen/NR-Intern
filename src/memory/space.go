@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode"
 
 	"AgenticService/src/domain"
+	"AgenticService/src/internal/textutil"
 )
 
 // SpaceConfig 是「回憶空間」的參數：跨對話共用記憶時的准入、視窗與上限。
@@ -157,48 +157,12 @@ func ScopeForSessionWithSpace(session domain.Session, spaceEnabled bool) string 
 // 與工具檢索用同一套判讀，中文不需要斷詞器。
 func queryTerms(text string) map[string]bool {
 	terms := map[string]bool{}
-	ascii := make([]rune, 0, 16)
-	cjk := make([]rune, 0, 16)
-	flushASCII := func() {
-		if len(ascii) >= 2 {
-			terms[string(ascii)] = true
+	textutil.VisitSearchTerms(text, func(term string) {
+		if !terms[term] {
+			terms[strings.Clone(term)] = true
 		}
-		ascii = ascii[:0]
-	}
-	flushCJK := func() {
-		switch {
-		case len(cjk) == 1:
-			terms[string(cjk)] = true
-		default:
-			for index := 0; index+1 < len(cjk); index++ {
-				terms[string(cjk[index:index+2])] = true
-			}
-		}
-		cjk = cjk[:0]
-	}
-	for _, value := range strings.ToLower(text) {
-		switch {
-		case isCJKRune(value):
-			flushASCII()
-			cjk = append(cjk, value)
-		case unicode.IsLetter(value) || unicode.IsDigit(value):
-			flushCJK()
-			ascii = append(ascii, value)
-		default:
-			flushASCII()
-			flushCJK()
-		}
-	}
-	flushASCII()
-	flushCJK()
+	})
 	return terms
-}
-
-func isCJKRune(value rune) bool {
-	return unicode.Is(unicode.Han, value) ||
-		unicode.Is(unicode.Hiragana, value) ||
-		unicode.Is(unicode.Katakana, value) ||
-		unicode.Is(unicode.Hangul, value)
 }
 
 // scoredMemory 是排序用的中間結果。

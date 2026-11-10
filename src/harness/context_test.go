@@ -32,7 +32,7 @@ func TestRepairToolCallPairsSynthesizesMissingResult(t *testing.T) {
 	if synthetic.ToolName != "shell_exec" {
 		t.Errorf("tool name = %q, want shell_exec", synthetic.ToolName)
 	}
-	if !strings.Contains(synthetic.Content, "沒有留下結果") {
+	if !strings.Contains(synthetic.Content, "工具結果未知") || domain.ToolExecutionState(synthetic.Metadata) != domain.ToolOutcomeUnknown {
 		t.Errorf("content = %q, want an explicit interruption notice", synthetic.Content)
 	}
 	if synthetic.Metadata["synthesized"] != true {

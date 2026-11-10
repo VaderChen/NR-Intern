@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -259,11 +260,21 @@ func fontPriority(fontPath string) int {
 }
 
 func inspectFontCandidate(candidate fontCandidate, required []rune) ([]fontCoverage, error) {
-	data, err := os.ReadFile(candidate.Path)
-	if err != nil || int64(len(data)) > maxFontFileBytes {
-		return nil, fmt.Errorf("read font: %w", err)
+	file, err := os.Open(candidate.Path)
+	if err != nil {
+		return nil, fmt.Errorf("open font: %w", err)
 	}
-	collection, err := sfnt.ParseCollection(data)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat font: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxFontFileBytes {
+		return nil, fmt.Errorf("font must be a regular file within the %d byte safety limit", maxFontFileBytes)
+	}
+	// 字形覆蓋只需要字型表，無須把整份大型 CJK 字型讀進記憶體。
+	// ReaderAt 生命週期涵蓋所有 Font 操作，並以開檔時的大小限制讀取範圍。
+	collection, err := sfnt.ParseCollectionReaderAt(io.NewSectionReader(file, 0, info.Size()))
 	if err != nil {
 		return nil, err
 	}

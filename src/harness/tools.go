@@ -333,6 +333,9 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			outcome.duration = time.Since(startedAt)
 		}
 	}()
+	if err := ctx.Err(); err != nil {
+		return toolOutcome{call: call, startedAt: startedAt, err: err}
+	}
 	// find_tools 是 Harness 自己的工具目錄檢索，不下放到任何 Runtime，
 	// 也不需要核准：它只讀取本 run 已經取得的工具定義。
 	if retriever.enabled() && strings.EqualFold(strings.TrimSpace(call.Name), findToolsToolName) {
@@ -442,8 +445,11 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 			if err := sink.emitEvent("run.approval_resolved", map[string]any{"approval": request, "decision": decision}); err != nil {
 				return toolOutcome{call: call, startedAt: startedAt, duration: time.Since(startedAt), err: err}
 			}
-			if decision.Decision == domain.ToolApprovalDeny {
+			if decision.Decision != domain.ToolApprovalApprove {
 				result.Content = "工具未執行：人工審核拒絕。"
+				if decision.Decision != domain.ToolApprovalDeny {
+					result.Content = "工具未執行：未取得有效的人工核准。"
+				}
 				if decision.Reason != "" {
 					result.Content += " 原因：" + decision.Reason
 				}
@@ -469,6 +475,10 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 				return toolOutcome{call: call, startedAt: startedAt, err: err}
 			}
 		}
+		// 保存派送意圖可能等待 I/O；完成後須再檢查取消，才可進入 Runtime。
+		if err := ctx.Err(); err != nil {
+			return toolOutcome{call: call, startedAt: startedAt, err: err}
+		}
 		dispatched = true
 		executed, err := r.Tools.Execute(ctx, session, call, func(update domain.ToolExecution) error {
 			return sink.emitEvent("tool.execution.update", map[string]any{
@@ -492,7 +502,21 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	executionState := domain.ToolExecutionState(result.Details)
 	if refused {
 		executionState = domain.ToolNotDispatched
+	} else if executionState == "" {
+		switch {
+		case ctx.Err() != nil:
+			executionState = domain.ToolOutcomeUnknown
+		case result.IsError:
+			executionState = domain.ToolFailed
+		default:
+			executionState = domain.ToolSucceeded
+		}
 	}
+	if result.Details == nil {
+		result.Details = map[string]any{}
+	}
+	result.Details["execution_state"] = executionState
+	executionFailed, terminate := result.IsError, result.Terminate
 	if r.AfterTool != nil {
 		result = r.AfterTool(ctx, session, call, result)
 	}
@@ -501,10 +525,15 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	if result.Details == nil {
 		result.Details = map[string]any{}
 	}
-	// 展示／內容 hook 不得抹除未派送或未知的執行事實，造成授權繞過或自動重送。
-	if executionState == domain.ToolNotDispatched || executionState == domain.ToolOutcomeUnknown {
+	// 在 hook 之前確立執行事實，避免取消或失敗被格式化成成功。
+	// hook 可以把成功結果判為不合格，但不能撤銷失敗／等待輸入或停止訊號。
+	result.IsError = result.IsError || executionFailed
+	result.Terminate = result.Terminate || terminate
+	if executionState != domain.ToolSucceeded {
 		result.Details["execution_state"] = executionState
-		result.IsError = true
+		if executionState == domain.ToolNotDispatched || executionState == domain.ToolOutcomeUnknown || executionState == domain.ToolFailed {
+			result.IsError = true
+		}
 	}
 	if unknownRetryApproved {
 		// 新呼叫成功也不抹除舊呼叫的未知紀錄，無法據此宣稱恰好執行一次。
@@ -512,10 +541,6 @@ func (r *Runner) executeToolCall(ctx context.Context, session domain.Session, ca
 	}
 	if domain.ToolExecutionState(result.Details) == "" {
 		switch {
-		case refused:
-			result.Details["execution_state"] = domain.ToolNotDispatched
-		case ctx.Err() != nil:
-			result.Details["execution_state"] = domain.ToolOutcomeUnknown
 		case result.IsError:
 			result.Details["execution_state"] = domain.ToolFailed
 		default:

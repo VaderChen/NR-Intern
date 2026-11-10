@@ -23,9 +23,6 @@ const (
 var (
 	taggedToolInstructionPattern  = regexp.MustCompile(`(?is)<\s*(tool_call|tool_use)\s*>(.*?)<\s*/\s*(tool_call|tool_use)\s*>`)
 	bracketToolInstructionPattern = regexp.MustCompile(`(?is)\[\s*(tool_call|tool_use)\s*\](.*?)\[\s*/\s*(tool_call|tool_use)\s*\]`)
-	// toolInstructionPrefixPattern 只比對 JSON object 的開頭鍵，避免把一般文字裡
-	// 提到的大括號誤判成被截斷的工具指令。
-	toolInstructionPrefixPattern = regexp.MustCompile(`(?is)^\{\s*"(type|tool|tool_name|action)"\s*:\s*"[^"]*"`)
 )
 
 func NormalizeToolCallMode(value string) ToolCallMode {
@@ -211,6 +208,9 @@ func parseInstructionToolCalls(content string, definitions []domain.ToolDefiniti
 		return nil, false, nil
 	}
 	stripped := stripJSONFence(trimmed)
+	if unterminatedToolInstruction(stripped) {
+		return nil, false, fmt.Errorf("%w: tool instruction JSON is incomplete; send the complete batch before execution", domain.ErrProviderProtocol)
+	}
 	calls := make([]domain.ToolCall, 0, 2)
 	for _, candidate := range jsonObjects(stripped) {
 		call, matched, err := decodeInstructionToolCall(candidate)
@@ -220,16 +220,24 @@ func parseInstructionToolCalls(content string, definitions []domain.ToolDefiniti
 		if !matched {
 			continue
 		}
-		if !instructionToolExists(call.Name, definitions) {
+		name := canonicalInstructionToolName(call.Name, definitions)
+		if name == "" {
 			return nil, false, fmt.Errorf("%w: tool instruction references unavailable tool %q", domain.ErrProviderProtocol, call.Name)
 		}
+		call.Name = name
 		calls = append(calls, call)
-		if len(calls) == maxParallelTools {
-			break
-		}
 	}
-	if len(calls) > 1 {
-		return calls, true, nil
+	if len(calls) > 0 {
+		if err := validateInstructionArrays(stripped); err != nil {
+			return nil, false, err
+		}
+		// 並行上限只決定執行分組，不得截斷整輪決策。所有 ID 也須先完成驗證，
+		// 避免先執行副作用後才發現後半批次不合法。
+		normalized, err := normalizeToolCalls(calls)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: %v", domain.ErrProviderProtocol, err)
+		}
+		return normalized, true, nil
 	}
 	// 單一指令仍走原本的完整比對，涵蓋標籤包裝與 to=<tool> 等退化格式。
 	call, matched, err := parseInstructionToolCall(content, definitions)
@@ -245,6 +253,9 @@ func parseInstructionToolCall(content string, definitions []domain.ToolDefinitio
 		return domain.ToolCall{}, false, nil
 	}
 	stripped := stripJSONFence(trimmed)
+	if unterminatedToolInstruction(stripped) {
+		return domain.ToolCall{}, false, fmt.Errorf("%w: tool instruction JSON is incomplete; send a complete instruction", domain.ErrProviderProtocol)
+	}
 	// Provider 可能違反「只能輸出 JSON」的協定，在 tool_use 前後混入規劃文字。
 	// 掃描所有平衡 JSON object，讓合法工具決策仍可進入 Harness loop；前後文字
 	// 不會被當成最終回答。Sandbox、權限與工具目錄檢查仍照原流程執行。
@@ -262,9 +273,11 @@ func parseInstructionToolCall(content string, definitions []domain.ToolDefinitio
 			return domain.ToolCall{}, false, err
 		}
 		if matched {
-			if !instructionToolExists(call.Name, definitions) {
+			name := canonicalInstructionToolName(call.Name, definitions)
+			if name == "" {
 				return domain.ToolCall{}, false, fmt.Errorf("%w: tool instruction references unavailable tool %q", domain.ErrProviderProtocol, call.Name)
 			}
+			call.Name = name
 			return call, true, nil
 		}
 	}
@@ -290,10 +303,82 @@ func parseInstructionToolCall(content string, definitions []domain.ToolDefinitio
 		}
 		return domain.ToolCall{ID: domain.NewID("call"), Name: name, Arguments: arguments}, true, nil
 	}
-	if unterminatedToolInstruction(trimmed) {
-		return domain.ToolCall{}, false, fmt.Errorf("%w: tool instruction JSON is incomplete, most likely cut off by the output length limit; send a smaller instruction (for example write long scripts to a file first, then run the file)", domain.ErrProviderProtocol)
-	}
 	return domain.ToolCall{}, false, nil
+}
+
+// 只讀 object 的頂層鍵；允許 id 在前，也不把一般 type 或巢狀字串範例當成工具。
+func toolInstructionObjectPrefix(content string) bool {
+	decoder := json.NewDecoder(strings.NewReader(content))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return false
+	}
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return false
+		}
+		var text string
+		if json.Unmarshal(value, &text) != nil {
+			continue
+		}
+		switch key {
+		case "tool", "tool_name":
+			return strings.TrimSpace(text) != ""
+		case "type", "action":
+			switch strings.ToLower(strings.TrimSpace(text)) {
+			case "tool", "tool_use", "tool_call":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// JSON 陣列必須整體合法；不能只擷取其中已閉合的 object 而忽略逗號或結尾。
+// 跳過完整 object，避免把工具參數內的陣列／文字誤判成另一批工具指令。
+func validateInstructionArrays(content string) error {
+	for offset := 0; offset < len(content); {
+		relative := strings.IndexAny(content[offset:], "[{")
+		if relative < 0 {
+			break
+		}
+		start := offset + relative
+		span := balancedJSONSpan(content[start:])
+		if content[start] == '[' {
+			candidate := content[start:]
+			if span != "" {
+				candidate = span
+			}
+			containsTool := false
+			for _, object := range jsonObjects(candidate) {
+				if toolInstructionObjectPrefix(object) {
+					containsTool = true
+					break
+				}
+			}
+			if containsTool {
+				var items []json.RawMessage
+				if span == "" || json.Unmarshal([]byte(span), &items) != nil {
+					return fmt.Errorf("%w: tool instruction array is incomplete or invalid", domain.ErrProviderProtocol)
+				}
+				for _, item := range items {
+					if _, matched, err := decodeInstructionToolCall(string(item)); err != nil || !matched {
+						return fmt.Errorf("%w: every tool instruction array item must be a complete tool call", domain.ErrProviderProtocol)
+					}
+				}
+			}
+		}
+		if span != "" {
+			offset = start + len(span)
+		} else {
+			offset = start + 1
+		}
+	}
+	return nil
 }
 
 // unterminatedToolInstruction 辨識「開頭像工具指令、但 JSON 沒有收尾」的輸出。
@@ -314,7 +399,7 @@ func unterminatedToolInstruction(content string) bool {
 			offset = start + len(object)
 			continue
 		}
-		if toolInstructionPrefixPattern.MatchString(remainder) {
+		if toolInstructionObjectPrefix(remainder) {
 			return true
 		}
 		offset = start + 1
@@ -322,14 +407,25 @@ func unterminatedToolInstruction(content string) bool {
 	return false
 }
 
-func instructionToolExists(name string, definitions []domain.ToolDefinition) bool {
+func canonicalInstructionToolName(name string, definitions []domain.ToolDefinition) string {
 	name = strings.TrimSpace(name)
 	for _, definition := range definitions {
-		if strings.EqualFold(strings.TrimSpace(definition.Name), name) {
-			return true
+		candidate := strings.TrimSpace(definition.Name)
+		if candidate == name && name != "" {
+			return candidate
 		}
 	}
-	return false
+	match := ""
+	for _, definition := range definitions {
+		candidate := strings.TrimSpace(definition.Name)
+		if strings.EqualFold(candidate, name) {
+			if match != "" && match != candidate {
+				return ""
+			}
+			match = candidate
+		}
+	}
+	return match
 }
 
 func decodeInstructionToolCall(candidate string) (domain.ToolCall, bool, error) {
@@ -341,6 +437,9 @@ func decodeInstructionToolCall(candidate string) (domain.ToolCall, bool, error) 
 	decoder := json.NewDecoder(strings.NewReader(candidate))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil {
+		if toolInstructionObjectPrefix(candidate) {
+			return domain.ToolCall{}, false, fmt.Errorf("%w: tool instruction JSON is invalid", domain.ErrProviderProtocol)
+		}
 		return domain.ToolCall{}, false, nil
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
@@ -348,7 +447,7 @@ func decodeInstructionToolCall(candidate string) (domain.ToolCall, bool, error) 
 	}
 	directive := strings.ToLower(firstRawString(value, "type", "action"))
 	name := firstRawString(value, "tool", "tool_name", "name")
-	if directive == "" && name != "" {
+	if directive == "" && firstRawString(value, "tool", "tool_name") != "" {
 		directive = "tool_use"
 	}
 	if directive != "tool_use" && directive != "tool_call" && directive != "tool" {
@@ -363,9 +462,11 @@ func decodeInstructionToolCall(candidate string) (domain.ToolCall, bool, error) 
 		if !exists || len(raw) == 0 || string(raw) == "null" {
 			continue
 		}
-		if err := json.Unmarshal(raw, &arguments); err != nil {
+		decoded, err := decodeJSONObject(string(raw))
+		if err != nil {
 			return domain.ToolCall{}, false, fmt.Errorf("%w: tool instruction input must be a JSON object: %v", domain.ErrProviderProtocol, err)
 		}
+		arguments = decoded
 		break
 	}
 	id := firstRawString(value, "id", "tool_call_id")

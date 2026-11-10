@@ -22,7 +22,7 @@ func TestEventOffsetIndexSmoke(t *testing.T) {
 			t.Fatalf("incremental=%v err=%v", events, err)
 		}
 	}
-	index := r.indexes["run_smoke"]
+	index, _ := r.indexes.get("run_smoke")
 	if index == nil || len(index.ends) != 31 || index.ends[29] <= 0 {
 		t.Fatal("missing seek index")
 	}

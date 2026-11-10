@@ -50,16 +50,31 @@ func (m *Model) Stream(ctx context.Context, request domain.ModelRequest, sink po
 	if streaming && m.streamIncludeUsage {
 		payload.StreamOptions = &streamOptions{IncludeUsage: true}
 	}
-	body, err := json.Marshal(payload)
+	var body []byte
+	var err error
+	if m.useClaude {
+		body, err = m.claudeRequest(request, modelName, streaming)
+	} else {
+		body, err = json.Marshal(payload)
+	}
 	if err != nil {
 		return domain.ModelResponse{}, fmt.Errorf("encode chat completion request: %w", err)
+	}
+	if m.useClaude && strings.EqualFold(strings.TrimSpace(request.ThinkingMode), domain.ThinkingModeNone) && sink != nil {
+		if err := sink(domain.ModelEvent{Type: domain.ModelEventProgress, Delta: "Claude 模型不一定支援關閉思考，已使用最低 effort（low）；未強制停用模型思考。"}); err != nil {
+			return domain.ModelResponse{}, err
+		}
 	}
 	// 每一次請求都留下結構摘要（只有形狀，沒有內容）。不做成「失敗才記」，
 	// 是因為失敗不一定看得出來：實測遇過中間的相容代理把上游的 400 包成
 	// 200 加一段錯誤文字，Harness 判定為一次成功的回答，事後也就沒有任何
 	// 線索可查。一行約 150 位元組，日誌緩衝有 512KB，代價可以忽略。
+	protocol := "chat"
+	if m.useClaude {
+		protocol = "claude-messages"
+	}
 	m.logger.Info("provider request shape",
-		"protocol", "chat",
+		"protocol", protocol,
 		"model", modelName,
 		"session_id", request.SessionID,
 		"messages", len(payload.Messages),
@@ -167,11 +182,33 @@ func (m *Model) executeAttempt(ctx context.Context, body []byte, modelName strin
 		}
 	}
 	defer response.Body.Close()
+	m.captureClaudeRateLimits(response.Header, modelName, response.StatusCode)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		providerErr, retryAfter := providerHTTPError(response, clientRequestID)
+		if m.useClaude {
+			providerErr.Operation = "Claude Messages"
+			providerErr.RequestID = response.Header.Get("request-id")
+			if response.StatusCode == 529 {
+				providerErr.Retryable = true
+			}
+		}
 		return domain.ModelResponse{}, retryAfter, providerErr
 	}
 	requestID := strings.TrimSpace(response.Header.Get("X-Request-ID"))
+	if m.useClaude {
+		requestID = response.Header.Get("request-id")
+		result, err := decodeClaude(response.Body, streaming && !strings.Contains(response.Header.Get("Content-Type"), "application/json"), modelName, requestID, sink)
+		if err == nil && result.Continuation != nil {
+			result.Continuation.Scope = m.continuationScope
+			result.Continuation.Model = modelName
+			prefixHash, hashErr := claudeRequestPrefixHash(body)
+			if hashErr != nil {
+				return domain.ModelResponse{}, 0, fmt.Errorf("bind Claude thinking prefix: %w", hashErr)
+			}
+			result.Continuation.PrefixHash = prefixHash
+		}
+		return result, 0, err
+	}
 	reader := bufio.NewReader(response.Body)
 	contentType := strings.ToLower(response.Header.Get("Content-Type"))
 	if responseIsJSON(reader, contentType, streaming) {

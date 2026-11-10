@@ -1,6 +1,7 @@
 package documents
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"html"
@@ -11,9 +12,16 @@ import (
 )
 
 var (
-	wordParagraphXMLPattern   = regexp.MustCompile(`(?s)<(?:[A-Za-z0-9_]+:)?p(?:\s[^>]*)?>.*?</(?:[A-Za-z0-9_]+:)?p\s*>`)
-	spreadsheetItemXMLPattern = regexp.MustCompile(`(?s)<(?:[A-Za-z0-9_]+:)?(?:si|is)(?:\s[^>]*)?>.*?</(?:[A-Za-z0-9_]+:)?(?:si|is)\s*>`)
-	xmlTextNodePattern        = regexp.MustCompile(`(?s)<(?:[A-Za-z0-9_]+:)?t\b[^>]*>(.*?)</(?:[A-Za-z0-9_]+:)?t\s*>`)
+	wordParagraphXMLPattern     = regexp.MustCompile(`(?s)<(?:[A-Za-z0-9_]+:)?p(?:\s[^>]*)?>.*?</(?:[A-Za-z0-9_]+:)?p\s*>`)
+	spreadsheetItemXMLPattern   = regexp.MustCompile(`(?s)<(?:[A-Za-z0-9_]+:)?(?:si|is)(?:\s[^>]*)?>.*?</(?:[A-Za-z0-9_]+:)?(?:si|is)\s*>`)
+	xmlTextNodePattern          = regexp.MustCompile(`(?s)<(?:[A-Za-z0-9_]+:)?t\b[^>]*>(.*?)</(?:[A-Za-z0-9_]+:)?t\s*>`)
+	worksheetStylePattern       = regexp.MustCompile(`\bs="([0-9]+)"`)
+	worksheetDimensionPattern   = regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?dimension\b[^>]*/>`)
+	worksheetOpeningPattern     = regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?worksheet\b[^>]*>`)
+	worksheetCellOpeningPattern = regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?c\b[^>]*\br="([A-Za-z]{1,3}[1-9][0-9]{0,6})"[^>]*>`)
+	worksheetRowClosingPattern  = regexp.MustCompile(`</(?:[A-Za-z0-9_]+:)?row\s*>`)
+	worksheetRowOpeningPattern  = regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?row\b[^>]*\br="([1-9][0-9]{0,6})"[^>]*>`)
+	worksheetDataClosingPattern = regexp.MustCompile(`</(?:[A-Za-z0-9_]+:)?sheetData\s*>`)
 )
 
 func editOpenXML(ctx context.Context, sourcePath string, format documentFormat, request documentEditRequest) (authoredDocument, error) {
@@ -285,12 +293,11 @@ func setWorksheetCell(data []byte, row, column int, cell worksheetCellValue) ([]
 		if clearCell {
 			return append(append([]byte(nil), data[:location[0]]...), data[location[1]:]...), true, nil
 		}
-		openingEnd := strings.Index(string(data[location[0]:location[1]]), ">")
+		openingEnd := bytes.IndexByte(data[location[0]:location[1]], '>')
 		style := 0
 		if openingEnd > 0 {
 			opening := string(data[location[0] : location[0]+openingEnd+1])
-			stylePattern := regexp.MustCompile(`\bs="([0-9]+)"`)
-			if match := stylePattern.FindStringSubmatch(opening); match != nil {
+			if match := worksheetStylePattern.FindStringSubmatch(opening); match != nil {
 				style, _ = strconv.Atoi(match[1])
 			}
 		}
@@ -341,11 +348,10 @@ func expandWorksheetDimension(data []byte, row, column int) []byte {
 	if row == 1 && column == 1 {
 		reference = "A1"
 	}
-	pattern := regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?dimension\b[^>]*/>`)
-	if location := pattern.FindIndex(data); location != nil {
+	if location := worksheetDimensionPattern.FindIndex(data); location != nil {
 		return append(append([]byte(nil), data[:location[0]]...), append([]byte(`<dimension ref="`+reference+`"/>`), data[location[1]:]...)...)
 	}
-	worksheetOpen := regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?worksheet\b[^>]*>`).FindIndex(data)
+	worksheetOpen := worksheetOpeningPattern.FindIndex(data)
 	if worksheetOpen == nil {
 		return data
 	}
@@ -353,18 +359,22 @@ func expandWorksheetDimension(data []byte, row, column int) []byte {
 }
 
 func bytesHasSelfClosingEnd(value []byte) bool {
-	return strings.HasSuffix(strings.TrimSpace(string(value)), "/>")
+	return bytes.HasSuffix(bytes.TrimSpace(value), []byte("/>"))
 }
 
 func worksheetCellInsertPosition(rowXML []byte, wantedColumn int) int {
-	cellPattern := regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?c\b[^>]*\br="([A-Za-z]{1,3}[1-9][0-9]{0,6})"[^>]*>`)
-	for _, match := range cellPattern.FindAllSubmatchIndex(rowXML, -1) {
-		_, column, err := parseSpreadsheetCellReference(string(rowXML[match[2]:match[3]]))
-		if err == nil && column > wantedColumn {
-			return match[0]
+	for offset := 0; offset < len(rowXML); {
+		match := worksheetCellOpeningPattern.FindSubmatchIndex(rowXML[offset:])
+		if match == nil {
+			break
 		}
+		_, column, err := parseSpreadsheetCellReference(string(rowXML[offset+match[2] : offset+match[3]]))
+		if err == nil && column > wantedColumn {
+			return offset + match[0]
+		}
+		offset += match[1]
 	}
-	closing := regexp.MustCompile(`</(?:[A-Za-z0-9_]+:)?row\s*>`).FindIndex(rowXML)
+	closing := worksheetRowClosingPattern.FindIndex(rowXML)
 	if closing == nil {
 		return -1
 	}
@@ -372,14 +382,18 @@ func worksheetCellInsertPosition(rowXML []byte, wantedColumn int) int {
 }
 
 func worksheetRowInsertPosition(worksheetXML []byte, wantedRow int) int {
-	rowPattern := regexp.MustCompile(`<(?:[A-Za-z0-9_]+:)?row\b[^>]*\br="([1-9][0-9]{0,6})"[^>]*>`)
-	for _, match := range rowPattern.FindAllSubmatchIndex(worksheetXML, -1) {
-		row, _ := strconv.Atoi(string(worksheetXML[match[2]:match[3]]))
-		if row > wantedRow {
-			return match[0]
+	for offset := 0; offset < len(worksheetXML); {
+		match := worksheetRowOpeningPattern.FindSubmatchIndex(worksheetXML[offset:])
+		if match == nil {
+			break
 		}
+		row, _ := strconv.Atoi(string(worksheetXML[offset+match[2] : offset+match[3]]))
+		if row > wantedRow {
+			return offset + match[0]
+		}
+		offset += match[1]
 	}
-	closing := regexp.MustCompile(`</(?:[A-Za-z0-9_]+:)?sheetData\s*>`).FindIndex(worksheetXML)
+	closing := worksheetDataClosingPattern.FindIndex(worksheetXML)
 	if closing == nil {
 		return -1
 	}

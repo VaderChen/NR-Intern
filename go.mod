@@ -2,6 +2,8 @@ module AgenticService
 
 go 1.25.11
 
+toolchain go1.27.3
+
 require (
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/webview/webview_go v0.0.0-20240831120633-6173450d4dd6

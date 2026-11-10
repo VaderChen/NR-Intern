@@ -376,6 +376,7 @@ func Build(config Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
+	// mcpManager 在上方已檢查建立錯誤，此處必為非 nil；見 tools.RemoteToolSource 的說明。
 	toolRuntime := &tools.Runtime{Native: nativeTools, MCP: mcpManager}
 	approvalToolNames := []string{}
 	for _, nativeTool := range nativeToolValues {
@@ -1049,12 +1050,17 @@ func (r *Runtime) TestProvider(ctx context.Context, providerID string) (domain.P
 	}
 	diagnostics := adapter.Diagnostics()
 	startedAt := time.Now()
+	toolChoice := "required"
+	if diagnostics.Protocol == "claude-messages" {
+		// 新模型不一定允許強制工具選擇；仍在回覆端驗證實際工具與參數。
+		toolChoice = "auto"
+	}
 	response, err := adapter.Stream(ctx, domain.ModelRequest{
 		SessionID:    "provider-settings-test",
 		ProviderID:   providerID,
 		Model:        diagnostics.DefaultModel,
-		ToolChoice:   "required",
-		SystemPrompt: "This is an OpenAI-compatible native tool-calling probe. You must call provider_connection_test exactly once with token set to ping. Do not answer with text and do not describe the call.",
+		ToolChoice:   toolChoice,
+		SystemPrompt: "This is a native tool-calling probe. You must call provider_connection_test exactly once with token set to ping. Do not answer with text and do not describe the call.",
 		UserPrompt:   "Run the provider connection test now.",
 		Tools: []domain.ToolDefinition{{
 			Name:        "provider_connection_test",
@@ -1072,13 +1078,7 @@ func (r *Runtime) TestProvider(ctx context.Context, providerID string) (domain.P
 	if err != nil {
 		return domain.ProviderTestResult{}, fmt.Errorf("%w: test provider %q: %v", domain.ErrInvalidInput, providerID, err)
 	}
-	toolCalling := false
-	for _, call := range response.ToolCalls {
-		if call.Name == "provider_connection_test" {
-			toolCalling = true
-			break
-		}
-	}
+	toolCalling := len(response.ToolCalls) == 1 && response.ToolCalls[0].Name == "provider_connection_test" && response.ToolCalls[0].Arguments["token"] == "ping"
 	if !toolCalling {
 		return domain.ProviderTestResult{}, fmt.Errorf("%w: provider %q completed a model request but did not return the required native tool call; verify that its protocol and model support native tools", domain.ErrInvalidInput, providerID)
 	}
@@ -1195,6 +1195,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			provided := value.OpenAICompatible
 			settings.BaseURL = strings.TrimSpace(provided.BaseURL)
 			settings.UseResponses = provided.UseResponses
+			settings.UseClaude = provided.UseClaude
 			settings.Model = strings.TrimSpace(provided.Model)
 			settings.InstructionRole = strings.ToLower(strings.TrimSpace(provided.InstructionRole))
 			settings.DisableStreaming = provided.DisableStreaming
@@ -1236,6 +1237,7 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			return domain.ProviderSettings{}, fmt.Errorf("%w: unsupported provider type %q", domain.ErrInvalidInput, value.Type)
 		}
 	}
+	candidate.ModelPrices = modelPricesForProviders(candidate.ModelPrices, candidate.Providers)
 	if err := validateConfig(&candidate); err != nil {
 		return domain.ProviderSettings{}, fmt.Errorf("%w: %v", domain.ErrInvalidInput, err)
 	}
@@ -1254,48 +1256,40 @@ func (r *Runtime) UpdateProviderSettings(ctx context.Context, input domain.Updat
 			}
 		}
 	}
-	for _, agent := range r.Application.ListAgents() {
-		sessions, listErr := r.Application.ListSessions(ctx, agent.ID)
-		if listErr != nil {
-			return domain.ProviderSettings{}, listErr
-		}
-		for _, session := range sessions {
-			providerID := strings.TrimSpace(session.ProviderID)
-			if providerID == "" {
-				continue
-			}
-			provider, exists := candidate.Providers[providerID]
-			if !exists {
-				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q is still used by session %q", domain.ErrConflict, providerID, session.ID)
-			}
-			if !provider.IsEnabled() {
-				return domain.ProviderSettings{}, fmt.Errorf("%w: provider %q must remain enabled while used by session %q", domain.ErrConflict, providerID, session.ID)
-			}
-		}
-	}
 	values, err := buildProviderValues(candidate, r.logger, r.ProviderAuth)
 	if err != nil {
 		return domain.ProviderSettings{}, fmt.Errorf("%w: %v", domain.ErrInvalidInput, err)
 	}
-	if err := persistProviderSettings(candidate.DataDir, candidate.DefaultProviderID, candidate.Providers); err != nil {
-		return domain.ProviderSettings{}, err
+	enabled := make(map[string]bool, len(candidate.Providers))
+	for id, provider := range candidate.Providers {
+		enabled[id] = provider.IsEnabled()
 	}
-	if err := r.Model.Replace(candidate.DefaultProviderID, values); err != nil {
-		return domain.ProviderSettings{}, err
-	}
-	r.requestProviderUsageRefresh()
-	if r.ProviderAuth != nil {
-		for providerID, existingProvider := range r.Config.Providers {
-			nextProvider, stillConfigured := candidate.Providers[providerID]
-			wasCodexOAuth := strings.EqualFold(strings.TrimSpace(existingProvider.Type), "openai-codex-responses")
-			isCodexOAuth := stillConfigured && strings.EqualFold(strings.TrimSpace(nextProvider.Type), "openai-codex-responses")
-			credentialsChanged := !stillConfigured || wasCodexOAuth != isCodexOAuth
-			if credentialsChanged {
-				_ = r.ProviderAuth.Disconnect(providerID)
+	err = r.Application.ApplyProviderSettings(ctx, enabled, values[candidate.DefaultProviderID].Descriptor, func() error {
+		if err := persistProviderSettings(candidate.DataDir, candidate.DefaultProviderID, candidate.Providers, candidate.ModelPrices); err != nil {
+			return err
+		}
+		if err := r.Model.Replace(candidate.DefaultProviderID, values); err != nil {
+			return err
+		}
+		r.requestProviderUsageRefresh()
+		if r.ProviderAuth != nil {
+			for providerID, existingProvider := range r.Config.Providers {
+				nextProvider, stillConfigured := candidate.Providers[providerID]
+				wasCodexOAuth := strings.EqualFold(strings.TrimSpace(existingProvider.Type), "openai-codex-responses")
+				isCodexOAuth := stillConfigured && strings.EqualFold(strings.TrimSpace(nextProvider.Type), "openai-codex-responses")
+				credentialsChanged := !stillConfigured || wasCodexOAuth != isCodexOAuth
+				if credentialsChanged {
+					_ = r.ProviderAuth.Disconnect(providerID)
+				}
 			}
 		}
+		r.Config = candidate
+		r.Application.UpdateModelPrices(candidate.ModelPrices)
+		return nil
+	})
+	if err != nil {
+		return domain.ProviderSettings{}, err
 	}
-	r.Config = candidate
 	return providerSettingsView(r.Config, r.ProviderAuth), nil
 }
 
@@ -1316,6 +1310,7 @@ func providerSettingsView(config Config, providerAuth *providerauth.Manager) dom
 			}
 			settings := provider.OpenAICompatible
 			value.OpenAICompatible = &domain.OpenAICompatibleProviderSetting{
+				UseClaude:                    settings.UseClaude,
 				BaseURL:                      settings.BaseURL,
 				UseResponses:                 settings.UseResponses,
 				HasAPIKey:                    strings.TrimSpace(settings.APIKey) != "",

@@ -24,6 +24,7 @@ const (
 )
 
 type Config struct {
+	UseClaude                    bool                                  `json:"use_claude,omitempty"`
 	UseResponses                 bool                                  `json:"use_responses,omitempty"`
 	BaseURL                      string                                `json:"base_url"`
 	APIKey                       string                                `json:"api_key,omitempty"`
@@ -62,6 +63,7 @@ type ModelLimits struct {
 }
 
 type Diagnostics struct {
+	Protocol           string `json:"protocol"`
 	Endpoint           string `json:"endpoint"`
 	DefaultModel       string `json:"default_model"`
 	InstructionRole    string `json:"instruction_role"`
@@ -75,6 +77,7 @@ type Diagnostics struct {
 }
 
 type Model struct {
+	useClaude            bool
 	continuationScope    string
 	useResponses         bool
 	endpoint             string
@@ -102,6 +105,9 @@ type Model struct {
 }
 
 func New(config Config) (*Model, error) {
+	if config.UseClaude && (config.UseResponses || strings.EqualFold(strings.TrimSpace(config.AuthMode), "oauth")) {
+		return nil, fmt.Errorf("Claude Messages cannot use Responses or OAuth")
+	}
 	authMode := strings.ToLower(strings.TrimSpace(config.AuthMode))
 	if authMode == "" {
 		authMode = "api_key"
@@ -115,7 +121,9 @@ func New(config Config) (*Model, error) {
 	endpoint := CodexResponsesEndpoint
 	if authMode != "oauth" {
 		var err error
-		if config.UseResponses {
+		if config.UseClaude {
+			endpoint, err = claudeEndpoint(config.BaseURL)
+		} else if config.UseResponses {
 			endpoint, err = responsesEndpoint(config.BaseURL)
 		} else {
 			endpoint, err = completionEndpoint(config.BaseURL)
@@ -172,7 +180,9 @@ func New(config Config) (*Model, error) {
 		TLSHandshakeTimeout:   connectTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
+	useClaude := config.UseClaude
 	return &Model{
+		useClaude:            config.UseClaude,
 		continuationScope:    domain.NewID("provider_state"),
 		useResponses:         config.UseResponses || authMode == "oauth",
 		endpoint:             endpoint,
@@ -191,7 +201,16 @@ func New(config Config) (*Model, error) {
 		maxHistoryCharacters: config.MaxHistoryCharacters,
 		modelLimits:          cloneModelLimits(config.ModelLimits),
 		logger:               logging.Or(config.Logger),
-		client:               &http.Client{Timeout: timeout, Transport: transport},
+		client: &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// x-api-key 不屬於 net/http 自動保護的敏感標頭，不跟隨 Claude 重導向。
+			if useClaude {
+				return http.ErrUseLastResponse
+			}
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return nil
+		}},
 	}, nil
 }
 
@@ -199,7 +218,15 @@ func (m *Model) Diagnostics() Diagnostics {
 	if m == nil {
 		return Diagnostics{}
 	}
+	protocol := "chat"
+	if m.useResponses {
+		protocol = "responses"
+	}
+	if m.useClaude {
+		protocol = "claude-messages"
+	}
 	return Diagnostics{
+		Protocol:           protocol,
 		Endpoint:           m.endpoint,
 		DefaultModel:       m.defaultModel,
 		InstructionRole:    m.instructionRole,
@@ -214,6 +241,12 @@ func (m *Model) Diagnostics() Diagnostics {
 }
 
 func (m *Model) applyAuthorization(ctx context.Context, request *http.Request) error {
+	if m != nil && request != nil && m.useClaude {
+		request.Header.Del("Authorization")
+		request.Header.Set("x-api-key", m.apiKey)
+		request.Header.Set("anthropic-version", "2023-06-01")
+		return nil
+	}
 	if m == nil || request == nil {
 		return fmt.Errorf("OpenAI-compatible authorization is unavailable")
 	}

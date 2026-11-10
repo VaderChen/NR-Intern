@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -42,7 +43,7 @@ type codexUsageAPIWindow struct {
 	ResetAfterSeconds  *float64 `json:"reset_after_seconds"`
 }
 
-// ProviderUsage 回傳最近一次由上游明確提供的 Codex 配額快照。
+// ProviderUsage 回傳最近一次上游明確提供的帳戶配額或速率快照。
 func (m *Model) ProviderUsage() domain.ProviderUsage {
 	if m == nil {
 		return domain.ProviderUsage{}
@@ -50,8 +51,51 @@ func (m *Model) ProviderUsage() domain.ProviderUsage {
 	m.usageMu.RLock()
 	defer m.usageMu.RUnlock()
 	usage := m.providerUsage
+	if m.useClaude {
+		usage.Kind = "rate_limit"
+	} else if m.authMode == "oauth" {
+		usage.Kind = "quota"
+	}
+	usage.RateLimits = append([]domain.ProviderRateLimit(nil), usage.RateLimits...)
 	usage.ResetCredits.Items = append([]domain.ProviderResetCredit(nil), usage.ResetCredits.Items...)
 	return usage
+}
+
+// Claude 一般 API Key 只讀取推論回應已有的速率標頭，不額外發起付費請求。
+func (m *Model) captureClaudeRateLimits(header http.Header, model string, status int) {
+	if !m.useClaude {
+		return
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		m.clearProviderUsage()
+		return
+	}
+	usage := domain.ProviderUsage{Kind: "rate_limit", Model: model}
+	for _, resource := range []string{"requests", "input_tokens", "output_tokens", "tokens"} {
+		prefix := "anthropic-ratelimit-" + strings.ReplaceAll(resource, "_", "-")
+		limit, e1 := strconv.ParseInt(strings.TrimSpace(header.Get(prefix+"-limit")), 10, 64)
+		remaining, e2 := strconv.ParseInt(strings.TrimSpace(header.Get(prefix+"-remaining")), 10, 64)
+		if e2 != nil || remaining < 0 || remaining > 9007199254740991 {
+			continue
+		}
+		if e1 != nil || limit <= 0 || limit > 9007199254740991 {
+			limit = 0
+		}
+		if limit > 0 && remaining > limit {
+			continue
+		}
+		value := domain.ProviderRateLimit{Resource: resource, Limit: limit, Remaining: remaining}
+		if reset, err := time.Parse(time.RFC3339, header.Get(prefix+"-reset")); err == nil {
+			value.ResetAt = reset.UTC().Format(time.RFC3339)
+		}
+		usage.RateLimits = append(usage.RateLimits, value)
+	}
+	if len(usage.RateLimits) > 0 {
+		usage.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	m.usageMu.Lock()
+	m.providerUsage = usage
+	m.usageMu.Unlock()
 }
 
 // RefreshProviderUsage 使用 ChatGPT/Codex OAuth 的唯讀用量端點更新快照，

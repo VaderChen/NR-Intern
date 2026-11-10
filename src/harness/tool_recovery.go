@@ -4,6 +4,8 @@ import (
 	"AgenticService/src/domain"
 	"AgenticService/src/ports"
 	"context"
+	"fmt"
+	"strings"
 )
 
 // 以原始稽核紀錄恢復未確認操作，不依賴會被壓縮／撤回的模型檢視。
@@ -15,11 +17,20 @@ func (g *toolLoopGuard) restoreUncertain(ctx context.Context, repository ports.S
 	pending := map[string]string{}
 	var cursor int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		entries, more, err := repository.ListEntriesPage(ctx, sessionID, cursor, 256)
 		if err != nil {
 			return err
 		}
+		if more && len(entries) == 0 {
+			return fmt.Errorf("%w: 工具稽核分頁宣告有後續資料但未回傳紀錄", domain.ErrConflict)
+		}
 		for _, entry := range entries {
+			if entry.Sequence <= cursor {
+				return fmt.Errorf("%w: 工具稽核分頁序號未遞增", domain.ErrConflict)
+			}
 			cursor = entry.Sequence
 			if message := entry.Message; message != nil {
 				for _, call := range message.ToolCalls {
@@ -28,7 +39,11 @@ func (g *toolLoopGuard) restoreUncertain(ctx context.Context, repository ports.S
 					}
 					pending[call.ID] = toolCallSignature(call)
 				}
-				if message.Role == "tool" && domain.ToolExecutionState(message.Metadata) != domain.ToolOutcomeUnknown {
+				if strings.EqualFold(message.Role, "tool") {
+					if signature := pending[message.ToolCallID]; signature != "" && domain.ToolExecutionState(message.Metadata) == domain.ToolOutcomeUnknown {
+						// 未知是已保存的事實；晚到或重複的成功訊息不能抹除它。
+						g.uncertainSignatures[signature] = true
+					}
 					delete(pending, message.ToolCallID)
 				}
 			}
@@ -40,7 +55,7 @@ func (g *toolLoopGuard) restoreUncertain(ctx context.Context, repository ports.S
 				}
 			}
 		}
-		if !more || len(entries) == 0 {
+		if !more {
 			break
 		}
 	}

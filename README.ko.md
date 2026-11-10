@@ -6,6 +6,8 @@ NR-Intern은 Go로 개발된 데스크톱 AI Agent입니다. 현재 대화, 검�
 
 ![NR-Intern 대화 화면](images/cap0001.jpg)
 
+최신 업데이트: **1.26.1110 build 1637**. Claude Platform API, Provider／모델 선택, 도구 실행과 Run 종료 처리, 성능 개선을 포함합니다. 검증 범위와 업그레이드 제한은 [변경 기록(번체 중국어)](docs/ai-agent/CHANGELOG.md)을 참고하세요.
+
 ## 주요 기능
 
 - OpenAI-compatible Chat Completions와 ChatGPT／Codex OAuth로 인증하는 OpenAI Codex Responses를 지원하는 확장 가능한 Provider Router. Codex 계정에 사용량 한도 재설정 횟수가 있으면 Provider 설정에서 사용할 수 있으며, 확인 창에 남은 횟수와 가장 이른 만료 시각을 표시합니다.

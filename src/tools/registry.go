@@ -173,14 +173,19 @@ func (r *Registry) Execute(ctx context.Context, session domain.Session, call dom
 	return result, err
 }
 
-func (r *Registry) ResolveDefinition(ctx context.Context, session domain.Session, name string) (domain.ToolDefinition, error) {
-	definitions, err := r.Definitions(ctx, session)
-	if err != nil {
-		return domain.ToolDefinition{}, err
-	}
-	for _, definition := range definitions {
-		if definition.Name == name {
-			return definition, nil
+func (r *Registry) ResolveDefinition(_ context.Context, session domain.Session, name string) (domain.ToolDefinition, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	registeredName := strings.TrimSpace(name)
+	value := r.items[registeredName]
+	if value != nil && r.isAllowed(registeredName) {
+		if _, disabled := toolDisabledReason(value); !disabled {
+			// 每次都讀取目前契約與權限；只省略無關工具的複製、雜湊及排序。
+			definition := value.Definition()
+			if definition.Name == name && (!definition.RequiresPermission || r.elevatedAllowed(session.PermissionProfile)) {
+				definition.ContractID = domain.ToolContractFingerprint(definition, "native")
+				return cloneDefinition(definition), nil
+			}
 		}
 	}
 	return domain.ToolDefinition{}, fmt.Errorf("%w: 工具已停用或權限不足", domain.ErrNotFound)

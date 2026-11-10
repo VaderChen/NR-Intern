@@ -112,7 +112,7 @@ func volatileRun(run domain.Run) bool {
 // 的擠出 runs.json——使用者在隔離專案跑得越多，一般專案的歷史消失得越快，而且
 // 完全看不出原因。分開之後兩邊互不影響，揮發那組也仍有上限，不會無限成長。
 func (r *RunRepository) pruneLocked() bool {
-	if r.retention <= 0 {
+	if r.retention <= 0 || len(r.runs) <= r.retention {
 		return false
 	}
 	before := len(r.pruned)
@@ -122,15 +122,29 @@ func (r *RunRepository) pruneLocked() bool {
 }
 
 func (r *RunRepository) pruneGroupLocked(volatile bool) {
-	ordered := make([]domain.Run, 0, len(r.runs))
+	count, eligible := 0, 0
 	for _, run := range r.runs {
 		if volatileRun(run) != volatile {
 			continue
 		}
-		ordered = append(ordered, run)
+		count++
+		if terminalRunStatus(run.Status) && !r.protected[run.ID] {
+			eligible++
+		}
 	}
-	if len(ordered) <= r.retention {
+	if count <= r.retention || eligible == 0 {
 		return
+	}
+	// 配額包含所有狀態，但排序只需要可淘汰紀錄的 ID 與建立時間。
+	type candidate struct {
+		ID        string
+		CreatedAt time.Time
+	}
+	ordered := make([]candidate, 0, eligible)
+	for _, run := range r.runs {
+		if volatileRun(run) == volatile && terminalRunStatus(run.Status) && !r.protected[run.ID] {
+			ordered = append(ordered, candidate{ID: run.ID, CreatedAt: run.CreatedAt})
+		}
 	}
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].CreatedAt.Equal(ordered[j].CreatedAt) {
@@ -138,15 +152,10 @@ func (r *RunRepository) pruneGroupLocked(volatile bool) {
 		}
 		return ordered[i].CreatedAt.Before(ordered[j].CreatedAt)
 	})
-	excess := len(ordered) - r.retention
+	excess := count - r.retention
 	for _, run := range ordered {
 		if excess <= 0 {
 			break
-		}
-		// 只淘汰已經結束的 run。paused 與 waiting_approval 看起來像停住了，
-		// 其實都還會寫回狀態——用「是否為終態」判斷才不會漏掉。
-		if !terminalRunStatus(run.Status) || r.protected[run.ID] {
-			continue
 		}
 		delete(r.runs, run.ID)
 		r.pruned = append(r.pruned, run.ID)

@@ -1,5 +1,226 @@
 # 執行與開發
 
+## Provider 刪除與計價一致性
+
+管理介面保存 Provider 時，會只保留仍存在的 Provider 計價表，並將 `model_prices`
+與 Provider 清單一起原子寫入 `providers.json`。明確的空計價表也會保存，避免重啟後重新套用
+基底設定中的舊價格。既有 `providers.json` 若沒有此欄位，則沿用基底價格並排除已刪除的 Provider。
+未使用管理覆寫檔時，基底設定中的錯誤 Provider 參照仍會由設定驗證攔截。
+
+正在使用的計價快照會同步替換，歷史 Run 已保存的成本不重算。刪除 Provider 時，引用它的
+Session 會改用本次設定的系統預設 Provider 及模型，思考程度回到自動；對話紀錄不變。
+遷移與新 Session／Run 啟動共用鎖，設定寫入失敗時還原對話的原選擇。
+受影響的 Session 有執行中工作，或 Workspace 仍引用該 Provider 時，會拒絕刪除，避免破壞執行狀態。
+停用 Provider 仍保留原有引用檢查。拒絕操作不得提前更動檔案或記憶體中的計價設定。
+相關合成驗證：`go test -race ./src/bootstrap ./src/application -run 'ProviderSettingsSaveDeleteSmoke|ProviderSessionFallback|ProviderPricesLegacyAndEmptySmoke|ModelPrice' -count=1`。
+
+## Claude Platform API
+
+輸入框上方、上下文用量左側顯示 Codex 的剩餘百分比；點開以數字及進度條呈現各視窗，
+並以 `updated_at` 顯示「更新時間」。`reset_at` 保留給內部過期判斷，不當成資料更新時間。
+Codex 使用既有唯讀帳戶 API 的 5 小時及每週視窗，摘要取已知視窗的最低剩餘比例，不把不同視窗加總；
+快照已到重設時間或逾 10 分鐘時加上 `*`，不推測其已回滿。切換 Session／模型及回報用量時更新，
+畫面可見時每 30 秒讀取本機快照。
+
+**Claude Platform 不顯示用量。** 推論回應的
+`anthropic-ratelimit-{requests,input-tokens,output-tokens,tokens}-{limit,remaining,reset}` 標頭只是
+每分鐘速率額度，幾秒就重設、只在模型回應時更新，數字會大幅跳動，不是使用者在後台看到的組織點數。
+2026-11-10 查閱官方文件索引，沒有可查詢點數餘額的介面；成本報表只回報已花費金額，且需要
+無法限縮權限的管理金鑰（[組織用量 API 的憑證要求](https://platform.claude.com/docs/en/manage-claude/usage-cost-api)）。
+因此前端在用量種類為 `rate_limit` 時隱藏輸入框上方的摘要，側邊欄的用量視窗只留一行說明。
+後端仍照常解析並保留速率快照（`GET /api/v1/providers/<id>/usage`），可供偵錯查看；
+不為取得 Claude 用量額外發起付費推論。依據：[Claude 速率標頭](https://platform.claude.com/docs/en/api/rate-limits)。
+
+Provider 設定的類型可選「Claude Platform API」，填入自己的 Platform API Key 與模型名稱。
+預設 Base URL 為 `https://api.anthropic.com/v1`；也可填完整 `/v1/messages` 或代理的 API 根路徑。
+訊息直接使用 Claude 原生 Messages API，不經 Chat Completions 相容層；模型列表使用同一 API 根路徑的
+`/models`，依 `after_id` 讀取分頁。儲存後更新模型列表，再選帳號可用的模型。
+
+為沿用既有安全儲存／匯入／匯出格式，持久化仍為 `type: "openai-compatible"`，
+在 `openai_compatible` 設定區塊新增 `use_claude: true`；與 `use_responses` 互斥。
+這是 HTTP adapter 的協定選擇，不代表網路請求會送往 OpenAI。金鑰省略保留、空字串清除，管理 API 不回傳明文。
+採 `x-api-key` 與 `anthropic-version: 2023-06-01`，不使用 ChatGPT OAuth 或 Claude 訂閱憑證；
+Claude 請求不跟隨重導向，避免金鑰傳到其他端點。
+「使用 Response」代表 OpenAI Responses 協定，與 Claude 原生 Messages 不同，因此 Claude 類型不開放此開關。
+若使用確實提供 Responses 的代理，改選 OpenAI Compatible、開啟此開關並填入完整 Responses URL；直接連接 Claude Platform 維持 Messages。
+
+首版支援文字、串流／非串流、原生 `tool_use`／`tool_result`、多工具結果、用量（含上游回報的快取輸入 token）、
+拒絕及輸出截斷。`max_tokens` 使用設定的最大輸出值；未設定時為 4096，不猜測模型 context window。
+支援模型預設回傳的 `thinking`／`redacted_thinking` 區塊與串流簽章；不透明狀態只回送原 Provider 實例及模型的工具回合。
+Claude 思考續接另綁定實際請求的 `system`、`tools`、先前 `messages` 之 SHA-256 摘要。
+動態階段提示、工具清單、歷史內容或壓縮摘要改變時，僅移除前綴不符的思考區塊，保留文字、工具呼叫與結果配對。
+舊紀錄沒有摘要時不回送思考；文字／工具與思考交錯而無法保留原始順序時也不重播思考。
+不調降認證、不停用模型思考、不重試必定被拒絕的相同簽章，也不重做已完成工具。
+此限制依 [Claude preserved thinking](https://platform.claude.com/docs/en/build-with-claude/preserved-thinking)；
+本地預先省略失效區塊，不強制所有模型／代理使用 beta 標頭或模型專用 thinking 參數。
+2026-11-10 經既有授權以真實 API 驗證：取得思考簽章與工具呼叫後，未變更前綴的續接成功；
+修改 system 並由 adapter 移除失效思考後也正常結束，該回覆沒有再次要求工具。
+本次手動保留舊思考的對照請求未觸發 400，因此未宣稱重現使用者原 Session 的完整錯誤；
+不同帳號／模型的拒絕政策依官方文件可能不同。前綴變更的省略規則另有合成回歸測試覆蓋。
+思考程度「自動」省略控制欄位，沿用模型預設；低／中／高／極高分別送出 `output_config.effort` 的
+`low`／`medium`／`high`／`xhigh`。「極低」映射為 `low`；「關閉思考」也使用 `low` 並透過進度訊息說明，
+不假設所有 Claude 模型都允許 `thinking.type: disabled`，也不冒稱已停用思考。
+未使用模型名稱特判；個別模型的 effort 支援仍依上游驗證，舊模型或代理可能不支援某些程度。
+手動 `budget_tokens`、圖片／PDF 輸入、伺服器端工具尚未支援。
+欄位依據：[Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort)。
+2026-11-10 以已授權 API Key 對 `claude-opus-5-5` 實測「只回答 OK」：`high`、`xhigh` 與 `none`→`low`
+各 1 次皆以 `stop` 正常結束（約 1.83／1.61／1.48 秒）；此為程度參數驗證，不是長任務品質評估。
+
+### Prompt caching
+
+每次請求固定標記兩個 `cache_control: {"type": "ephemeral"}` 斷點（5 分鐘 TTL）：最後一個工具定義，
+以及 system 中固定指示（System、Host、Tool 三段）的最後一個區塊。階段提示、情境資料與對話歷史
+排在斷點之後，不在快取範圍內。依據：[提示快取](https://platform.claude.com/docs/zh-TW/build-with-claude/prompt-caching)。
+
+- 斷點不是內容：思考簽章綁定的前綴摘要會先去掉標記再計算，加入快取前保存的摘要仍然有效。
+- 工具清單改變（檢索到新工具、收斂輪清空工具）時，快取依「工具 → system → messages」的順序整段失效。
+- 回應的 `cache_read_input_tokens`、`cache_creation_input_tokens` 仍計入 `input_tokens`（總量不變），
+  另外分別記為事件用量的 `cache_read_tokens`、`cache_write_tokens`，用來確認是否命中；成本估算仍以
+  單一輸入單價計算，未區分快取讀寫價格。
+- 2026-11-10 實測（Claude API，同一 Session 連續兩輪）：第一輪 `cache_write_tokens` 11,997，
+  第二輪 `cache_read_tokens` 11,997，輸入總量約 15 萬 tokens。對話歷史尚未被快取。
+
+不支援的回覆區塊明確報錯，不把不完整回覆當成功。
+
+Claude「測試連線」採 `tool_choice: auto` 並以提示指定測試工具，避免對不接受 `any`／`tool` 的模型送出無效請求。
+成功仍必須收到且只收到一次 `provider_connection_test`，參數 `token` 必須為 `ping`；不會因只拿到模型列表或文字回覆就視為成功。
+測試失敗的完整原因會保留在表單中。模型限制依[官方工具選擇說明](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)，
+預設思考行為依[官方 Thinking 說明](https://platform.claude.com/docs/en/build-with-claude/thinking)。
+
+連線及暫時性錯誤沿用 `max_attempts`（預設三次總嘗試）、預設 10／20 秒退避與 Retry-After；Claude 529 過載也可重試。
+等待可取消，已交付文字、思考或工具 delta 後不重送。串流需 `message_start`、已知結束原因及 `message_stop`。
+收到訊息終態時，以累積內容收尾；最後區塊缺少 `content_block_stop` 不再一律報 `unfinished block`。
+原生工具仍僅在 `stop_reason: tool_use` 且所有參數為完整 JSON 物件、呼叫 ID 唯一時交付。
+`max_tokens`／`model_context_window_exceeded` 轉為 `length` 並提示截斷，不交付原生工具或不完整思考續接狀態；
+缺少訊息終態仍失敗，不將斷線視為完成。只有用量的後續 `message_delta` 不會覆蓋已取得的結束原因。
+核准、工具契約、Run 終態與前端等待沿用原流程。
+
+2026-11-10 核對官方 [Python SDK 串流累積](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/lib/streaming/_messages.py)、
+[OpenCode Messages adapter](https://github.com/anomalyco/opencode/blob/dev/packages/ai/src/protocols/anthropic-messages.ts) 與
+[Goose Anthropic provider](https://github.com/block/goose/blob/main/crates/goose-providers/src/anthropic.rs)。
+參考其原生協定與內容累積方式，保留本專案較嚴格的工具執行驗證；不直接照搬其他 Agent 的輸出預算或重試政策。
+僅憑畫面中的 `unfinished block` 無法確定當次上游是否截斷、代理缺漏事件或其他原因；合成測試不等同實際帳號驗收。
+
+官方協定：[Messages](https://platform.claude.com/docs/en/api/messages)、
+[Streaming](https://platform.claude.com/docs/en/build-with-claude/streaming)、
+[Models](https://platform.claude.com/docs/en/api/models/list)。
+
+對應合成檢查（不讀取真實金鑰、不呼叫付費上游）：
+
+```sh
+go test -race ./src/adapters/openaicompat ./src/bootstrap -run 'Claude|Smoke' -count=1 -timeout=120s
+node scripts/smoke-provider-claude.cjs
+node scripts/smoke-provider-responses.cjs
+go build -buildvcs=false ./src/...
+```
+
+Harness 對 `length` 在原生／指令工具解析之前統一攔截：截斷回覆只留作內部記錄，不交付工具或思考續接狀態。
+同一 Run 最多一次要求縮小工作，不增加使用者的輸出額度、不重做先前已成功的操作；再次截斷即以明確原因失敗，
+不進入一般空回答重試。補救仍受取消、Run token／時間／回合預算約束。
+
+2026-11-10 經使用者授權，透過目前 Go adapter 與本機已設定金鑰呼叫官方 `claude-opus-5-5`。
+測試輸入為「建立單檔五子棋 HTML、內嵌 CSS／JavaScript、人機對戰與重新開始」，僅提供 `file_write(path, content)`，
+不帶專案歷史、不實際執行工具，每個輸出額度各 1 個樣本；關閉自動重試，串流 timeout 150 秒。
+
+| 請求最大輸出 tokens | 實際輸入／輸出 tokens | 總耗時 | 結果 |
+| --- | --- | --- | --- |
+| 4096 | 480／4096 | 34.308 秒 | `length`，無可執行工具呼叫 |
+| 16384 | 480／8412 | 68.797 秒 | `tool_calls`，完整 JSON 參數，HTML 14635 bytes |
+| 128000 | 480／8751 | 71.887 秒 | `tool_calls`，完整 JSON 參數，HTML 15142 bytes |
+
+兩次成功回覆皆包含 HTML 文件與 script 開閉標記，未實際執行生成的 JavaScript 或驗收遊戲演算法。
+同帳號 Models API 回報最大輸入 1000000、最大輸出 128000；512K 不能直接當成此模型的單次輸出額度。
+這是 API／adapter 實測，不是桌面 APP、完整 Harness 或多樣本穩定性驗收。金鑰及上游回覆全文未寫入文件。
+舊 APP 需重新建置啟動才會載入程式修正。
+
+## 效能與記憶體檢查
+
+2026-10-03 以 macOS arm64／Apple M4 Pro 的本機程式量測，全部使用合成文字、記憶資料與暫存字型；
+不讀取帳號、金鑰或實際對話，不呼叫上游。以下為同一基準修改前後各 3 次的中位數（時間四捨五入）。
+`B/op` 是每次操作累計配置的 bytes，不是同時存活的記憶體，也不是整個 APP 的 RSS。
+
+| 合成工作負載 | 修改前 → 修改後耗時 | 修改前 → 修改後 B/op |
+|---|---|---|
+| 1 MiB ASCII 截成 4096 字 | 0.881 → 0.0054 ms | 4,203,663 → 4,864 |
+| 48 則訊息、64 份工具 schema 的摘要預算搜尋 | 10.358 → 1.088 ms | 8,328,656 → 694,238 |
+| 約 368 KiB 工具 JSON，每段 256 bytes 的串流前綴判讀 | 702.167 → 0.0019 ms | 285,713,872 → 256 |
+| 約 40 KiB 含大括號的一般文字判讀 | 294.382 → 0.117 ms | 521,491,344 → 98,320 |
+| 一萬筆記憶取最新 8 筆 | 14.761 → 0.349 ms | 22,964,464 → 10,384 |
+| 一萬筆記憶依文字搜尋取 8 筆 | 140.548 → 13.018 ms | 125,606,600 → 13,040 |
+| 32 MiB 合成字型的覆蓋檢查 | 2.054 → 0.0257 ms | 33,569,553 → 12,032 |
+
+串流判讀數值只涵蓋 Harness 過濾器，不包含 Provider 的網路傳輸、最終 JSON 解析或工具執行。
+字型使用 Go Regular 測試字型加上尾端填充，不能代表所有實際 CJK 字型的速度。
+前端 1200 段不同思考文字的去重由約 180 ms 降至約 1 ms；同時以 400 組合成段落比對原有算法，
+並用 DOM 替身驗證同幀合併、重複內容略過、同步收尾、追加失效與解析器回退，不等於實際 WebView 的視覺／長時間測試。
+
+重跑相同基準與對應 Smoke：
+
+```sh
+go test ./src/harness ./src/adapters/filestore ./src/tools/native/documents -run '^$' -bench '^BenchmarkPerformance' -benchmem -benchtime=150ms -count=3
+go test -race ./src/internal/textutil ./src/harness ./src/adapters/filestore ./src/tools/native/documents -run 'Smoke' -count=1 -timeout=120s
+node scripts/smoke-render-performance.cjs
+node scripts/smoke-run-reconnect.cjs
+node --check src/web/console/assets/app.js
+node --check src/web/console/assets/rich-text.js
+go build -buildvcs=false ./src/...
+```
+
+不以合成配置量推算整個 APP 的記憶體降幅；實際多 Session、MCP、網路重連與長任務仍需另外量測。
+Session／Run 事件的 LRU 各限制最近 128 份檔案索引，淘汰後可重建且不刪歷史；單一檔案索引不截斷，
+所以這不是固定的程序記憶體上限。已開啟的舊 APP 不會自動載入新程式。
+
+### 函式級最佳化（2026-10-03）
+
+本輪先以 Go AST 盤點當時 `src` 下 254 份非測試 Go 原始碼、1,842 個有實作的函式（含不同平台版本），
+再檢查自有前端的渲染／排序路徑；函式大小與迴圈數只用來篩選，不視為實際執行熱點。
+未機械式改寫所有函式，也未修改第三方程式。以下是同機合成 Go 基準各 3 次的中位數；
+沿用上述 `B/op` 定義，時間為毫秒，數值不代表整個 Run 或 APP 加速比例。
+
+| 函式／合成情境 | 修改前 → 修改後 ms/op | 修改前 → 修改後 B/op |
+|---|---|---|
+| `ResolveDefinition`：256 個工具中解析 1 個 | 0.290 → 0.00111 | 346,867 → 1,161 |
+| `newToolRetriever`：256 個工具、檢索關閉 | 3.474 → 0.0115 | 2,060,073 → 62,936 |
+| `newToolRetriever`：256 個工具、檢索開啟 | 3.500 → 1.386 | 2,151,778 → 311,409 |
+| `search`：4096 個工具取前 8 個 | 0.223 → 0.169 | 788,264 → 1,928 |
+| `PurgeInactive`：一萬筆記憶、沒有符合刪除條件 | 2.509 → 0.122 | 6,996,929 → 0 |
+| `pruneLocked`：501 筆 Run 超額淘汰 1 筆 | 0.0838 → 0.0619 | 262,729 → 16,760 |
+| `LogBuffer.Write`：容量 512 KiB，暖機後每次追加 640 bytes | 0.0278 → 0.000027 | 1,095,442 → 0 |
+| `LogBuffer.String`：512 KiB 快照 | 0.0543 → 0.0284 | 1,048,577 → 524,291 |
+| `worksheetCellInsertPosition`：1000 欄、前端插入位置 | 0.615 → 0.00128 | 103,787 → 292 |
+| `queryTerms`：重複的合成中英混合內容 | 0.199 → 0.0855 | 41,672 → 792 |
+
+Run 超額淘汰一列是同一測試內的舊算法參考實作／新實作比較，包含恢復被淘汰項目的固定成本；
+其餘 Go 數字使用修改前後同一份基準。未達留存門檻與無須清理的測量不包含落盤成本，
+真實 `Save`／`Remember` 仍需序列化並原子替換檔案。日誌的零配置只指既有容量足夠的寫入，
+不包含第一次成長、輸入的建立或 `String` 快照；容量保留至緩衝釋放。
+
+前端另以 100 組合成資料比對原有分組／排序，涵蓋釘選、未分類、相同位置及折疊狀態，
+500 專案／一萬個 Session 的 DOM 替身基準，中位數由 40.430 ms 降至 2.515 ms；
+這不代表 WebView 實際渲染耗時。
+token 計數曾嘗試優先判斷 ASCII，但對照基準顯示 CJK 變慢，已退回原實作；
+保留混合文字與非二進位精確權重的回歸檢查，不以改變浮點累加或估算結果換取速度。
+
+重跑本輪基準與對應檢查：
+
+```sh
+go test ./src/tools ./src/harness ./src/adapters/filestore ./src/desktop/supervisor ./src/tools/native/documents ./src/memory -run '^$' -bench '^BenchmarkFunction' -benchmem -benchtime=150ms -count=3
+go test ./src/tokens -run 'FunctionTokenWeightCompatibilitySmoke' -bench '^BenchmarkFunctionTokenWeight' -benchmem -benchtime=200ms -count=3
+go test -race ./src/... -run 'Smoke' -count=1 -timeout=120s
+go test -race ./src/memory -run 'Test(Remember|Recall|Scope)' -count=1 -timeout=120s
+node scripts/smoke-navigation-performance.cjs
+node scripts/smoke-render-performance.cjs
+node scripts/smoke-run-reconnect.cjs
+node --check src/web/console/assets/app.js
+go build -buildvcs=false ./src/...
+```
+
+Smoke 涵蓋工具權限與契約更新、同分同名 top-k、並行首次建索引、Unicode 分詞、
+隨機分段日誌、超大輸入、磁碟寫入失敗回復，以及 200 組持久／揮發 Run 留存參考比對。
+未進行真實上游負載、長任務 RSS 追蹤、跨平台實機或 APP 重新啟動；不據此宣稱全專案每個函式皆已達最佳效能。
+本輪全專案 Smoke／race、上述記憶功能回歸、三份前端 Smoke、修改範圍 `go vet` 與指定建置皆通過；
+macOS 仍有既有的 duplicate `-lobjc` linker warning，未變更連結或封裝設定。
+
 ## macOS 原生選檔
 
 桌面容器為 WKWebView 安裝並持有 `WKUIDelegate`，共用於所有 HTML `input[type=file]`。

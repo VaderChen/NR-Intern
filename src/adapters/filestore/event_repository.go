@@ -26,10 +26,9 @@ type RunEventRepository struct {
 
 	roots atomic.Pointer[ProjectRoots]
 
-	mu        sync.Mutex
-	locks     [64]sync.RWMutex
-	sequences map[string]int64
-	indexes   map[string]*eventOffsetIndex
+	mu      sync.Mutex
+	locks   [64]sync.RWMutex
+	indexes indexCache[*eventOffsetIndex]
 }
 
 func NewRunEventRepository(dataDir string) (*RunEventRepository, error) {
@@ -41,11 +40,7 @@ func NewRunEventRepository(dataDir string) (*RunEventRepository, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create run event store: %w", err)
 	}
-	return &RunEventRepository{
-		root:      root,
-		sequences: map[string]int64{},
-		indexes:   map[string]*eventOffsetIndex{},
-	}, nil
+	return &RunEventRepository{root: root}, nil
 }
 
 // SetProjectRoots 讓事件檔跟著所屬專案走。
@@ -75,7 +70,7 @@ func (r *RunEventRepository) Append(ctx context.Context, event domain.Event) err
 	lock := r.runLock(event.RunID)
 	lock.Lock()
 	defer lock.Unlock()
-	last, err := r.lastSequenceLocked(event.RunID, path)
+	last, err := r.lastSequenceLocked(ctx, event.RunID, path)
 	if err != nil {
 		return err
 	}
@@ -87,8 +82,7 @@ func (r *RunEventRepository) Append(ctx context.Context, event domain.Event) err
 	defer func() {
 		if !written {
 			r.mu.Lock()
-			delete(r.sequences, event.RunID)
-			delete(r.indexes, event.RunID)
+			r.indexes.delete(event.RunID)
 			r.mu.Unlock()
 		}
 	}()
@@ -120,17 +114,16 @@ func (r *RunEventRepository) Append(ctx context.Context, event domain.Event) err
 		return statErr
 	}
 	r.mu.Lock()
-	r.sequences[event.RunID] = event.Sequence
-	index := r.indexes[event.RunID]
+	index, _ := r.indexes.get(event.RunID)
 	if index == nil && last == 0 {
 		index = &eventOffsetIndex{ends: []int64{0}}
 	}
 	if index != nil && int64(len(index.ends)) == event.Sequence {
 		index.ends = append(index.ends, info.Size())
 		index.info = info
-		r.indexes[event.RunID] = index
+		r.indexes.set(event.RunID, index)
 	} else {
-		delete(r.indexes, event.RunID)
+		r.indexes.delete(event.RunID)
 	}
 	r.mu.Unlock()
 	written = true
@@ -155,41 +148,34 @@ func (r *RunEventRepository) List(ctx context.Context, runID string, afterSequen
 		}
 		// 索引讀取異常時交回完整驗證／隔離路徑，不能繼續信任舊位移。
 		r.mu.Lock()
-		delete(r.indexes, runID)
-		delete(r.sequences, runID)
+		r.indexes.delete(runID)
 		r.mu.Unlock()
 	}
-	values, last, err := r.readEventLogLocked(ctx, runID, path, afterSequence, true)
+	values, _, err := r.readEventLogLocked(ctx, runID, path, afterSequence, true)
 	r.mu.Lock()
 	if err != nil {
 		// 發現中段損壞後不能讓 Append 以舊快取繼續寫入。
-		delete(r.sequences, runID)
-		delete(r.indexes, runID)
-	} else {
-		r.sequences[runID] = last
+		r.indexes.delete(runID)
 	}
 	r.mu.Unlock()
 	return values, err
 }
 
-func (r *RunEventRepository) lastSequenceLocked(runID, path string) (int64, error) {
+func (r *RunEventRepository) lastSequenceLocked(ctx context.Context, runID, path string) (int64, error) {
 	if index := r.validEventIndex(runID, path); index != nil {
 		return int64(len(index.ends) - 1), nil
 	}
-	_, last, err := r.readEventLogLocked(context.Background(), runID, path, 0, false)
+	_, last, err := r.readEventLogLocked(ctx, runID, path, 0, false)
 	if err != nil {
 		return 0, err
 	}
-	r.mu.Lock()
-	r.sequences[runID] = last
-	r.mu.Unlock()
 	return last, nil
 }
 
 // 逐行驗證，只修復缺少換行且 JSON 未完成的最後一筆。中段錯誤與序號異常不能跳過。
 func (r *RunEventRepository) readEventLogLocked(ctx context.Context, runID, path string, after int64, collect bool) ([]domain.Event, int64, error) {
 	r.mu.Lock()
-	delete(r.indexes, runID)
+	r.indexes.delete(runID)
 	r.mu.Unlock()
 	file, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -247,14 +233,13 @@ func (r *RunEventRepository) readEventLogLocked(ctx context.Context, runID, path
 			break
 		}
 	}
-	r.mu.Lock()
-	r.sequences[runID] = last
 	if info, err := os.Stat(path); err == nil {
 		// 尾筆修復可能補上換行，最後位移使用修復後的實際長度。
 		ends[len(ends)-1] = info.Size()
-		r.indexes[runID] = &eventOffsetIndex{info: info, ends: ends}
+		r.mu.Lock()
+		r.indexes.set(runID, &eventOffsetIndex{info: info, ends: ends})
+		r.mu.Unlock()
 	}
-	r.mu.Unlock()
 	return values, last, nil
 }
 
@@ -342,8 +327,7 @@ func (r *RunEventRepository) deleteLocked(runID, path string) error {
 		return fmt.Errorf("delete run events: %w", removeErr)
 	}
 	r.mu.Lock()
-	delete(r.sequences, runID)
-	delete(r.indexes, runID)
+	r.indexes.delete(runID)
 	// 固定分片鎖不隨事件刪除而換身分，也不隨歷史 Run 數量無限成長。
 	r.mu.Unlock()
 	return nil

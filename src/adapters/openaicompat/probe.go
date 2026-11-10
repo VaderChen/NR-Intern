@@ -31,6 +31,9 @@ const (
 // ListModels 讀取 OpenAI-compatible 的模型目錄。
 // 除了標準 data 陣列，也接受部分相容服務使用的 models 陣列。
 func (m *Model) ListModels(ctx context.Context) ([]string, error) {
+	if m != nil && m.useClaude {
+		return m.listClaudeModels(ctx)
+	}
 	if m == nil || m.client == nil {
 		return nil, fmt.Errorf("OpenAI-compatible model is unavailable")
 	}

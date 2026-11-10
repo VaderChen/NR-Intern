@@ -30,6 +30,7 @@ type ProviderSetting struct {
 // OpenAICompatibleProviderSetting 同時作為管理 API 的讀取模型與寫入模型。
 // APIKey=nil 代表保留現有值，指向空字串則代表明確清除金鑰。
 type OpenAICompatibleProviderSetting struct {
+	UseClaude                    bool    `json:"use_claude"`
 	UseResponses                 bool    `json:"use_responses"`
 	BaseURL                      string  `json:"base_url"`
 	APIKey                       *string `json:"api_key,omitempty"`
@@ -108,14 +109,25 @@ type ProviderUsageWindow struct {
 	ResetAt          string  `json:"reset_at,omitempty"`
 }
 
-// ProviderUsage 保存每個 Provider 最近一次實際回應的用量標頭。
-// Codex primary／secondary 視窗分別呈現為 5 小時與 7 天；未回傳的視窗保持不可用。
+// ProviderUsage 保存最近的真實用量快照。Codex 使用帳戶 API 視窗，
+// Claude 使用模型回應的速率標頭；缺少資料不可當作滿額。
 type ProviderUsage struct {
 	ProviderID   string               `json:"provider_id"`
+	Kind         string               `json:"kind,omitempty"`
+	Model        string               `json:"model,omitempty"`
+	RateLimits   []ProviderRateLimit  `json:"rate_limits,omitempty"`
 	UpdatedAt    string               `json:"updated_at,omitempty"`
 	FiveHour     ProviderUsageWindow  `json:"five_hour"`
 	SevenDay     ProviderUsageWindow  `json:"seven_day"`
 	ResetCredits ProviderResetCredits `json:"reset_credits"`
+}
+
+// ProviderRateLimit 是上游回報的速率限制快照，不代表帳戶餘額或訂閱配額。
+type ProviderRateLimit struct {
+	Resource  string `json:"resource"`
+	Limit     int64  `json:"limit,omitempty"`
+	Remaining int64  `json:"remaining"`
+	ResetAt   string `json:"reset_at,omitempty"`
 }
 
 // ProviderResetCredits 是 ChatGPT／Codex 帳號可用的「用量上限重置」次數。
