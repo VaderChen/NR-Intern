@@ -251,7 +251,7 @@ func (s *restartableServer) restart() {
 	s.mu.Unlock()
 }
 
-func TestCallRecoversAfterServerRestart(t *testing.T) {
+func TestCallHandlesServerRestartWithoutUnsafeReplay(t *testing.T) {
 	server := newRestartableServer(t)
 	manager := newTestManager(t, ServerConfig{
 		ID: "mars", Enabled: true, Transport: TransportStreamableHTTP, URL: server.http.URL,
@@ -271,10 +271,30 @@ func TestCallRecoversAfterServerRestart(t *testing.T) {
 		t.Fatalf("Execute: %v", err)
 	}
 	if result.IsError {
-		t.Fatalf("call after server restart failed: %s", result.Content)
+		// SDK 可能先偵測到連線關閉，也可能先收到舊 session 的錯誤。
+		// 後者沒有可證明未派送的型別，不可要求非冪等工具自動重送。
+		if domain.ToolExecutionState(result.Details) != domain.ToolOutcomeUnknown {
+			t.Fatalf("restart failure must preserve unknown outcome: %+v", result.Details)
+		}
+		if got := server.calls.Load(); got != 0 {
+			t.Fatalf("failed call executed %d times, want no automatic replay", got)
+		}
+		// 測試端知道此合成伺服器未執行；重新取得目錄後可明確呼叫。
+		definitions, err = manager.Definitions(context.Background(), session)
+		if err != nil || len(definitions) != 1 {
+			t.Fatalf("Definitions after restart: %v (%d)", err, len(definitions))
+		}
+		result, err = manager.Execute(context.Background(), session,
+			domain.ToolCall{ID: "call_2", Name: definitions[0].Name, Arguments: map[string]any{"text": "hello"}}, nil)
+		if err != nil || result.IsError {
+			t.Fatalf("explicit call after reconnect failed: %v / %s", err, result.Content)
+		}
 	}
 	if !strings.Contains(result.Content, "hello") {
 		t.Fatalf("unexpected content: %s", result.Content)
+	}
+	if got := server.calls.Load(); got != 1 {
+		t.Fatalf("server executed %d calls, want exactly one", got)
 	}
 }
 

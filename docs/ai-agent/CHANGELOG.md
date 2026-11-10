@@ -29,6 +29,8 @@
 - 最大輸出須符合模型能力，未設定時仍為 4096。歷次授權 API 實測及合成效能資料記錄於開發說明，不代表整體正確率、併發容量或長時間穩定性驗收。
 - 本次發布重新執行 Go 編譯、對應 Smoke 與 JavaScript 語法檢查；未另行呼叫付費模型。具體發布驗證結果見本版 GitHub Release。
 - macOS ARM64 使用簽章及公證 DMG；Windows x64／ARM64 使用 NSIS `setup.exe`，目前未具備 Authenticode 簽章，可能出現 SmartScreen 警告。Windows 實機安裝、升級及移除仍未驗收。
+- Windows ARM64 未內附 NetPassClient Runtime，該平台的反向代理功能不可用。
+- MCP 重啟案例依安全政策驗證：無法確認派送狀態時停止自動重送，重新取得目錄後的明確呼叫只執行一次。
 - Release 附件以 `RELEASE-SHA256SUMS` 核對完整性；`PACKAGES-SHA256SUMS` 僅列通過簽章驗證的產物。
 
 ## 1.26.0912 build 1635
