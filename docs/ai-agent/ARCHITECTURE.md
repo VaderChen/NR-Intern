@@ -281,6 +281,15 @@ Harness 另有結構化重複操作防護：同一 Run 中，沒有後續資源�
 
 ### Run budget
 
+Session 執行中可更新模型名稱與 Thinking（單獨或一起）。Application 先保存設定，再以加鎖的
+`RunModelSelection` 通知該 Session 的活動 Run；不同欄位合併，各欄位保留最後值。
+Thinking 的空字串明確表示切回自動，與未修改不同。
+Harness 在回合邊界、組裝上下文前取用，保留既有工具結果及 Run 預算，
+不取消當前請求或重做工具。`run.model_changed` 記錄套用回合，`turn.start`
+附帶實際 Provider／模型，前端不把切換前的用量歸給新模型。
+若 Run 已完成且沒有下一回合，Session 的新設定供下次工作使用。
+原 Run 的模型欄位仍表示建立時的選擇，逐回合變化以事件及分模型用量為準。
+
 每個 Run 可受 `max_turns`、`max_wall_clock_seconds`、`max_tokens` 與
 `max_tool_calls` 限制。`max_tokens` 與 `max_tool_calls` 設為 `0` 時不限制，預設採此模式，
 避免長任務因累計用量提前停止；兩者仍可從系統管理或設定檔重新啟用限制。

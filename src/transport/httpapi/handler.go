@@ -226,6 +226,7 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/cancel", h.cancelRun)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/pause", h.pauseRun)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/resume", h.resumeRun)
+	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/inputs", h.appendRunInput)
 	h.mux.HandleFunc("POST /api/v1/runs/cancel-all", h.cancelAllRuns)
 	h.mux.HandleFunc("POST /api/v1/runs/{run_id}/decision", h.decideRun)
 	h.mux.HandleFunc("POST /api/v1/questions/{question_id}/answer", h.answerQuestion)
@@ -1311,6 +1312,25 @@ func (h *Handler) decideRun(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	value, err := h.service.DecideRun(request.Context(), request.PathValue("run_id"), input)
+	if err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	writeData(writer, http.StatusAccepted, value)
+}
+
+// appendRunInput 在 Run 執行中追加使用者訊息，於下一個回合邊界插入對話。
+// Run 已結束時回 409，前端應改以新的 Run 送出。
+func (h *Handler) appendRunInput(writer http.ResponseWriter, request *http.Request) {
+	var input struct {
+		Input    string `json:"input"`
+		ClientID string `json:"client_id,omitempty"`
+	}
+	if err := h.decodeJSON(writer, request, &input); err != nil {
+		writeProblem(writer, request, err)
+		return
+	}
+	value, err := h.service.AppendRunInput(request.Context(), request.PathValue("run_id"), input.Input, input.ClientID)
 	if err != nil {
 		writeProblem(writer, request, err)
 		return

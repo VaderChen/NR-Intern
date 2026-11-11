@@ -478,6 +478,7 @@ async function request(path, options = {}) {
         let detail = `${response.status} ${response.statusText}`;
         try { detail = (await response.json()).detail || detail; } catch (_) {}
         const error = new Error(detail);
+        error.status = response.status;
         error.noReconnect = true;
         throw error;
       }
@@ -1072,6 +1073,7 @@ async function loadApplicationState() {
   if (!state.agent || !state.workspace) return;
   await Promise.all([loadProjects(), loadSessions(), loadSchedules()]);
   await restoreWorkspaceRun();
+  await reconcileSavedRunInputs();
   if (notificationCenterEnabled()) void loadNotifications();
   void drainPromptQueue();
   $("newProject").disabled = !state.backendHealthy || !state.workspace;
@@ -2597,8 +2599,8 @@ function syncSessionRuntimeControlState() {
   const disabled = !state.session || selectedSessionIsRunning() || state.sessionRuntimeSaving;
   const providerID = state.session?.provider_id || state.workspace?.default_provider_id || "";
   $("sessionProviderSelect").disabled = disabled;
-  $("sessionModelSelect").disabled = disabled || sessionRuntimeModels(providerID).length === 0;
-  $("sessionThinkingSelect").disabled = disabled;
+  $("sessionModelSelect").disabled = !state.session || !state.backendHealthy || state.sessionRuntimeSaving || sessionRuntimeModels(providerID).length === 0;
+  $("sessionThinkingSelect").disabled = !state.session || !state.backendHealthy || state.sessionRuntimeSaving;
   $("sessionRuntimeControls").setAttribute("aria-busy", state.sessionRuntimeSaving ? "true" : "false");
 }
 
@@ -2709,6 +2711,9 @@ async function updateSessionRuntime(sessionID, input) {
       syncSessionUI();
     }
     renderNavigation();
+    if ((input.model !== undefined || input.thinking_mode !== undefined) && selectedSessionIsRunning() && state.session?.id === sessionID) {
+      toast(translate("模型與 Thinking 設定已儲存，將於下一回合使用；目前回覆與工具繼續完成。"));
+    }
     return updated;
   } catch (error) {
     if (state.session?.id === sessionID) syncSessionRuntimeControls({ loadModels: false });
@@ -2748,13 +2753,13 @@ async function changeSessionProvider(event) {
 
 async function changeSessionModel(event) {
   const sessionID = state.session?.id;
-  if (!sessionID || selectedSessionIsRunning()) return;
+  if (!sessionID || state.sessionRuntimeSaving || !event.target.value) return;
   await updateSessionRuntime(sessionID, { model: event.target.value });
 }
 
 async function changeSessionThinking(event) {
   const sessionID = state.session?.id;
-  if (!sessionID || selectedSessionIsRunning()) return;
+  if (!sessionID || state.sessionRuntimeSaving) return;
   await updateSessionRuntime(sessionID, { thinking_mode: event.target.value });
 }
 
@@ -5145,6 +5150,8 @@ function serializablePromptItem(item) {
     })),
     status: item.status || "pending",
     runId: item.runId || "",
+    insertionRunId: item.insertionRunId || "",
+    inputId: item.inputId || "",
     lastSequence: Number(item.lastSequence || 0),
     error: item.error || "",
     createdAt: item.createdAt || new Date().toISOString(),
@@ -5191,7 +5198,7 @@ async function loadPromptOutbox() {
     state.promptQueue = savedItems.filter((item) => !promptUsesMemoryOnly(item))
       .map((item) => ({
         ...item,
-        status: item.status === "sending" ? "pending" : (item.status || "pending"),
+        status: item.status === "inserting" ? "insert_unknown" : item.status === "sending" ? "pending" : (item.status || "pending"),
         attachments: Array.isArray(item.attachments) ? item.attachments : [],
         attachmentIds: Array.isArray(item.attachmentIds) ? item.attachmentIds : [],
       }))
@@ -5205,6 +5212,7 @@ async function loadPromptOutbox() {
   } finally {
     state.outboxLoaded = true;
     renderPromptQueue();
+    if (state.backendHealthy) await reconcileSavedRunInputs();
     if (state.backendHealthy) void drainPromptQueue();
   }
 }
@@ -5229,38 +5237,50 @@ function renderPromptQueue() {
   const sessionID = state.session?.id || "";
   // 執行中的輸入已經顯示在對話區；只保留真正等待送出或需要重試的項目，
   // 避免同一段文字同時出現在使用者訊息與輸入框佇列中。
-  const queued = state.promptQueue.filter((item) => item.sessionId === sessionID && item.status !== "sending");
+  const queued = state.promptQueue.filter((item) => item.sessionId === sessionID && !["sending", "insert_applied"].includes(item.status));
   for (const [index, item] of queued.entries()) {
     const row = document.createElement("div");
     row.className = "queued-prompt";
     const status = document.createElement("span");
     status.className = "queued-prompt-status";
-    status.textContent = item.status === "failed" ? "需要重試" : item.status === "sending" ? "傳送中" : `排隊 ${index + 1}`;
-    status.classList.toggle("error", item.status === "failed");
+    const labels = { inserting: "正在插入", waiting_insert: "等待插入", insert_unknown: "插入結果未確認", returned: "已退回，待送出", failed: "需要重試" };
+    status.textContent = labels[item.status] ? translate(labels[item.status]) : `排隊 ${index + 1}`;
+    status.classList.toggle("error", ["failed", "insert_unknown"].includes(item.status));
     const content = document.createElement("span");
     content.className = "queued-prompt-content";
     const attachmentCount = item.attachments.length;
     content.textContent = `${item.input}${attachmentCount ? ` · ${attachmentCount} 個附件` : ""}`;
-    content.title = content.textContent;
+    content.title = item.error ? `${content.textContent}\n${item.error}` : content.textContent;
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "remove-queued-prompt";
     remove.textContent = "×";
     remove.title = "移除待送訊息";
     remove.setAttribute("aria-label", `移除排隊中的第 ${index + 1} 則訊息`);
-    remove.disabled = item.status === "sending";
+    remove.disabled = ["sending", "inserting", "waiting_insert"].includes(item.status);
     remove.addEventListener("click", () => { void removeQueuedPrompt(item.id); });
-    if (item.status === "failed") {
+    if (["failed", "returned", "insert_unknown"].includes(item.status)) {
       const retry = document.createElement("button");
       retry.type = "button";
       retry.className = "retry-queued-prompt";
       retry.textContent = "↻";
-      retry.title = "重試待送訊息";
-      retry.setAttribute("aria-label", "重試待送訊息");
+      retry.title = translate(item.status === "returned" ? "送出退回訊息" : "重試待送訊息");
+      retry.setAttribute("aria-label", retry.title);
       retry.addEventListener("click", () => { void retryQueuedPrompt(item.id); });
       row.append(status, content, retry, remove);
     } else {
       row.append(status, content, remove);
+    }
+    const active = activeRunFor(sessionID);
+    if (item.status === "pending" && !item.attachments.length && !item.attachmentIds.length && active?.runId && !active.terminal && !active.canceling) {
+      const insert = document.createElement("button");
+      insert.type = "button";
+      insert.className = "insert-queued-prompt";
+      insert.textContent = translate("插入");
+      insert.title = translate("在目前回合結束後插入這則訊息");
+      insert.disabled = !state.backendHealthy;
+      insert.addEventListener("click", () => { void insertQueuedPrompt(item, active); });
+      row.insertBefore(insert, remove);
     }
     tray.append(row);
   }
@@ -5270,7 +5290,7 @@ function renderPromptQueue() {
 
 async function removeQueuedPrompt(queueID) {
   const item = state.promptQueue.find((value) => value.id === queueID);
-  if (!item || item.status === "sending") return;
+  if (!item || ["sending", "inserting", "waiting_insert"].includes(item.status)) return;
   state.promptQueue = state.promptQueue.filter((value) => value.id !== queueID);
   try {
     await deletePromptOutboxItem(queueID, item);
@@ -5292,7 +5312,13 @@ function clearPromptQueue({ persist = false } = {}) {
 
 async function retryQueuedPrompt(queueID) {
   const item = state.promptQueue.find((value) => value.id === queueID);
-  if (!item || item.status !== "failed") return;
+  if (!item || !["failed", "returned", "insert_unknown"].includes(item.status)) return;
+  if (item.status === "insert_unknown") {
+    if (!(await confirmAction(translate("無法確認這則訊息是否已處理，再次送出可能重複執行。仍要送出嗎？")))) return;
+    if (!state.promptQueue.includes(item) || item.status !== "insert_unknown") return;
+  }
+  item.insertionRunId = "";
+  item.inputId = "";
   item.status = "pending";
   item.error = "";
   try {
@@ -5336,9 +5362,166 @@ async function enqueuePrompt(input, { attachments = [], attachmentIds = [] } = {
   state.promptQueue.push(item);
   renderPromptQueue();
   syncRunActionButton();
+  const active = activeRunFor(item.sessionId);
+  if (active?.canceling) {
+    item.status = "returned";
+    await savePromptOutboxItem(item).catch((error) => toast(error.message));
+    renderPromptQueue();
+    return true;
+  }
   if (queued) toast(`已加入待送佇列（共 ${state.promptQueue.length} 則）`);
   void drainPromptQueue();
   return true;
+}
+
+// 插入端點沒有冪等重送契約；先保存狀態，網路結果未知時只能等事件確認。
+async function insertQueuedPrompt(item, runState) {
+  if (!state.promptQueue.includes(item) || item.status !== "pending" || item.attachments.length || item.attachmentIds.length
+      || !runState?.runId || runState.canceling || runState.terminal || activeRunFor(item.sessionId) !== runState) return;
+  item.status = "inserting";
+  item.insertionRunId = runState.runId;
+  renderPromptQueue();
+  try {
+    await savePromptOutboxItem(item);
+  } catch (error) {
+    item.status = "failed";
+    item.insertionRunId = "";
+    item.error = error.message;
+    renderPromptQueue();
+    toast(error.message);
+    return;
+  }
+  try {
+    if (runState.canceling || runState.terminal || item.status !== "inserting") {
+      if (item.status === "inserting") item.status = "returned";
+    } else {
+      const input = await request(`/api/v1/runs/${encodeURIComponent(runState.runId)}/inputs`, {
+        method: "POST", reconnects: 0, body: JSON.stringify({ input: item.input, client_id: item.id }),
+      });
+      // SSE 可能比 POST 回覆早到；不得把已套用／退回的狀態改回等待。
+      item.inputId = input?.id || item.inputId;
+      if (item.status === "inserting") item.status = runState.terminal ? "insert_unknown" : "waiting_insert";
+    }
+  } catch (error) {
+    if (item.status === "inserting") {
+      if (error.status === 409) {
+        item.status = runState.canceling || runState.status === "canceled" ? "returned" : "pending";
+        item.insertionRunId = "";
+      } else if (error.status >= 400 && error.status < 500 && error.status !== 408) {
+        item.status = "failed";
+        item.insertionRunId = "";
+      } else {
+        item.status = "insert_unknown";
+      }
+      item.error = error.message;
+    }
+  }
+  if (state.promptQueue.includes(item)) await savePromptOutboxItem(item).catch((error) => toast(error.message));
+  renderPromptQueue();
+  void drainPromptQueue();
+}
+
+async function holdPendingPrompts(sessionID) {
+  const items = state.promptQueue.filter((item) => item.sessionId === sessionID && item.status === "pending" && !item.runId);
+  for (const item of items) item.status = "returned";
+  renderPromptQueue();
+  for (const item of items) await savePromptOutboxItem(item);
+}
+
+async function applyRunInputEvent(event, sessionID) {
+  const runID = String(event.run_id || "");
+  if (!runID || !sessionID) return;
+  const payload = event.payload || {};
+  const terminal = ["run.completed", "run.failed", "run.canceled"].includes(event.type);
+  const message = event.type === "message.end" && payload.message?.role === "user" && payload.message?.metadata?.inserted ? payload.message : null;
+  const inputs = terminal ? (Array.isArray(payload.returned_inputs) ? payload.returned_inputs : [])
+    : event.type === "run.input_queued" && payload.input ? [payload.input] : [];
+  const find = (id, clientID) => state.promptQueue.find((item) => item.sessionId === sessionID && item.insertionRunId === runID
+    && ((id && item.inputId === id) || (clientID && item.id === clientID)));
+  for (const input of inputs) {
+    if (!input?.id || typeof input.input !== "string") continue;
+    let item = find(input.id, input.client_id);
+    if (!item) {
+      // 舊事件不能蓋掉使用者已明確重新送出的同一筆本機訊息。
+      const id = input.client_id || `insert-${runID}-${input.id}`;
+      if (state.promptQueue.some((other) => other.id === id)) continue;
+      item = { id, sessionId: sessionID, input: input.input, attachments: [], attachmentIds: [],
+        idempotencyKey: crypto.randomUUID(), runId: "", insertionRunId: runID, createdAt: input.created_at || new Date().toISOString() };
+      state.promptQueue.push(item);
+    }
+    item.inputId = input.id;
+    if (terminal) item.status = "returned";
+    else if (!["insert_applied", "returned"].includes(item.status)) item.status = "waiting_insert";
+    await savePromptOutboxItem(item);
+  }
+  if (message) {
+    const item = find(message.metadata.input_id, message.metadata.client_id);
+    if (item) {
+      item.inputId = message.metadata.input_id;
+      item.status = "insert_applied";
+      await savePromptOutboxItem(item);
+    }
+  }
+  if (event.type === "run.input_applied") {
+    const ids = new Set(payload.input_ids || []);
+    for (const item of state.promptQueue.filter((item) => item.sessionId === sessionID && item.insertionRunId === runID && ids.has(item.inputId))) {
+      item.status = "insert_applied";
+      await savePromptOutboxItem(item);
+    }
+  }
+  if (terminal) {
+    if (event.type === "run.canceled") await holdPendingPrompts(sessionID);
+    for (const item of [...state.promptQueue]) {
+      if (item.sessionId !== sessionID || item.insertionRunId !== runID) continue;
+      if (item.status === "insert_applied") {
+        await deletePromptOutboxItem(item.id, item);
+        state.promptQueue = state.promptQueue.filter((other) => other !== item);
+      } else if (["inserting", "waiting_insert"].includes(item.status)) {
+        // 沒有套用或退回證據時保留，不把缺少事件當成可以重送。
+        item.status = "insert_unknown";
+        await savePromptOutboxItem(item);
+      }
+    }
+  }
+  if (inputs.length || message || terminal || event.type === "run.input_applied") renderPromptQueue();
+}
+
+async function reconcileTerminalInputs(run, sessionID) {
+  if (run.status === "canceled") await holdPendingPrompts(sessionID).catch((error) => toast(error.message));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    // cancel 回覆只有 Run；退回內容必須從 durable 事件取得，不能先 abort SSE。
+    const active = activeRunFor(sessionID);
+    const sequence = active?.runId === run.id ? Number(active.lastSequence || 0) : 0;
+    const response = await fetch(`/backend/api/v1/runs/${encodeURIComponent(run.id)}/events`, {
+      signal: controller.signal, headers: { "Last-Event-ID": String(sequence) },
+    });
+    if (!response.ok) throw new Error(translate("無法確認插入結果，訊息已保留，請勿重複送出。"));
+    const progress = { lastSequence: sequence, terminal: false };
+    await consumeEvents(response.body, progress, sessionID, true);
+    if (!progress.terminal) throw new Error(translate("無法確認插入結果，訊息已保留，請勿重複送出。"));
+  } catch (error) {
+    for (const item of state.promptQueue.filter((item) => item.sessionId === sessionID && item.insertionRunId === run.id && ["inserting", "waiting_insert"].includes(item.status))) {
+      item.status = "insert_unknown";
+      await savePromptOutboxItem(item).catch(() => {});
+    }
+    toast(translate("無法確認插入結果，訊息已保留，請勿重複送出。"));
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+    renderPromptQueue();
+  }
+}
+
+async function reconcileSavedRunInputs() {
+  const runs = new Map(state.promptQueue.filter((item) => item.insertionRunId).map((item) => [item.insertionRunId, item.sessionId]));
+  for (const [id, sessionID] of runs) {
+    try {
+      const run = await request(`/api/v1/runs/${encodeURIComponent(id)}`, { reconnects: 0 });
+      if (["completed", "failed", "canceled"].includes(run.status)) await reconcileTerminalInputs(run, sessionID);
+    } catch (_) { /* 不確認的訊息保留，禁止自動重送。 */ }
+  }
 }
 
 async function sendPrompt(event) {
@@ -5473,7 +5656,7 @@ async function runWithReconnect(task) {
       progress.runId = response.headers.get("X-Run-ID") || progress.runId;
       if (!progress.runId) throw new Error("後端未回傳 Run ID，無法安全重連");
       runState.runId = progress.runId;
-      runState.runDraft.operationId = progress.runId;
+      if (runState.runDraft) runState.runDraft.operationId = progress.runId;
       if (typeof task.onRunIdentified === "function") await task.onRunIdentified(progress.runId, progress.lastSequence);
       if (!runState.status) runState.status = "running";
       runState.connectionLost = false;
@@ -5485,6 +5668,7 @@ async function runWithReconnect(task) {
       if (progress.terminal) return;
       const run = await request(`/api/v1/runs/${encodeURIComponent(progress.runId)}`);
       if (["completed", "failed", "canceled"].includes(run.status)) {
+        await reconcileTerminalInputs(run, sessionID);
         handleTerminalRun(run, sessionID);
         progress.terminal = true;
         return;
@@ -5499,6 +5683,7 @@ async function runWithReconnect(task) {
         try {
           const run = await request(`/api/v1/runs/${encodeURIComponent(progress.runId)}`, { reconnects: 0 });
           if (["completed", "failed", "canceled"].includes(run.status)) {
+            await reconcileTerminalInputs(run, sessionID);
             handleTerminalRun(run, sessionID);
             return;
           }
@@ -5545,7 +5730,7 @@ async function openRunStream(task, progress) {
   return response;
 }
 
-async function consumeEvents(stream, progress, sessionID) {
+async function consumeEvents(stream, progress, sessionID, inputsOnly = false) {
   if (!stream) throw new Error("後端未提供事件串流");
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -5566,8 +5751,11 @@ async function consumeEvents(stream, progress, sessionID) {
       if (!data) continue;
       const event = JSON.parse(data);
       if (Number.isInteger(event.sequence) && event.sequence <= progress.lastSequence) continue;
-      handleEvent(event, sessionID);
+      if (inputsOnly) await applyRunInputEvent(event, sessionID);
+      else await handleEvent(event, sessionID);
       if (Number.isInteger(event.sequence)) progress.lastSequence = event.sequence;
+      const active = activeRunFor(sessionID);
+      if (!inputsOnly && active?.runId === event.run_id) active.lastSequence = progress.lastSequence;
       if (["run.completed", "run.failed", "run.canceled"].includes(event.type)) {
         progress.terminal = true;
         // 終止事件已經是完整結果，不應繼續等待 SSE 自己斷線；部分後端／
@@ -5618,13 +5806,26 @@ function handleTerminalRun(run, sessionID) {
   syncRunStateAliases();
 }
 
-function handleEvent(event, sessionID) {
+async function handleEvent(event, sessionID) {
   const payload = event.payload || {};
   const visible = state.session?.id === sessionID;
+  // 退回與套用通知即使晚於本機停止確認，也必須收下。
+  await applyRunInputEvent(event, sessionID).catch((error) => toast(error.message));
 
   const runState = activeRunFor(sessionID);
   // 停止已被本地確認後，串流中尚未送達的 late event 不得重新點亮處理動畫。
-  if (!runState || runState.terminalHandled) return;
+  if (!runState || runState.terminalHandled || (event.run_id && runState.runId && event.run_id !== runState.runId)) return;
+  if (event.type === "message.end" && payload.message?.role === "user" && payload.message?.metadata?.inserted) {
+    if (visible && !findMessage(payload.message.id)) {
+      setAgentProcessing(runState.liveMessage, false);
+      appendMessage(payload.message);
+      scrollMessages();
+    }
+    runState.liveMessage = null;
+    runState.runDraft = null;
+    syncRunStateAliases();
+    return;
+  }
   if (event.run_id) runState.runId = String(event.run_id);
 	if (event.type === "agent.progress") {
     setRunActivity(String(payload.message || ""), sessionID);
@@ -5636,7 +5837,7 @@ function handleEvent(event, sessionID) {
 	}
 	if (visible && event.type === "turn.usage" && payload.usage) {
 	  const identity = activeContextIdentity();
-	  recordContextUsage(payload.usage, sessionID, identity.providerID, identity.model);
+	  recordContextUsage(payload.usage, sessionID, runState.turnProviderID || identity.providerID, runState.turnModel || identity.model);
 	  void loadActiveProviderUsage();
 	}
 	if (visible && event.type === "tool.execution.end" && String(payload.result?.tool_name || "").startsWith("plan_")) {
@@ -5811,6 +6012,8 @@ function handleEvent(event, sessionID) {
       if (visible) renderSelectedRunDraft();
     }
   } else if (event.type === "turn.start") {
+    runState.turnProviderID = payload.provider_id || "";
+    runState.turnModel = payload.model || "";
     // 新的一輪開始 = 又要等模型。上一輪的文字已經留在畫面上，若不重新標記處理中，
     // 接下來的等待（本機模型可能好幾分鐘）畫面完全靜止，跟當機無法區分。
     //
@@ -5992,9 +6195,11 @@ async function cancelCurrentRun() {
   syncRunStateAliases();
   syncRunActionButton();
   try {
+    await holdPendingPrompts(sessionID).catch((error) => toast(error.message));
     const canceledRun = await request(`/api/v1/runs/${encodeURIComponent(runState.runId)}/cancel`, { method: "POST", body: "{}" });
     if (activeRunFor(sessionID) !== runState) return;
     if (canceledRun?.status && ["completed", "failed", "canceled"].includes(canceledRun.status)) {
+      await reconcileTerminalInputs(canceledRun, sessionID);
       handleTerminalRun(canceledRun, sessionID);
     } else {
       setRunActivity("取消要求已送出，等待後端確認終態…", sessionID);
@@ -10374,6 +10579,7 @@ $("pauseRun").addEventListener("click", () => void pauseCurrentRun());
 $("resumeRun").addEventListener("click", () => void resumeCurrentRun());
 $("cancelAllRuns").addEventListener("click", async () => {
   if (!(await confirmAction("確定取消所有排隊中與執行中的 Run 嗎？"))) return;
+  for (const sessionID of state.activeRuns.keys()) await holdPendingPrompts(sessionID).catch((error) => toast(error.message));
   try { const value = await request("/api/v1/runs/cancel-all", { method: "POST", body: "{}" }); toast("已送出取消 " + (value.accepted || 0) + " 個 Run 的要求"); } catch (error) { toast(error.message); }
 });
 $("refreshPermissions").addEventListener("click", loadPermissionCenter);

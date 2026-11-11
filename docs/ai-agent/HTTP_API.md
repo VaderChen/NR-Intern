@@ -1,5 +1,20 @@
 # HTTP API
 
+`POST /api/v1/runs/{run_id}/inputs` 接受 `{"input":"補充文字","client_id":"本機識別碼"}`，
+成功回 202 與 `id`、`input`、`client_id`、`created_at`。只接受文字，單則最多 32000 字元，
+最多 16 則尚未消化訊息；Run 結束、不在本程序執行或佇列滿時回 409。
+`client_id` 用於事件對應，尚非冪等鍵，結果未知時不可自動重送。
+`run.input_queued` 通知接受、`run.input_applied` 提供已套用的 `input_ids`，
+終止事件以 `returned_inputs` 回傳尚未消化內容；取消 API 的 Run 回覆不含該清單，須讀取事件。
+
+執行中的 Session 可透過 `PATCH /api/v1/sessions/{session_id}` 送出
+`{"model":"模型名稱","thinking_mode":"high"}`，兩個欄位可單獨或一起更新。
+`thinking_mode` 空字串代表自動；非法程度回 400。設定保存後，在目前 Run 的下一回合邊界切換；
+當前回覆與工具批次不會中斷。混合修改其他欄位仍回 409，空模型回 400；
+若 Run 使用不同的 Provider 覆寫，也會拒絕切換。`run.model_changed` 事件
+提供 `provider_id`、`model`、`thinking_mode` 與 `turn`，`turn.start` 帶有該回合實際模型與 Thinking。
+若更新時 Run 已完成，設定於下次工作生效，不因此另建 Run。
+
 預設位址為 `http://127.0.0.1:8787`。若設定 `api_token`，除 `/healthz`、`/readyz` 與 CORS preflight 外，請帶入：
 
 ```http

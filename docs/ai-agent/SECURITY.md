@@ -58,7 +58,7 @@ NetPass 連線前必須保存自己的 API Key 並明確接受使用政策；這
 - Project 必須屬於 Workspace；Session 的 `workspace_id` 與 `project_id` 必須一致。
 - 啟動時會檢查已持久化的 Workspace／Project／Session 關聯與 Provider 引用；資料不一致時 fail fast，不在背景靜默搬移或改寫。
 - Workspace／Project 只允許在沒有子項目時刪除，不做隱含級聯刪除。
-- Session 有 queued/running/paused/waiting_approval Run 時，禁止更新或刪除 Session，避免執行途中改變 Provider、工具權限、workspace path 或移除資料。
+- Session 有 queued/running/paused/waiting_approval Run 時，僅允許更新非空的模型名稱與有效的 Thinking 程度（可合併），且 Run 必須使用相同 Provider；於下一回合邊界生效。Provider、工具權限、workspace path、其他欄位及刪除操作仍受限制，混合更新不會部分套用。
 - Session 的工具沙箱根目錄由後端在建立 Session 時寫入，request 帶入的 `metadata.workspace_root` 會被覆寫。
 - 職務說明（Workspace／Project 的 `instructions`）由後端依 Session 所屬層級注入提示；`StartRun` 會先移除呼叫端自帶的 `metadata.instructions`，避免 Client 直接對提示注入內容。單一層級上限 8000 字。
 

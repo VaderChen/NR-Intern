@@ -25,11 +25,16 @@ function run(arguments) {
   window.level = $.NSFloatingWindowLevel;
 
   const content = $.NSView.alloc.initWithFrame($.NSMakeRect(0, 0, 360, 224));
-  content.wantsLayer = true;
-  content.layer.backgroundColor = $.NSColor.windowBackgroundColor.CGColor;
-  content.layer.cornerRadius = 22;
-  content.layer.borderWidth = 1;
-  content.layer.borderColor = $.NSColor.separatorColor.CGColor;
+  // JXA 傳遞 CGColor 到 CALayer 在部分 macOS／Apple Silicon 會觸發 PAC 崩潰。
+  // 改由 AppKit 接收 NSColor，保留原有圓角外觀且不跨接 Core Graphics 指標。
+  const background = $.NSBox.alloc.initWithFrame($.NSMakeRect(0, 0, 360, 224));
+  background.boxType = $.NSBoxCustom;
+  background.borderType = $.NSLineBorder;
+  background.cornerRadius = 22;
+  background.borderWidth = 1;
+  background.fillColor = $.NSColor.windowBackgroundColor;
+  background.borderColor = $.NSColor.separatorColor;
+  content.addSubview(background);
 
   const icon = $.NSImage.alloc.initWithContentsOfFile(iconPath);
   const iconView = $.NSImageView.alloc.initWithFrame($.NSMakeRect(136, 116, 88, 88));

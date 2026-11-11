@@ -43,22 +43,22 @@ type Session struct {
 
 type Message struct {
 	Continuation      *ModelContinuation `json:"continuation,omitempty"`
-	ID                string         `json:"id"`
-	SessionID         string         `json:"session_id"`
-	Role              string         `json:"role"`
-	Content           string         `json:"content,omitempty"`
-	Reasoning         string         `json:"reasoning,omitempty"`
-	ToolCalls         []ToolCall     `json:"tool_calls,omitempty"`
-	ToolCallID        string         `json:"tool_call_id,omitempty"`
-	ToolName          string         `json:"tool_name,omitempty"`
-	IsError           bool           `json:"is_error,omitempty"`
-	ProviderID        string         `json:"provider_id,omitempty"`
-	ProviderRequestID string         `json:"provider_request_id,omitempty"`
-	Model             string         `json:"model,omitempty"`
-	StopReason        string         `json:"stop_reason,omitempty"`
-	Usage             *Usage         `json:"usage,omitempty"`
-	Metadata          map[string]any `json:"metadata,omitempty"`
-	CreatedAt         time.Time      `json:"created_at"`
+	ID                string             `json:"id"`
+	SessionID         string             `json:"session_id"`
+	Role              string             `json:"role"`
+	Content           string             `json:"content,omitempty"`
+	Reasoning         string             `json:"reasoning,omitempty"`
+	ToolCalls         []ToolCall         `json:"tool_calls,omitempty"`
+	ToolCallID        string             `json:"tool_call_id,omitempty"`
+	ToolName          string             `json:"tool_name,omitempty"`
+	IsError           bool               `json:"is_error,omitempty"`
+	ProviderID        string             `json:"provider_id,omitempty"`
+	ProviderRequestID string             `json:"provider_request_id,omitempty"`
+	Model             string             `json:"model,omitempty"`
+	StopReason        string             `json:"stop_reason,omitempty"`
+	Usage             *Usage             `json:"usage,omitempty"`
+	Metadata          map[string]any     `json:"metadata,omitempty"`
+	CreatedAt         time.Time          `json:"created_at"`
 }
 
 // Attachment 是使用者透過 Browser／Desktop 對話輸入區上傳的檔案。
@@ -204,6 +204,9 @@ type RunInput struct {
 	SandboxRoots   []string       `json:"-"`
 	Metadata       map[string]any `json:"metadata,omitempty"`
 	IdempotencyKey string         `json:"-"`
+	// Inputs 只由 Application 在啟動 Run 時填入，承接執行中追加的使用者訊息。
+	Inputs         *RunInputQueue     `json:"-"`
+	ModelSelection *RunModelSelection `json:"-"`
 }
 
 type RunStatus string

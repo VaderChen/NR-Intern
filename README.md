@@ -51,13 +51,14 @@ NR-Intern 是以 Go 建立的桌面 AI Agent。它會依目前對話、實際工
 
 本輪變更與升級限制見 [更新紀錄](docs/ai-agent/CHANGELOG.md)。
 
-## 本次更新：1.26.1110 build 1637
+## 本次更新：1.26.1111 build 1702
 
-- **Claude Platform API**：支援模型列表、串流與非串流、原生工具、思考續接與 effort；固定指示及工具定義支援 prompt caching，記錄快取讀寫 token。Claude 使用 Messages，設定中的「使用 Response」則屬於 OpenAI Responses 協定。
-- **Provider 管理**：修正儲存／刪除後的計價參照；刪除時，受影響且未執行工作的 Session 回到系統預設 Provider／模型。Workspace 仍引用或工作執行中時會保護原設定。
-- **長任務可靠性**：工具批次完整驗證後才派送；取消或事件失敗時補齊未派送結果，改善 Run 終態與截斷回覆處理。Context 裁切保留完整工具呼叫／結果群組，避免不完整歷史造成重做。
-- **效能與記憶體**：改善工具檢索、串流文字判讀、記憶搜尋、日誌緩衝與前端渲染；Session／事件索引採有界 LRU。實測條件及限制見[開發說明](docs/ai-agent/DEVELOPMENT.md#效能與記憶體檢查)，合成基準不代表整個 APP 的加速比例。
-- **剩餘用量**：Codex 顯示百分比、進度條及實際資料更新時間。Claude 速率快照供內部使用，不顯示為帳戶點數或金額餘額。
+- **執行中插入訊息**：待送純文字旁新增「插入」按鈕，由使用者選擇於目前 Run 下一回合處理；附件仍排隊。
+- **停止後保留訊息**：未送出或後端退回的訊息保留在待送區，須手動再送；結果未確認時不自動重送，避免重複執行。
+- **模型與 Thinking 即時設定**：執行中可調整，於下一回合生效，當前回覆及工具繼續完成；Thinking 可切回自動，Provider 與權限仍受保護。
+- **macOS 啟動畫面**：修正 `run.command` 的 Logo 前導視窗原生崩潰，恢復啟動進度顯示。
+
+完整行為、驗證範圍及升級限制見[更新紀錄](docs/ai-agent/CHANGELOG.md)。
 
 Claude 最大輸出 Tokens 應依模型能力設定；預設 4096 可能不足以一次生成完整程式。
 截斷的工具參數不會執行。模型支援的思考程度、輸入類型與其他限制請見[Claude 設定說明](docs/ai-agent/DEVELOPMENT.md#claude-platform-api)。

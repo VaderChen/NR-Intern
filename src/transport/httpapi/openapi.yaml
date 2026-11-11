@@ -939,6 +939,7 @@ paths:
         default: { $ref: "#/components/responses/Problem" }
     patch:
       summary: 更新 Session 管理欄位
+      description: 執行中接受 model 與 thinking_mode 更新，可單獨或一起提交，於目前 Run 下一回合邊界生效；model 不可為空，thinking_mode 空字串代表自動。不取消當前模型請求或工具。混合其他欄位仍回 409。Run 若覆寫為不同 Provider 則不允許切換。
       description: workspace_root 不可透過此 API 修改。
       requestBody:
         required: true
@@ -1309,6 +1310,28 @@ paths:
       summary: 恢復已暫停 Run
       responses:
         "202": { $ref: "#/components/responses/JSONData" }
+        default: { $ref: "#/components/responses/Problem" }
+  /api/v1/runs/{run_id}/inputs:
+    parameters:
+      - $ref: "#/components/parameters/RunID"
+    post:
+      summary: 執行中追加使用者訊息
+      description: 不中斷進行中的模型回覆或工具執行；訊息在目前回合結束、下一輪請求前寫入對話。模型即將完成時收到訊息會多跑一輪。Run 結束時尚未消化的訊息放在終止事件的 returned_inputs 退回。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              additionalProperties: false
+              properties:
+                input: { type: string, minLength: 1, maxLength: 32000 }
+                client_id: { type: string, maxLength: 128 }
+      responses:
+        "202": { $ref: "#/components/responses/JSONData" }
+        "409":
+          description: Run 已結束、未在本程序執行或待插入訊息過多；請改以新 Run 送出
         default: { $ref: "#/components/responses/Problem" }
   /api/v1/runs/{run_id}/decision:
     parameters:

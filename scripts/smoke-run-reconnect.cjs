@@ -12,6 +12,7 @@ const context = vm.createContext({
   removeActiveRun: () => { removed = true; return false; },
   syncRunStateAliases() {}, syncRunActionButton() {}, setRunActivity() {}, showApproval() {},
   handleTerminalRun: (value) => { run.terminal = true; run.status = value.status; },
+  reconcileTerminalInputs: async () => {},
   request: async () => (++reads >= 5 ? {status:'completed'} : {status:'running'}),
 });
 for (const [start, end] of [

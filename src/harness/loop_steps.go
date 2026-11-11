@@ -122,6 +122,41 @@ func (r *Runner) recordUserMessage(ctx context.Context, input Input, emit EventS
 	return userMessage, nil
 }
 
+// injectRunInputs 取出 Run 執行中追加的使用者訊息，依送達順序寫入 transcript，
+// 並發送與一般使用者訊息相同的生命週期事件。回傳寫入的則數。
+func (r *Runner) injectRunInputs(ctx context.Context, input Input, emit EventSink, turn int) (int, error) {
+	queued := input.Inputs.Take()
+	if len(queued) == 0 {
+		return 0, nil
+	}
+	ids := make([]string, 0, len(queued))
+	for _, item := range queued {
+		metadata := map[string]any{"inserted": true, "input_id": item.ID}
+		if item.ClientID != "" {
+			metadata["client_id"] = item.ClientID
+		}
+		message := domain.Message{
+			ID:        domain.NewID("msg"),
+			SessionID: input.Session.ID,
+			Role:      "user",
+			Content:   strings.TrimSpace(item.Content),
+			Metadata:  metadata,
+			CreatedAt: time.Now().UTC(),
+		}
+		if _, err := appendMessage(ctx, r.Sessions, input.Session.ID, message); err != nil {
+			return len(ids), err
+		}
+		if err := emitMessageLifecycle(emit, "message.start", message); err != nil {
+			return len(ids), err
+		}
+		if err := emitMessageLifecycle(emit, "message.end", message); err != nil {
+			return len(ids), err
+		}
+		ids = append(ids, item.ID)
+	}
+	return len(ids), emitEvent(emit, "run.input_applied", map[string]any{"turn": turn, "input_ids": ids})
+}
+
 // reportCompactionStarted 記錄並通知 Context 壓縮開始。
 func reportCompactionStarted(logger *slog.Logger, emit EventSink, turn int, status ContextCompactionStatus) error {
 	logger.Info("session context compaction started",

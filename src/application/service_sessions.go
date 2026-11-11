@@ -202,8 +202,35 @@ func (s *Service) UpdateSession(ctx context.Context, sessionID string, input dom
 	if err != nil {
 		return domain.Session{}, err
 	}
-	if s.hasActiveSession(sessionID) {
+	runtimeOnly := (input.Model != nil || input.ThinkingMode != nil) && input.Title == nil && input.WorkspaceID == nil && input.ProjectID == nil && input.ProviderID == nil && input.LockPlans == nil && input.PermissionProfile == nil && input.MemoryScope == nil && input.Pinned == nil && input.Position == nil
+	busy := s.hasActiveSession(sessionID)
+	if busy && !runtimeOnly {
 		return domain.Session{}, fmt.Errorf("%w: session has a queued or running run", domain.ErrConflict)
+	}
+	if busy && input.Model != nil && strings.TrimSpace(*input.Model) == "" {
+		return domain.Session{}, fmt.Errorf("%w: model cannot be empty", domain.ErrInvalidInput)
+	}
+	if busy && runtimeOnly {
+		provider := current.ProviderID
+		if provider == "" && current.WorkspaceID != "" {
+			workspace, err := s.workspaces.Get(ctx, current.WorkspaceID)
+			if err != nil {
+				return domain.Session{}, err
+			}
+			provider = workspace.DefaultProviderID
+		}
+		provider = valueutil.FirstNonEmpty(provider, s.providers.DefaultProviderID())
+		s.mu.Lock()
+		compatible := true
+		for _, active := range s.active {
+			if active.sessionID == sessionID && !active.cancelRequested && (active.modelSelection == nil || valueutil.FirstNonEmpty(active.providerID, s.providers.DefaultProviderID()) != provider) {
+				compatible = false
+			}
+		}
+		s.mu.Unlock()
+		if !compatible {
+			return domain.Session{}, fmt.Errorf("%w: 目前工作使用不同 Provider 或不支援切換，請完成或取消後再調整模型", domain.ErrConflict)
+		}
 	}
 	workspaceID := current.WorkspaceID
 	projectID := current.ProjectID
@@ -252,6 +279,21 @@ func (s *Service) UpdateSession(ctx context.Context, sessionID string, input dom
 	updated, err := engine.UpdateSession(ctx, sessionID, input)
 	if err != nil {
 		return domain.Session{}, err
+	}
+	if runtimeOnly {
+		// 設定落盤後才通知 Run；更新失敗不可悄悄切換執行中的模型。
+		s.mu.Lock()
+		for _, active := range s.active {
+			if active.sessionID == sessionID && !active.cancelRequested {
+				var model *string
+				if input.Model != nil {
+					value := strings.TrimSpace(*input.Model)
+					model = &value
+				}
+				active.modelSelection.Update(model, input.ThinkingMode)
+			}
+		}
+		s.mu.Unlock()
 	}
 	if input.LockPlans != nil {
 		if _, err := s.plans.Reconcile(ctx, updated.ID, updated.LockPlans); err != nil {

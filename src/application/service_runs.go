@@ -232,9 +232,11 @@ func (s *Service) startRunLocked(ctx context.Context, input domain.RunInput, bef
 		return domain.Run{}, err
 	}
 	input.RunID = run.ID
+	input.Inputs = domain.NewRunInputQueue()
+	input.ModelSelection = &domain.RunModelSelection{}
 	runCtx, cancel := context.WithCancel(s.rootCtx)
 	s.mu.Lock()
-	s.active[run.ID] = activeRun{sessionID: session.ID, cancel: cancel}
+	s.active[run.ID] = activeRun{sessionID: session.ID, cancel: cancel, inputs: input.Inputs, modelSelection: input.ModelSelection, providerID: input.ProviderID}
 	s.mu.Unlock()
 	s.wg.Add(1)
 	s.logger.Info("run queued", "run_id", run.ID, "session_id", session.ID, "agent_id", session.AgentID, "provider_id", run.ProviderID, "model", run.Model)
@@ -410,11 +412,18 @@ func (s *Service) persistImmediateCancellation(run domain.Run) (domain.Run, erro
 	run.PendingApproval = nil
 	run.Error = &domain.RunError{Code: "run_canceled", Message: "run canceled", Retryable: true}
 	run.CompletedAt = &completedAt
+	// 停止後不再接受插入；尚未寫進對話的訊息隨終止事件退回。
+	s.mu.Lock()
+	returned := s.closeRunInputsLocked(run.ID)
+	s.mu.Unlock()
 	current, changed, err := s.saveTerminalRun(run)
 	if err != nil || !changed {
 		return current, err
 	}
 	payload := map[string]any{"status": current.Status, "error": current.Error}
+	if len(returned) > 0 {
+		payload["returned_inputs"] = returned
+	}
 	if current.Usage != nil {
 		payload["usage"] = *current.Usage
 	}

@@ -19,6 +19,11 @@ type activeRun struct {
 	sessionID       string
 	cancel          context.CancelFunc
 	cancelRequested bool
+	// inputs 承接執行中追加的使用者訊息；Run 進入終止狀態時關閉，
+	// 尚未消化的訊息放進終止事件的 returned_inputs 退回。
+	inputs         *domain.RunInputQueue
+	modelSelection *domain.RunModelSelection
+	providerID     string
 }
 
 type Service struct {

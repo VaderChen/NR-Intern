@@ -72,6 +72,7 @@ func usageAtLeast(candidate, previous *domain.RunUsage) bool {
 // commitCompletedRun 的 bool 表示仍暫停，呼叫端應在鎖外等待。
 // 兩層鎖分別以 defer 釋放，事件儲存異常也不能永久鎖住同分片的其他 Run。
 func (s *Service) commitCompletedRun(run domain.Run, sequence *int64) (paused bool, err error) {
+	var returned []domain.RunInputMessage
 	lock := s.eventLock(run.ID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -85,6 +86,7 @@ func (s *Service) commitCompletedRun(run domain.Run, sequence *int64) (paused bo
 			paused = true
 			return nil
 		}
+		returned = s.closeRunInputsLocked(run.ID)
 		return s.runs.Save(context.Background(), run)
 	}()
 	if err != nil || paused {
@@ -92,6 +94,9 @@ func (s *Service) commitCompletedRun(run domain.Run, sequence *int64) (paused bo
 	}
 	defer s.notifyRun(run.ID)
 	payload := map[string]any{"status": run.Status, "result": run.Result}
+	if len(returned) > 0 {
+		payload["returned_inputs"] = returned
+	}
 	if err := s.appendEventLocked(run, sequence, "run.completed", payload); err != nil {
 		// 工作已完成，事件通道故障不改寫成 failed；重連時只補事件。
 		s.logger.Error("terminal event write failed", "run_id", run.ID, "error", err)
@@ -105,6 +110,10 @@ func (s *Service) finishTerminalRun(run domain.Run, sequence *int64) {
 	defer lock.Unlock()
 	// 即使事件寫入失敗，等待者仍須醒來讀取終態並嘗試補齊事件。
 	defer s.notifyRun(run.ID)
+	// 先關閉插入佇列，之後送達的訊息一律回 409，由前端改以新 Run 送出。
+	s.mu.Lock()
+	returned := s.closeRunInputsLocked(run.ID)
+	s.mu.Unlock()
 	current, changed, err := s.saveTerminalRun(run)
 	if err != nil {
 		s.logger.Error("terminal run write failed", "run_id", run.ID, "error", err)
@@ -114,6 +123,9 @@ func (s *Service) finishTerminalRun(run domain.Run, sequence *int64) {
 		return
 	}
 	payload := map[string]any{"status": current.Status, "error": current.Error}
+	if len(returned) > 0 {
+		payload["returned_inputs"] = returned
+	}
 	if current.Usage != nil {
 		payload["usage"] = *current.Usage
 	}

@@ -511,6 +511,8 @@ details[open] > .reasoning-summary::after { transform: rotate(45deg); }
 .queued-prompt-content { overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
 .retry-queued-prompt, .remove-queued-prompt { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--muted); }
 .retry-queued-prompt:hover { background: var(--navigation-hover); color: var(--accent); }
+.insert-queued-prompt { min-height: 22px; padding: 2px 7px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--accent); font: inherit; white-space: nowrap; }
+.insert-queued-prompt:hover:not(:disabled) { background: var(--navigation-hover); }
 .remove-queued-prompt:hover { background: var(--navigation-hover); color: var(--text); }
 .attachment-tray, .message-attachments { display: flex; flex-wrap: wrap; gap: 7px; }
 .pending-attachment, .message-attachment { display: flex; min-width: 0; max-width: 260px; align-items: center; gap: 7px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: var(--text); }

@@ -6,7 +6,7 @@ NR-Intern은 Go로 개발된 데스크톱 AI Agent입니다. 현재 대화, 검�
 
 ![NR-Intern 대화 화면](images/cap0001.jpg)
 
-최신 업데이트: **1.26.1110 build 1637**. Claude Platform API, Provider／모델 선택, 도구 실행과 Run 종료 처리, 성능 개선을 포함합니다. 검증 범위와 업그레이드 제한은 [변경 기록(번체 중국어)](docs/ai-agent/CHANGELOG.md)을 참고하세요.
+최신 업데이트: **1.26.1111 build 1702**. 대기 메시지 수동 삽입, 중지 후 반환 메시지 보관, 다음 턴부터 모델／Thinking 변경, macOS 시작 화면 수정을 포함합니다. 검증 범위와 제한은 [변경 기록(번체 중국어)](docs/ai-agent/CHANGELOG.md)을 참고하세요.
 
 ## 주요 기능
 

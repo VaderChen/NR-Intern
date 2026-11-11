@@ -132,6 +132,9 @@ type Input struct {
 	Model        string
 	ThinkingMode string
 	Metadata     map[string]any
+	// Inputs 是執行中追加的使用者訊息；nil 表示此 Run 不支援插入。
+	Inputs         *domain.RunInputQueue
+	ModelSelection *domain.RunModelSelection
 }
 
 type turnLifecycleKey struct{}
@@ -328,6 +331,31 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 			return domain.RunResult{}, fmt.Errorf("%w: %v", domain.ErrCanceled, err)
 		}
 		budget.startTurn(turn)
+		selected, thinking := input.ModelSelection.TakeSettings()
+		changed := false
+		if selected != "" && selected != modelID {
+			modelID = selected
+			effectiveSession.Model = selected
+			input.Model = selected
+			input.Session.Model = selected
+			changed = true
+		}
+		if thinking != nil && *thinking != input.ThinkingMode {
+			input.ThinkingMode = *thinking
+			input.Session.ThinkingMode = *thinking
+			effectiveSession.ThinkingMode = *thinking
+			changed = true
+		}
+		if changed {
+			if err := emitEvent(emit, "run.model_changed", map[string]any{"provider_id": providerID, "model": modelID, "thinking_mode": input.ThinkingMode, "turn": turn}); err != nil {
+				return domain.RunResult{}, err
+			}
+		}
+		// 執行中追加的使用者訊息在回合邊界寫入：上一輪的工具結果都已落盤，
+		// 訊息排在它們之後，下一次重讀歷史時自然帶給模型。
+		if _, err := r.injectRunInputs(ctx, input, emit, turn); err != nil {
+			return domain.RunResult{}, err
+		}
 		if turn > 1 {
 			latestDefinitions, err := r.Tools.Definitions(ctx, input.Session)
 			if err != nil {
@@ -387,6 +415,9 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		}
 		*turnState = turnLifecycle{id: turnID, number: turn, startedAt: turnStartedAt}
 		if err := emitEvent(emit, "turn.start", map[string]any{
+			"provider_id":     providerID,
+			"model":           modelID,
+			"thinking_mode":   input.ThinkingMode,
 			"turn":            turn,
 			"turn_id":         turnID,
 			"available_tools": availableToolNamesSorted(activeDefinitions),
@@ -844,6 +875,14 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 					return domain.RunResult{}, err
 				}
 				completionDirective = completionCheckDirective
+				continue
+			}
+			// 模型準備收尾時使用者又補了訊息：保留這次回答，再跑一輪回應補充內容。
+			// 已是最後一輪時照常完成，未消化的訊息由 Application 在終止事件中退回。
+			if input.Inputs.Pending() && turn < budget.budget.MaxTurns {
+				if err := r.closeToollessTurn(ctx, emit, ref, "input_received", response); err != nil {
+					return domain.RunResult{}, err
+				}
 				continue
 			}
 			if err := r.closeToollessTurn(ctx, emit, ref, "completed", response); err != nil {

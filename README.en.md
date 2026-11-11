@@ -41,7 +41,7 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 
 The interface language controls only the UI and an uncustomized default name. The agent infers the user's preferred language from the current message, recent conversation, and explicit preferences.
 
-Latest update: **1.26.1110 build 1637** adds Claude API support, provider/model selection improvements, safer tool and run completion, and performance optimizations. See the [release notes (Traditional Chinese)](docs/ai-agent/CHANGELOG.md) for validation and upgrade limits.
+Latest update: **1.26.1111 build 1702** adds manual insertion of queued text, preserves returned messages after stopping, allows model and Thinking changes at the next turn, and fixes the macOS startup splash. See the [release notes (Traditional Chinese)](docs/ai-agent/CHANGELOG.md) for validation and upgrade limits.
 
 ## Getting started
 

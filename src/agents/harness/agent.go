@@ -290,13 +290,15 @@ func (a *Agent) Run(ctx context.Context, input domain.RunInput, emit ports.Agent
 		return domain.RunResult{}, err
 	}
 	return a.runner.Run(ctx, harnesscore.Input{
-		RunID:        input.RunID,
-		Session:      session,
-		UserInput:    input.UserInput,
-		ProviderID:   input.ProviderID,
-		Model:        input.Model,
-		ThinkingMode: thinkingMode,
-		Metadata:     input.Metadata,
+		RunID:          input.RunID,
+		Session:        session,
+		UserInput:      input.UserInput,
+		ProviderID:     input.ProviderID,
+		Model:          input.Model,
+		ThinkingMode:   thinkingMode,
+		Metadata:       input.Metadata,
+		Inputs:         input.Inputs,
+		ModelSelection: input.ModelSelection,
 	}, harnesscore.EventSink(emit))
 }
 

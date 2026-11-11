@@ -1,5 +1,29 @@
 # 更新紀錄
 
+## 1.26.1111 build 1702
+
+### 執行中操作
+
+- 待送純文字訊息新增「插入」按鈕；送出仍先排隊，由使用者決定是否加入目前 Run。附件維持原本排隊流程。
+- 插入於當前回合結束後套用，不中斷模型回覆或工具。顯示傳送、等待、未確認及退回狀態，處理 API／SSE 到達順序差異。
+- 停止時保留未送出的本機佇列，並讀取終止事件中的退回訊息，須手動再送，避免停止後自行啟動下一個 Run。
+- 網路結果不明時不自動重送插入；重新載入後核對事件。隔離 Session 保持記憶體佇列，不寫入 IndexedDB。
+- 執行中可修改模型與 Thinking，於下一回合生效；連續選擇合併為各欄位最後設定，Thinking 可切回自動。當前回覆及工具批次繼續完成，既有 Run 預算不重設。
+- Provider、權限與專案等設定仍維持執行中保護。Run 使用不同 Provider 覆寫時拒絕套用模型／Thinking；若本次已完成，新的 Session 設定供下次工作使用。
+
+### macOS 啟動畫面
+
+- 修正 `run.command` 的 Logo 前導視窗因 JXA 將 CGColor 傳給 CALayer 而觸發原生 PAC 崩潰；改由 AppKit NSBox 繪製圓角、背景與框線。
+- 獨立啟動 Smoke 已確認程序持續運作、就緒訊號與取消清理後正常結束；未自動重啟使用者正在執行的 APP。
+
+### 驗證與限制
+
+- 對應前端及 Go Smoke、模型／Thinking 回合切換 race 檢查通過；完整發布檢查結果另列於 GitHub Release。
+- 本次未呼叫付費模型，未進行桌面全流程與 Windows 實機驗收；合成測試不代表長時間穩定性或模型品質評估。
+- 插入 API 的 `client_id` 供事件對應，尚非冪等重送保證；記憶體中的待插入內容不保證跨後端程序中止保留。前端保留未確認內容並避免自動重做。
+- macOS ARM64 提供已簽章及公證的 DMG；Windows x64／ARM64 提供 NSIS `setup.exe`。Windows 尚未具備 Authenticode 簽章，可能出現 SmartScreen 警告；ARM64 不含 NetPassClient Runtime。
+- 升級前請備份所需資料，RAM 工作區不跨重啟保留；以附件 `RELEASE-SHA256SUMS` 核對安裝檔完整性。
+
 ## 1.26.1110 build 1637
 
 本版整合 Claude Platform API、Provider 管理、Harness 可靠性與效能優化。
