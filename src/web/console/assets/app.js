@@ -3838,7 +3838,7 @@ async function loadMessages() {
       continue;
     }
     if (entry.type === "message" && entry.message) {
-      if (entry.message.role === "tool") {
+      if (entry.message.role === "tool" && !entry.message.is_error) {
         // tool 訊息不會顯示，但它的 metadata 記著這一輪產出了哪些檔案。
         // 不在這裡攔下來，重新載入對話後晶片就消失了。
         const produced = producedPathsFrom(entry.message.metadata);
@@ -4648,7 +4648,9 @@ function appendRunOutcome(outcome) {
   if (findMessage(outcomeID)) return null;
   const detail = typeof outcome.error === "string" ? outcome.error : outcome.error?.message;
   const canceled = outcome.status === "canceled";
-  return appendMessage({
+  const hasFiles = Boolean(state.producedFiles.get(outcome.id)?.length);
+  const emptyAnswer = detail === "model returned neither text nor tool calls" || detail === "模型只輸出了思考內容，沒有產生回答";
+  const message = appendMessage({
     id: outcomeID,
     role: "assistant",
     // 這則提示沒有對應的後端訊息，時間得由呼叫端給。重新載入舊對話時若讓它
@@ -4657,8 +4659,12 @@ function appendRunOutcome(outcome) {
     variant: canceled ? "run-canceled" : "run-failed",
     content: canceled
       ? (detail || "此 Run 已取消，未產生回答。")
+      : hasFiles && emptyAnswer ? "工具已產出檔案。模型未提供文字摘要。"
+      : hasFiles ? `工具已產出檔案，但 Run 執行失敗：${detail || "執行失敗"}`
       : `此 Run 未產生回答：${detail || "執行失敗"}`,
-  });
+  }, { operationId: outcome.id });
+  if (hasFiles) renderProducedFiles(outcome.id);
+  return message;
 }
 
 function messageCopyIcon() {

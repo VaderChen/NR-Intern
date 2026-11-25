@@ -1218,6 +1218,25 @@ func TestRunRetriesWhenTheModelOnlyProducesReasoning(t *testing.T) {
 	}
 }
 
+func TestRunReturnsProducedFileWhenFinalAnswerStaysEmpty(t *testing.T) {
+	sessions := newMemorySessions(testSession())
+	model := &scriptedModel{responses: []domain.ModelResponse{
+		{ToolCalls: []domain.ToolCall{{ID: "write", Name: "export_document"}}},
+		{},
+	}}
+	tools := &fakeTools{
+		definitions: []domain.ToolDefinition{{Name: "export_document"}},
+		execute: func(_ context.Context, _ domain.Session, call domain.ToolCall) (domain.ToolExecution, error) {
+			return domain.ToolExecution{ToolCallID: call.ID, ToolName: call.Name, Content: "已寫入",
+				Details: map[string]any{"produced_paths": []string{t.TempDir() + "/result.html"}}}, nil
+		},
+	}
+	result, err := newTestRunner(sessions, model, tools).Run(context.Background(), Input{Session: testSession(), UserInput: "匯出文件"}, nil)
+	if err != nil || !strings.Contains(result.Message.Content, "已產出檔案") || len(model.requests) != 2+maxEmptyAnswerRetries {
+		t.Fatalf("回合數 %d，回覆 %q，錯誤 %v", len(model.requests), result.Message.Content, err)
+	}
+}
+
 // 明確要求之後還是只有思考，就必須誠實失敗，而不是無限重試。
 func TestRunFailsClearlyWhenTheModelNeverAnswers(t *testing.T) {
 	sessions := newMemorySessions(testSession())

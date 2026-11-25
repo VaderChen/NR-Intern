@@ -311,6 +311,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 	lastPlanCompletionKey := ""
 	toolProtocolRepairAttempts := 0
 	emptyAnswerRetries := 0
+	hasProducedFile := false
 	truncationRetries := 0
 	// finishBudget 是所有 budget 退出點唯一的收尾路徑。集中在一處，是為了讓
 	// 「補齊未執行的 tool call」這個 transcript 不變式不可能被某一條路徑漏掉——
@@ -353,8 +354,10 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		}
 		// 執行中追加的使用者訊息在回合邊界寫入：上一輪的工具結果都已落盤，
 		// 訊息排在它們之後，下一次重讀歷史時自然帶給模型。
-		if _, err := r.injectRunInputs(ctx, input, emit, turn); err != nil {
+		if added, err := r.injectRunInputs(ctx, input, emit, turn); err != nil {
 			return domain.RunResult{}, err
+		} else if added > 0 {
+			hasProducedFile = false
 		}
 		if turn > 1 {
 			latestDefinitions, err := r.Tools.Definitions(ctx, input.Session)
@@ -752,7 +755,8 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 		)
 		pendingPlanDirective := ""
 		pendingPlan := domain.Plan{}
-		if response.StopReason != "refusal" && !protocolRepairExhausted && len(response.ToolCalls) == 0 && strings.TrimSpace(response.Content) != "" {
+		useFileResult := hasProducedFile && emptyAnswerRetries >= maxEmptyAnswerRetries && len(completion.failures) == 0 && strings.TrimSpace(response.Content) == ""
+		if response.StopReason != "refusal" && !protocolRepairExhausted && len(response.ToolCalls) == 0 && (strings.TrimSpace(response.Content) != "" || useFileResult) {
 			pendingPlanDirective, pendingPlan, err = r.planCompletionDirective(ctx, input.Session.ID, input.Session.LockPlans)
 			if err != nil {
 				_ = emitEvent(emit, "message.end", map[string]any{
@@ -760,6 +764,9 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				})
 				_ = r.finishTurn(context.WithoutCancel(ctx), input.Session.ID, operationID, turnID, turn, turnStartedAt, "failed", 0, response, err)
 				return domain.RunResult{}, err
+			}
+			if useFileResult && pendingPlan.ID == "" {
+				response.Content = "工具已產出檔案。模型未提供文字摘要。"
 			}
 		}
 		planCompletionKey := pendingPlanStateKey(pendingPlan)
@@ -928,6 +935,7 @@ func (r *Runner) Run(ctx context.Context, input Input, emit EventSink) (output d
 				call, result := outcome.call, outcome.result
 				toolResultsObserved = true
 				completion.observe(call, result)
+				hasProducedFile = hasProducedFile || toolProducedFile(result)
 				if successfulPlanStepCompletion(call, result) {
 					planStepCompleted = true
 				}

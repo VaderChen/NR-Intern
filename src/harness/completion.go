@@ -3,6 +3,7 @@ package harness
 import (
 	"AgenticService/src/domain"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -197,4 +198,26 @@ func (t *completionTracker) completion() *domain.RunCompletion {
 		ChecksPerformed:    t.checks,
 		UnresolvedFailures: unresolved,
 	}
+}
+
+// 只採用工具回報的絕對路徑，並支援經過 JSON 解碼的結果。
+func toolProducedFile(result domain.ToolExecution) bool {
+	if result.IsError {
+		return false
+	}
+	switch paths := result.Details["produced_paths"].(type) {
+	case []string:
+		for _, path := range paths {
+			if filepath.IsAbs(path) {
+				return true
+			}
+		}
+	case []any:
+		for _, value := range paths {
+			if path, ok := value.(string); ok && filepath.IsAbs(path) {
+				return true
+			}
+		}
+	}
+	return false
 }

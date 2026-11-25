@@ -15,6 +15,7 @@ NR-Intern is a desktop AI agent written in Go. It keeps working from the current
 - Configurable Thinking levels; lock plans for sequential work or unlock them to switch between unfinished plans. Different sessions can work concurrently.
 - A standalone schedule section: each schedule carries its own recurrence and sandbox, and starts a new conversation on time.
 - Durable runs, replayable SSE, streamed responses, and reconnection support. After a UI restart, choose which conversations to reconnect; interrupted work retains a retry option.
+- Open files produced by tools directly from the conversation. If the model still returns no summary after a retry, the run reports the files once completion checks pass. The files also appear when you reopen the conversation.
 - Recovery controls, an optional persistent notification center, pause/resume/cancel-all for runs, and redacted diagnostic exports.
 - Global search, safe backup/restore, and a read-only permissions center with pre-restore snapshots.
 - Download a configuration bundle with credential fields redacted to reference provider, MCP, reverse-proxy, and service settings on another machine.
